@@ -250,6 +250,11 @@ func NewThinker(apiKey string) *Thinker {
 	}
 	t.handleTools = mainToolHandler(t)
 
+	// Connect MCP servers and register their tools
+	if len(cfg.MCPServers) > 0 {
+		connectAndRegisterMCP(cfg.MCPServers, t.registry, t.memory)
+	}
+
 	// Respawn persistent threads from config
 	for _, pt := range cfg.GetThreads() {
 		t.threads.Spawn(pt.ID, pt.Directive, pt.Tools, pt.Thinking)

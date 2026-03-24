@@ -1,5 +1,6 @@
 .env
 thinking
+mcp-pushover-server
 memory.jsonl
 config.json
 workspace/

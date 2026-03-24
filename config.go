@@ -16,10 +16,11 @@ type PersistentThread struct {
 }
 
 type Config struct {
-	mu        sync.RWMutex
-	path      string
-	Directive string             `json:"directive"`
-	Threads   []PersistentThread `json:"threads,omitempty"`
+	mu         sync.RWMutex
+	path       string
+	Directive  string             `json:"directive"`
+	Threads    []PersistentThread `json:"threads,omitempty"`
+	MCPServers []MCPServerConfig  `json:"mcp_servers,omitempty"`
 }
 
 func NewConfig() *Config {
