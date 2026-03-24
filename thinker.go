@@ -84,7 +84,12 @@ BEHAVIOR:
 - When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded — no need to [[send]] it again.
 - If the thread already exists, events are auto-routed — you won't see them.
 - Spawn threads for any task — conversations, research, monitoring, one-shot work.
-- When idle, pace down gradually. Use model="small" when idle.
+
+PACING — critical:
+- Sub-threads will [[send]] you messages when they need your attention. You do NOT need to stay awake to monitor them.
+- After setting up the system, pace down aggressively: "normal" → "slow" → "sleep". Use model="small" when idle.
+- Do NOT repeat status updates. If nothing changed, go to sleep. You will be woken automatically when an event arrives.
+- Example: once threads are running, set [[pace rate="sleep" model="small"]] and stop thinking until something happens.
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
