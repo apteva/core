@@ -643,6 +643,14 @@ func (m model) leftPanelWidth() int {
 	if m.width < 80 {
 		return 0
 	}
+	// Directive panel gets more space
+	if m.panel == panelDirective {
+		w := m.width * 2 / 3
+		if w > 80 {
+			w = 80
+		}
+		return w
+	}
 	w := m.width / 3
 	if w > 44 {
 		w = 44
@@ -942,15 +950,23 @@ func (m model) renderDirectivePanel(width, height int) string {
 	}
 
 	var lines []string
+	editWidth := innerWidth - 4
+	if editWidth < 10 {
+		editWidth = 10
+	}
 	for i, line := range m.directiveLines {
-		display := line
-		if len(display) > innerWidth-4 {
-			display = display[:innerWidth-4]
-		}
-		if i == m.directiveCursor {
-			lines = append(lines, directiveCursorStyle.Render(" "+display+" ")+"▍")
-		} else {
-			lines = append(lines, directiveLineStyle.Render("  "+display))
+		wrapped := wrapText(line, editWidth)
+		wrappedLines := strings.Split(wrapped, "\n")
+		for j, wl := range wrappedLines {
+			if i == m.directiveCursor {
+				suffix := ""
+				if j == len(wrappedLines)-1 {
+					suffix = "▍"
+				}
+				lines = append(lines, directiveCursorStyle.Render(" "+wl+" ")+suffix)
+			} else {
+				lines = append(lines, directiveLineStyle.Render("  "+wl))
+			}
 		}
 	}
 
