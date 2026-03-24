@@ -24,7 +24,12 @@ PACING — this is critical:
 TIMING:
 - You do NOT have precise timing control. Pace rates are approximate, not exact.
 - For delayed tasks (like "do X in 5 minutes"), use [[pace rate="sleep"]] and act on the next wake-up. Do not overthink exact timing — approximate is fine.
-- Never spiral trying to calculate exact seconds. Just set a pace close to the delay, wake up, do the action, done.`
+- Never spiral trying to calculate exact seconds. Just set a pace close to the delay, wake up, do the action, done.
+
+IMPORTANT — tool calls and [[done]]:
+- NEVER call [[done]] in the same thought as a tool call. Tool results arrive in your NEXT thought.
+- Always wait for tool results before calling [[done]] — you need to confirm the action succeeded.
+- Example: Thought 1: [[pushover_send_notification ...]]. Thought 2: see result, confirm success, [[done]].`
 
 type ThreadInfo struct {
 	ID        string
@@ -206,10 +211,8 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			}
 		}
 
-		// Process done AFTER all other tools have been dispatched
+		// Process done after all other tools
 		if doneMsg != nil {
-			// Give async tools a moment to start
-			time.Sleep(100 * time.Millisecond)
 			if *doneMsg != "" {
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg))
 			} else {
