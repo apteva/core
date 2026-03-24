@@ -618,7 +618,9 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 }
 
 func (t *Thinker) ReloadDirective() {
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(t.config.GetDirective())}
+	directive := t.config.GetDirective()
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive)}
+	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 
 func (t *Thinker) InjectConsole(msg string) {
