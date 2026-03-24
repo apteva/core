@@ -67,7 +67,7 @@ EVENT FORMAT:
 BEHAVIOR:
 - When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded — no need to [[send]] it again.
 - If the thread already exists, events are auto-routed — you won't see them.
-- Spawn threads for any task — conversations, research, monitoring, one-shot work.
+- Spawn threads for any task — conversations, research, monitoring. Threads call [[done]] when finished.
 - Additional tools may appear in [available tools] blocks based on context. If you need a tool you don't see, describe what you need.
 
 PACING — critical:
@@ -198,7 +198,6 @@ type Thinker struct {
 	handleTools    ToolHandler
 	filterEvents   EventFilter
 	onStop         func()
-	oneShot        bool
 	toolAllowlist  map[string]bool // nil = all tools allowed (main thread)
 
 	// API event log — shared across all threads, owned by main thinker
@@ -257,7 +256,7 @@ func NewThinker(apiKey string) *Thinker {
 
 	// Respawn persistent threads from config
 	for _, pt := range cfg.GetThreads() {
-		t.threads.Spawn(pt.ID, pt.Directive, pt.Tools, pt.Thinking)
+		t.threads.Spawn(pt.ID, pt.Directive, pt.Tools)
 	}
 
 	return t
@@ -277,17 +276,16 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					directive = call.Args["prompt"] // backwards compat
 				}
 				toolsStr := call.Args["tools"]
-				thinking := call.Args["thinking"] != "false"
 				var tools []string
 				if toolsStr != "" {
 					tools = strings.Split(toolsStr, ",")
 				}
 				if id != "" && directive != "" {
-					if err := t.threads.Spawn(id, directive, tools, thinking, consumed...); err != nil {
+					if err := t.threads.Spawn(id, directive, tools, consumed...); err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
 					} else {
 						t.config.SaveThread(PersistentThread{
-							ID: id, Directive: directive, Tools: tools, Thinking: thinking,
+							ID: id, Directive: directive, Tools: tools,
 						})
 					}
 				}
@@ -493,10 +491,6 @@ func (t *Thinker) Run() {
 			t.logAPI(APIEvent{Type: "reply", Message: r})
 		}
 
-		// One-shot: run once and stop
-		if t.oneShot {
-			return
-		}
 
 		// Interruptible sleep
 		select {

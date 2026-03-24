@@ -25,7 +25,6 @@ type ThreadInfo struct {
 	ID        string
 	Directive string
 	Tools     []string
-	Thinking  bool
 	Running   bool
 	Iteration int
 	Rate      ThinkRate
@@ -39,7 +38,6 @@ type Thread struct {
 	Thinker  *Thinker
 	Parent   *Thinker
 	Tools    map[string]bool
-	Thinking bool
 	Started  time.Time
 }
 
@@ -64,7 +62,7 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 	}
 }
 
-func (tm *ThreadManager) Spawn(id, directive string, tools []string, thinking bool, initialMessages ...string) error {
+func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMessages ...string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -93,9 +91,8 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, thinking bo
 		ID:        id,
 		Directive: directive,
 		Parent:    tm.parent,
-		Tools:    toolSet,
-		Thinking: thinking,
-		Started:  time.Now(),
+		Tools:     toolSet,
+		Started:   time.Now(),
 	}
 
 	// Create a Thinker — same struct as main, different hooks
@@ -112,7 +109,6 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, thinking bo
 		rate:      RateReactive,
 		agentRate: RateNormal,
 		memory:    tm.parent.memory,
-		oneShot:   !thinking,
 		onStop:    func() { tm.cleanupThread(id) },
 		handleTools: threadToolHandler(thread, tm),
 		threadID:  id,
@@ -195,7 +191,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					t.messages[0] = Message{Role: "system", Content: baseThreadPrompt + coreDocs + "\n\n[DIRECTIVE]\n" + d}
 					// Persist
 					tm.parent.config.SaveThread(PersistentThread{
-						ID: thread.ID, Directive: d, Tools: toolSetToSlice(thread.Tools), Thinking: thread.Thinking,
+						ID: thread.ID, Directive: d, Tools: toolSetToSlice(thread.Tools),
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
 				}
@@ -283,7 +279,6 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			ID:        t.ID,
 			Directive: t.Directive,
 			Tools:     toolSetToSlice(t.Tools),
-			Thinking:  t.Thinking,
 			Running:   true,
 			Iteration: t.Thinker.iteration,
 			Rate:      t.Thinker.rate,

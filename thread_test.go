@@ -28,7 +28,7 @@ func TestThreadManager_SpawnAndList(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	err := thinker.threads.Spawn("test-thread", "Test prompt", []string{"reply", "web"}, true)
+	err := thinker.threads.Spawn("test-thread", "Test prompt", []string{"reply", "web"})
 	if err != nil {
 		t.Fatalf("Spawn error: %v", err)
 	}
@@ -44,8 +44,8 @@ func TestThreadManager_SpawnAndList(t *testing.T) {
 	if threads[0].ID != "test-thread" {
 		t.Errorf("expected id 'test-thread', got %q", threads[0].ID)
 	}
-	if !threads[0].Thinking {
-		t.Error("expected thinking=true")
+	if !threads[0].Running {
+		t.Error("expected running=true")
 	}
 }
 
@@ -53,8 +53,8 @@ func TestThreadManager_SpawnDuplicate(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("dup", "test", nil, true)
-	err := thinker.threads.Spawn("dup", "test2", nil, true)
+	thinker.threads.Spawn("dup", "test", nil)
+	err := thinker.threads.Spawn("dup", "test2", nil)
 	if err == nil {
 		t.Error("expected error on duplicate spawn")
 	}
@@ -64,7 +64,7 @@ func TestThreadManager_Kill(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("killme", "test", nil, true)
+	thinker.threads.Spawn("killme", "test", nil)
 	if thinker.threads.Count() != 1 {
 		t.Fatal("expected 1 thread")
 	}
@@ -82,7 +82,7 @@ func TestThreadManager_Send(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("sendto", "test", nil, true)
+	thinker.threads.Spawn("sendto", "test", nil)
 
 	ok := thinker.threads.Send("sendto", "hello from parent")
 	if !ok {
@@ -99,7 +99,7 @@ func TestThreadManager_Route(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("marco", "Handle Marco", []string{"reply"}, true)
+	thinker.threads.Spawn("marco", "Handle Marco", []string{"reply"})
 
 	// Should route to thread
 	routed := thinker.threads.Route("[user:marco] Hello there")
@@ -124,7 +124,7 @@ func TestThreadManager_ToolSetAlwaysIncludesBuiltins(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("minimal", "test", nil, true)
+	thinker.threads.Spawn("minimal", "test", nil)
 
 	threads := thinker.threads.List()
 	if len(threads) != 1 {

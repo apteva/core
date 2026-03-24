@@ -69,9 +69,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, tools, and thinking loop. Threads are persistent across restarts.",
-		Syntax:      `[[spawn id="name" directive="What this thread does" tools="reply,web" thinking="true"]]`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated. thinking: true for loop, false for one-shot.`,
+		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Threads are persistent across restarts.",
+		Syntax:      `[[spawn id="name" directive="What this thread does" tools="reply,web"]]`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated. Thread runs continuously and calls [[done]] when finished.`,
 		Core:        true,
 		MainOnly:    true,
 	})

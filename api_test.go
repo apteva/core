@@ -96,7 +96,7 @@ func TestAPI_Threads_MainOnly(t *testing.T) {
 
 func TestAPI_Threads_WithSubThreads(t *testing.T) {
 	api, thinker := newTestAPI()
-	thinker.threads.Spawn("test-thread", "test prompt", []string{"web"}, true)
+	thinker.threads.Spawn("test-thread", "test prompt", []string{"web"})
 	defer thinker.threads.Kill("test-thread")
 
 	req := httptest.NewRequest("GET", "/threads", nil)

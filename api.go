@@ -45,7 +45,6 @@ type threadJSON struct {
 	ID        string   `json:"id"`
 	Directive string   `json:"directive,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
-	Thinking  bool     `json:"thinking"`
 	Iteration int      `json:"iteration"`
 	Rate      string   `json:"rate"`
 	Model     string   `json:"model"`
@@ -56,7 +55,6 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	// Always include main
 	out := []threadJSON{{
 		ID:        "main",
-		Thinking:  true,
 		Iteration: a.thinker.iteration,
 		Rate:      a.thinker.rate.String(),
 		Model:     a.thinker.model.String(),
@@ -68,7 +66,6 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 			ID:        t.ID,
 			Directive: t.Directive,
 			Tools:     t.Tools,
-			Thinking:  t.Thinking,
 			Iteration: t.Iteration,
 			Rate:      t.Rate.String(),
 			Model:     t.Model.String(),

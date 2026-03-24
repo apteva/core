@@ -9,10 +9,9 @@ import (
 const configFile = "config.json"
 
 type PersistentThread struct {
-	ID       string   `json:"id"`
+	ID        string   `json:"id"`
 	Directive string   `json:"directive"`
-	Tools    []string `json:"tools"`
-	Thinking bool     `json:"thinking"`
+	Tools     []string `json:"tools"`
 }
 
 type Config struct {

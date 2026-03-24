@@ -36,7 +36,7 @@ func TestEventFilter_RoutesToThreads(t *testing.T) {
 	defer thinker.Stop()
 
 	// Spawn a thread
-	thinker.threads.Spawn("alice", "test", nil, true)
+	thinker.threads.Spawn("alice", "test", nil)
 	defer thinker.threads.Kill("alice")
 
 	// Set up the filter (same as NewThinker does)
@@ -95,7 +95,7 @@ func TestSubThread_ReceivesEvents(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("worker", "test worker", []string{"web"}, true)
+	thinker.threads.Spawn("worker", "test worker", []string{"web"})
 	defer thinker.threads.Kill("worker")
 
 	// Send to the thread
@@ -119,7 +119,7 @@ func TestSubThread_InitialMessages(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("greeter", "test", nil, true, "[user] Hello", "[user] How are you?")
+	thinker.threads.Spawn("greeter", "test", nil, "[user] Hello", "[user] How are you?")
 	defer thinker.threads.Kill("greeter")
 
 	thinker.threads.mu.RLock()
@@ -139,7 +139,7 @@ func TestSubThread_HasBasePrompt(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("worker", "You monitor files", []string{"list_files"}, true)
+	thinker.threads.Spawn("worker", "You monitor files", []string{"list_files"})
 	defer thinker.threads.Kill("worker")
 
 	thinker.threads.mu.RLock()
@@ -170,7 +170,7 @@ func TestSubThread_SharedMemory(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("worker", "test", nil, true)
+	thinker.threads.Spawn("worker", "test", nil)
 	defer thinker.threads.Kill("worker")
 
 	thinker.threads.mu.RLock()
@@ -187,7 +187,7 @@ func TestSubThread_SharedAPILog(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("worker", "test", nil, true)
+	thinker.threads.Spawn("worker", "test", nil)
 	defer thinker.threads.Kill("worker")
 
 	thinker.threads.mu.RLock()
@@ -207,7 +207,7 @@ func TestSubThread_APILogTagsThreadID(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("worker", "test", nil, true)
+	thinker.threads.Spawn("worker", "test", nil)
 	defer thinker.threads.Kill("worker")
 
 	thinker.threads.mu.RLock()
@@ -234,7 +234,7 @@ func TestSubThread_ToolSet(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("writer", "test", []string{"write_file", "read_file"}, true)
+	thinker.threads.Spawn("writer", "test", []string{"write_file", "read_file"})
 	defer thinker.threads.Kill("writer")
 
 	threads := thinker.threads.List()
@@ -261,7 +261,7 @@ func TestSubThread_KillRemovesFromList(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("temp", "test", nil, true)
+	thinker.threads.Spawn("temp", "test", nil)
 
 	if thinker.threads.Count() != 1 {
 		t.Fatal("expected 1 thread")
@@ -278,9 +278,9 @@ func TestSubThread_KillAll(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("a", "test", nil, true)
-	thinker.threads.Spawn("b", "test", nil, true)
-	thinker.threads.Spawn("c", "test", nil, true)
+	thinker.threads.Spawn("a", "test", nil)
+	thinker.threads.Spawn("b", "test", nil)
+	thinker.threads.Spawn("c", "test", nil)
 
 	if thinker.threads.Count() != 3 {
 		t.Fatalf("expected 3 threads, got %d", thinker.threads.Count())
@@ -296,8 +296,8 @@ func TestSubThread_KillAll(t *testing.T) {
 func TestConfig_PersistentThreads(t *testing.T) {
 	cfg := &Config{path: "/dev/null"}
 
-	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "write stuff", Tools: []string{"write_file"}, Thinking: true})
-	cfg.SaveThread(PersistentThread{ID: "reader", Directive: "read stuff", Tools: []string{"read_file"}, Thinking: true})
+	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "write stuff", Tools: []string{"write_file"}})
+	cfg.SaveThread(PersistentThread{ID: "reader", Directive: "read stuff", Tools: []string{"read_file"}})
 
 	threads := cfg.GetThreads()
 	if len(threads) != 2 {
@@ -305,7 +305,7 @@ func TestConfig_PersistentThreads(t *testing.T) {
 	}
 
 	// Update existing
-	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "updated", Tools: []string{"write_file", "web"}, Thinking: true})
+	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "updated", Tools: []string{"write_file", "web"}})
 	threads = cfg.GetThreads()
 	if len(threads) != 2 {
 		t.Fatalf("expected still 2 threads after update, got %d", len(threads))
@@ -399,7 +399,7 @@ func TestAPIEvents_ThreadLifecycle(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("lifecycle-test", "test", nil, true)
+	thinker.threads.Spawn("lifecycle-test", "test", nil)
 
 	// Should have thread_started event
 	events, _ := thinker.APIEvents(0)

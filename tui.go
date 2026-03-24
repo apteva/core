@@ -857,20 +857,16 @@ func (m model) renderThreadPanel(width, height int) string {
 	} else {
 		for i, thr := range threads {
 			age := formatAge(time.Since(thr.Started))
-			mode := "thinking"
-			if !thr.Thinking {
-				mode = "one-shot"
-			}
 			info := fmt.Sprintf("%s/%s #%d", thr.Rate, thr.Model, thr.Iteration)
 			toolStr := strings.Join(thr.Tools, ",")
 
 			if i == m.threadCursor {
 				lines = append(lines, threadSelectedStyle.Render(fmt.Sprintf(" %s ", thr.ID)))
-				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s │ %s", mode, info, age)))
+				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s", info, age)))
 				lines = append(lines, statsStyle.Render(fmt.Sprintf("  tools: %s", toolStr)))
 			} else {
 				lines = append(lines, threadActiveStyle.Render("  "+thr.ID))
-				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s │ %s", mode, info, age)))
+				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s", info, age)))
 			}
 			lines = append(lines, "")
 		}
