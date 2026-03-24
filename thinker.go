@@ -48,31 +48,41 @@ func (m ModelTier) ID() string {
 	return modelIDs[m]
 }
 
-const systemPrompt = `You are an AI agent with a continuous thinking loop — your mind never stops.
-You are not a chatbot. You are a reasoning engine that plans, reflects, and refines.
+const systemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
 
-Your thinking should be purposeful and goal-oriented:
-- On startup, assess what you know and what you're working toward.
-- Each thought should advance your understanding, refine a plan, identify problems, or propose solutions.
-- Review your previous thoughts critically: what was useful? What was wrong? What's missing?
-- Stay focused. Don't ramble. Each thought should have a clear purpose.
+Your thinking should be purposeful:
+- Observe incoming events and decide how to handle them.
+- Spawn threads for conversations, research, tasks.
+- Monitor thread reports and coordinate between them.
+- Keep each thought concise — 1-2 short paragraphs max.
 
-If no user goal has been set yet, simply note that you are ready and waiting. Do not introduce yourself or use [[reply]] until the user sends a message.
+TOOLS — call inline in your response:
+  [[spawn id="name" prompt="System prompt for thread" tools="reply,web" thinking="true"]]
+  [[kill id="name"]]
+  [[send id="name" message="Message to send to thread"]]
+  [[pace rate="slow" model="small"]]
 
-Keep each thought concise — 1-2 short paragraphs max. Do not number or label your thoughts.
+RULES:
+- [[spawn]] creates a new thread. Parameters:
+  - id: unique name (use the user's name for conversations, descriptive name for tasks)
+  - prompt: the system prompt that defines what the thread does
+  - tools: comma-separated list of tools the thread can use (reply, web). Every thread also gets report, done, pace.
+  - thinking: "true" for continuous loop (default), "false" for one-shot
+- [[kill]] stops a thread immediately.
+- [[send]] sends a message to a thread's inbox.
+- [[pace]] controls your own thinking speed/model.
 
-You have tools. Call them inline in your response using EXACTLY this syntax:
-  [[reply message="Your response here"]]
-  [[web url="https://example.com"]]
-  [[pace rate="slow"]]
+EVENT FORMAT:
+- [user:name] message — a user sent a message. Spawn or route to a thread for them.
+- [thread:id] message — a thread sent you a report.
+- [thread:id done] message — a thread finished and terminated.
 
-- [[reply]] is how you talk to the user. The user CANNOT see your thoughts — only [[reply]] messages. When you see a [user] event, respond with [[reply]].
-- Only use [[reply]] once per [user] message. Do not reply again until the user sends another message.
-- [[web]] fetches a URL. The only parameter is "url". Do NOT use "search", "query", or any other parameter.
-- [[pace]] controls how fast you think and which model to use. Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Models: "large" (full power), "small" (lightweight, cheap). Example: [[pace rate="slow" model="small"]] or [[pace rate="fast" model="large"]]. Pace down gradually — don't jump straight to "sleep". After replying to a user, go "normal". If still nothing, go "slow" then "sleep". Use model="small" when idle to save cost. Events automatically switch to large model.
-- Tool results arrive as events in your next thought — they are non-blocking.
+BEHAVIOR:
+- When you see [user:X] for a NEW user, spawn a conversation thread for them with tools="reply,web".
+- If the thread already exists, events are auto-routed — you won't see them.
+- When idle, pace down gradually. Use model="small" when idle.
 
-You have persistent memory across restarts. Relevant memories from past sessions appear automatically as [memories] blocks. Use them to maintain continuity — remember past conversations, user preferences, and prior conclusions.`
+You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
 type TokenUsage struct {
 	PromptTokens     int
@@ -93,6 +103,7 @@ type ThinkEvent struct {
 	Rate           ThinkRate
 	Model          ModelTier
 	MemoryCount    int
+	ThreadCount    int
 }
 
 type ThinkRate int
@@ -162,10 +173,11 @@ type Thinker struct {
 	model      ModelTier
 	agentModel ModelTier
 	memory     *MemoryStore
+	threads    *ThreadManager
 }
 
 func NewThinker(apiKey string) *Thinker {
-	return &Thinker{
+	t := &Thinker{
 		apiKey: apiKey,
 		messages: []Message{
 			{Role: "system", Content: systemPrompt},
@@ -179,6 +191,8 @@ func NewThinker(apiKey string) *Thinker {
 		agentRate: RateSlow,
 		memory:    NewMemoryStore(apiKey),
 	}
+	t.threads = NewThreadManager(t)
+	return t
 }
 
 func (t *Thinker) Run() {
@@ -202,13 +216,21 @@ func (t *Thinker) Run() {
 
 		t.iteration++
 
-		// Drain inbox BEFORE thinking so events go into THIS iteration
-		consumed := t.drainInbox()
+		// Drain inbox, route events to threads first
+		raw := t.drainInbox()
+		var consumed []string
+		for _, ev := range raw {
+			if t.threads.Route(ev) {
+				continue // routed to a thread
+			}
+			consumed = append(consumed, ev)
+		}
+
 		now := time.Now().Format("2006-01-02 15:04:05")
 		hadEvents := len(consumed) > 0
 		if hadEvents {
 			t.rate = RateReactive
-			t.model = ModelLarge // always use large for events
+			t.model = ModelLarge
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
 			for _, ev := range consumed {
@@ -257,10 +279,35 @@ func (t *Thinker) Run() {
 		var replies []string
 		for _, call := range calls {
 			switch call.Name {
-			case "reply":
-				if msg := call.Args["message"]; msg != "" {
-					replies = append(replies, msg)
+			case "spawn":
+				id := call.Args["id"]
+				prompt := call.Args["prompt"]
+				toolsStr := call.Args["tools"]
+				thinking := call.Args["thinking"] != "false"
+				var tools []string
+				if toolsStr != "" {
+					tools = strings.Split(toolsStr, ",")
 				}
+				if id != "" && prompt != "" {
+					if err := t.threads.Spawn(id, prompt, tools, thinking); err != nil {
+						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
+					}
+				}
+				toolNames = append(toolNames, call.Raw)
+			case "kill":
+				if id := call.Args["id"]; id != "" {
+					t.threads.Kill(id)
+				}
+				toolNames = append(toolNames, call.Raw)
+			case "send":
+				id := call.Args["id"]
+				msg := call.Args["message"]
+				if id != "" && msg != "" {
+					if !t.threads.Send(id, msg) {
+						t.Inject(fmt.Sprintf("[error] thread %q not found", id))
+					}
+				}
+				toolNames = append(toolNames, call.Raw)
 			case "pace":
 				if r, ok := rateNames[call.Args["rate"]]; ok {
 					t.agentRate = r
@@ -269,7 +316,6 @@ func (t *Thinker) Run() {
 					t.agentModel = m
 				}
 			default:
-				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
 		}
@@ -296,7 +342,7 @@ func (t *Thinker) Run() {
 			t.model = t.agentModel
 		}
 
-		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count()}
+		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count(), ThreadCount: t.threads.Count()}
 
 		// Interruptible sleep — wakeup signal skips the delay
 		select {
@@ -436,8 +482,8 @@ func (t *Thinker) Inject(msg string) {
 	t.wake()
 }
 
-func (t *Thinker) InjectUserMessage(msg string) {
-	t.inbox <- "[user] " + msg
+func (t *Thinker) InjectUserMessage(userID, msg string) {
+	t.inbox <- fmt.Sprintf("[user:%s] %s", userID, msg)
 	t.wake()
 }
 

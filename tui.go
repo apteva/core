@@ -10,7 +10,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Styles
 var (
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -84,10 +83,24 @@ var (
 				Foreground(lipgloss.Color("235")).
 				Background(lipgloss.Color("141")).
 				Bold(true)
+
+	threadTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("77")).
+				Padding(0, 1)
+
+	threadActiveStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("77"))
+
+	threadSelectedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("235")).
+				Background(lipgloss.Color("77")).
+				Bold(true)
 )
 
 type tickMsg time.Time
 type thinkEventMsg ThinkEvent
+type threadEventMsg ThreadEvent
 
 const (
 	priceInputPerToken  = 0.60 / 1_000_000
@@ -96,15 +109,17 @@ const (
 )
 
 type chatMessage struct {
-	isUser bool
-	text   string
+	isUser   bool
+	text     string
+	threadID string // which thread this belongs to
 }
 
 type panelMode int
 
 const (
-	panelChat   panelMode = iota
+	panelChat    panelMode = iota
 	panelMemory
+	panelThreads
 )
 
 type model struct {
@@ -121,16 +136,19 @@ type model struct {
 	input        textinput.Model
 	inputActive  bool
 
-	chat        []chatMessage
-	rate        ThinkRate
-	aiModel     ModelTier
-	memoryCount int
+	chat         []chatMessage
+	rate         ThinkRate
+	aiModel      ModelTier
+	memoryCount  int
+	threadCount  int
 
-	// Left panel mode
-	panel         panelMode
-	memoryCursor  int
+	panel        panelMode
+	memoryCursor int
+	threadCursor int
 
-	// Token accounting
+	// Which user ID to send messages as (for now just "user")
+	userID string
+
 	totalPromptTokens     int
 	totalCachedTokens     int
 	totalCompletionTokens int
@@ -155,20 +173,27 @@ func newModel(thinker *Thinker) model {
 		input:        ti,
 		rate:         RateSlow,
 		memoryCount:  thinker.memory.Count(),
+		userID:       "user",
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		pollEvents(m.thinker),
+		pollThreadEvents(m.thinker.threads),
 		tickCmd(),
 	)
 }
 
 func pollEvents(t *Thinker) tea.Cmd {
 	return func() tea.Msg {
-		ev := <-t.events
-		return thinkEventMsg(ev)
+		return thinkEventMsg(<-t.events)
+	}
+}
+
+func pollThreadEvents(tm *ThreadManager) tea.Cmd {
+	return func() tea.Msg {
+		return threadEventMsg(<-tm.events)
 	}
 }
 
@@ -186,8 +211,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				val := strings.TrimSpace(m.input.Value())
 				if val != "" {
-					m.thinker.InjectUserMessage(val)
-					m.chat = append(m.chat, chatMessage{isUser: true, text: val})
+					m.thinker.InjectUserMessage(m.userID, val)
+					m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
 				}
 				m.input.Reset()
 				m.input.Blur()
@@ -216,18 +241,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, textinput.Blink
 			}
 		case "m":
-			if m.panel == panelChat {
+			if m.panel == panelMemory {
+				m.panel = panelChat
+			} else {
 				m.panel = panelMemory
 				m.memoryCursor = 0
-			} else {
+			}
+			return m, nil
+		case "t":
+			if m.panel == panelThreads {
 				m.panel = panelChat
+			} else {
+				m.panel = panelThreads
+				m.threadCursor = 0
 			}
 			return m, nil
 		case "d":
 			if m.panel == panelMemory {
-				entries := m.thinker.memory.Recent(m.thinker.memory.Count())
-				if len(entries) > 0 && m.memoryCursor < len(entries) {
-					// Delete from the actual store (index is reversed since Recent returns newest-last)
+				if m.memoryCount > 0 && m.memoryCursor < m.memoryCount {
 					realIndex := m.thinker.memory.Count() - 1 - m.memoryCursor
 					m.thinker.memory.Delete(realIndex)
 					m.memoryCount = m.thinker.memory.Count()
@@ -237,35 +268,53 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.panel == panelThreads {
+				threads := m.thinker.threads.List()
+				if m.threadCursor < len(threads) {
+					m.thinker.threads.Kill(threads[m.threadCursor].ID)
+				}
+				return m, nil
+			}
 		case " ":
 			m.paused = !m.paused
 			m.thinker.TogglePause()
 			return m, nil
 		case "j", "down":
-			if m.panel == panelMemory {
+			switch m.panel {
+			case panelMemory:
 				if m.memoryCursor < m.memoryCount-1 {
 					m.memoryCursor++
 				}
-			} else {
+			case panelThreads:
+				threads := m.thinker.threads.List()
+				if m.threadCursor < len(threads)-1 {
+					m.threadCursor++
+				}
+			default:
 				m.scrollOffset = min(m.scrollOffset+1, m.maxScroll())
 			}
 			return m, nil
 		case "k", "up":
-			if m.panel == panelMemory {
+			switch m.panel {
+			case panelMemory:
 				if m.memoryCursor > 0 {
 					m.memoryCursor--
 				}
-			} else {
+			case panelThreads:
+				if m.threadCursor > 0 {
+					m.threadCursor--
+				}
+			default:
 				m.scrollOffset = max(m.scrollOffset-1, 0)
 			}
 			return m, nil
 		case "G":
-			if m.panel != panelMemory {
+			if m.panel == panelChat {
 				m.scrollOffset = m.maxScroll()
 			}
 			return m, nil
 		case "g":
-			if m.panel != panelMemory {
+			if m.panel == panelChat {
 				m.scrollOffset = 0
 			}
 			return m, nil
@@ -294,10 +343,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if ev.Done {
-			content := m.currentChunk.String()
 			m.thoughts = append(m.thoughts, thought{
 				iteration: ev.Iteration,
-				content:   content,
+				content:   m.currentChunk.String(),
 				duration:  ev.Duration,
 			})
 			m.currentChunk.Reset()
@@ -305,6 +353,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rate = ev.Rate
 			m.aiModel = ev.Model
 			m.memoryCount = ev.MemoryCount
+			m.threadCount = ev.ThreadCount
 
 			u := ev.Usage
 			m.totalPromptTokens += u.PromptTokens
@@ -318,14 +367,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				float64(u.CachedTokens)*priceCachedPerToken +
 				float64(u.CompletionTokens)*priceOutputPerToken
 
-			for _, reply := range ev.Replies {
-				m.chat = append(m.chat, chatMessage{isUser: false, text: reply})
-			}
-
 			m.scrollOffset = m.maxScroll()
 		}
 
 		return m, pollEvents(m.thinker)
+
+	case threadEventMsg:
+		ev := ThreadEvent(msg)
+		switch ev.Type {
+		case "reply":
+			m.chat = append(m.chat, chatMessage{isUser: false, text: ev.Message, threadID: ev.ThreadID})
+		case "report":
+			// Reports show in thoughts area as system info
+		case "started":
+			m.threadCount = m.thinker.threads.Count()
+		case "done":
+			m.threadCount = m.thinker.threads.Count()
+		}
+		return m, pollThreadEvents(m.thinker.threads)
 
 	case tickMsg:
 		return m, tickCmd()
@@ -369,7 +428,6 @@ func (m model) thoughtsPanelWidth() int {
 
 func (m model) renderThoughts(maxWidth int) string {
 	var sb strings.Builder
-
 	contentWidth := maxWidth - 4
 	if contentWidth < 10 {
 		contentWidth = 10
@@ -397,19 +455,18 @@ func (m model) renderChatPanel(width, height int) string {
 	if width <= 0 {
 		return ""
 	}
-
 	innerWidth := width - 4
 	if innerWidth < 5 {
 		innerWidth = 5
 	}
 
-	title := chatTitleStyle.Render("Chat") + statsStyle.Render(fmt.Sprintf(" [%d mem]", m.memoryCount))
+	title := chatTitleStyle.Render("Chat") + statsStyle.Render(fmt.Sprintf(" [%d thr │ %d mem]", m.threadCount, m.memoryCount))
 
 	var inputArea string
 	if m.inputActive {
 		inputArea = inputLabelStyle.Render("> ") + m.input.View()
 	} else {
-		inputArea = helpStyle.Render("i: chat │ m: memory")
+		inputArea = helpStyle.Render("i: chat │ t: threads │ m: mem")
 	}
 
 	listHeight := height - 4
@@ -429,12 +486,16 @@ func (m model) renderChatPanel(width, height int) string {
 				}
 			}
 		} else {
-			wrapped := wrapText(msg.text, innerWidth-6)
+			label := "  ↩ "
+			if msg.threadID != "" {
+				label = fmt.Sprintf(" [%s] ", msg.threadID)
+			}
+			wrapped := wrapText(msg.text, innerWidth-len(label)-2)
 			for i, line := range strings.Split(wrapped, "\n") {
 				if i == 0 {
-					lines = append(lines, chatAgentLabelStyle.Render("  ↩ ")+chatAgentStyle.Render(line))
+					lines = append(lines, chatAgentLabelStyle.Render(label)+chatAgentStyle.Render(line))
 				} else {
-					lines = append(lines, "    "+chatAgentStyle.Render(line))
+					lines = append(lines, strings.Repeat(" ", len(label))+chatAgentStyle.Render(line))
 				}
 			}
 		}
@@ -453,40 +514,31 @@ func (m model) renderChatPanel(width, height int) string {
 	}
 
 	body := title + "\n" + strings.Join(lines, "\n") + "\n" + inputArea
-
-	return panelBorderStyle.
-		Width(innerWidth).
-		Height(height - 2).
-		Render(body)
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
 }
 
 func (m model) renderMemoryPanel(width, height int) string {
 	if width <= 0 {
 		return ""
 	}
-
 	innerWidth := width - 4
 	if innerWidth < 5 {
 		innerWidth = 5
 	}
 
 	title := memoryTitleStyle.Render(fmt.Sprintf("Memory (%d)", m.memoryCount))
-
-	footer := helpStyle.Render("j/k: nav │ d: delete │ m: chat")
+	footer := helpStyle.Render("j/k: nav │ d: del │ m: back")
 
 	listHeight := height - 4
 	if listHeight < 1 {
 		listHeight = 1
 	}
 
-	// Get recent memories (newest last)
 	entries := m.thinker.memory.Recent(m.memoryCount)
-
 	var lines []string
 	if len(entries) == 0 {
 		lines = append(lines, statsStyle.Render("no memories yet"))
 	} else {
-		// Show newest first
 		for idx := len(entries) - 1; idx >= 0; idx-- {
 			e := entries[idx]
 			displayIdx := len(entries) - 1 - idx
@@ -495,7 +547,7 @@ func (m model) renderMemoryPanel(width, height int) string {
 
 			if displayIdx == m.memoryCursor {
 				lines = append(lines, memorySelectedStyle.Render(fmt.Sprintf(" %s ", text)))
-				lines = append(lines, memoryAgeStyle.Render(fmt.Sprintf("  %s ago │ %s", age, e.Session[:8])))
+				lines = append(lines, memoryAgeStyle.Render(fmt.Sprintf("  %s ago │ %s", age, e.Session[:min(8, len(e.Session))])))
 			} else {
 				lines = append(lines, memoryTextStyle.Render("  "+text))
 				lines = append(lines, memoryAgeStyle.Render(fmt.Sprintf("  %s ago", age)))
@@ -504,13 +556,11 @@ func (m model) renderMemoryPanel(width, height int) string {
 		}
 	}
 
-	// Scroll to keep cursor visible
-	cursorLine := m.memoryCursor * 3 // 3 lines per entry (text + age + blank)
+	cursorLine := m.memoryCursor * 3
 	scrollStart := 0
 	if cursorLine >= listHeight {
 		scrollStart = cursorLine - listHeight + 3
 	}
-
 	if scrollStart > len(lines) {
 		scrollStart = len(lines)
 	}
@@ -525,11 +575,72 @@ func (m model) renderMemoryPanel(width, height int) string {
 	}
 
 	body := title + "\n" + strings.Join(visible, "\n") + "\n" + footer
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
+}
 
-	return panelBorderStyle.
-		Width(innerWidth).
-		Height(height - 2).
-		Render(body)
+func (m model) renderThreadPanel(width, height int) string {
+	if width <= 0 {
+		return ""
+	}
+	innerWidth := width - 4
+	if innerWidth < 5 {
+		innerWidth = 5
+	}
+
+	title := threadTitleStyle.Render(fmt.Sprintf("Threads (%d)", m.threadCount))
+	footer := helpStyle.Render("j/k: nav │ d: kill │ t: back")
+
+	listHeight := height - 4
+	if listHeight < 1 {
+		listHeight = 1
+	}
+
+	threads := m.thinker.threads.List()
+	var lines []string
+	if len(threads) == 0 {
+		lines = append(lines, statsStyle.Render("no threads"))
+	} else {
+		for i, thr := range threads {
+			age := formatAge(time.Since(thr.Started))
+			mode := "thinking"
+			if !thr.Thinking {
+				mode = "one-shot"
+			}
+			info := fmt.Sprintf("%s/%s #%d", thr.Rate, thr.Model, thr.Iteration)
+			toolStr := strings.Join(thr.Tools, ",")
+
+			if i == m.threadCursor {
+				lines = append(lines, threadSelectedStyle.Render(fmt.Sprintf(" %s ", thr.ID)))
+				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s │ %s", mode, info, age)))
+				lines = append(lines, statsStyle.Render(fmt.Sprintf("  tools: %s", toolStr)))
+			} else {
+				lines = append(lines, threadActiveStyle.Render("  "+thr.ID))
+				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s │ %s", mode, info, age)))
+			}
+			lines = append(lines, "")
+		}
+	}
+
+	cursorLine := m.threadCursor * 3
+	scrollStart := 0
+	if cursorLine >= listHeight {
+		scrollStart = cursorLine - listHeight + 3
+	}
+	if scrollStart > len(lines) {
+		scrollStart = len(lines)
+	}
+	endLine := scrollStart + listHeight
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+
+	visible := lines[scrollStart:endLine]
+	for len(visible) < listHeight {
+		visible = append(visible, "")
+	}
+
+	body := title + "\n" + strings.Join(visible, "\n") + "\n" + footer
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
 }
 
 func (m model) View() string {
@@ -548,8 +659,8 @@ func (m model) View() string {
 	}
 
 	stats := statsStyle.Render(fmt.Sprintf(
-		"#%d │ %s │ %s/thought │ next: %s",
-		m.iteration, elapsed, m.lastDuration.Round(time.Millisecond), m.rate.Delay(),
+		"#%d │ %s │ %s/thought │ next: %s │ thr: %d",
+		m.iteration, elapsed, m.lastDuration.Round(time.Millisecond), m.rate.Delay(), m.threadCount,
 	))
 
 	header := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", statusRender, "  ", stats)
@@ -604,6 +715,8 @@ func (m model) View() string {
 		switch m.panel {
 		case panelMemory:
 			leftPanel = m.renderMemoryPanel(leftWidth, viewHeight)
+		case panelThreads:
+			leftPanel = m.renderThreadPanel(leftWidth, viewHeight)
 		default:
 			leftPanel = m.renderChatPanel(leftWidth, viewHeight)
 		}

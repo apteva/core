@@ -129,10 +129,10 @@ func TestInjectUserMessage(t *testing.T) {
 		inbox:  make(chan string, 10),
 		wakeup: make(chan struct{}, 1),
 	}
-	thinker.InjectUserMessage("Hello")
+	thinker.InjectUserMessage("marco", "Hello")
 	items := thinker.drainInbox()
-	if len(items) != 1 || items[0] != "[user] Hello" {
-		t.Errorf("expected '[user] Hello', got %v", items)
+	if len(items) != 1 || items[0] != "[user:marco] Hello" {
+		t.Errorf("expected '[user:marco] Hello', got %v", items)
 	}
 }
 
