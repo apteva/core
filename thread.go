@@ -249,7 +249,7 @@ func buildThreadToolDocs(tools map[string]bool) string {
 		sb.WriteString("  [[web url=\"https://example.com\"]]\n")
 	}
 	sb.WriteString("  [[report message=\"Send observation to main thread\"]]\n")
-	sb.WriteString("  [[done message=\"Final result, then terminate\"]]\n")
+	sb.WriteString("  [[done message=\"Final result, then PERMANENTLY terminate this thread\"]]\n")
 	sb.WriteString("  [[pace rate=\"fast\" model=\"large\"]]\n")
 	sb.WriteString("\nRULES:\n")
 	if tools["reply"] {
@@ -259,7 +259,9 @@ func buildThreadToolDocs(tools map[string]bool) string {
 		sb.WriteString("- [[web]] fetches a URL. Only param is url.\n")
 	}
 	sb.WriteString("- [[report]] sends info to the main coordinating thread.\n")
-	sb.WriteString("- [[done]] sends a final summary and terminates this thread.\n")
-	sb.WriteString("- [[pace]] controls thinking speed and model.\n")
+	sb.WriteString("- [[done]] PERMANENTLY kills this thread. Only use when your task is truly complete and you will never be needed again. Do NOT use after a single reply in a conversation — the user may send more messages.\n")
+	sb.WriteString(`- [[pace]] controls thinking speed and model. Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Models: "large", "small".
+  IMPORTANT: When you have nothing to do, pace down gradually: "normal" → "slow" → "sleep". Do NOT keep generating idle thoughts. New events auto-switch you back to fast.
+`)
 	return sb.String()
 }
