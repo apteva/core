@@ -97,6 +97,20 @@ var (
 				Background(lipgloss.Color("77")).
 				Bold(true)
 
+	toolsTitleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("49")).
+			Padding(0, 1)
+
+	toolCoreStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("49"))
+
+	toolDiscoverStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
+
+	toolMCPStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("212"))
+
 	tabActiveStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("235")).
@@ -156,6 +170,7 @@ const (
 	panelMemory
 	panelThreads
 	panelDirective
+	panelTools
 )
 
 type inputMode int
@@ -430,6 +445,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.directiveLines = strings.Split(m.thinker.config.GetDirective(), "\n")
 			m.directiveCursor = 0
 			return m, nil
+		case "o":
+			if m.panel == panelTools {
+				m.panel = panelChat
+			} else {
+				m.panel = panelTools
+			}
+			return m, nil
 		case "m":
 			if m.panel == panelMemory {
 				m.panel = panelChat
@@ -699,7 +721,7 @@ func (m model) renderChatPanel(width, height int) string {
 	if m.inputActive {
 		inputArea = inputLabelStyle.Render("> ") + m.input.View()
 	} else {
-		inputArea = helpStyle.Render("i: chat │ c: cmd │ e: dir")
+		inputArea = helpStyle.Render("i:chat c:cmd e:dir o:tools m:mem")
 	}
 
 	listHeight := height - 4
@@ -975,6 +997,65 @@ func (m model) renderDirectivePanel(width, height int) string {
 	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
 }
 
+func (m model) renderToolsPanel(width, height int) string {
+	if width <= 0 {
+		return ""
+	}
+	innerWidth := width - 4
+	if innerWidth < 5 {
+		innerWidth = 5
+	}
+
+	toolCount := 0
+	if m.thinker.registry != nil {
+		toolCount = m.thinker.registry.Count()
+	}
+	title := toolsTitleStyle.Render(fmt.Sprintf("Tools (%d)", toolCount))
+	footer := helpStyle.Render("o: back")
+
+	listHeight := height - 4
+	if listHeight < 1 {
+		listHeight = 1
+	}
+
+	var lines []string
+	if m.thinker.registry != nil {
+		tools := m.thinker.registry.AllTools()
+		for _, tool := range tools {
+			var style lipgloss.Style
+			prefix := ""
+			if tool.Core {
+				style = toolCoreStyle
+				prefix = "[core] "
+			} else if strings.HasPrefix(tool.Description, "[") {
+				style = toolMCPStyle
+				prefix = "[mcp]  "
+			} else {
+				style = toolDiscoverStyle
+				prefix = "[rag]  "
+			}
+			lines = append(lines, style.Render(prefix+tool.Name))
+			desc := truncate(tool.Description, innerWidth-4)
+			lines = append(lines, statsStyle.Render("  "+desc))
+			lines = append(lines, "")
+		}
+	}
+
+	if len(lines) == 0 {
+		lines = append(lines, statsStyle.Render("no tools registered"))
+	}
+
+	if len(lines) > listHeight {
+		lines = lines[:listHeight]
+	}
+	for len(lines) < listHeight {
+		lines = append(lines, "")
+	}
+
+	body := title + "\n" + strings.Join(lines, "\n") + "\n" + footer
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
+}
+
 func (m model) renderTabBar() string {
 	var parts []string
 	for _, tab := range m.tabs {
@@ -1076,6 +1157,8 @@ func (m model) View() string {
 			leftPanel = m.renderThreadPanel(leftWidth, viewHeight)
 		case panelDirective:
 			leftPanel = m.renderDirectivePanel(leftWidth, viewHeight)
+		case panelTools:
+			leftPanel = m.renderToolsPanel(leftWidth, viewHeight)
 		default:
 			leftPanel = m.renderChatPanel(leftWidth, viewHeight)
 		}

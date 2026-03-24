@@ -320,6 +320,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
 				}
+			default:
+				// Dispatch to registry (MCP tools, etc)
+				executeTool(t, call)
+				toolNames = append(toolNames, call.Raw)
 			}
 		}
 		return replies, toolNames

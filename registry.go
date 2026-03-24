@@ -280,3 +280,21 @@ func (tr *ToolRegistry) AllToolNames() []string {
 	}
 	return names
 }
+
+// AllTools returns all tool definitions for display.
+func (tr *ToolRegistry) AllTools() []*ToolDef {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	var out []*ToolDef
+	for _, tool := range tr.tools {
+		out = append(out, tool)
+	}
+	return out
+}
+
+// Count returns the total number of registered tools.
+func (tr *ToolRegistry) Count() int {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	return len(tr.tools)
+}
