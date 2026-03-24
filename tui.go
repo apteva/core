@@ -461,7 +461,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.panel == panelThreads {
 				threads := m.thinker.threads.List()
 				if m.threadCursor < len(threads) {
-					m.thinker.threads.Kill(threads[m.threadCursor].ID)
+					id := threads[m.threadCursor].ID
+					m.thinker.threads.Kill(id)
+					m.thinker.config.RemoveThread(id)
+					m.removeTab(id)
+					m.threadCount = m.thinker.threads.Count()
+					if m.threadCursor >= m.threadCount && m.threadCursor > 0 {
+						m.threadCursor--
+					}
 				}
 				return m, nil
 			}
