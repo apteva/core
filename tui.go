@@ -106,6 +106,26 @@ var (
 	tabInactiveStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("241")).
 				Padding(0, 1)
+
+	consoleTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("208")).
+				Padding(0, 1)
+
+	consoleLineStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("208"))
+
+	directiveTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("220")).
+				Padding(0, 1)
+
+	directiveLineStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
+
+	directiveCursorStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("235")).
+				Background(lipgloss.Color("220"))
 )
 
 type tickMsg time.Time
@@ -131,9 +151,19 @@ type chatMessage struct {
 type panelMode int
 
 const (
-	panelChat    panelMode = iota
+	panelChat      panelMode = iota
+	panelConsole
 	panelMemory
 	panelThreads
+	panelDirective
+)
+
+type inputMode int
+
+const (
+	inputChat    inputMode = iota
+	inputConsole
+	inputDirective
 )
 
 type threadView struct {
@@ -154,18 +184,24 @@ type model struct {
 	lastDuration time.Duration
 	input        textinput.Model
 	inputActive  bool
+	inputMode    inputMode
 
-	chat         []chatMessage
-	memoryCount  int
-	threadCount  int
+	chat           []chatMessage
+	consoleHistory []string
+	memoryCount    int
+	threadCount    int
 
 	panel        panelMode
 	memoryCursor int
 	threadCursor int
 
-	// Tab system: "main" + thread IDs
-	activeTab    string              // which tab is shown in thoughts panel
-	tabs         []string            // ordered tab list: ["main", "thread1", ...]
+	// Directive editing
+	directiveLines []string
+	directiveCursor int
+
+	// Tab system
+	activeTab    string
+	tabs         []string
 	threadViews  map[string]*threadView
 
 	userID string
@@ -197,6 +233,7 @@ func newModel(thinker *Thinker) model {
 		threadViews: map[string]*threadView{
 			"main": {currentChunk: &strings.Builder{}},
 		},
+		directiveLines: strings.Split(thinker.config.GetDirective(), "\n"),
 	}
 }
 
@@ -291,13 +328,68 @@ func tickCmd() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Directive editing mode
+		if m.panel == panelDirective {
+			switch msg.String() {
+			case "esc":
+				// Save and exit
+				directive := strings.Join(m.directiveLines, "\n")
+				m.thinker.config.SetDirective(directive)
+				m.thinker.ReloadDirective()
+				m.panel = panelChat
+				return m, nil
+			case "enter":
+				// Insert new line after cursor
+				m.directiveLines = append(m.directiveLines[:m.directiveCursor+1],
+					append([]string{""}, m.directiveLines[m.directiveCursor+1:]...)...)
+				m.directiveCursor++
+				return m, nil
+			case "backspace":
+				if m.directiveCursor > 0 && len(m.directiveLines[m.directiveCursor]) == 0 {
+					// Delete empty line
+					m.directiveLines = append(m.directiveLines[:m.directiveCursor], m.directiveLines[m.directiveCursor+1:]...)
+					m.directiveCursor--
+				} else if len(m.directiveLines[m.directiveCursor]) > 0 {
+					line := m.directiveLines[m.directiveCursor]
+					m.directiveLines[m.directiveCursor] = line[:len(line)-1]
+				}
+				return m, nil
+			case "up":
+				if m.directiveCursor > 0 {
+					m.directiveCursor--
+				}
+				return m, nil
+			case "down":
+				if m.directiveCursor < len(m.directiveLines)-1 {
+					m.directiveCursor++
+				}
+				return m, nil
+			default:
+				// Type characters into current line
+				if len(msg.String()) == 1 || msg.String() == "space" {
+					ch := msg.String()
+					if ch == "space" {
+						ch = " "
+					}
+					m.directiveLines[m.directiveCursor] += ch
+				}
+				return m, nil
+			}
+		}
+
 		if m.inputActive {
 			switch msg.String() {
 			case "enter":
 				val := strings.TrimSpace(m.input.Value())
 				if val != "" {
-					m.thinker.InjectUserMessage(m.userID, val)
-					m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
+					switch m.inputMode {
+					case inputChat:
+						m.thinker.InjectUserMessage(m.userID, val)
+						m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
+					case inputConsole:
+						m.thinker.InjectConsole(val)
+						m.consoleHistory = append(m.consoleHistory, val)
+					}
 				}
 				m.input.Reset()
 				m.input.Blur()
@@ -319,12 +411,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			m.thinker.Stop()
 			return m, tea.Quit
-		case "i", "/":
-			if m.panel == panelChat {
-				m.inputActive = true
-				m.input.Focus()
-				return m, textinput.Blink
-			}
+		case "i":
+			m.panel = panelChat
+			m.inputMode = inputChat
+			m.input.Placeholder = "message..."
+			m.inputActive = true
+			m.input.Focus()
+			return m, textinput.Blink
+		case "c":
+			m.panel = panelConsole
+			m.inputMode = inputConsole
+			m.input.Placeholder = "command..."
+			m.inputActive = true
+			m.input.Focus()
+			return m, textinput.Blink
+		case "e":
+			m.panel = panelDirective
+			m.directiveLines = strings.Split(m.thinker.config.GetDirective(), "\n")
+			m.directiveCursor = 0
+			return m, nil
 		case "m":
 			if m.panel == panelMemory {
 				m.panel = panelChat
@@ -594,7 +699,7 @@ func (m model) renderChatPanel(width, height int) string {
 	if m.inputActive {
 		inputArea = inputLabelStyle.Render("> ") + m.input.View()
 	} else {
-		inputArea = helpStyle.Render("i: chat │ t: threads │ m: mem")
+		inputArea = helpStyle.Render("i: chat │ c: cmd │ e: dir")
 	}
 
 	listHeight := height - 4
@@ -771,6 +876,97 @@ func (m model) renderThreadPanel(width, height int) string {
 	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
 }
 
+func (m model) renderConsolePanel(width, height int) string {
+	if width <= 0 {
+		return ""
+	}
+	innerWidth := width - 4
+	if innerWidth < 5 {
+		innerWidth = 5
+	}
+
+	title := consoleTitleStyle.Render("Console")
+
+	var inputArea string
+	if m.inputActive && m.inputMode == inputConsole {
+		inputArea = consoleTitleStyle.Render("> ") + m.input.View()
+	} else {
+		inputArea = helpStyle.Render("c: command │ i: chat │ e: dir")
+	}
+
+	listHeight := height - 4
+	if listHeight < 1 {
+		listHeight = 1
+	}
+
+	var lines []string
+	for _, cmd := range m.consoleHistory {
+		lines = append(lines, consoleLineStyle.Render("> "+truncate(cmd, innerWidth-4)))
+	}
+	if len(lines) == 0 {
+		lines = append(lines, statsStyle.Render("no commands yet"))
+	}
+	if len(lines) > listHeight {
+		lines = lines[len(lines)-listHeight:]
+	}
+	for len(lines) < listHeight {
+		lines = append(lines, "")
+	}
+
+	body := title + "\n" + strings.Join(lines, "\n") + "\n" + inputArea
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
+}
+
+func (m model) renderDirectivePanel(width, height int) string {
+	if width <= 0 {
+		return ""
+	}
+	innerWidth := width - 4
+	if innerWidth < 5 {
+		innerWidth = 5
+	}
+
+	title := directiveTitleStyle.Render("Directive (esc: save)")
+	footer := helpStyle.Render("↑↓: nav │ type to edit │ esc: save")
+
+	listHeight := height - 4
+	if listHeight < 1 {
+		listHeight = 1
+	}
+
+	var lines []string
+	for i, line := range m.directiveLines {
+		display := line
+		if len(display) > innerWidth-4 {
+			display = display[:innerWidth-4]
+		}
+		if i == m.directiveCursor {
+			lines = append(lines, directiveCursorStyle.Render(" "+display+" ")+"▍")
+		} else {
+			lines = append(lines, directiveLineStyle.Render("  "+display))
+		}
+	}
+
+	if len(lines) > listHeight {
+		// Keep cursor visible
+		start := 0
+		if m.directiveCursor >= listHeight {
+			start = m.directiveCursor - listHeight + 1
+		}
+		end := start + listHeight
+		if end > len(lines) {
+			end = len(lines)
+		}
+		lines = lines[start:end]
+	}
+	for len(lines) < listHeight {
+		lines = append(lines, "")
+	}
+
+	body := title + "\n" + strings.Join(lines, "\n") + "\n" + footer
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
+}
+
 func (m model) renderTabBar() string {
 	var parts []string
 	for _, tab := range m.tabs {
@@ -864,10 +1060,14 @@ func (m model) View() string {
 	if leftWidth > 0 {
 		var leftPanel string
 		switch m.panel {
+		case panelConsole:
+			leftPanel = m.renderConsolePanel(leftWidth, viewHeight)
 		case panelMemory:
 			leftPanel = m.renderMemoryPanel(leftWidth, viewHeight)
 		case panelThreads:
 			leftPanel = m.renderThreadPanel(leftWidth, viewHeight)
+		case panelDirective:
+			leftPanel = m.renderDirectivePanel(leftWidth, viewHeight)
 		default:
 			leftPanel = m.renderChatPanel(leftWidth, viewHeight)
 		}

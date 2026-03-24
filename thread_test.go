@@ -18,6 +18,7 @@ func newTestThinker() *Thinker {
 		rate:      RateSlow,
 		agentRate: RateSlow,
 		memory:    &MemoryStore{path: "/dev/null"},
+		config:    &Config{Directive: "test"},
 	}
 	t.threads = NewThreadManager(t)
 	return t

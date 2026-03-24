@@ -1,4 +1,5 @@
 .env
 thinking
 memory.jsonl
+config.json
 .claude/

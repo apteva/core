@@ -48,7 +48,8 @@ func (m ModelTier) ID() string {
 	return modelIDs[m]
 }
 
-const systemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
+// baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
+const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
 
 Your thinking should be purposeful:
 - Observe incoming events and decide how to handle them.
@@ -76,6 +77,7 @@ EVENT FORMAT:
 - [user:name] message — a user sent a message. Spawn or route to a thread for them.
 - [thread:id] message — a thread sent you a report.
 - [thread:id done] message — a thread finished and terminated.
+- [console] message — a direct system command. Do NOT reply — just incorporate into your thinking.
 
 BEHAVIOR:
 - When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded — no need to [[send]] it again.
@@ -84,6 +86,10 @@ BEHAVIOR:
 - When idle, pace down gradually. Use model="small" when idle.
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
+
+func buildSystemPrompt(directive string) string {
+	return "[DIRECTIVE]\n" + directive + "\n\n" + baseSystemPrompt
+}
 
 type TokenUsage struct {
 	PromptTokens     int
@@ -182,6 +188,7 @@ type Thinker struct {
 	agentModel ModelTier
 	memory     *MemoryStore
 	threads    *ThreadManager
+	config     *Config
 
 	// Hooks — set these to customize behavior. nil = defaults.
 	handleTools  ToolHandler
@@ -191,11 +198,13 @@ type Thinker struct {
 }
 
 func NewThinker(apiKey string) *Thinker {
+	cfg := NewConfig()
 	t := &Thinker{
 		apiKey: apiKey,
 		messages: []Message{
-			{Role: "system", Content: systemPrompt},
+			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective())},
 		},
+		config: cfg,
 		events:    make(chan ThinkEvent, 100),
 		inbox:     make(chan string, 50),
 		wakeup:    make(chan struct{}, 1),
@@ -534,6 +543,15 @@ func (t *Thinker) buildMemorySummary(consumed []string, thought string, replies 
 		return ""
 	}
 	return strings.Join(parts, " | ")
+}
+
+func (t *Thinker) ReloadDirective() {
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(t.config.GetDirective())}
+}
+
+func (t *Thinker) InjectConsole(msg string) {
+	t.inbox <- "[console] " + msg
+	t.wake()
 }
 
 func (t *Thinker) Inject(msg string) {
