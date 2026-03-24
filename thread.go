@@ -205,7 +205,8 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				if text := call.Args["text"]; text != "" && t.memory != nil {
 					go t.memory.Store(text)
 				}
-			case "web", "write_file", "read_file", "list_files":
+			default:
+				// Dispatch to registry (MCP tools, file tools, web, etc)
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
