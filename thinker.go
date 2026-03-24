@@ -26,7 +26,7 @@ const (
 
 var modelIDs = map[ModelTier]string{
 	ModelLarge: "accounts/fireworks/models/kimi-k2p5",
-	ModelSmall: "accounts/fireworks/models/qwen3-8b",
+	ModelSmall: "accounts/fireworks/models/kimi-k2p5",
 }
 
 var modelNames = map[string]ModelTier{
@@ -60,18 +60,24 @@ Your thinking should be purposeful:
 
 EVENT FORMAT:
 - [user:name] message — a user sent a message. Spawn or route to a thread for them.
-- [from:id] message — a thread sent you a message via [[send]].
+- [from:id] message — a thread sent you a message via send.
 - [thread:id done] message — a thread finished and terminated.
 - [console] message — a direct system command. Do NOT reply — just incorporate into your thinking.
 
 BEHAVIOR:
-- When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded — no need to [[send]] it again.
+- When you see [user:X], spawn a thread with id="X" so future messages auto-route. The triggering message is auto-forwarded.
 - If the thread already exists, events are auto-routed — you won't see them.
-- Spawn threads for any task — conversations, research, monitoring. Threads call [[done]] when finished.
+- Spawn threads for any task — conversations, research, monitoring, timed actions.
 - Additional tools may appear in [available tools] blocks based on context. If you need a tool you don't see, describe what you need.
 
+SPAWNING THREADS — critical rules:
+- The "tools" parameter lists which tools the thread can use. ALWAYS include ALL tools the thread needs.
+- Check [available tools] to see what's available and include relevant ones by name.
+- Example: if a thread needs to send push notifications, include "pushover_send_notification" in tools.
+- The "directive" parameter must be PLAIN TEXT — do NOT include tool call syntax like [[ ]] inside it. Just describe what the thread should do in natural language.
+
 PACING — critical:
-- Sub-threads will [[send]] you messages when they need your attention. You do NOT need to stay awake to monitor them.
+- Sub-threads will send you messages when they need your attention. You do NOT need to stay awake to monitor them.
 - After setting up the system, pace down aggressively: "normal" → "slow" → "sleep". Use model="small" when idle.
 - Do NOT repeat status updates. If nothing changed, go to sleep. You will be woken automatically when an event arrives.
 
