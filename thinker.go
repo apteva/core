@@ -358,8 +358,10 @@ func (t *Thinker) Run() {
 		if hasExternalEvent {
 			t.rate = RateReactive
 			t.model = ModelLarge
+		} else if hadEvents {
+			// Tool results — wake but less aggressive than external events
+			t.rate = RateFast
 		}
-		// Tool results don't change rate — agent already set its pace
 		if hadEvents {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
@@ -429,14 +431,10 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		// Fall back to agent's chosen rate/model
-		if hasExternalEvent {
-			t.rate = RateReactive
-			t.model = ModelLarge
-		} else {
-			t.rate = t.agentRate
-			t.model = t.agentModel
-		}
+		// After processing, fall back to agent's chosen rate
+		// (external events already set reactive above for this iteration)
+		t.rate = t.agentRate
+		t.model = t.agentModel
 
 		// Thread count (0 if no thread manager)
 		threadCount := 0
@@ -641,11 +639,6 @@ func (t *Thinker) Inject(msg string) {
 	t.wake()
 }
 
-// injectToolResult puts a tool result in the inbox without waking the thinker.
-// The result will be picked up on the next natural iteration.
-func (t *Thinker) injectToolResult(msg string) {
-	t.inbox <- msg
-}
 
 func (t *Thinker) InjectUserMessage(userID, msg string) {
 	t.inbox <- fmt.Sprintf("[user:%s] %s", userID, msg)
