@@ -14,6 +14,7 @@ type ToolDef struct {
 	Rules       string // usage rules for the prompt
 	Core        bool   // always in prompt (pace, send, done, evolve)
 	MainOnly    bool   // only for main thread (spawn, kill)
+	ThreadOnly  bool   // only for sub-threads, not main (reply)
 	Handler     func(args map[string]string) string // nil = handled inline by tool handler
 	Embedding   []float64
 }
@@ -97,7 +98,8 @@ func (tr *ToolRegistry) registerDefaults() {
 		Description: "Send a visible message to the user. Users cannot see your thoughts — only reply messages. Use for conversations and responses.",
 		Syntax:      `[[reply message="Your response"]]`,
 		Rules:       `Users can ONLY see [[reply]] messages, not your thoughts.`,
-		Handler:     nil, // handled inline
+		Handler:     nil, // handled inline by thread tool handler
+		ThreadOnly:  true, // NOT available to main thread
 	})
 	tr.Register(&ToolDef{
 		Name:        "web",
@@ -200,12 +202,19 @@ func (tr *ToolRegistry) Retrieve(query string, n int, allowed map[string]bool, m
 		score float64
 	}
 
+	isMainThread := allowed == nil
 	var results []scored
 	for _, tool := range tr.tools {
 		if tool.Core || len(tool.Embedding) == 0 {
 			continue
 		}
 		if allowed != nil && !allowed[tool.Name] {
+			continue
+		}
+		if isMainThread && tool.ThreadOnly {
+			continue
+		}
+		if !isMainThread && tool.MainOnly {
 			continue
 		}
 		sim := cosineSimilarity(queryEmb, tool.Embedding)
@@ -235,12 +244,19 @@ func (tr *ToolRegistry) Retrieve(query string, n int, allowed map[string]bool, m
 func (tr *ToolRegistry) getAllowed(allowed map[string]bool) []*ToolDef {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
+	isMainThread := allowed == nil
 	var out []*ToolDef
 	for _, tool := range tr.tools {
 		if tool.Core {
 			continue
 		}
 		if allowed != nil && !allowed[tool.Name] {
+			continue
+		}
+		if isMainThread && tool.ThreadOnly {
+			continue
+		}
+		if !isMainThread && tool.MainOnly {
 			continue
 		}
 		out = append(out, tool)
