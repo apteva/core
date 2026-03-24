@@ -132,26 +132,26 @@ func TestThreadManager_ToolSetAlwaysIncludesBuiltins(t *testing.T) {
 	}
 
 	tools := threads[0].Tools
-	hasReport := false
+	hasSend := false
 	hasDone := false
 	hasPace := false
 	for _, tool := range tools {
 		switch tool {
-		case "report":
-			hasReport = true
+		case "send":
+			hasSend = true
 		case "done":
 			hasDone = true
 		case "pace":
 			hasPace = true
 		}
 	}
-	if !hasReport || !hasDone || !hasPace {
+	if !hasSend || !hasDone || !hasPace {
 		t.Errorf("expected report, done, pace in tools; got %v", tools)
 	}
 }
 
 func TestBuildThreadToolDocs(t *testing.T) {
-	tools := map[string]bool{"reply": true, "web": true, "report": true, "done": true, "pace": true}
+	tools := map[string]bool{"reply": true, "web": true, "send": true, "done": true, "pace": true}
 	docs := buildThreadToolDocs(tools)
 
 	if !strings.Contains(docs, "[[reply") {
@@ -160,8 +160,8 @@ func TestBuildThreadToolDocs(t *testing.T) {
 	if !strings.Contains(docs, "[[web") {
 		t.Error("expected web in docs")
 	}
-	if !strings.Contains(docs, "[[report") {
-		t.Error("expected report in docs")
+	if !strings.Contains(docs, "[[send") {
+		t.Error("expected send in docs")
 	}
 	if !strings.Contains(docs, "[[done") {
 		t.Error("expected done in docs")
@@ -169,7 +169,7 @@ func TestBuildThreadToolDocs(t *testing.T) {
 }
 
 func TestBuildThreadToolDocs_NoReply(t *testing.T) {
-	tools := map[string]bool{"web": true, "report": true, "done": true, "pace": true}
+	tools := map[string]bool{"web": true, "send": true, "done": true, "pace": true}
 	docs := buildThreadToolDocs(tools)
 
 	if strings.Contains(docs, "[[reply") {

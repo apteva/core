@@ -64,18 +64,18 @@ TOOLS — call inline in your response:
   [[pace rate="slow" model="small"]]
 
 RULES:
-- [[spawn]] creates a new thread. Parameters:
+- [[spawn]] creates a new thread. Spawned threads are persistent — they survive restarts. Parameters:
   - id: unique name (use the user's name for conversations, descriptive name for tasks)
   - prompt: the system prompt that defines what the thread does
-  - tools: comma-separated list of tools the thread can use (reply, web). Every thread also gets report, done, pace.
+  - tools: comma-separated list from: reply, web, write_file, read_file, list_files. Every thread also gets send, done, pace.
   - thinking: "true" for continuous loop (default), "false" for one-shot
-- [[kill]] stops a thread immediately.
+- [[kill]] stops a thread immediately and removes it from persistent config.
 - [[send]] sends a message to a thread's inbox.
 - [[pace]] controls your own thinking speed/model.
 
 EVENT FORMAT:
 - [user:name] message — a user sent a message. Spawn or route to a thread for them.
-- [thread:id] message — a thread sent you a report.
+- [from:id] message — a thread sent you a message via [[send]].
 - [thread:id done] message — a thread finished and terminated.
 - [console] message — a direct system command. Do NOT reply — just incorporate into your thinking.
 
@@ -227,6 +227,12 @@ func NewThinker(apiKey string) *Thinker {
 		return kept
 	}
 	t.handleTools = mainToolHandler(t)
+
+	// Respawn persistent threads from config
+	for _, pt := range cfg.GetThreads() {
+		t.threads.Spawn(pt.ID, pt.Prompt, pt.Tools, pt.Thinking)
+	}
+
 	return t
 }
 
@@ -247,15 +253,20 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					tools = strings.Split(toolsStr, ",")
 				}
 				if id != "" && prompt != "" {
-					// Forward consumed events so the new thread has context
 					if err := t.threads.Spawn(id, prompt, tools, thinking, consumed...); err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
+					} else {
+						// Persist to config
+						t.config.SaveThread(PersistentThread{
+							ID: id, Prompt: prompt, Tools: tools, Thinking: thinking,
+						})
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
 				if id := call.Args["id"]; id != "" {
 					t.threads.Kill(id)
+					t.config.RemoveThread(id)
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "send":

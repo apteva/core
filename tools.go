@@ -53,8 +53,14 @@ func executeTool(t *Thinker, call toolCall) {
 		switch call.Name {
 		case "web":
 			result = webTool(call.Args)
+		case "write_file":
+			result = writeFileTool(call.Args)
+		case "read_file":
+			result = readFileTool(call.Args)
+		case "list_files":
+			result = listFilesTool(call.Args)
 		default:
-			result = fmt.Sprintf("unknown tool %q — available: [[web url=\"...\"]]. Use exact syntax.", call.Name)
+			result = fmt.Sprintf("unknown tool %q", call.Name)
 		}
 		t.Inject(fmt.Sprintf("[tool:%s] %s", call.Name, result))
 	}()

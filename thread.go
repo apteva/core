@@ -61,7 +61,7 @@ func (tm *ThreadManager) Spawn(id, prompt string, tools []string, thinking bool,
 	for _, t := range tools {
 		toolSet[strings.TrimSpace(t)] = true
 	}
-	toolSet["report"] = true
+	toolSet["send"] = true
 	toolSet["done"] = true
 	toolSet["pace"] = true
 
@@ -127,10 +127,18 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					replies = append(replies, msg)
 					tm.events <- ThreadEvent{ThreadID: thread.ID, Type: "reply", Message: msg}
 				}
-			case "report":
-				if msg := call.Args["message"]; msg != "" {
-					thread.Parent.Inject(fmt.Sprintf("[thread:%s] %s", thread.ID, msg))
-					tm.events <- ThreadEvent{ThreadID: thread.ID, Type: "report", Message: msg}
+			case "send":
+				id := call.Args["id"]
+				msg := call.Args["message"]
+				if id != "" && msg != "" {
+					tagged := fmt.Sprintf("[from:%s] %s", thread.ID, msg)
+					if id == "main" {
+						thread.Parent.Inject(tagged)
+					} else {
+						if !tm.Send(id, tagged) {
+							t.Inject(fmt.Sprintf("[error] thread %q not found", id))
+						}
+					}
 				}
 			case "done":
 				msg := call.Args["message"]
@@ -148,7 +156,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
 				}
-			case "web":
+			case "web", "write_file", "read_file", "list_files":
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
@@ -248,7 +256,16 @@ func buildThreadToolDocs(tools map[string]bool) string {
 	if tools["web"] {
 		sb.WriteString("  [[web url=\"https://example.com\"]]\n")
 	}
-	sb.WriteString("  [[report message=\"Send observation to main thread\"]]\n")
+	if tools["write_file"] {
+		sb.WriteString("  [[write_file path=\"drafts/doc.md\" content=\"...\"]]\n")
+	}
+	if tools["read_file"] {
+		sb.WriteString("  [[read_file path=\"drafts/doc.md\"]]\n")
+	}
+	if tools["list_files"] {
+		sb.WriteString("  [[list_files path=\"drafts/\"]]\n")
+	}
+	sb.WriteString("  [[send id=\"thread-name\" message=\"message to send\"]]\n")
 	sb.WriteString("  [[done message=\"Final result, then PERMANENTLY terminate this thread\"]]\n")
 	sb.WriteString("  [[pace rate=\"fast\" model=\"large\"]]\n")
 	sb.WriteString("\nRULES:\n")
@@ -258,8 +275,11 @@ func buildThreadToolDocs(tools map[string]bool) string {
 	if tools["web"] {
 		sb.WriteString("- [[web]] fetches a URL. Only param is url.\n")
 	}
-	sb.WriteString("- [[report]] sends info to the main coordinating thread.\n")
-	sb.WriteString("- [[done]] PERMANENTLY kills this thread. Only use when your task is truly complete and you will never be needed again. Do NOT use after a single reply in a conversation — the user may send more messages.\n")
+	if tools["write_file"] || tools["read_file"] || tools["list_files"] {
+		sb.WriteString("- File tools operate in the workspace/ directory. Paths are relative.\n")
+	}
+	sb.WriteString("- [[send]] sends a message to any thread by id. Use id=\"main\" for the coordinator.\n")
+	sb.WriteString("- [[done]] PERMANENTLY kills this thread. Only use when your task is truly complete and you will never be needed again. Do NOT use after a single reply in a conversation.\n")
 	sb.WriteString(`- [[pace]] controls thinking speed and model. Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Models: "large", "small".
   IMPORTANT: When you have nothing to do, pace down gradually: "normal" → "slow" → "sleep". Do NOT keep generating idle thoughts. New events auto-switch you back to fast.
 `)

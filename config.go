@@ -8,10 +8,18 @@ import (
 
 const configFile = "config.json"
 
+type PersistentThread struct {
+	ID       string   `json:"id"`
+	Prompt   string   `json:"prompt"`
+	Tools    []string `json:"tools"`
+	Thinking bool     `json:"thinking"`
+}
+
 type Config struct {
 	mu        sync.RWMutex
 	path      string
-	Directive string `json:"directive"` // user-editable system directive
+	Directive string             `json:"directive"`
+	Threads   []PersistentThread `json:"threads,omitempty"`
 }
 
 func NewConfig() *Config {
@@ -54,4 +62,42 @@ func (c *Config) SetDirective(d string) {
 	c.Directive = d
 	c.mu.Unlock()
 	c.Save()
+}
+
+func (c *Config) SaveThread(pt PersistentThread) {
+	c.mu.Lock()
+	// Update if exists, otherwise append
+	found := false
+	for i, t := range c.Threads {
+		if t.ID == pt.ID {
+			c.Threads[i] = pt
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.Threads = append(c.Threads, pt)
+	}
+	c.mu.Unlock()
+	c.Save()
+}
+
+func (c *Config) RemoveThread(id string) {
+	c.mu.Lock()
+	for i, t := range c.Threads {
+		if t.ID == id {
+			c.Threads = append(c.Threads[:i], c.Threads[i+1:]...)
+			break
+		}
+	}
+	c.mu.Unlock()
+	c.Save()
+}
+
+func (c *Config) GetThreads() []PersistentThread {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]PersistentThread, len(c.Threads))
+	copy(out, c.Threads)
+	return out
 }
