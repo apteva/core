@@ -651,5 +651,10 @@ func (t *Thinker) TogglePause() {
 }
 
 func (t *Thinker) Stop() {
-	close(t.quit)
+	select {
+	case <-t.quit:
+		// already closed
+	default:
+		close(t.quit)
+	}
 }

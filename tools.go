@@ -75,6 +75,23 @@ func executeTool(t *Thinker, call toolCall) {
 	}()
 }
 
+func waitTool(args map[string]string) string {
+	s := args["seconds"]
+	if s == "" {
+		return "error: missing seconds parameter"
+	}
+	var seconds int
+	fmt.Sscanf(s, "%d", &seconds)
+	if seconds <= 0 {
+		return "error: seconds must be positive"
+	}
+	if seconds > 3600 {
+		seconds = 3600 // cap at 1 hour
+	}
+	time.Sleep(time.Duration(seconds) * time.Second)
+	return fmt.Sprintf("waited %d seconds", seconds)
+}
+
 func webTool(args map[string]string) string {
 	url := args["url"]
 	if url == "" {

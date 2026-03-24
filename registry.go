@@ -94,6 +94,13 @@ func (tr *ToolRegistry) registerDefaults() {
 
 	// Discoverable tools — retrieved by RAG
 	tr.Register(&ToolDef{
+		Name:        "wait",
+		Description: "Wait for a specified number of seconds. Use for delayed actions, timers, scheduled tasks. The thread blocks until the time has passed, then continues.",
+		Syntax:      `[[wait seconds="30"]]`,
+		Rules:       `Blocks the thread for the specified duration. Result arrives as an event when done. Use this instead of trying to pace-hack delays.`,
+		Handler:     waitTool,
+	})
+	tr.Register(&ToolDef{
 		Name:        "reply",
 		Description: "Send a visible message to the user. Users cannot see your thoughts — only reply messages. Use for conversations and responses.",
 		Syntax:      `[[reply message="Your response"]]`,
