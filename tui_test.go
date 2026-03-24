@@ -132,10 +132,10 @@ func TestPanelWidths(t *testing.T) {
 		t.Errorf("widths should sum to terminal width: %d + %d + 1 = %d, want 120", lw, tw, lw+tw+1)
 	}
 
-	// Cap at 44
+	// Always 1/3
 	m.width = 200
-	if m.leftPanelWidth() > 44 {
-		t.Errorf("left panel should cap at 44, got %d", m.leftPanelWidth())
+	if m.leftPanelWidth() != 66 {
+		t.Errorf("left panel should be 1/3 of 200 = 66, got %d", m.leftPanelWidth())
 	}
 }
 

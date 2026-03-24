@@ -55,6 +55,12 @@ func main() {
 	thinker := NewThinker(apiKey)
 	go thinker.Run()
 
+	apiPort := os.Getenv("API_PORT")
+	if apiPort == "" {
+		apiPort = "8080"
+	}
+	go startAPI(thinker, ":"+apiPort)
+
 	p := tea.NewProgram(newModel(thinker), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

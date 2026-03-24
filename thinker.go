@@ -88,7 +88,7 @@ BEHAVIOR:
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
 func buildSystemPrompt(directive string) string {
-	return "[DIRECTIVE]\n" + directive + "\n\n" + baseSystemPrompt
+	return baseSystemPrompt + "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
 }
 
 type TokenUsage struct {

@@ -643,22 +643,7 @@ func (m model) leftPanelWidth() int {
 	if m.width < 80 {
 		return 0
 	}
-	// Directive panel gets more space
-	if m.panel == panelDirective {
-		w := m.width * 2 / 3
-		if w > 80 {
-			w = 80
-		}
-		return w
-	}
-	w := m.width / 3
-	if w > 44 {
-		w = 44
-	}
-	if w < 30 {
-		w = 30
-	}
-	return w
+	return m.width / 3
 }
 
 func (m model) thoughtsPanelWidth() int {
