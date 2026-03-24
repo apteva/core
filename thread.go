@@ -147,6 +147,8 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 	return func(t *Thinker, calls []toolCall, _ []string) ([]string, []string) {
 		var replies []string
 		var toolNames []string
+		var doneMsg *string // defer done until all tools processed
+
 		for _, call := range calls {
 			if !thread.Tools[call.Name] {
 				continue
@@ -172,13 +174,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				}
 			case "done":
 				msg := call.Args["message"]
-				if msg != "" {
-					thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, msg))
-				} else {
-					thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
-				}
-				tm.events <- ThreadEvent{ThreadID: thread.ID, Type: "done", Message: msg}
-				t.Stop()
+				doneMsg = &msg // defer — process after all other tools
 			case "pace":
 				if r, ok := rateNames[call.Args["rate"]]; ok {
 					t.agentRate = r
@@ -209,6 +205,20 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				toolNames = append(toolNames, call.Raw)
 			}
 		}
+
+		// Process done AFTER all other tools have been dispatched
+		if doneMsg != nil {
+			// Give async tools a moment to start
+			time.Sleep(100 * time.Millisecond)
+			if *doneMsg != "" {
+				thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg))
+			} else {
+				thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
+			}
+			tm.events <- ThreadEvent{ThreadID: thread.ID, Type: "done", Message: *doneMsg}
+			t.Stop()
+		}
+
 		return replies, toolNames
 	}
 }
