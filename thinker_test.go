@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -150,68 +149,6 @@ func TestWakeup_NonBlocking(t *testing.T) {
 	case <-thinker.wakeup:
 	default:
 		t.Error("expected wakeup signal")
-	}
-}
-
-func TestBuildMemorySummary(t *testing.T) {
-	thinker := &Thinker{}
-
-	tests := []struct {
-		name     string
-		consumed []string
-		thought  string
-		replies  []string
-		tools    []string
-		contains []string
-		empty    bool
-	}{
-		{
-			name:     "user message and reply",
-			consumed: []string{"[user] Hello"},
-			thought:  "The user said hello, I should greet them back",
-			replies:  []string{"Hi there!"},
-			contains: []string{"User: Hello", "Replied: Hi there!", "Thought:"},
-		},
-		{
-			name:     "tool call",
-			consumed: []string{},
-			thought:  "fetching data",
-			tools:    []string{"[[web url=\"https://example.com\"]]"},
-			contains: []string{"Called:", "example.com"},
-		},
-		{
-			name:     "tool result event",
-			consumed: []string{"[tool:web] Some content from the web"},
-			thought:  "analyzing the content",
-			contains: []string{"[tool:web]", "Thought:"},
-		},
-		{
-			name:  "empty iteration",
-			empty: true,
-		},
-		{
-			name:     "strips tool calls from thought",
-			thought:  `Thinking [[reply message="hi"]] more thought`,
-			replies:  []string{"hi"},
-			contains: []string{"Thought: Thinking", "more thought"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := thinker.buildMemorySummary(tt.consumed, tt.thought, tt.replies, tt.tools)
-			if tt.empty {
-				if result != "" {
-					t.Errorf("expected empty, got %q", result)
-				}
-				return
-			}
-			for _, c := range tt.contains {
-				if !strings.Contains(result, c) {
-					t.Errorf("expected result to contain %q, got %q", c, result)
-				}
-			}
-		})
 	}
 }
 

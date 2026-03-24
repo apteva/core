@@ -195,6 +195,10 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
 				}
+			case "remember":
+				if text := call.Args["text"]; text != "" && t.memory != nil {
+					go t.memory.Store(text)
+				}
 			case "web", "write_file", "read_file", "list_files":
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)

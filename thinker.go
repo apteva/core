@@ -311,6 +311,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 				}
+			case "remember":
+				if text := call.Args["text"]; text != "" && t.memory != nil {
+					go t.memory.Store(text)
+				}
 			case "pace":
 				if r, ok := rateNames[call.Args["rate"]]; ok {
 					t.agentRate = r
@@ -460,13 +464,6 @@ func (t *Thinker) Run() {
 			t.messages = append(t.messages[:1], t.messages[len(t.messages)-maxHistory:]...)
 		}
 
-		// Store memory for meaningful iterations
-		if t.memory != nil && (hadEvents || len(replies) > 0 || len(toolNames) > 0) {
-			summary := t.buildMemorySummary(consumed, reply, replies, toolNames)
-			if summary != "" {
-				go t.memory.Store(summary)
-			}
-		}
 
 		// After processing, fall back to agent's chosen rate
 		// (external events already set reactive above for this iteration)
@@ -580,50 +577,7 @@ func (t *Thinker) drainInbox() []string {
 }
 
 
-func (t *Thinker) buildMemorySummary(consumed []string, thought string, replies []string, tools []string) string {
-	var parts []string
 
-	// What events came in
-	for _, ev := range consumed {
-		if strings.HasPrefix(ev, "[user] ") {
-			parts = append(parts, "User: "+strings.TrimPrefix(ev, "[user] "))
-		} else if strings.HasPrefix(ev, "[tool:") {
-			// Truncate tool results
-			if len(ev) > 200 {
-				ev = ev[:200] + "..."
-			}
-			parts = append(parts, ev)
-		}
-	}
-
-	// What the agent replied
-	for _, r := range replies {
-		if len(r) > 200 {
-			r = r[:200] + "..."
-		}
-		parts = append(parts, "Replied: "+r)
-	}
-
-	// What tools were called
-	for _, tc := range tools {
-		parts = append(parts, "Called: "+tc)
-	}
-
-	// Thought summary — first 200 chars of the thought (stripped of tool calls)
-	clean := stripToolCalls(thought)
-	clean = strings.TrimSpace(clean)
-	if len(clean) > 200 {
-		clean = clean[:200] + "..."
-	}
-	if clean != "" {
-		parts = append(parts, "Thought: "+clean)
-	}
-
-	if len(parts) == 0 {
-		return ""
-	}
-	return strings.Join(parts, " | ")
-}
 
 func (t *Thinker) logAPI(ev APIEvent) {
 	if t.apiNotify == nil || t.apiLog == nil {

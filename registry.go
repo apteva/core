@@ -66,6 +66,14 @@ func (tr *ToolRegistry) registerDefaults() {
 		Core:        true,
 	})
 
+	tr.Register(&ToolDef{
+		Name:        "remember",
+		Description: "Store something in persistent memory. Use for important facts, user preferences, lessons learned, decisions made. Memories survive restarts and are auto-recalled by relevance.",
+		Syntax:      `[[remember text="Important fact to remember"]]`,
+		Rules:       `Be selective — only store what you'd want to recall in future sessions. Not for transient state.`,
+		Core:        true,
+	})
+
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
