@@ -32,14 +32,16 @@ IMPORTANT — tool calls and [[done]]:
 - Example: Thought 1: [[pushover_send_notification ...]]. Thought 2: see result, confirm success, [[done]].`
 
 type ThreadInfo struct {
-	ID        string
-	Directive string
-	Tools     []string
-	Running   bool
-	Iteration int
-	Rate      ThinkRate
-	Model     ModelTier
-	Started   time.Time
+	ID           string
+	Directive    string
+	Tools        []string
+	Running      bool
+	Iteration    int
+	Rate         ThinkRate
+	Model        ModelTier
+	Started      time.Time
+	ContextMsgs  int
+	ContextChars int
 }
 
 type Thread struct {
@@ -55,20 +57,12 @@ type ThreadManager struct {
 	mu      sync.RWMutex
 	threads map[string]*Thread
 	parent  *Thinker
-	events  chan ThreadEvent
-}
-
-type ThreadEvent struct {
-	ThreadID string
-	Type     string // "started", "done", "reply", "report"
-	Message  string
 }
 
 func NewThreadManager(parent *Thinker) *ThreadManager {
 	return &ThreadManager{
 		threads: make(map[string]*Thread),
 		parent:  parent,
-		events:  make(chan ThreadEvent, 100),
 	}
 }
 
@@ -105,15 +99,14 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 		Started:   time.Now(),
 	}
 
-	// Create a Thinker — same struct as main, different hooks
+	// Create a Thinker — same struct as main, shares the bus
 	thinker := &Thinker{
 		apiKey: tm.parent.apiKey,
 		messages: []Message{
 			{Role: "system", Content: threadSystemPrompt},
 		},
-		events:    make(chan ThinkEvent, 100),
-		inbox:     make(chan string, 50),
-		wakeup:    make(chan struct{}, 1),
+		bus:       tm.parent.bus,
+		sub:       tm.parent.bus.Subscribe(id, 100),
 		pause:     make(chan bool),
 		quit:      make(chan struct{}),
 		rate:      RateReactive,
@@ -127,6 +120,18 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 		apiNotify:     tm.parent.apiNotify,
 		registry:      tm.parent.registry,
 		toolAllowlist: toolSet,
+		rebuildPrompt: func(toolDocs string) string {
+			cd := ""
+			if tm.parent.registry != nil {
+				cd = "\n" + tm.parent.registry.CoreDocs(false)
+			}
+			prompt := baseThreadPrompt + cd
+			if toolDocs != "" {
+				prompt += "\n" + toolDocs
+			}
+			prompt += "\n\n[DIRECTIVE]\n" + thread.Directive
+			return prompt
+		},
 	}
 	thread.Thinker = thinker
 
@@ -134,13 +139,13 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 
 	// Inject initial messages before starting so first thought picks them up
 	for _, msg := range initialMessages {
-		thinker.inbox <- msg
+		tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: msg})
 	}
 
 	// Same Run() as the main thinker — no duplicated loop
 	go thinker.Run()
 
-	tm.events <- ThreadEvent{ThreadID: id, Type: "started", Message: fmt.Sprintf("Thread %q spawned", id)}
+	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned", id)})
 	tm.parent.Inject(fmt.Sprintf("[thread:%s] started", id))
 	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
 
@@ -159,11 +164,6 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				continue
 			}
 			switch call.Name {
-			case "reply":
-				if msg := call.Args["message"]; msg != "" {
-					replies = append(replies, msg)
-					tm.events <- ThreadEvent{ThreadID: thread.ID, Type: "reply", Message: msg}
-				}
 			case "send":
 				id := call.Args["id"]
 				msg := call.Args["message"]
@@ -190,11 +190,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					thread.Directive = d
-					coreDocs := ""
-					if tm.parent.registry != nil {
-						coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
+					if t.rebuildPrompt != nil {
+						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
 					}
-					t.messages[0] = Message{Role: "system", Content: baseThreadPrompt + coreDocs + "\n\n[DIRECTIVE]\n" + d}
 					// Persist
 					tm.parent.config.SaveThread(PersistentThread{
 						ID: thread.ID, Directive: d, Tools: toolSetToSlice(thread.Tools),
@@ -219,7 +217,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			} else {
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
 			}
-			tm.events <- ThreadEvent{ThreadID: thread.ID, Type: "done", Message: *doneMsg}
+			tm.parent.bus.Publish(Event{Type: EventThreadDone, From: thread.ID, Text: *doneMsg})
 			t.Stop()
 		}
 
@@ -263,12 +261,12 @@ func (tm *ThreadManager) KillAll() {
 
 func (tm *ThreadManager) Send(id, message string) bool {
 	tm.mu.RLock()
-	thread, exists := tm.threads[id]
+	_, exists := tm.threads[id]
 	tm.mu.RUnlock()
 	if !exists {
 		return false
 	}
-	thread.Thinker.Inject(message)
+	tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: message})
 	return true
 }
 
@@ -280,11 +278,11 @@ func (tm *ThreadManager) Route(event string) bool {
 			msg := strings.TrimSpace(event[idx+1:])
 
 			tm.mu.RLock()
-			thread, exists := tm.threads[userID]
+			_, exists := tm.threads[userID]
 			tm.mu.RUnlock()
 
 			if exists {
-				thread.Thinker.Inject(fmt.Sprintf("[user] %s", msg))
+				tm.parent.bus.Publish(Event{Type: EventInbox, To: userID, Text: fmt.Sprintf("[user] %s", msg)})
 				return true
 			}
 		}
@@ -304,9 +302,11 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Tools:     toolSetToSlice(t.Tools),
 			Running:   true,
 			Iteration: t.Thinker.iteration,
-			Rate:      t.Thinker.rate,
-			Model:     t.Thinker.model,
-			Started:   t.Started,
+			Rate:         t.Thinker.rate,
+			Model:        t.Thinker.model,
+			Started:      t.Started,
+			ContextMsgs:  len(t.Thinker.messages),
+			ContextChars: func() int { n := 0; for _, m := range t.Thinker.messages { n += len(m.Content) }; return n }(),
 		})
 	}
 	return infos
@@ -322,7 +322,9 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	tm.mu.Lock()
 	delete(tm.threads, id)
 	tm.mu.Unlock()
-	tm.events <- ThreadEvent{ThreadID: id, Type: "done"}
+	tm.parent.config.RemoveThread(id) // remove from persistent config so it doesn't respawn
+	tm.parent.bus.Publish(Event{Type: EventThreadDone, From: id})
+	tm.parent.bus.Unsubscribe(id)
 	tm.parent.logAPI(APIEvent{Type: "thread_done", ThreadID: id})
 }
 
@@ -333,4 +335,3 @@ func toolSetToSlice(m map[string]bool) []string {
 	}
 	return out
 }
-

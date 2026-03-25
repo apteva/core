@@ -100,12 +100,13 @@ func TestTruncate(t *testing.T) {
 }
 
 func TestPanelWidths(t *testing.T) {
+	bus := NewEventBus()
 	thinker := &Thinker{
-		inbox:  make(chan string, 1),
-		wakeup: make(chan struct{}, 1),
-		events: make(chan ThinkEvent, 1),
-		memory: &MemoryStore{path: "/dev/null"},
-		config: &Config{Directive: "test"},
+		bus:      bus,
+		sub:      bus.Subscribe("main", 1),
+		memory:   &MemoryStore{path: "/dev/null"},
+		config:   &Config{Directive: "test"},
+		threadID: "main",
 	}
 	m := newModel(thinker)
 

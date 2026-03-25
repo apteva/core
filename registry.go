@@ -94,40 +94,11 @@ func (tr *ToolRegistry) registerDefaults() {
 
 	// Discoverable tools — retrieved by RAG
 	tr.Register(&ToolDef{
-		Name:        "reply",
-		Description: "Send a visible message to the user. Users cannot see your thoughts — only reply messages. Use for conversations and responses.",
-		Syntax:      `[[reply message="Your response"]]`,
-		Rules:       `Users can ONLY see [[reply]] messages, not your thoughts.`,
-		Handler:     nil, // handled inline by thread tool handler
-		ThreadOnly:  true, // NOT available to main thread
-	})
-	tr.Register(&ToolDef{
 		Name:        "web",
 		Description: "Fetch a URL from the internet and return its text content. Use for research, looking up information, checking websites.",
 		Syntax:      `[[web url="https://example.com"]]`,
 		Rules:       `Only parameter is url. Results arrive as events in your next thought.`,
 		Handler:     webTool,
-	})
-	tr.Register(&ToolDef{
-		Name:        "write_file",
-		Description: "Write content to a file in the workspace directory. Use for creating documents, saving drafts, producing output files.",
-		Syntax:      `[[write_file path="drafts/doc.md" content="..."]]`,
-		Rules:       `Paths are relative to workspace/ directory.`,
-		Handler:     writeFileTool,
-	})
-	tr.Register(&ToolDef{
-		Name:        "read_file",
-		Description: "Read a file from the workspace directory. Use for reviewing documents, checking existing content, loading data.",
-		Syntax:      `[[read_file path="drafts/doc.md"]]`,
-		Rules:       `Paths are relative to workspace/ directory.`,
-		Handler:     readFileTool,
-	})
-	tr.Register(&ToolDef{
-		Name:        "list_files",
-		Description: "List files and directories in the workspace. Use for checking what files exist, monitoring for changes.",
-		Syntax:      `[[list_files path="drafts/"]]`,
-		Rules:       `Paths are relative to workspace/ directory.`,
-		Handler:     listFilesTool,
 	})
 }
 
@@ -321,4 +292,19 @@ func (tr *ToolRegistry) Count() int {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
 	return len(tr.tools)
+}
+
+// Counts returns core, discoverable (RAG), and total tool counts.
+func (tr *ToolRegistry) Counts() (core, rag, total int) {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	for _, tool := range tr.tools {
+		if tool.Core {
+			core++
+		} else {
+			rag++
+		}
+	}
+	total = core + rag
+	return
 }

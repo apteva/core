@@ -32,9 +32,9 @@ type PromptTokensDetails struct {
 }
 
 type Usage struct {
-	PromptTokens        int                 `json:"prompt_tokens"`
-	CompletionTokens    int                 `json:"completion_tokens"`
-	TotalTokens         int                 `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
 	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }
 
@@ -61,9 +61,22 @@ func main() {
 	}
 	go startAPI(thinker, ":"+apiPort)
 
-	p := tea.NewProgram(newModel(thinker), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	// Check for --headless flag or NO_TUI env var
+	headless := os.Getenv("NO_TUI") != ""
+	for _, arg := range os.Args[1:] {
+		if arg == "--headless" {
+			headless = true
+		}
+	}
+
+	if headless {
+		fmt.Fprintf(os.Stderr, "thinking engine running headless (API on :%s)\n", apiPort)
+		<-thinker.quit
+	} else {
+		p := tea.NewProgram(newModel(thinker), tea.WithAltScreen())
+		if _, err := p.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }

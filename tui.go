@@ -143,12 +143,7 @@ var (
 )
 
 type tickMsg time.Time
-type thinkEventMsg ThinkEvent
-type threadEventMsg ThreadEvent
-type threadThinkEventMsg struct {
-	ThreadID string
-	Event    ThinkEvent
-}
+type busEventMsg Event
 
 const (
 	priceInputPerToken  = 0.60 / 1_000_000
@@ -171,6 +166,7 @@ const (
 	panelThreads
 	panelDirective
 	panelTools
+	panelBus
 )
 
 type inputMode int
@@ -187,10 +183,13 @@ type threadView struct {
 	iteration    int
 	rate         ThinkRate
 	model        ModelTier
+	contextMsgs  int
+	contextChars int
 }
 
 type model struct {
 	thinker      *Thinker
+	busSub       *Subscription
 	width        int
 	height       int
 	scrollOffset int
@@ -203,6 +202,7 @@ type model struct {
 
 	chat           []chatMessage
 	consoleHistory []string
+	busLog         []string // recent bus events for display
 	memoryCount    int
 	threadCount    int
 
@@ -239,6 +239,7 @@ func newModel(thinker *Thinker) model {
 	ti.CharLimit = 500
 	return model{
 		thinker:     thinker,
+		busSub:      thinker.bus.SubscribeAll("tui", 500),
 		startTime:   time.Now(),
 		input:       ti,
 		memoryCount: thinker.memory.Count(),
@@ -288,49 +289,14 @@ func (m *model) removeTab(id string) {
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
-		pollEvents(m.thinker),
-		pollThreadEvents(m.thinker.threads),
-		pollThreadThinkEvents(m.thinker.threads),
+		pollBusEvent(m.busSub),
 		tickCmd(),
 	)
 }
 
-func pollEvents(t *Thinker) tea.Cmd {
+func pollBusEvent(sub *Subscription) tea.Cmd {
 	return func() tea.Msg {
-		return thinkEventMsg(<-t.events)
-	}
-}
-
-func pollThreadEvents(tm *ThreadManager) tea.Cmd {
-	return func() tea.Msg {
-		return threadEventMsg(<-tm.events)
-	}
-}
-
-// pollThreadThinkEvents watches all thread thinkers for thought events.
-func pollThreadThinkEvents(tm *ThreadManager) tea.Cmd {
-	return func() tea.Msg {
-		// Poll all current threads, return first event from any
-		for {
-			tm.mu.RLock()
-			threads := make(map[string]*Thread, len(tm.threads))
-			for k, v := range tm.threads {
-				threads[k] = v
-			}
-			tm.mu.RUnlock()
-
-			for id, thread := range threads {
-				select {
-				case ev := <-thread.Thinker.events:
-					return threadThinkEventMsg{ThreadID: id, Event: ev}
-				default:
-				}
-			}
-			// Small sleep to avoid busy-looping
-			select {
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
+		return busEventMsg(<-sub.C)
 	}
 }
 
@@ -444,6 +410,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.panel = panelDirective
 			m.directiveLines = strings.Split(m.thinker.config.GetDirective(), "\n")
 			m.directiveCursor = 0
+			return m, nil
+		case "b":
+			if m.panel == panelBus {
+				m.panel = panelChat
+			} else {
+				m.panel = panelBus
+			}
 			return m, nil
 		case "o":
 			if m.panel == panelTools {
@@ -565,89 +538,94 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 
-	case thinkEventMsg:
-		ev := ThinkEvent(msg)
-		v := m.getOrCreateView("main")
-		m.applyThinkEvent(v, "main", ev)
-		if ev.Done {
-			m.memoryCount = ev.MemoryCount
-			m.threadCount = ev.ThreadCount
+	case busEventMsg:
+		ev := Event(msg)
+		// Log meaningful events to the bus panel (skip chunks and broadcasts with no target)
+		if ev.Type != EventChunk {
+			ts := time.Now().Format("15:04:05")
+			text := ev.Text
+			if len(text) > 60 {
+				text = text[:60] + "..."
+			}
+			var logLine string
+			if ev.Type == EventThinkDone {
+				evCount := len(ev.ConsumedEvents)
+				logLine = fmt.Sprintf("%s %s %s events=%d", ts, ev.Type, ev.From, evCount)
+			} else if ev.To != "" {
+				logLine = fmt.Sprintf("%s %s %s→%s %s", ts, ev.Type, ev.From, ev.To, text)
+			} else {
+				logLine = fmt.Sprintf("%s %s %s %s", ts, ev.Type, ev.From, text)
+			}
+			m.busLog = append(m.busLog, logLine)
+			if len(m.busLog) > 200 {
+				m.busLog = m.busLog[len(m.busLog)-200:]
+			}
 		}
-		return m, pollEvents(m.thinker)
 
-	case threadThinkEventMsg:
-		v := m.getOrCreateView(msg.ThreadID)
-		m.applyThinkEvent(v, msg.ThreadID, msg.Event)
-		return m, pollThreadThinkEvents(m.thinker.threads)
-
-	case threadEventMsg:
-		ev := ThreadEvent(msg)
 		switch ev.Type {
-		case "reply":
-			m.chat = append(m.chat, chatMessage{isUser: false, text: ev.Message, threadID: ev.ThreadID})
-		case "started":
-			m.getOrCreateView(ev.ThreadID)
+		case EventChunk:
+			v := m.getOrCreateView(ev.From)
+			v.currentChunk.WriteString(ev.Text)
+			v.iteration = ev.Iteration
+			if m.activeTab == ev.From {
+				m.scrollOffset = m.maxScroll()
+			}
+		case EventThinkDone:
+			v := m.getOrCreateView(ev.From)
+			v.thoughts = append(v.thoughts, thought{
+				iteration: ev.Iteration,
+				content:   v.currentChunk.String(),
+				duration:  ev.Duration,
+			})
+			v.currentChunk.Reset()
+			v.rate = ev.Rate
+			v.model = ev.Model
+			v.contextMsgs = ev.ContextMsgs
+			v.contextChars = ev.ContextChars
+			m.lastDuration = ev.Duration
+			u := ev.Usage
+			m.totalPromptTokens += u.PromptTokens
+			m.totalCachedTokens += u.CachedTokens
+			m.totalCompletionTokens += u.CompletionTokens
+			uncachedInput := u.PromptTokens - u.CachedTokens
+			if uncachedInput < 0 {
+				uncachedInput = 0
+			}
+			m.totalCost += float64(uncachedInput)*priceInputPerToken +
+				float64(u.CachedTokens)*priceCachedPerToken +
+				float64(u.CompletionTokens)*priceOutputPerToken
+			if ev.From == "main" {
+				m.memoryCount = ev.MemoryCount
+				m.threadCount = ev.ThreadCount
+			}
+			if m.activeTab == ev.From {
+				m.scrollOffset = m.maxScroll()
+			}
+		case EventThinkError:
+			v := m.getOrCreateView(ev.From)
+			v.thoughts = append(v.thoughts, thought{
+				iteration: ev.Iteration,
+				content:   fmt.Sprintf("ERROR: %v", ev.Error),
+			})
+			if m.activeTab == ev.From {
+				m.scrollOffset = m.maxScroll()
+			}
+		case EventThreadStart:
+			m.getOrCreateView(ev.From)
 			m.threadCount = m.thinker.threads.Count()
-		case "done":
-			m.removeTab(ev.ThreadID)
+		case EventThreadDone:
+			m.removeTab(ev.From)
 			m.threadCount = m.thinker.threads.Count()
+		case EventThreadReply:
+			m.chat = append(m.chat, chatMessage{isUser: false, text: ev.Text, threadID: ev.From})
 		}
-		return m, pollThreadEvents(m.thinker.threads)
+		return m, pollBusEvent(m.busSub)
 
 	case tickMsg:
 		return m, tickCmd()
 	}
 
 	return m, nil
-}
-
-func (m *model) applyThinkEvent(v *threadView, tabID string, ev ThinkEvent) {
-	if ev.Error != nil {
-		v.thoughts = append(v.thoughts, thought{
-			iteration: ev.Iteration,
-			content:   fmt.Sprintf("ERROR: %v", ev.Error),
-		})
-		if m.activeTab == tabID {
-			m.scrollOffset = m.maxScroll()
-		}
-		return
-	}
-
-	if ev.Chunk != "" {
-		v.currentChunk.WriteString(ev.Chunk)
-		v.iteration = ev.Iteration
-		if m.activeTab == tabID {
-			m.scrollOffset = m.maxScroll()
-		}
-	}
-
-	if ev.Done {
-		v.thoughts = append(v.thoughts, thought{
-			iteration: ev.Iteration,
-			content:   v.currentChunk.String(),
-			duration:  ev.Duration,
-		})
-		v.currentChunk.Reset()
-		v.rate = ev.Rate
-		v.model = ev.Model
-		m.lastDuration = ev.Duration
-
-		u := ev.Usage
-		m.totalPromptTokens += u.PromptTokens
-		m.totalCachedTokens += u.CachedTokens
-		m.totalCompletionTokens += u.CompletionTokens
-		uncachedInput := u.PromptTokens - u.CachedTokens
-		if uncachedInput < 0 {
-			uncachedInput = 0
-		}
-		m.totalCost += float64(uncachedInput)*priceInputPerToken +
-			float64(u.CachedTokens)*priceCachedPerToken +
-			float64(u.CompletionTokens)*priceOutputPerToken
-
-		if m.activeTab == tabID {
-			m.scrollOffset = m.maxScroll()
-		}
-	}
 }
 
 func (m model) maxScroll() int {
@@ -721,7 +699,7 @@ func (m model) renderChatPanel(width, height int) string {
 	if m.inputActive {
 		inputArea = inputLabelStyle.Render("> ") + m.input.View()
 	} else {
-		inputArea = helpStyle.Render("i:chat c:cmd e:dir o:tools m:mem")
+		inputArea = helpStyle.Render("i:chat c:cmd e:dir o:tools m:mem b:bus")
 	}
 
 	listHeight := height - 4
@@ -858,15 +836,16 @@ func (m model) renderThreadPanel(width, height int) string {
 		for i, thr := range threads {
 			age := formatAge(time.Since(thr.Started))
 			info := fmt.Sprintf("%s/%s #%d", thr.Rate, thr.Model, thr.Iteration)
+			ctx := fmt.Sprintf("ctx:%dm/%dk", thr.ContextMsgs, thr.ContextChars/1000)
 			toolStr := strings.Join(thr.Tools, ",")
 
 			if i == m.threadCursor {
 				lines = append(lines, threadSelectedStyle.Render(fmt.Sprintf(" %s ", thr.ID)))
-				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s", info, age)))
+				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s │ %s", info, ctx, age)))
 				lines = append(lines, statsStyle.Render(fmt.Sprintf("  tools: %s", toolStr)))
 			} else {
 				lines = append(lines, threadActiveStyle.Render("  "+thr.ID))
-				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s", info, age)))
+				lines = append(lines, statsStyle.Render(fmt.Sprintf("  %s │ %s │ %s", info, ctx, age)))
 			}
 			lines = append(lines, "")
 		}
@@ -1052,6 +1031,48 @@ func (m model) renderToolsPanel(width, height int) string {
 	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
 }
 
+func (m model) renderBusPanel(width, height int) string {
+	if width <= 0 {
+		return ""
+	}
+	innerWidth := width - 4
+	if innerWidth < 5 {
+		innerWidth = 5
+	}
+
+	title := consoleTitleStyle.Render(fmt.Sprintf("Event Bus (%d)", len(m.busLog)))
+	footer := helpStyle.Render("b: back")
+
+	listHeight := height - 4
+	if listHeight < 1 {
+		listHeight = 1
+	}
+
+	var lines []string
+	if len(m.busLog) == 0 {
+		lines = append(lines, statsStyle.Render("no events yet"))
+	} else {
+		for _, entry := range m.busLog {
+			// Wrap long lines
+			if len(entry) > innerWidth-2 {
+				entry = entry[:innerWidth-2]
+			}
+			lines = append(lines, statsStyle.Render(entry))
+		}
+	}
+
+	// Show most recent at bottom
+	if len(lines) > listHeight {
+		lines = lines[len(lines)-listHeight:]
+	}
+	for len(lines) < listHeight {
+		lines = append(lines, "")
+	}
+
+	body := title + "\n" + strings.Join(lines, "\n") + "\n" + footer
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
+}
+
 func (m model) renderTabBar() string {
 	var parts []string
 	for _, tab := range m.tabs {
@@ -1078,17 +1099,28 @@ func (m model) View() string {
 
 	// Show active tab's status
 	var statusRender string
+	var ctxInfo string
 	if m.paused {
 		statusRender = pausedStyle.Render("PAUSED")
 	} else if v, ok := m.threadViews[m.activeTab]; ok {
 		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s)", v.rate, v.model))
+		if v.contextChars > 0 {
+			estTokens := v.contextChars / 4 // rough estimate: ~4 chars per token
+			ctxInfo = fmt.Sprintf(" │ ctx: %dm/~%dtok", v.contextMsgs, estTokens)
+		}
 	} else {
 		statusRender = statusBarStyle.Render("THINKING")
 	}
 
+	toolInfo := ""
+	if m.thinker.registry != nil {
+		core, rag, total := m.thinker.registry.Counts()
+		toolInfo = fmt.Sprintf(" │ tools: %d(%dc+%dr)", total, core, rag)
+	}
+
 	stats := statsStyle.Render(fmt.Sprintf(
-		"%s │ thr: %d │ mem: %d",
-		elapsed, m.threadCount, m.memoryCount,
+		"%s │ thr: %d │ mem: %d%s%s",
+		elapsed, m.threadCount, m.memoryCount, ctxInfo, toolInfo,
 	))
 
 	header := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", statusRender, "  ", stats)
@@ -1155,6 +1187,8 @@ func (m model) View() string {
 			leftPanel = m.renderDirectivePanel(leftWidth, viewHeight)
 		case panelTools:
 			leftPanel = m.renderToolsPanel(leftWidth, viewHeight)
+		case panelBus:
+			leftPanel = m.renderBusPanel(leftWidth, viewHeight)
 		default:
 			leftPanel = m.renderChatPanel(leftWidth, viewHeight)
 		}

@@ -65,7 +65,6 @@ func TestModelTier_ID(t *testing.T) {
 	if ModelSmall.ID() == "" {
 		t.Error("small model ID should not be empty")
 	}
-	// Both may use the same model ID temporarily
 	_ = ModelLarge.ID()
 	_ = ModelSmall.ID()
 }
@@ -78,25 +77,34 @@ func TestModelNames(t *testing.T) {
 	}
 }
 
-func TestDrainInbox_Empty(t *testing.T) {
+func TestDrainEvents_Empty(t *testing.T) {
+	bus := NewEventBus()
 	thinker := &Thinker{
-		inbox: make(chan string, 10),
+		bus:      bus,
+		sub:      bus.Subscribe("test", 10),
+		threadID: "test",
 	}
-	items := thinker.drainInbox()
+	items := thinker.drainEvents()
 	if len(items) != 0 {
 		t.Errorf("expected empty, got %d items", len(items))
 	}
 }
 
-func TestDrainInbox_WithMessages(t *testing.T) {
+func TestDrainEvents_WithMessages(t *testing.T) {
+	bus := NewEventBus()
 	thinker := &Thinker{
-		inbox: make(chan string, 10),
+		bus:      bus,
+		sub:      bus.Subscribe("test", 10),
+		threadID: "test",
 	}
-	thinker.inbox <- "msg1"
-	thinker.inbox <- "msg2"
-	thinker.inbox <- "msg3"
+	bus.Publish(Event{Type: EventInbox, To: "test", Text: "msg1"})
+	bus.Publish(Event{Type: EventInbox, To: "test", Text: "msg2"})
+	bus.Publish(Event{Type: EventInbox, To: "test", Text: "msg3"})
 
-	items := thinker.drainInbox()
+	// Small sleep to let publishes land
+	time.Sleep(10 * time.Millisecond)
+
+	items := thinker.drainEvents()
 	if len(items) != 3 {
 		t.Fatalf("expected 3 items, got %d", len(items))
 	}
@@ -105,51 +113,51 @@ func TestDrainInbox_WithMessages(t *testing.T) {
 	}
 
 	// Should be empty now
-	items2 := thinker.drainInbox()
+	items2 := thinker.drainEvents()
 	if len(items2) != 0 {
 		t.Errorf("expected empty after drain, got %d", len(items2))
 	}
 }
 
 func TestInject(t *testing.T) {
+	bus := NewEventBus()
 	thinker := &Thinker{
-		inbox:  make(chan string, 10),
-		wakeup: make(chan struct{}, 1),
+		bus:      bus,
+		sub:      bus.Subscribe("test", 10),
+		threadID: "test",
 	}
 	thinker.Inject("test event")
-	items := thinker.drainInbox()
+	time.Sleep(10 * time.Millisecond)
+	items := thinker.drainEvents()
 	if len(items) != 1 || items[0] != "test event" {
 		t.Errorf("unexpected items: %v", items)
 	}
 }
 
 func TestInjectUserMessage(t *testing.T) {
+	bus := NewEventBus()
 	thinker := &Thinker{
-		inbox:  make(chan string, 10),
-		wakeup: make(chan struct{}, 1),
+		bus:      bus,
+		sub:      bus.Subscribe("test", 10),
+		threadID: "test",
 	}
 	thinker.InjectUserMessage("marco", "Hello")
-	items := thinker.drainInbox()
+	time.Sleep(10 * time.Millisecond)
+	items := thinker.drainEvents()
 	if len(items) != 1 || items[0] != "[user:marco] Hello" {
 		t.Errorf("expected '[user:marco] Hello', got %v", items)
 	}
 }
 
-func TestWakeup_NonBlocking(t *testing.T) {
-	thinker := &Thinker{
-		inbox:  make(chan string, 10),
-		wakeup: make(chan struct{}, 1),
-	}
-	// Should not block even when called multiple times
-	thinker.wake()
-	thinker.wake()
-	thinker.wake()
-	// Drain wakeup
-	select {
-	case <-thinker.wakeup:
-	default:
-		t.Error("expected wakeup signal")
-	}
+func TestPublish_NonBlocking(t *testing.T) {
+	bus := NewEventBus()
+	// Small buffer — should not block even when full
+	bus.Subscribe("slow", 1)
+	// Publish multiple times — should never block
+	bus.Publish(Event{Type: EventInbox, To: "slow", Text: "1"})
+	bus.Publish(Event{Type: EventInbox, To: "slow", Text: "2"})
+	bus.Publish(Event{Type: EventInbox, To: "slow", Text: "3"})
+	// If we get here without hanging, it works
 }
 
 func TestThinkerStop(t *testing.T) {

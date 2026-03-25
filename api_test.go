@@ -11,12 +11,12 @@ import (
 )
 
 func newTestAPI() (*APIServer, *Thinker) {
+	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:    "test",
 		messages:  []Message{{Role: "system", Content: "test"}},
-		events:    make(chan ThinkEvent, 100),
-		inbox:     make(chan string, 50),
-		wakeup:    make(chan struct{}, 1),
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
 		pause:     make(chan bool),
 		quit:      make(chan struct{}),
 		rate:      RateSlow,
@@ -128,9 +128,9 @@ func TestAPI_PostEvent(t *testing.T) {
 	}
 
 	// Check it was injected
-	items := thinker.drainInbox()
+	items := thinker.drainEvents()
 	if len(items) != 1 {
-		t.Fatalf("expected 1 item in inbox, got %d", len(items))
+		t.Fatalf("expected 1 item in events, got %d", len(items))
 	}
 	if items[0] != "[console] test command" {
 		t.Errorf("expected '[console] test command', got %q", items[0])

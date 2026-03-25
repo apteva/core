@@ -52,10 +52,11 @@ func (m ModelTier) ID() string {
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
 const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
 
-Your thinking should be purposeful:
-- Observe incoming events and decide how to handle them.
-- Spawn threads for conversations, research, tasks.
-- Monitor thread reports and coordinate between them.
+THINKING — every thought must contain meaningful text:
+- Always explain what you observe, what you're doing, and why — even briefly.
+- NEVER output only tool calls. Always include at least one sentence of reasoning.
+- When idle: briefly state your current status and what you're waiting for.
+- When busy: explain what you're working on and next steps.
 - Keep each thought concise — 1-2 short paragraphs max.
 
 EVENT FORMAT:
@@ -74,43 +75,44 @@ SPAWNING THREADS — critical rules:
 - The "tools" parameter lists which tools the thread can use. ALWAYS include ALL tools the thread needs.
 - Check [available tools] to see what's available and include relevant ones by name.
 - Example: if a thread needs to send push notifications, include "pushover_send_notification" in tools.
-- The "directive" parameter must be PLAIN TEXT — do NOT include tool call syntax like [[ ]] inside it. Just describe what the thread should do in natural language.
+- The "directive" parameter must be PLAIN NATURAL LANGUAGE describing the thread's goal and behavior.
+  NEVER put tool call syntax like [[ ]] in the directive. NEVER put tool names in the directive.
+  The thread already receives its own tool documentation — it knows what tools it has.
+  BAD:  directive="Call [[helpdesk_list_tickets]] to check for tickets"
+  GOOD: directive="Check for new support tickets periodically. When you find tickets, report them to main."
 
 PACING — critical:
 - Sub-threads will send you messages when they need your attention. You do NOT need to stay awake to monitor them.
 - After setting up the system, pace down aggressively: "normal" → "slow" → "sleep". Use model="small" when idle.
-- Do NOT repeat status updates. If nothing changed, go to sleep. You will be woken automatically when an event arrives.
+- You do NOT need to call [[pace]] every thought. Your current pace persists until you change it. Only call pace when you want to change speed.
+- You will be woken automatically when an event arrives — no need to stay awake.
+
+CRITICAL — never hallucinate events:
+- You ONLY receive events in [Events:] blocks. If there is no [Events:] block, NOTHING happened.
+- NEVER invent, imagine, or assume events that are not explicitly shown to you.
+- NEVER pretend a user sent a message. NEVER fabricate [user:...] events.
+- If no events arrived, your ONLY job is to set your pace and wait. Do not take any action.
+- Violating this rule causes real damage — spawning threads or sending notifications based on imagined events wastes resources and confuses users.
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
-func buildSystemPrompt(directive string, registry *ToolRegistry) string {
+func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs string) string {
 	coreDocs := ""
 	if registry != nil {
 		coreDocs = "\n" + registry.CoreDocs(true)
 	}
-	return baseSystemPrompt + coreDocs + "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
+	prompt := baseSystemPrompt + coreDocs
+	if extraToolDocs != "" {
+		prompt += "\n" + extraToolDocs
+	}
+	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
+	return prompt
 }
 
 type TokenUsage struct {
 	PromptTokens     int
 	CachedTokens     int
 	CompletionTokens int
-}
-
-type ThinkEvent struct {
-	Chunk          string
-	Done           bool
-	Iteration      int
-	Error          error
-	Duration       time.Duration
-	ConsumedEvents []string
-	Usage          TokenUsage
-	ToolCalls      []string
-	Replies        []string
-	Rate           ThinkRate
-	Model          ModelTier
-	MemoryCount    int
-	ThreadCount    int
 }
 
 type ThinkRate int
@@ -178,15 +180,14 @@ type APIEvent struct {
 // consumed contains the events that were consumed this iteration (for context).
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string)
 
-// EventFilter preprocesses drained inbox events. Can route/drop events.
+// EventFilter preprocesses drained bus events. Can route/drop events.
 type EventFilter func(events []string) []string
 
 type Thinker struct {
 	apiKey    string
 	messages  []Message
-	events    chan ThinkEvent
-	inbox     chan string
-	wakeup    chan struct{}
+	bus       *EventBus
+	sub       *Subscription
 	pause     chan bool
 	quit      chan struct{}
 	iteration int
@@ -203,6 +204,7 @@ type Thinker struct {
 	// Hooks — set these to customize behavior. nil = defaults.
 	handleTools    ToolHandler
 	filterEvents   EventFilter
+	rebuildPrompt  func(toolDocs string) string // rebuild system prompt with current tool docs
 	onStop         func()
 	toolAllowlist  map[string]bool // nil = all tools allowed (main thread)
 
@@ -215,15 +217,15 @@ type Thinker struct {
 
 func NewThinker(apiKey string) *Thinker {
 	cfg := NewConfig()
+	bus := NewEventBus()
 	t := &Thinker{
 		apiKey: apiKey,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), nil)},
+			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), nil, "")},
 		},
-		config: cfg,
-		events:    make(chan ThinkEvent, 100),
-		inbox:     make(chan string, 50),
-		wakeup:    make(chan struct{}, 1),
+		config:    cfg,
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
 		pause:     make(chan bool),
 		quit:      make(chan struct{}),
 		rate:      RateSlow,
@@ -238,7 +240,7 @@ func NewThinker(apiKey string) *Thinker {
 	t.registry = NewToolRegistry(apiKey)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry, "")}
 
 	// Embed tool descriptions in background (non-blocking)
 	go t.registry.EmbedAll(t.memory)
@@ -254,6 +256,9 @@ func NewThinker(apiKey string) *Thinker {
 		return kept
 	}
 	t.handleTools = mainToolHandler(t)
+	t.rebuildPrompt = func(toolDocs string) string {
+		return buildSystemPrompt(t.config.GetDirective(), t.registry, toolDocs)
+	}
 
 	// Connect MCP servers and register their tools
 	if len(cfg.MCPServers) > 0 {
@@ -314,7 +319,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					t.config.SetDirective(d)
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry)}
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry, "")}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 				}
 			case "remember":
@@ -365,8 +370,8 @@ func (t *Thinker) Run() {
 
 		t.iteration++
 
-		// Drain inbox, optionally filter/route events
-		consumed := t.drainInbox()
+		// Drain events from bus, optionally filter/route
+		consumed := t.drainEvents()
 		if t.filterEvents != nil {
 			consumed = t.filterEvents(consumed)
 		}
@@ -380,7 +385,6 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		now := time.Now().Format("2006-01-02 15:04:05")
 		hadEvents := len(consumed) > 0
 		if hasExternalEvent {
 			t.rate = RateReactive
@@ -389,6 +393,8 @@ func (t *Thinker) Run() {
 			// Tool results — wake but less aggressive than external events
 			t.rate = RateFast
 		}
+
+		now := time.Now().Format("2006-01-02 15:04:05")
 		if hadEvents {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
@@ -397,7 +403,7 @@ func (t *Thinker) Run() {
 			}
 			t.messages = append(t.messages, Message{Role: "user", Content: sb.String()})
 		} else {
-			t.messages = append(t.messages, Message{Role: "system", Content: fmt.Sprintf("[%s] No new events.", now)})
+			t.messages = append(t.messages, Message{Role: "user", Content: fmt.Sprintf("[%s] (no events)", now)})
 		}
 
 		// Memory recall
@@ -421,8 +427,8 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		// Tool discovery via RAG — inject relevant tools based on context
-		if t.registry != nil {
+		// Tool discovery via RAG — update system prompt with discovered tools
+		if t.registry != nil && t.rebuildPrompt != nil {
 			var toolQuery string
 			if hadEvents {
 				toolQuery = strings.Join(consumed, " ")
@@ -434,11 +440,9 @@ func (t *Thinker) Run() {
 					}
 				}
 			}
-			// Retrieve up to 5 relevant tools (generous — low threshold)
 			tools := t.registry.Retrieve(toolQuery, 5, t.allowedTools(), t.memory)
-			if docs := t.registry.BuildDocs(tools); docs != "" {
-				t.messages = append(t.messages, Message{Role: "system", Content: docs})
-			}
+			toolDocs := t.registry.BuildDocs(tools)
+			t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt(toolDocs)}
 		}
 
 		start := time.Now()
@@ -446,7 +450,7 @@ func (t *Thinker) Run() {
 		duration := time.Since(start)
 
 		if err != nil {
-			t.events <- ThinkEvent{Error: err, Iteration: t.iteration}
+			t.bus.Publish(Event{Type: EventThinkError, From: t.threadID, Error: err, Iteration: t.iteration})
 			select {
 			case <-time.After(5 * time.Second):
 			case <-t.quit:
@@ -470,7 +474,6 @@ func (t *Thinker) Run() {
 			t.messages = append(t.messages[:1], t.messages[len(t.messages)-maxHistory:]...)
 		}
 
-
 		// After processing, fall back to agent's chosen rate
 		// (external events already set reactive above for this iteration)
 		t.rate = t.agentRate
@@ -482,7 +485,21 @@ func (t *Thinker) Run() {
 			threadCount = t.threads.Count()
 		}
 
-		t.events <- ThinkEvent{Done: true, Iteration: t.iteration, Duration: duration, ConsumedEvents: consumed, Usage: usage, ToolCalls: toolNames, Replies: replies, Rate: t.rate, Model: t.model, MemoryCount: t.memory.Count(), ThreadCount: threadCount}
+		// Context size
+		ctxChars := 0
+		for _, msg := range t.messages {
+			ctxChars += len(msg.Content)
+		}
+
+		t.bus.Publish(Event{
+			Type: EventThinkDone, From: t.threadID,
+			Iteration: t.iteration, Duration: duration,
+			ConsumedEvents: consumed, Usage: usage,
+			ToolCalls: toolNames, Replies: replies,
+			Rate: t.rate, Model: t.model,
+			MemoryCount: t.memory.Count(), ThreadCount: threadCount,
+			ContextMsgs: len(t.messages), ContextChars: ctxChars,
+		})
 
 		// Log to API — include full reply so tool calls are visible too
 		logMsg := strings.TrimSpace(reply)
@@ -494,17 +511,15 @@ func (t *Thinker) Run() {
 			t.logAPI(APIEvent{Type: "reply", Message: r})
 		}
 
-
-		// Interruptible sleep
+		// Interruptible sleep — wakes on new event or quit
 		select {
 		case <-time.After(t.rate.Delay()):
-		case <-t.wakeup:
+		case <-t.sub.Wake:
 		case <-t.quit:
 			return
 		}
 	}
 }
-
 
 func (t *Thinker) think() (string, TokenUsage, error) {
 	reqBody := Request{
@@ -556,7 +571,7 @@ func (t *Thinker) think() (string, TokenUsage, error) {
 		if len(event.Choices) > 0 {
 			chunk := event.Choices[0].Delta.Content
 			full.WriteString(chunk)
-			t.events <- ThinkEvent{Chunk: chunk, Iteration: t.iteration}
+			t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
 		}
 		if event.Usage != nil {
 			usage.PromptTokens = event.Usage.PromptTokens
@@ -570,20 +585,23 @@ func (t *Thinker) think() (string, TokenUsage, error) {
 	return full.String(), usage, nil
 }
 
-func (t *Thinker) drainInbox() []string {
+// drainEvents reads all pending events and wake signals from this thinker's bus subscription.
+func (t *Thinker) drainEvents() []string {
 	var items []string
 	for {
 		select {
-		case msg := <-t.inbox:
-			items = append(items, msg)
+		case ev := <-t.sub.C:
+			if ev.Type == EventInbox {
+				items = append(items, ev.Text)
+			}
+		case <-t.sub.Wake:
+			// Consume wake signals alongside their events
+			continue
 		default:
 			return items
 		}
 	}
 }
-
-
-
 
 func (t *Thinker) logAPI(ev APIEvent) {
 	if t.apiNotify == nil || t.apiLog == nil {
@@ -618,38 +636,28 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 
 // allowedTools returns the tool allowlist for this thinker. nil = all tools allowed.
 func (t *Thinker) allowedTools() map[string]bool {
-	// Main thread has no restrictions
-	// Sub-threads get their allowlist set during spawn
 	return t.toolAllowlist
 }
 
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "")}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 
-func (t *Thinker) InjectConsole(msg string) {
-	t.inbox <- "[console] " + msg
-	t.wake()
-}
-
+// Inject sends a message event to this thinker's bus subscription.
 func (t *Thinker) Inject(msg string) {
-	t.inbox <- msg
-	t.wake()
+	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: msg})
 }
 
+// InjectConsole sends a console event to this thinker.
+func (t *Thinker) InjectConsole(msg string) {
+	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: "[console] " + msg})
+}
 
+// InjectUserMessage sends a user message event to this thinker.
 func (t *Thinker) InjectUserMessage(userID, msg string) {
-	t.inbox <- fmt.Sprintf("[user:%s] %s", userID, msg)
-	t.wake()
-}
-
-func (t *Thinker) wake() {
-	select {
-	case t.wakeup <- struct{}{}:
-	default:
-	}
+	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: fmt.Sprintf("[user:%s] %s", userID, msg)})
 }
 
 func (t *Thinker) TogglePause() {
@@ -659,7 +667,6 @@ func (t *Thinker) TogglePause() {
 func (t *Thinker) Stop() {
 	select {
 	case <-t.quit:
-		// already closed
 	default:
 		close(t.quit)
 	}

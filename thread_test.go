@@ -7,18 +7,19 @@ import (
 )
 
 func newTestThinker() *Thinker {
+	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:    "test-key",
 		messages:  []Message{{Role: "system", Content: "test"}},
-		events:    make(chan ThinkEvent, 100),
-		inbox:     make(chan string, 50),
-		wakeup:    make(chan struct{}, 1),
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
 		pause:     make(chan bool),
 		quit:      make(chan struct{}),
 		rate:      RateSlow,
 		agentRate: RateSlow,
 		memory:    &MemoryStore{path: "/dev/null"},
 		config:    &Config{Directive: "test"},
+		threadID:  "main",
 	}
 	t.threads = NewThreadManager(t)
 	return t
@@ -28,7 +29,7 @@ func TestThreadManager_SpawnAndList(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	err := thinker.threads.Spawn("test-thread", "Test prompt", []string{"reply", "web"})
+	err := thinker.threads.Spawn("test-thread", "Test prompt", []string{"web"})
 	if err != nil {
 		t.Fatalf("Spawn error: %v", err)
 	}
@@ -99,7 +100,7 @@ func TestThreadManager_Route(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("marco", "Handle Marco", []string{"reply"})
+	thinker.threads.Spawn("marco", "Handle Marco", []string{"web"})
 
 	// Should route to thread
 	routed := thinker.threads.Route("[user:marco] Hello there")
@@ -177,13 +178,10 @@ func TestToolRegistry_CoreDocs(t *testing.T) {
 func TestToolRegistry_Dispatch(t *testing.T) {
 	reg := NewToolRegistry("test")
 
-	// Known tool with handler
-	result, ok := reg.Dispatch("list_files", map[string]string{"path": "."})
+	// Known tool with handler — web needs a URL but we just check dispatch works
+	_, ok := reg.Dispatch("web", map[string]string{"url": ""})
 	if !ok {
-		t.Error("expected list_files to dispatch")
-	}
-	if result == "" {
-		t.Error("expected non-empty result")
+		t.Error("expected web to dispatch")
 	}
 
 	// Core tool (no handler)

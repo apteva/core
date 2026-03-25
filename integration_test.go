@@ -30,16 +30,17 @@ func getAPIKey(t *testing.T) string {
 	return key
 }
 
-// drainEvents continuously drains the events channel in the background.
-// Returns a stop function that stops draining and returns chunk count.
+// drainEvents subscribes to the bus and counts chunks in the background.
+// Returns a stop function that unsubscribes and returns chunk count.
 func drainEvents(thinker *Thinker) func() int {
+	sub := thinker.bus.SubscribeAll("drain", 500)
 	chunks := 0
 	done := make(chan struct{})
 	go func() {
 		for {
 			select {
-			case ev := <-thinker.events:
-				if ev.Chunk != "" {
+			case ev := <-sub.C:
+				if ev.Type == EventChunk {
 					chunks++
 				}
 			case <-done:
@@ -49,6 +50,7 @@ func drainEvents(thinker *Thinker) func() int {
 	}()
 	return func() int {
 		close(done)
+		thinker.bus.Unsubscribe("drain")
 		return chunks
 	}
 }

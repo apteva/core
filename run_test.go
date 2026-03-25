@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -10,12 +9,12 @@ import (
 
 // newTestThinkerFull creates a thinker with all fields initialized for testing Run()
 func newTestThinkerFull() *Thinker {
+	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:    "test",
 		messages:  []Message{{Role: "system", Content: "test"}},
-		events:    make(chan ThinkEvent, 100),
-		inbox:     make(chan string, 50),
-		wakeup:    make(chan struct{}, 1),
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
 		pause:     make(chan bool),
 		quit:      make(chan struct{}),
 		rate:      RateSlow,
@@ -109,7 +108,7 @@ func TestSubThread_ReceivesEvents(t *testing.T) {
 	thread := thinker.threads.threads["worker"]
 	thinker.threads.mu.RUnlock()
 
-	items := thread.Thinker.drainInbox()
+	items := thread.Thinker.drainEvents()
 	if len(items) != 1 || items[0] != "do work" {
 		t.Errorf("expected 'do work' in thread inbox, got %v", items)
 	}
@@ -126,7 +125,7 @@ func TestSubThread_InitialMessages(t *testing.T) {
 	thread := thinker.threads.threads["greeter"]
 	thinker.threads.mu.RUnlock()
 
-	items := thread.Thinker.drainInbox()
+	items := thread.Thinker.drainEvents()
 	if len(items) != 2 {
 		t.Fatalf("expected 2 initial messages, got %d", len(items))
 	}
@@ -139,7 +138,7 @@ func TestSubThread_HasBasePrompt(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("worker", "You monitor files", []string{"list_files"})
+	thinker.threads.Spawn("worker", "You do web research", []string{"web"})
 	defer thinker.threads.Kill("worker")
 
 	thinker.threads.mu.RLock()
@@ -153,12 +152,8 @@ func TestSubThread_HasBasePrompt(t *testing.T) {
 		t.Error("missing base thread prompt")
 	}
 	// Should have the role
-	if !strings.Contains(sysPrompt, "You monitor files") {
+	if !strings.Contains(sysPrompt, "You do web research") {
 		t.Error("missing role prompt")
-	}
-	// Should have tool docs
-	if !strings.Contains(sysPrompt, "[[list_files") {
-		t.Error("missing list_files tool docs")
 	}
 	// Should have pacing instructions
 	if !strings.Contains(sysPrompt, "PACING") {
@@ -234,8 +229,8 @@ func TestSubThread_ToolSet(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("writer", "test", []string{"write_file", "read_file"})
-	defer thinker.threads.Kill("writer")
+	thinker.threads.Spawn("researcher", "test", []string{"web"})
+	defer thinker.threads.Kill("researcher")
 
 	threads := thinker.threads.List()
 	if len(threads) != 1 {
@@ -248,8 +243,8 @@ func TestSubThread_ToolSet(t *testing.T) {
 	}
 
 	// Requested tools
-	if !tools["write_file"] || !tools["read_file"] {
-		t.Error("missing requested tools")
+	if !tools["web"] {
+		t.Error("missing requested tool: web")
 	}
 	// Built-in tools
 	if !tools["send"] || !tools["done"] || !tools["pace"] {
@@ -296,8 +291,8 @@ func TestSubThread_KillAll(t *testing.T) {
 func TestConfig_PersistentThreads(t *testing.T) {
 	cfg := &Config{path: "/dev/null"}
 
-	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "write stuff", Tools: []string{"write_file"}})
-	cfg.SaveThread(PersistentThread{ID: "reader", Directive: "read stuff", Tools: []string{"read_file"}})
+	cfg.SaveThread(PersistentThread{ID: "worker-a", Directive: "do stuff", Tools: []string{"web"}})
+	cfg.SaveThread(PersistentThread{ID: "worker-b", Directive: "research", Tools: []string{"web"}})
 
 	threads := cfg.GetThreads()
 	if len(threads) != 2 {
@@ -305,7 +300,7 @@ func TestConfig_PersistentThreads(t *testing.T) {
 	}
 
 	// Update existing
-	cfg.SaveThread(PersistentThread{ID: "writer", Directive: "updated", Tools: []string{"write_file", "web"}})
+	cfg.SaveThread(PersistentThread{ID: "worker-a", Directive: "updated", Tools: []string{"web"}})
 	threads = cfg.GetThreads()
 	if len(threads) != 2 {
 		t.Fatalf("expected still 2 threads after update, got %d", len(threads))
@@ -315,13 +310,13 @@ func TestConfig_PersistentThreads(t *testing.T) {
 	}
 
 	// Remove
-	cfg.RemoveThread("writer")
+	cfg.RemoveThread("worker-a")
 	threads = cfg.GetThreads()
 	if len(threads) != 1 {
 		t.Fatalf("expected 1 thread after remove, got %d", len(threads))
 	}
-	if threads[0].ID != "reader" {
-		t.Errorf("expected reader, got %q", threads[0].ID)
+	if threads[0].ID != "worker-b" {
+		t.Errorf("expected worker-b, got %q", threads[0].ID)
 	}
 
 	// Clear all
@@ -331,46 +326,6 @@ func TestConfig_PersistentThreads(t *testing.T) {
 	}
 }
 
-func TestFileTools(t *testing.T) {
-	// Write
-	result := writeFileTool(map[string]string{"path": "test_output.txt", "content": "hello world"})
-	if strings.Contains(result, "error") {
-		t.Fatalf("write_file error: %s", result)
-	}
-	t.Cleanup(func() {
-		os.Remove("workspace/test_output.txt")
-	})
-
-	// Read
-	result = readFileTool(map[string]string{"path": "test_output.txt"})
-	if result != "hello world" {
-		t.Errorf("expected 'hello world', got %q", result)
-	}
-
-	// List
-	result = listFilesTool(map[string]string{"path": "."})
-	if !strings.Contains(result, "test_output.txt") {
-		t.Errorf("expected test_output.txt in listing, got %q", result)
-	}
-
-	// Nonexistent dir
-	result = listFilesTool(map[string]string{"path": "nonexistent/"})
-	if result != "(directory does not exist)" {
-		t.Errorf("expected does not exist, got %q", result)
-	}
-
-	// Missing path
-	result = readFileTool(map[string]string{})
-	if result != "error: missing path" {
-		t.Errorf("expected missing path error, got %q", result)
-	}
-
-	// Path escape
-	result = writeFileTool(map[string]string{"path": "../../../etc/passwd", "content": "hack"})
-	if !strings.Contains(result, "error") {
-		t.Error("expected error for path escape")
-	}
-}
 
 func TestAPIEvents_Ordering(t *testing.T) {
 	thinker := newTestThinkerFull()
