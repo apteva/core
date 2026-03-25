@@ -1,6 +1,6 @@
 # Cogito
 
-A continuous thinking engine that runs autonomous AI agent teams. Agents coordinate through an event bus, use MCP servers as tools, and manage themselves via directives.
+A continuous thinking engine that runs autonomous AI agent teams. Agents coordinate through an event bus, use external tool servers, and manage themselves via natural language directives.
 
 *Cogito ergo sum* — I think, therefore I am.
 
@@ -21,7 +21,7 @@ A continuous thinking engine that runs autonomous AI agent teams. Agents coordin
  Thread  Thread  Thread   ← permanent or temporary workers
     │      │      │
     ▼      ▼      ▼
-  MCP    MCP    MCP       ← external tools via Model Context Protocol
+ Server  Server  Server   ← external tools (any stdio JSON-RPC server)
 ```
 
 ## Quick Start
@@ -35,8 +35,6 @@ go build -o cogito . && ./cogito
 
 # Or run headless (API only)
 ./cogito --headless
-# or
-NO_TUI=1 ./cogito
 ```
 
 ## API
@@ -74,45 +72,47 @@ Always available to all threads:
 
 | Tool | Description |
 |------|-------------|
-| `[[pace rate="..." model="..."]]` | Set thinking speed (fast/normal/slow/sleep) and model (large/small) |
-| `[[send id="..." message="..."]]` | Send message to another thread |
-| `[[done message="..."]]` | Terminate this thread |
-| `[[evolve directive="..."]]` | Rewrite own directive |
-| `[[remember text="..."]]` | Store to persistent memory |
-| `[[spawn id="..." directive="..." tools="..."]]` | Create new thread (main only) |
-| `[[kill id="..."]]` | Stop a thread (main only) |
+| `pace` | Set thinking speed (fast/normal/slow/sleep) and model size |
+| `send` | Send message to another thread |
+| `done` | Terminate this thread |
+| `evolve` | Rewrite own directive |
+| `remember` | Store to persistent memory |
+| `spawn` | Create new thread (coordinator only) |
+| `kill` | Stop a thread (coordinator only) |
 
-## MCP Servers
+Additional tools are provided by external servers and discovered automatically.
 
-External tools are connected via [Model Context Protocol](https://modelcontextprotocol.io/) servers. Configure in `config.json`:
+## Configuration
 
 ```json
 {
   "directive": "Your mission here",
   "mcp_servers": [
     {
-      "name": "pushover",
-      "command": "./mcp-pushover-server",
-      "env": {"PUSHOVER_API_TOKEN": "..."}
+      "name": "myservice",
+      "command": "./my-server-binary",
+      "env": {"API_KEY": "..."}
     }
   ]
 }
 ```
 
-Included MCP servers in `mcps/`:
+## Tool Servers
 
-| Server | Tools | Purpose |
-|--------|-------|---------|
-| `pushover` | send_notification | Push notifications |
-| `helpdesk` | list_tickets, reply_ticket, close_ticket, lookup_kb | Support desk |
-| `chat` | get_messages, send_reply | User conversations |
-| `orders` | get_orders, update_order | Order management |
-| `inventory` | check_stock, use_stock, list_stock | Inventory tracking |
-| `schedule` | get_schedule, update_slot | Content calendar |
-| `creative` | generate_post, generate_image | AI content generation |
-| `social` | post, get_channels, get_posts | Social media publishing |
-| `sensors` | read_sensors, read_camera | Robot sensor readings |
-| `motors` | move, turn, stop, get_status | Robot motor control |
+External tools connect via [MCP](https://modelcontextprotocol.io/) (stdio JSON-RPC). The `mcps/` directory contains examples:
+
+| Server | Purpose |
+|--------|---------|
+| `helpdesk` | Support ticket management |
+| `chat` | User conversations |
+| `orders` | Order management |
+| `inventory` | Stock tracking |
+| `schedule` | Content calendar |
+| `creative` | AI content generation |
+| `social` | Social media publishing |
+| `sensors` | Robot sensor readings |
+| `motors` | Robot motor control |
+| `pushover` | Push notifications |
 
 ## Scenarios
 
@@ -121,28 +121,16 @@ Integration tests that validate full agent team behavior:
 ```bash
 # Run all scenarios
 go test -v -run TestScenario -timeout=600s
-
-# Run specific scenario
-go test -v -run TestScenario_Chat -timeout=300s
 ```
 
-| Scenario | Threads | MCPs | What it tests |
-|----------|---------|------|---------------|
-| Helpdesk | 1 worker | helpdesk | Ticket monitoring, KB lookup, reply/close |
-| Chat | per-user | chat | Multi-user conversation, factual Q&A |
-| Bakery | 2 workers | orders + inventory | Multi-MCP coordination, stock checks, failure handling |
-| Social Team | 3 workers | schedule + creative + social | 3-stage content pipeline, team coordination |
-| Robot | 1 pilot | sensors + motors | Sensor loop, obstacle avoidance, camera scanning |
-
-## EventBus
-
-All communication flows through a single event bus:
-
-- **Targeted events** (`To: "thread-id"`) — delivered to specific thread, wakes it
-- **Broadcasts** (`To: ""`) — only delivered to observers (TUI, tests), never wake threads
-- **Publishing never blocks** — if a subscriber is slow, events are dropped
-- Subscribers: `Subscribe(id)` for threads, `SubscribeAll(id)` for observers
+| Scenario | What it tests |
+|----------|---------------|
+| Helpdesk | Ticket monitoring, KB lookup, reply/close |
+| Chat | Multi-user conversation, factual Q&A |
+| Bakery | Multi-service coordination, stock management, failure handling |
+| Social Team | 3-stage content pipeline with 3 permanent workers |
+| Robot | Sensor-motor loop, obstacle avoidance, camera scanning |
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)

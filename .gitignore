@@ -8,3 +8,4 @@ workspace/
 .claude/
 debug.log
 stdout.log
+*.exe
