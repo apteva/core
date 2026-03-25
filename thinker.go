@@ -50,7 +50,7 @@ func (m ModelTier) ID() string {
 }
 
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
-const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
+const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine (Cogito). You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
 
 THINKING — every thought must contain meaningful text:
 - Always explain what you observe, what you're doing, and why — even briefly.

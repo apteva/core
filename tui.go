@@ -1095,7 +1095,7 @@ func (m model) View() string {
 	}
 
 	elapsed := time.Since(m.startTime).Round(time.Second)
-	title := titleStyle.Render("Continuous Thinking Engine")
+	title := titleStyle.Render("Cogito")
 
 	// Show active tab's status
 	var statusRender string

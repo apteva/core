@@ -136,7 +136,7 @@ func main() {
 					continue
 				}
 				if title == "" {
-					title = "Thinking Engine"
+					title = "Cogito"
 				}
 
 				if userKey == "" || apiToken == "" {

@@ -1,7 +1,10 @@
 .env
+cogito
 thinking
 mcp-pushover-server
 memory.jsonl
 config.json
 workspace/
 .claude/
+debug.log
+stdout.log

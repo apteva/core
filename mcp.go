@@ -111,7 +111,7 @@ func connectMCP(cfg MCPServerConfig) (*MCPServer, error) {
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]string{
-			"name":    "thinking-engine",
+			"name":    "cogito",
 			"version": "1.0.0",
 		},
 	})

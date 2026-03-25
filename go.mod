@@ -1,4 +1,4 @@
-module github.com/marcoschwartz/thinking
+module github.com/apteva/cogito
 
 go 1.25.1
 

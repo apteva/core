@@ -148,7 +148,7 @@ func TestSubThread_HasBasePrompt(t *testing.T) {
 	sysPrompt := thread.Thinker.messages[0].Content
 
 	// Should have base thread prompt
-	if !strings.Contains(sysPrompt, "continuous thinking engine") {
+	if !strings.Contains(sysPrompt, "Cogito") {
 		t.Error("missing base thread prompt")
 	}
 	// Should have the role
