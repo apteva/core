@@ -40,9 +40,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Core tools — always in prompt
 	tr.Register(&ToolDef{
 		Name:        "pace",
-		Description: "Control thinking speed and model size. Set rate to fast, normal, slow, or sleep. Set model to large or small.",
-		Syntax:      `[[pace rate="slow" model="small"]]`,
-		Rules:       `Rates: "fast" (2s), "normal" (10s), "slow" (30s), "sleep" (2min). Models: "large", "small". Pace down when idle.`,
+		Description: "Control how long to sleep between iterations and which model to use. Use sleep for any duration. Events always wake you immediately.",
+		Syntax:      `[[pace sleep="5m" model="small"]]`,
+		Rules:       `sleep accepts any duration: "2s", "30s", "5m", "1h", "6h". Named aliases also work: rate="fast" (2s), rate="normal" (10s), rate="slow" (30s), rate="sleep" (2m). Models: "large", "small". Sleep long when idle — you'll be woken by events.`,
 		Core:        true,
 	})
 	tr.Register(&ToolDef{

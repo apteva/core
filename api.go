@@ -35,7 +35,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"uptime_seconds": int(elapsed.Seconds()),
 		"iteration":      a.thinker.iteration,
-		"rate":           a.thinker.rate.String(),
+		"rate":           formatSleep(a.thinker.agentSleep),
 		"model":          a.thinker.model.String(),
 		"threads":        a.thinker.threads.Count() + 1, // +1 for main
 		"memories":       a.thinker.memory.Count(),

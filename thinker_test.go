@@ -49,6 +49,63 @@ func TestRateNames(t *testing.T) {
 	}
 }
 
+func TestParseSleepDuration(t *testing.T) {
+	tests := []struct {
+		input string
+		want  time.Duration
+		ok    bool
+	}{
+		// Named aliases
+		{"fast", 2 * time.Second, true},
+		{"normal", 10 * time.Second, true},
+		{"slow", 30 * time.Second, true},
+		{"sleep", 2 * time.Minute, true},
+		{"reactive", 500 * time.Millisecond, true},
+		// Go duration strings
+		{"5s", 5 * time.Second, true},
+		{"30s", 30 * time.Second, true},
+		{"5m", 5 * time.Minute, true},
+		{"1h", 1 * time.Hour, true},
+		{"2h30m", 2*time.Hour + 30*time.Minute, true},
+		{"500ms", 500 * time.Millisecond, true},
+		// Clamping
+		{"100ms", 500 * time.Millisecond, true}, // clamped to min
+		{"48h", 24 * time.Hour, true},             // clamped to max
+		// Invalid
+		{"garbage", 0, false},
+		{"", 0, false},
+	}
+	for _, tt := range tests {
+		got, ok := parseSleepDuration(tt.input)
+		if ok != tt.ok {
+			t.Errorf("parseSleepDuration(%q): ok=%v, want %v", tt.input, ok, tt.ok)
+			continue
+		}
+		if ok && got != tt.want {
+			t.Errorf("parseSleepDuration(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestFormatSleep(t *testing.T) {
+	tests := []struct {
+		dur  time.Duration
+		want string
+	}{
+		{500 * time.Millisecond, "0.5s"},
+		{2 * time.Second, "2.0s"},
+		{30 * time.Second, "30.0s"},
+		{5 * time.Minute, "5.0m"},
+		{1 * time.Hour, "1.0h"},
+		{90 * time.Minute, "1.5h"},
+	}
+	for _, tt := range tests {
+		if got := formatSleep(tt.dur); got != tt.want {
+			t.Errorf("formatSleep(%v) = %q, want %q", tt.dur, got, tt.want)
+		}
+	}
+}
+
 func TestModelTier_String(t *testing.T) {
 	if ModelLarge.String() != "large" {
 		t.Errorf("expected 'large', got %q", ModelLarge.String())

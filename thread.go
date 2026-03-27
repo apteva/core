@@ -25,7 +25,8 @@ BEHAVIOR:
 PACING — this is critical:
 - Tool results (like [[list_files]] or [[web]]) will wake you up for the next thought. Do NOT set [[pace]] in the same thought as a tool call — you'll be woken immediately.
 - Instead: call tools first, THEN in the next thought (after seeing results), set your pace.
-- Example flow: Thought 1: call [[list_files]]. Thought 2: process results, [[send]] report, [[pace rate="sleep"]].
+- Example flow: Thought 1: call [[list_files]]. Thought 2: process results, [[send]] report, [[pace sleep="5m"]].
+- Set sleep duration based on need: "2s" when actively working, "5m" when monitoring, "1h" for deep idle.
 - Only use [[pace]] when you have NO pending tool calls and are ready to wait.
 
 TIMING:
@@ -118,8 +119,9 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 		sub:       tm.parent.bus.Subscribe(id, 100),
 		pause:     make(chan bool),
 		quit:      make(chan struct{}),
-		rate:      RateReactive,
-		agentRate: RateNormal,
+		rate:       RateReactive,
+		agentRate:  RateNormal,
+		agentSleep: 10 * time.Second,
 		memory:    tm.parent.memory,
 		onStop:    func() { tm.cleanupThread(id) },
 		handleTools: threadToolHandler(thread, tm),
@@ -207,8 +209,16 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				msg := call.Args["message"]
 				doneMsg = &msg // defer — process after all other tools
 			case "pace":
-				if r, ok := rateNames[call.Args["rate"]]; ok {
+				if s := call.Args["sleep"]; s != "" {
+					if d, ok := parseSleepDuration(s); ok {
+						t.agentSleep = d
+						t.agentRate = RateSleep
+					}
+				} else if r, ok := rateNames[call.Args["rate"]]; ok {
 					t.agentRate = r
+					if d, ok2 := rateAliases[call.Args["rate"]]; ok2 {
+						t.agentSleep = d
+					}
 				}
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m

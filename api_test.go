@@ -53,6 +53,7 @@ func TestAPI_Status(t *testing.T) {
 	api, thinker := newTestAPI()
 	thinker.iteration = 5
 	thinker.rate = RateFast
+	thinker.agentSleep = 2 * time.Second
 	thinker.model = ModelLarge
 
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -67,8 +68,8 @@ func TestAPI_Status(t *testing.T) {
 	if body["iteration"].(float64) != 5 {
 		t.Errorf("expected iteration 5, got %v", body["iteration"])
 	}
-	if body["rate"] != "fast" {
-		t.Errorf("expected rate fast, got %v", body["rate"])
+	if body["rate"] != "2.0s" {
+		t.Errorf("expected rate 2.0s, got %v", body["rate"])
 	}
 	if body["model"] != "large" {
 		t.Errorf("expected model large, got %v", body["model"])

@@ -73,10 +73,11 @@ SPAWNING THREADS — critical rules:
   GOOD: directive="Check for new support tickets periodically. When you find tickets, report them to main."
 
 PACING — critical:
-- Sub-threads will send you messages when they need your attention. You do NOT need to stay awake to monitor them.
-- After setting up the system, pace down aggressively: "normal" → "slow" → "sleep". Use model="small" when idle.
-- You do NOT need to call [[pace]] every thought. Your current pace persists until you change it. Only call pace when you want to change speed.
-- You will be woken automatically when an event arrives — no need to stay awake.
+- Events ALWAYS wake you instantly, no matter how long your sleep is. There is ZERO cost to sleeping long.
+- Be aggressive about saving power: if you have no pending work, go straight to [[pace sleep="1h" model="small"]]. Do NOT gradually increase — jump to long sleep immediately.
+- Only use short sleep (2-10s) when you are actively waiting for a tool result in the NEXT iteration.
+- Your pace persists until you change it. Do NOT call [[pace]] every thought — only when transitioning between active work and idle.
+- When an event wakes you, you automatically switch to large model and fast pace for that iteration. You do NOT need to manually set pace when events arrive.
 
 CRITICAL — never hallucinate events:
 - You ONLY receive events in [Events:] blocks. If there is no [Events:] block, NOTHING happened.
@@ -125,12 +126,60 @@ const (
 	RateSleep                     // 120s — deep idle
 )
 
+// rateAliases maps named rates to durations (backwards compat + convenience)
+var rateAliases = map[string]time.Duration{
+	"reactive": 500 * time.Millisecond,
+	"fast":     2 * time.Second,
+	"normal":   10 * time.Second,
+	"slow":     30 * time.Second,
+	"sleep":    2 * time.Minute,
+}
+
+// rateNames kept for ThinkRate enum mapping (used by eventbus, TUI, etc.)
 var rateNames = map[string]ThinkRate{
 	"reactive": RateReactive,
 	"fast":     RateFast,
 	"normal":   RateNormal,
 	"slow":     RateSlow,
 	"sleep":    RateSleep,
+}
+
+const (
+	minSleep = 500 * time.Millisecond
+	maxSleep = 24 * time.Hour
+)
+
+// parseSleepDuration parses a sleep duration from agent input.
+// Accepts Go duration strings ("30s", "5m", "2h") or named aliases ("slow", "sleep").
+func parseSleepDuration(s string) (time.Duration, bool) {
+	// Check named aliases first
+	if d, ok := rateAliases[s]; ok {
+		return d, true
+	}
+	// Try Go duration string
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, false
+	}
+	// Clamp to bounds
+	if d < minSleep {
+		d = minSleep
+	}
+	if d > maxSleep {
+		d = maxSleep
+	}
+	return d, true
+}
+
+// formatSleep returns a human-readable sleep duration string.
+func formatSleep(d time.Duration) string {
+	if d >= time.Hour {
+		return fmt.Sprintf("%.1fh", d.Hours())
+	}
+	if d >= time.Minute {
+		return fmt.Sprintf("%.1fm", d.Minutes())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
 }
 
 func (r ThinkRate) String() string {
@@ -195,6 +244,7 @@ type Thinker struct {
 	paused    bool
 	rate       ThinkRate
 	agentRate  ThinkRate
+	agentSleep time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
 	model      ModelTier
 	agentModel ModelTier
 	memory     *MemoryStore
@@ -236,8 +286,9 @@ func NewThinker(apiKey string, provider LLMProvider) *Thinker {
 		sub:       bus.Subscribe("main", 100),
 		pause:     make(chan bool, 1),
 		quit:      make(chan struct{}),
-		rate:      RateSlow,
-		agentRate: RateSlow,
+		rate:       RateSlow,
+		agentRate:  RateSlow,
+		agentSleep: 30 * time.Second,
 		memory:    NewMemoryStore(apiKey),
 		apiLog:    &[]APIEvent{},
 		apiMu:     &sync.RWMutex{},
@@ -338,8 +389,18 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					go t.memory.Store(text)
 				}
 			case "pace":
-				if r, ok := rateNames[call.Args["rate"]]; ok {
+				// Freeform sleep duration takes priority
+				if s := call.Args["sleep"]; s != "" {
+					if d, ok := parseSleepDuration(s); ok {
+						t.agentSleep = d
+						t.agentRate = RateSleep // fallback enum for display
+					}
+				} else if r, ok := rateNames[call.Args["rate"]]; ok {
+					// Named rate alias — also set agentSleep from alias
 					t.agentRate = r
+					if d, ok2 := rateAliases[call.Args["rate"]]; ok2 {
+						t.agentSleep = d
+					}
 				}
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
@@ -580,10 +641,16 @@ func (t *Thinker) Run() {
 			t.messages = append(t.messages[:1], t.messages[len(t.messages)-maxHistory:]...)
 		}
 
-		// After processing, fall back to agent's chosen rate
+		// After processing, fall back to agent's chosen rate/sleep
 		// (external events already set reactive above for this iteration)
 		t.rate = t.agentRate
 		t.model = t.agentModel
+
+		// Compute actual sleep duration: agentSleep takes priority, else rate enum
+		sleepDur := t.agentSleep
+		if sleepDur <= 0 {
+			sleepDur = t.rate.Delay()
+		}
 
 		// Thread count (0 if no thread manager)
 		threadCount := 0
@@ -627,7 +694,7 @@ func (t *Thinker) Run() {
 				DurationMs:   duration.Milliseconds(),
 				CostUSD:      calculateCostForProvider(t.provider, usage),
 				Iteration:    t.iteration,
-				Rate:         t.rate.String(),
+				Rate:         formatSleep(sleepDur),
 				ContextMsgs:  len(t.messages),
 				ContextChars: ctxChars,
 				MemoryCount:  t.memory.Count(),
@@ -637,9 +704,9 @@ func (t *Thinker) Run() {
 		}
 
 		// Interruptible sleep — wakes on new event, quit, or pause
-		logMsg("RUN", fmt.Sprintf("[%s] sleeping %s", t.threadID, t.rate.Delay()))
+		logMsg("RUN", fmt.Sprintf("[%s] sleeping %s", t.threadID, formatSleep(sleepDur)))
 		select {
-		case <-time.After(t.rate.Delay()):
+		case <-time.After(sleepDur):
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
 		case <-t.sub.Wake:
 			logMsg("RUN", fmt.Sprintf("[%s] woke: event received", t.threadID))
