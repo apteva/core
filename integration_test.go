@@ -59,7 +59,7 @@ func TestIntegration_Think(t *testing.T) {
 	t.Parallel()
 	apiKey := getAPIKey(t)
 
-	thinker := NewThinker(apiKey)
+	thinker := NewThinker(apiKey, NewFireworksProvider(apiKey))
 	thinker.messages = append(thinker.messages, Message{
 		Role:    "user",
 		Content: "Reply with exactly one word: hello",
@@ -86,7 +86,7 @@ func TestIntegration_ThinkWithToolCall(t *testing.T) {
 	t.Parallel()
 	apiKey := getAPIKey(t)
 
-	thinker := NewThinker(apiKey)
+	thinker := NewThinker(apiKey, NewFireworksProvider(apiKey))
 	thinker.messages = append(thinker.messages, Message{
 		Role:    "user",
 		Content: `Reply with exactly this text and nothing else: [[reply message="test"]]`,

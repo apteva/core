@@ -7,12 +7,19 @@ import (
 	"time"
 )
 
-const baseThreadPrompt = `You are a thread in a continuous thinking engine (Cogito). Your loop runs forever.
+// baseThreadPrompt is a template — %s is replaced with the thread ID at spawn time.
+const baseThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous thinking engine (Cogito). You were spawned by the main coordinator thread.
+
+IDENTITY:
+- Your ID is "%s". You are NOT the main thread — you are a worker thread with a specific task.
+- You cannot spawn other threads. You cannot restructure the system.
+- You report results back to main via [[send id="main" message="..."]].
+- When your task is complete, call [[done message="..."]].
 
 BEHAVIOR:
 - Think out loud — explain what you're doing and why. Never output empty thoughts.
 - Process events when they arrive. Use your tools to accomplish tasks.
-- Use [[send id="main" message="..."]] to report results to the coordinator.
+- Stay focused on YOUR directive. Do not try to take over coordination duties.
 - Keep each thought concise — 1-2 short paragraphs max.
 
 PACING — this is critical:
@@ -85,11 +92,12 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 	toolSet["evolve"] = true
 
 	// Build system prompt: core behavior + directive + core tool docs
+	basePrompt := fmt.Sprintf(baseThreadPromptTemplate, id, id)
 	coreDocs := ""
 	if tm.parent.registry != nil {
 		coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
 	}
-	threadSystemPrompt := baseThreadPrompt + coreDocs + "\n\n[DIRECTIVE]\n" + directive
+	threadSystemPrompt := basePrompt + coreDocs + "\n\n[DIRECTIVE]\n" + directive
 
 	thread := &Thread{
 		ID:        id,
@@ -101,7 +109,8 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 
 	// Create a Thinker — same struct as main, shares the bus
 	thinker := &Thinker{
-		apiKey: tm.parent.apiKey,
+		apiKey:   tm.parent.apiKey,
+		provider: tm.parent.provider,
 		messages: []Message{
 			{Role: "system", Content: threadSystemPrompt},
 		},
@@ -125,7 +134,7 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 			if tm.parent.registry != nil {
 				cd = "\n" + tm.parent.registry.CoreDocs(false)
 			}
-			prompt := baseThreadPrompt + cd
+			prompt := fmt.Sprintf(baseThreadPromptTemplate, id, id) + cd
 			if toolDocs != "" {
 				prompt += "\n" + toolDocs
 			}
@@ -134,6 +143,7 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 		},
 	}
 	thread.Thinker = thinker
+	thinker.telemetry = tm.parent.telemetry // share telemetry
 
 	tm.threads[id] = thread
 
@@ -148,6 +158,15 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned", id)})
 	tm.parent.Inject(fmt.Sprintf("[thread:%s] started", id))
 	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
+
+	// Telemetry: thread.spawn
+	if tm.parent.telemetry != nil {
+		tm.parent.telemetry.Emit("thread.spawn", id, ThreadSpawnData{
+			ParentID:  "main",
+			Directive: directive,
+			Tools:     tools,
+		})
+	}
 
 	return nil
 }
@@ -169,12 +188,19 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				msg := call.Args["message"]
 				if id != "" && msg != "" {
 					tagged := fmt.Sprintf("[from:%s] %s", thread.ID, msg)
+					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q", thread.ID, id, msg))
 					if id == "main" {
 						thread.Parent.Inject(tagged)
 					} else {
 						if !tm.Send(id, tagged) {
 							t.Inject(fmt.Sprintf("[error] thread %q not found", id))
 						}
+					}
+					// Telemetry: thread.message
+					if t.telemetry != nil {
+						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{
+							From: thread.ID, To: id, Message: msg,
+						})
 					}
 				}
 			case "done":
@@ -211,13 +237,17 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 		}
 
 		// Process done LAST — after all other tools have been dispatched
+		// Stop() triggers cleanupThread which publishes EventThreadDone + logAPI
 		if doneMsg != nil {
+			logMsg("THREAD", fmt.Sprintf("%s calling done, msg=%q", thread.ID, *doneMsg))
 			if *doneMsg != "" {
+				logMsg("THREAD", fmt.Sprintf("%s injecting done message to parent (main)", thread.ID))
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg))
 			} else {
+				logMsg("THREAD", fmt.Sprintf("%s injecting done (no message) to parent", thread.ID))
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
 			}
-			tm.parent.bus.Publish(Event{Type: EventThreadDone, From: thread.ID, Text: *doneMsg})
+			logMsg("THREAD", fmt.Sprintf("%s calling Stop()", thread.ID))
 			t.Stop()
 		}
 
@@ -319,13 +349,23 @@ func (tm *ThreadManager) Count() int {
 }
 
 func (tm *ThreadManager) cleanupThread(id string) {
+	logMsg("THREAD", fmt.Sprintf("%s cleanupThread start", id))
 	tm.mu.Lock()
 	delete(tm.threads, id)
 	tm.mu.Unlock()
-	tm.parent.config.RemoveThread(id) // remove from persistent config so it doesn't respawn
+	tm.parent.config.RemoveThread(id)
+	logMsg("THREAD", fmt.Sprintf("%s publishing EventThreadDone from cleanup", id))
 	tm.parent.bus.Publish(Event{Type: EventThreadDone, From: id})
+	logMsg("THREAD", fmt.Sprintf("%s unsubscribing from bus", id))
 	tm.parent.bus.Unsubscribe(id)
 	tm.parent.logAPI(APIEvent{Type: "thread_done", ThreadID: id})
+
+	// Telemetry: thread.done
+	if tm.parent.telemetry != nil {
+		tm.parent.telemetry.Emit("thread.done", id, ThreadDoneData{
+			ParentID: "main",
+		})
+	}
 }
 
 func toolSetToSlice(m map[string]bool) []string {

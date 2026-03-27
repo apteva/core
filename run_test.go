@@ -12,6 +12,7 @@ func newTestThinkerFull() *Thinker {
 	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:    "test",
+		provider:  NewFireworksProvider("test"),
 		messages:  []Message{{Role: "system", Content: "test"}},
 		bus:       bus,
 		sub:       bus.Subscribe("main", 100),
@@ -25,6 +26,7 @@ func newTestThinkerFull() *Thinker {
 		apiMu:     &sync.RWMutex{},
 		apiNotify: make(chan struct{}, 1),
 		threadID:  "main",
+		telemetry: &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
 	}
 	t.threads = NewThreadManager(t)
 	return t

@@ -1,21 +1,13 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
 
-const (
-	fireworksURL = "https://api.fireworks.ai/inference/v1/chat/completions"
-	maxHistory   = 20
-)
+const maxHistory = 20
 
 type ModelTier int
 
@@ -23,11 +15,6 @@ const (
 	ModelLarge ModelTier = iota
 	ModelSmall
 )
-
-var modelIDs = map[ModelTier]string{
-	ModelLarge: "accounts/fireworks/models/kimi-k2p5",
-	ModelSmall: "accounts/fireworks/models/kimi-k2p5",
-}
 
 var modelNames = map[string]ModelTier{
 	"large": ModelLarge,
@@ -45,8 +32,12 @@ func (m ModelTier) String() string {
 	}
 }
 
-func (m ModelTier) ID() string {
-	return modelIDs[m]
+// modelID returns the model ID from the provider for a given tier.
+func (t *Thinker) modelID() string {
+	if t.provider != nil {
+		return t.provider.Models()[t.model]
+	}
+	return "unknown"
 }
 
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
@@ -96,7 +87,7 @@ CRITICAL — never hallucinate events:
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
-func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs string) string {
+func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs string, servers []MCPConn) string {
 	coreDocs := ""
 	if registry != nil {
 		coreDocs = "\n" + registry.CoreDocs(true)
@@ -105,6 +96,15 @@ func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs s
 	if extraToolDocs != "" {
 		prompt += "\n" + extraToolDocs
 	}
+
+	// Inject connected servers
+	if len(servers) > 0 {
+		prompt += "\n\n[CONNECTED SERVERS]\n"
+		for _, srv := range servers {
+			prompt += "- " + srv.GetName() + "\n"
+		}
+	}
+
 	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
 	return prompt
 }
@@ -185,6 +185,7 @@ type EventFilter func(events []string) []string
 
 type Thinker struct {
 	apiKey    string
+	provider  LLMProvider
 	messages  []Message
 	bus       *EventBus
 	sub       *Subscription
@@ -213,20 +214,27 @@ type Thinker struct {
 	apiMu     *sync.RWMutex
 	apiNotify chan struct{}
 	threadID  string // "main" for main thinker, thread ID for sub-threads
+
+	// Telemetry — shared across all threads, owned by main thinker
+	telemetry *Telemetry
+
+	// Live MCP connections — servers connected at runtime
+	mcpServers []MCPConn
 }
 
-func NewThinker(apiKey string) *Thinker {
+func NewThinker(apiKey string, provider LLMProvider) *Thinker {
 	cfg := NewConfig()
 	bus := NewEventBus()
 	t := &Thinker{
-		apiKey: apiKey,
+		apiKey:   apiKey,
+		provider: provider,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), nil, "")},
+			{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), nil, "", nil)},
 		},
 		config:    cfg,
 		bus:       bus,
 		sub:       bus.Subscribe("main", 100),
-		pause:     make(chan bool),
+		pause:     make(chan bool, 1),
 		quit:      make(chan struct{}),
 		rate:      RateSlow,
 		agentRate: RateSlow,
@@ -235,12 +243,13 @@ func NewThinker(apiKey string) *Thinker {
 		apiMu:     &sync.RWMutex{},
 		apiNotify: make(chan struct{}, 1),
 		threadID:  "main",
+		telemetry: NewTelemetry(),
 	}
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry, "")}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry, "", nil)}
 
 	// Embed tool descriptions in background (non-blocking)
 	go t.registry.EmbedAll(t.memory)
@@ -257,12 +266,14 @@ func NewThinker(apiKey string) *Thinker {
 	}
 	t.handleTools = mainToolHandler(t)
 	t.rebuildPrompt = func(toolDocs string) string {
-		return buildSystemPrompt(t.config.GetDirective(), t.registry, toolDocs)
+		return buildSystemPrompt(t.config.GetDirective(), t.registry, toolDocs, t.mcpServers)
 	}
 
 	// Connect MCP servers and register their tools
 	if len(cfg.MCPServers) > 0 {
-		connectAndRegisterMCP(cfg.MCPServers, t.registry, t.memory)
+		t.mcpServers = connectAndRegisterMCP(cfg.MCPServers, t.registry, t.memory)
+		// Rebuild prompt now that servers are connected
+		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(cfg.GetDirective(), t.registry, "", t.mcpServers)}
 	}
 
 	// Respawn persistent threads from config
@@ -319,7 +330,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					t.config.SetDirective(d)
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry, "")}
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry, "", t.mcpServers)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 				}
 			case "remember":
@@ -333,6 +344,85 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
 				}
+			case "connect":
+				name := call.Args["name"]
+				command := call.Args["command"]
+				argsStr := call.Args["args"]
+				url := call.Args["url"]
+				transport := call.Args["transport"]
+				if name != "" && (command != "" || url != "") {
+					var mcpArgs []string
+					if argsStr != "" {
+						mcpArgs = strings.Split(argsStr, ",")
+					}
+					cfg := MCPServerConfig{Name: name, Command: command, Args: mcpArgs, URL: url, Transport: transport}
+					srv, err := connectAnyMCP(cfg)
+					if err != nil {
+						t.Inject(fmt.Sprintf("[connect] error: %v", err))
+					} else {
+						tools, err := srv.ListTools()
+						if err != nil {
+							t.Inject(fmt.Sprintf("[connect] tool discovery error: %v", err))
+							srv.Close()
+						} else {
+							t.mcpServers = append(t.mcpServers, srv)
+							for _, tool := range tools {
+								fullName := name + "_" + tool.Name
+								syntax := buildMCPSyntax(fullName, tool.InputSchema)
+								t.registry.Register(&ToolDef{
+									Name:        fullName,
+									Description: fmt.Sprintf("[%s] %s", name, tool.Description),
+									Syntax:      syntax,
+									Rules:       fmt.Sprintf("Provided by MCP server '%s'.", name),
+									Handler:     mcpProxyHandler(srv, tool.Name),
+								})
+							}
+							if t.memory != nil {
+								go func(srvName string, srvTools []mcpToolDef) {
+									for _, tl := range srvTools {
+										fullName := srvName + "_" + tl.Name
+										emb, err := t.memory.embed(fullName + ": " + tl.Description)
+										if err == nil {
+											td := t.registry.Get(fullName)
+											if td != nil {
+												td.Embedding = emb
+											}
+										}
+									}
+								}(name, tools)
+							}
+							t.Inject(fmt.Sprintf("[connect] connected to %s: %d tools registered", name, len(tools)))
+							// Persist to config for restart survival
+							t.config.SaveMCPServer(cfg)
+						}
+					}
+				}
+				toolNames = append(toolNames, call.Raw)
+			case "disconnect":
+				name := call.Args["name"]
+				if name != "" {
+					found := false
+					for i, srv := range t.mcpServers {
+						if srv.GetName() == name {
+							srv.Close()
+							t.mcpServers = append(t.mcpServers[:i], t.mcpServers[i+1:]...)
+							t.Inject(fmt.Sprintf("[disconnect] disconnected from %s", name))
+							t.config.RemoveMCPServer(name)
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Inject(fmt.Sprintf("[disconnect] server %q not found", name))
+					}
+				}
+				toolNames = append(toolNames, call.Raw)
+			case "list_connected":
+				var names []string
+				for _, srv := range t.mcpServers {
+					names = append(names, srv.GetName())
+				}
+				t.Inject(fmt.Sprintf("[connected] %d servers: %s", len(names), strings.Join(names, ", ")))
 			default:
 				// Dispatch to registry (MCP tools, etc)
 				executeTool(t, call)
@@ -369,9 +459,20 @@ func (t *Thinker) Run() {
 		}
 
 		t.iteration++
+		logMsg("RUN", fmt.Sprintf("[%s] iteration #%d start, rate=%s", t.threadID, t.iteration, t.rate.String()))
 
 		// Drain events from bus, optionally filter/route
 		consumed := t.drainEvents()
+		if len(consumed) > 0 {
+			logMsg("RUN", fmt.Sprintf("[%s] drained %d events", t.threadID, len(consumed)))
+			for i, ev := range consumed {
+				preview := ev
+				if len(preview) > 100 {
+					preview = preview[:100] + "..."
+				}
+				logMsg("RUN", fmt.Sprintf("[%s]   event[%d]: %s", t.threadID, i, preview))
+			}
+		}
 		if t.filterEvents != nil {
 			consumed = t.filterEvents(consumed)
 		}
@@ -451,6 +552,11 @@ func (t *Thinker) Run() {
 
 		if err != nil {
 			t.bus.Publish(Event{Type: EventThinkError, From: t.threadID, Error: err, Iteration: t.iteration})
+			if t.telemetry != nil {
+				t.telemetry.Emit("llm.error", t.threadID, LLMErrorData{
+					Model: t.modelID(), Error: err.Error(), Iteration: t.iteration,
+				})
+			}
 			select {
 			case <-time.After(5 * time.Second):
 			case <-t.quit:
@@ -502,87 +608,71 @@ func (t *Thinker) Run() {
 		})
 
 		// Log to API — include full reply so tool calls are visible too
-		logMsg := strings.TrimSpace(reply)
-		if len(logMsg) > 1000 {
-			logMsg = logMsg[:1000] + "..."
+		thoughtLog := strings.TrimSpace(reply)
+		if len(thoughtLog) > 1000 {
+			thoughtLog = thoughtLog[:1000] + "..."
 		}
-		t.logAPI(APIEvent{Type: "thought", Iteration: t.iteration, Message: logMsg, Duration: duration.Round(time.Millisecond).String()})
+		t.logAPI(APIEvent{Type: "thought", Iteration: t.iteration, Message: thoughtLog, Duration: duration.Round(time.Millisecond).String()})
 		for _, r := range replies {
 			t.logAPI(APIEvent{Type: "reply", Message: r})
 		}
 
-		// Interruptible sleep — wakes on new event or quit
+		// Telemetry: llm.done with full data
+		if t.telemetry != nil {
+			t.telemetry.Emit("llm.done", t.threadID, LLMDoneData{
+				Model:        t.modelID(),
+				TokensIn:     usage.PromptTokens,
+				TokensCached: usage.CachedTokens,
+				TokensOut:    usage.CompletionTokens,
+				DurationMs:   duration.Milliseconds(),
+				CostUSD:      calculateCostForProvider(t.provider, usage),
+				Iteration:    t.iteration,
+				Rate:         t.rate.String(),
+				ContextMsgs:  len(t.messages),
+				ContextChars: ctxChars,
+				MemoryCount:  t.memory.Count(),
+				ThreadCount:  threadCount,
+				Message:      thoughtLog,
+			})
+		}
+
+		// Interruptible sleep — wakes on new event, quit, or pause
+		logMsg("RUN", fmt.Sprintf("[%s] sleeping %s", t.threadID, t.rate.Delay()))
 		select {
 		case <-time.After(t.rate.Delay()):
+			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
 		case <-t.sub.Wake:
+			logMsg("RUN", fmt.Sprintf("[%s] woke: event received", t.threadID))
+		case p := <-t.pause:
+			t.paused = p
+			logMsg("RUN", fmt.Sprintf("[%s] paused=%v during sleep", t.threadID, t.paused))
+			if t.paused {
+				// Block until unpaused or quit
+				select {
+				case p = <-t.pause:
+					t.paused = p
+					logMsg("RUN", fmt.Sprintf("[%s] resumed", t.threadID))
+				case <-t.quit:
+					return
+				}
+			}
 		case <-t.quit:
+			logMsg("RUN", fmt.Sprintf("[%s] woke: quit signal", t.threadID))
 			return
 		}
 	}
 }
 
 func (t *Thinker) think() (string, TokenUsage, error) {
-	reqBody := Request{
-		Model:    t.model.ID(),
-		Messages: t.messages,
-		Stream:   true,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", TokenUsage{}, err
-	}
-
-	req, err := http.NewRequest("POST", fireworksURL, bytes.NewReader(body))
-	if err != nil {
-		return "", TokenUsage{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+t.apiKey)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", TokenUsage{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", TokenUsage{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var full strings.Builder
-	var usage TokenUsage
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
-
-		var event StreamEvent
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			continue
-		}
-		if len(event.Choices) > 0 {
-			chunk := event.Choices[0].Delta.Content
-			full.WriteString(chunk)
-			t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
-		}
-		if event.Usage != nil {
-			usage.PromptTokens = event.Usage.PromptTokens
-			usage.CompletionTokens = event.Usage.CompletionTokens
-			if event.Usage.PromptTokensDetails != nil {
-				usage.CachedTokens = event.Usage.PromptTokensDetails.CachedTokens
-			}
+	onChunk := func(chunk string) {
+		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
+		if t.telemetry != nil && chunk != "" {
+			t.telemetry.EmitLive("llm.chunk", t.threadID, LLMChunkData{
+				Text: chunk, Iteration: t.iteration,
+			})
 		}
 	}
-
-	return full.String(), usage, nil
+	return t.provider.Chat(t.messages, t.modelID(), onChunk)
 }
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.
@@ -641,12 +731,13 @@ func (t *Thinker) allowedTools() map[string]bool {
 
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "")}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "", t.mcpServers)}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 
 // Inject sends a message event to this thinker's bus subscription.
 func (t *Thinker) Inject(msg string) {
+	logMsg("INJECT", fmt.Sprintf("to=%s msg=%s", t.threadID, msg))
 	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: msg})
 }
 
@@ -661,7 +752,14 @@ func (t *Thinker) InjectUserMessage(userID, msg string) {
 }
 
 func (t *Thinker) TogglePause() {
-	t.pause <- !t.paused
+	newState := !t.paused
+	// Non-blocking send — channel is buffered(1), drain any stale value first
+	select {
+	case <-t.pause:
+	default:
+	}
+	t.pause <- newState
+	t.paused = newState
 }
 
 func (t *Thinker) Stop() {

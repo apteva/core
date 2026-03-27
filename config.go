@@ -101,6 +101,35 @@ func (c *Config) RemoveThread(id string) {
 	c.Save()
 }
 
+func (c *Config) SaveMCPServer(cfg MCPServerConfig) {
+	c.mu.Lock()
+	found := false
+	for i, s := range c.MCPServers {
+		if s.Name == cfg.Name {
+			c.MCPServers[i] = cfg
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.MCPServers = append(c.MCPServers, cfg)
+	}
+	c.mu.Unlock()
+	c.Save()
+}
+
+func (c *Config) RemoveMCPServer(name string) {
+	c.mu.Lock()
+	for i, s := range c.MCPServers {
+		if s.Name == name {
+			c.MCPServers = append(c.MCPServers[:i], c.MCPServers[i+1:]...)
+			break
+		}
+	}
+	c.mu.Unlock()
+	c.Save()
+}
+
 func (c *Config) GetThreads() []PersistentThread {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

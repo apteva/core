@@ -19,7 +19,7 @@ type toolCall struct {
 }
 
 // [[tool_name key="val" key2="val2"]] — values can span multiple lines, escaped quotes allowed
-var toolCallRe = regexp.MustCompile(`(?s)\[\[(\w+)((?:\s+\w+="(?:[^"\\]|\\.)*")*)\]\]`)
+var toolCallRe = regexp.MustCompile(`(?s)\[\[([\w-]+)((?:\s+\w+="(?:[^"\\]|\\.)*")*)\]\]`)
 var argRe = regexp.MustCompile(`(?s)(\w+)="((?:[^"\\]|\\.)*)"`)
 
 // stripToolCalls removes [[...]] tool call syntax from text for display
@@ -45,10 +45,37 @@ func parseToolCalls(text string) []toolCall {
 }
 
 func executeTool(t *Thinker, call toolCall) {
+	// Telemetry: tool.call
+	if t.telemetry != nil {
+		argsSummary := ""
+		for k, v := range call.Args {
+			if len(argsSummary) > 0 {
+				argsSummary += ", "
+			}
+			val := v
+			if len(val) > 50 {
+				val = val[:50] + "..."
+			}
+			argsSummary += k + "=" + val
+		}
+		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+			Name: call.Name, Args: argsSummary,
+		})
+	}
+
 	go func() {
+		logMsg("TOOL", fmt.Sprintf("dispatch %s args=%v", call.Name, call.Args))
+		start := time.Now()
 		defer func() {
 			if r := recover(); r != nil {
+				logMsg("TOOL", fmt.Sprintf("PANIC %s: %v", call.Name, r))
 				t.Inject(fmt.Sprintf("[tool:%s] error: panic: %v", call.Name, r))
+				if t.telemetry != nil {
+					t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
+						Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
+						Success: false, Result: fmt.Sprintf("panic: %v", r),
+					})
+				}
 			}
 		}()
 		var result string
@@ -73,6 +100,26 @@ func executeTool(t *Thinker, call toolCall) {
 				result = fmt.Sprintf("unknown tool %q", call.Name)
 			}
 		}
+
+		resultPreview := result
+		if len(resultPreview) > 200 {
+			resultPreview = resultPreview[:200] + "..."
+		}
+		logMsg("TOOL", fmt.Sprintf("result %s (%dms): %s", call.Name, time.Since(start).Milliseconds(), resultPreview))
+
+		// Telemetry: tool.result
+		if t.telemetry != nil {
+			resultSummary := result
+			if len(resultSummary) > 200 {
+				resultSummary = resultSummary[:200] + "..."
+			}
+			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
+				Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
+				Success: !strings.HasPrefix(result, "error") && !strings.HasPrefix(result, "unknown"),
+				Result: resultSummary,
+			})
+		}
+
 		t.Inject(fmt.Sprintf("[tool:%s] %s", call.Name, result))
 	}()
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -129,6 +130,26 @@ var (
 	consoleLineStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("208"))
 
+	telemetryTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("214")).
+				Padding(0, 1)
+
+	telemetryLLMStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("214"))
+
+	telemetryThreadStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("77"))
+
+	telemetryToolStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("49"))
+
+	telemetryErrorStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("196"))
+
+	telemetryDimStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("241"))
+
 	directiveTitleStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color("220")).
@@ -167,6 +188,7 @@ const (
 	panelDirective
 	panelTools
 	panelBus
+	panelTelemetry
 )
 
 type inputMode int
@@ -203,6 +225,8 @@ type model struct {
 	chat           []chatMessage
 	consoleHistory []string
 	busLog         []string // recent bus events for display
+	telemetryLog   []string // recent telemetry events for display
+	telemetryCursor int
 	memoryCount    int
 	threadCount    int
 
@@ -418,6 +442,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.panel = panelBus
 			}
 			return m, nil
+		case "x":
+			if m.panel == panelTelemetry {
+				m.panel = panelChat
+			} else {
+				m.panel = panelTelemetry
+			}
+			return m, nil
+		case "p":
+			// Cycle through available providers
+			if m.thinker.provider != nil {
+				available := availableProviders()
+				if len(available) > 1 {
+					current := m.thinker.provider.Name()
+					for i, p := range available {
+						if p.Name() == current {
+							next := available[(i+1)%len(available)]
+							m.thinker.provider = next
+							m.consoleHistory = append(m.consoleHistory, fmt.Sprintf("switched to %s", next.Name()))
+							break
+						}
+					}
+				}
+			}
+			return m, nil
 		case "o":
 			if m.panel == panelTools {
 				m.panel = panelChat
@@ -587,13 +635,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.totalPromptTokens += u.PromptTokens
 			m.totalCachedTokens += u.CachedTokens
 			m.totalCompletionTokens += u.CompletionTokens
-			uncachedInput := u.PromptTokens - u.CachedTokens
-			if uncachedInput < 0 {
-				uncachedInput = 0
+			if m.thinker.provider != nil {
+				m.totalCost += calculateCostForProvider(m.thinker.provider, u)
 			}
-			m.totalCost += float64(uncachedInput)*priceInputPerToken +
-				float64(u.CachedTokens)*priceCachedPerToken +
-				float64(u.CompletionTokens)*priceOutputPerToken
 			if ev.From == "main" {
 				m.memoryCount = ev.MemoryCount
 				m.threadCount = ev.ThreadCount
@@ -622,6 +666,77 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, pollBusEvent(m.busSub)
 
 	case tickMsg:
+		// Poll telemetry events for the TUI panel
+		if m.thinker.telemetry != nil {
+			events, newCursor := m.thinker.telemetry.Events(m.telemetryCursor)
+			m.telemetryCursor = newCursor
+			for _, ev := range events {
+				ts := ev.Time.Format("15:04:05")
+				var line string
+				switch {
+				case ev.Type == "llm.done":
+					var d LLMDoneData
+					if json.Unmarshal(ev.Data, &d) == nil {
+						line = fmt.Sprintf("%s %s %s %d→%d tok %dms $%.4f #%d",
+							ts, telemetryLLMStyle.Render("llm.done"), ev.ThreadID,
+							d.TokensIn, d.TokensOut, d.DurationMs, d.CostUSD, d.Iteration)
+					}
+				case ev.Type == "llm.error":
+					var d LLMErrorData
+					if json.Unmarshal(ev.Data, &d) == nil {
+						line = fmt.Sprintf("%s %s %s %s",
+							ts, telemetryErrorStyle.Render("llm.err"), ev.ThreadID, d.Error)
+					}
+				case ev.Type == "thread.spawn":
+					var d ThreadSpawnData
+					if json.Unmarshal(ev.Data, &d) == nil {
+						dir := d.Directive
+						if len(dir) > 40 {
+							dir = dir[:40] + "..."
+						}
+						line = fmt.Sprintf("%s %s %s parent=%s %s",
+							ts, telemetryThreadStyle.Render("t.spawn"), ev.ThreadID, d.ParentID, dir)
+					}
+				case ev.Type == "thread.done":
+					line = fmt.Sprintf("%s %s %s",
+						ts, telemetryThreadStyle.Render("t.done"), ev.ThreadID)
+				case ev.Type == "thread.message":
+					var d ThreadMessageData
+					if json.Unmarshal(ev.Data, &d) == nil {
+						msg := d.Message
+						if len(msg) > 50 {
+							msg = msg[:50] + "..."
+						}
+						line = fmt.Sprintf("%s %s %s→%s %s",
+							ts, telemetryThreadStyle.Render("t.msg"), d.From, d.To, msg)
+					}
+				case ev.Type == "tool.call":
+					var d ToolCallData
+					if json.Unmarshal(ev.Data, &d) == nil {
+						line = fmt.Sprintf("%s %s %s %s",
+							ts, telemetryToolStyle.Render("tool"), ev.ThreadID, d.Name)
+					}
+				case ev.Type == "tool.result":
+					var d ToolResultData
+					if json.Unmarshal(ev.Data, &d) == nil {
+						status := "ok"
+						if !d.Success {
+							status = "fail"
+						}
+						line = fmt.Sprintf("%s %s %s %s %s %dms",
+							ts, telemetryToolStyle.Render("tool.r"), ev.ThreadID, d.Name, status, d.DurationMs)
+					}
+				default:
+					line = fmt.Sprintf("%s %s %s", ts, telemetryDimStyle.Render(ev.Type), ev.ThreadID)
+				}
+				if line != "" {
+					m.telemetryLog = append(m.telemetryLog, line)
+				}
+			}
+			if len(m.telemetryLog) > 500 {
+				m.telemetryLog = m.telemetryLog[len(m.telemetryLog)-500:]
+			}
+		}
 		return m, tickCmd()
 	}
 
@@ -699,7 +814,7 @@ func (m model) renderChatPanel(width, height int) string {
 	if m.inputActive {
 		inputArea = inputLabelStyle.Render("> ") + m.input.View()
 	} else {
-		inputArea = helpStyle.Render("i:chat c:cmd e:dir o:tools m:mem b:bus")
+		inputArea = helpStyle.Render("i:chat c:cmd e:dir o:tools m:mem b:bus x:telem p:provider")
 	}
 
 	listHeight := height - 4
@@ -1073,6 +1188,47 @@ func (m model) renderBusPanel(width, height int) string {
 	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
 }
 
+func (m model) renderTelemetryPanel(width, height int) string {
+	if width <= 0 {
+		return ""
+	}
+	innerWidth := width - 4
+	if innerWidth < 5 {
+		innerWidth = 5
+	}
+
+	title := telemetryTitleStyle.Render(fmt.Sprintf("Telemetry (%d)", len(m.telemetryLog)))
+	footer := helpStyle.Render("x: back")
+
+	listHeight := height - 4
+	if listHeight < 1 {
+		listHeight = 1
+	}
+
+	var lines []string
+	if len(m.telemetryLog) == 0 {
+		lines = append(lines, statsStyle.Render("no telemetry events yet"))
+	} else {
+		for _, entry := range m.telemetryLog {
+			if len(entry) > innerWidth-2 {
+				entry = entry[:innerWidth-2]
+			}
+			lines = append(lines, entry)
+		}
+	}
+
+	// Show most recent at bottom
+	if len(lines) > listHeight {
+		lines = lines[len(lines)-listHeight:]
+	}
+	for len(lines) < listHeight {
+		lines = append(lines, "")
+	}
+
+	body := title + "\n" + strings.Join(lines, "\n") + "\n" + footer
+	return panelBorderStyle.Width(innerWidth).Height(height - 2).Render(body)
+}
+
 func (m model) renderTabBar() string {
 	var parts []string
 	for _, tab := range m.tabs {
@@ -1100,10 +1256,14 @@ func (m model) View() string {
 	// Show active tab's status
 	var statusRender string
 	var ctxInfo string
+	providerName := ""
+	if m.thinker.provider != nil {
+		providerName = m.thinker.provider.Name()
+	}
 	if m.paused {
 		statusRender = pausedStyle.Render("PAUSED")
 	} else if v, ok := m.threadViews[m.activeTab]; ok {
-		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s)", v.rate, v.model))
+		statusRender = statusBarStyle.Render(fmt.Sprintf("THINKING (%s/%s/%s)", providerName, v.rate, v.model))
 		if v.contextChars > 0 {
 			estTokens := v.contextChars / 4 // rough estimate: ~4 chars per token
 			ctxInfo = fmt.Sprintf(" │ ctx: %dm/~%dtok", v.contextMsgs, estTokens)
@@ -1189,6 +1349,8 @@ func (m model) View() string {
 			leftPanel = m.renderToolsPanel(leftWidth, viewHeight)
 		case panelBus:
 			leftPanel = m.renderBusPanel(leftWidth, viewHeight)
+		case panelTelemetry:
+			leftPanel = m.renderTelemetryPanel(leftWidth, viewHeight)
 		default:
 			leftPanel = m.renderChatPanel(leftWidth, viewHeight)
 		}

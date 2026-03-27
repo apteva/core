@@ -171,6 +171,93 @@ func TestAPI_PostEvent_WrongMethod(t *testing.T) {
 	}
 }
 
+func TestAPI_PostEvent_ThreadTarget(t *testing.T) {
+	api, thinker := newTestAPI()
+
+	// Subscribe a "webhook-listener" on the bus
+	listenerSub := thinker.bus.Subscribe("webhook-listener", 10)
+
+	// Post event targeting the thread
+	payload, _ := json.Marshal(map[string]string{
+		"message":   "[webhook:omnikit] {\"event\":\"message.received\"}",
+		"thread_id": "webhook-listener",
+	})
+	req := httptest.NewRequest("POST", "/event", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.postEvent(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Check response includes thread_id
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["thread_id"] != "webhook-listener" {
+		t.Errorf("expected thread_id 'webhook-listener', got %q", resp["thread_id"])
+	}
+
+	// The event should arrive on the listener subscription, NOT on main
+	select {
+	case ev := <-listenerSub.C:
+		if ev.Text != "[webhook:omnikit] {\"event\":\"message.received\"}" {
+			t.Errorf("unexpected event text: %q", ev.Text)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("expected event on webhook-listener subscription")
+	}
+
+	// Main should NOT have received it
+	mainEvents := thinker.drainEvents()
+	if len(mainEvents) != 0 {
+		t.Errorf("main should not receive thread-targeted event, got %d events", len(mainEvents))
+	}
+}
+
+func TestAPI_PostEvent_NoThreadID_GoesToMain(t *testing.T) {
+	api, thinker := newTestAPI()
+
+	// Post event without thread_id — should go to main
+	payload, _ := json.Marshal(map[string]string{"message": "hello main"})
+	req := httptest.NewRequest("POST", "/event", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.postEvent(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["thread_id"] != "main" {
+		t.Errorf("expected thread_id 'main', got %q", resp["thread_id"])
+	}
+
+	items := thinker.drainEvents()
+	if len(items) != 1 {
+		t.Fatalf("expected 1 event on main, got %d", len(items))
+	}
+}
+
+func TestAPI_PostEvent_MainThreadID_GoesToMain(t *testing.T) {
+	api, thinker := newTestAPI()
+
+	// Explicitly targeting "main" should behave same as no thread_id
+	payload, _ := json.Marshal(map[string]string{"message": "explicit main", "thread_id": "main"})
+	req := httptest.NewRequest("POST", "/event", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.postEvent(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	items := thinker.drainEvents()
+	if len(items) != 1 {
+		t.Fatalf("expected 1 event on main, got %d", len(items))
+	}
+}
+
 func TestAPI_Config_Get(t *testing.T) {
 	api, _ := newTestAPI()
 	req := httptest.NewRequest("GET", "/config", nil)

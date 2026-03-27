@@ -53,13 +53,23 @@ type mcpCallResult struct {
 
 // MCPServerConfig is stored in config.json
 type MCPServerConfig struct {
-	Name    string            `json:"name"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
-	Env     map[string]string `json:"env,omitempty"`
+	Name      string            `json:"name"`
+	Command   string            `json:"command,omitempty"`   // stdio transport
+	Args      []string          `json:"args,omitempty"`      // stdio transport
+	Env       map[string]string `json:"env,omitempty"`       // stdio transport
+	Transport string            `json:"transport,omitempty"` // "stdio" (default) or "http"
+	URL       string            `json:"url,omitempty"`       // http transport
 }
 
-// MCPServer manages a running MCP server subprocess
+// MCPConn is the interface for any MCP server connection (stdio or HTTP)
+type MCPConn interface {
+	GetName() string
+	ListTools() ([]mcpToolDef, error)
+	CallTool(name string, args map[string]string) (string, error)
+	Close()
+}
+
+// MCPServer manages a running MCP server subprocess (stdio transport)
 type MCPServer struct {
 	Name    string
 	cmd     *exec.Cmd
@@ -238,6 +248,8 @@ func (s *MCPServer) CallTool(name string, args map[string]string) (string, error
 	return strings.Join(texts, "\n"), nil
 }
 
+func (s *MCPServer) GetName() string { return s.Name }
+
 func (s *MCPServer) Close() {
 	s.stdin.Close()
 	s.cmd.Process.Kill()
@@ -245,7 +257,7 @@ func (s *MCPServer) Close() {
 }
 
 // mcpProxyHandler returns a tool handler that proxies calls to an MCP server
-func mcpProxyHandler(server *MCPServer, toolName string) func(args map[string]string) string {
+func mcpProxyHandler(server MCPConn, toolName string) func(args map[string]string) string {
 	return func(args map[string]string) string {
 		result, err := server.CallTool(toolName, args)
 		if err != nil {
@@ -269,11 +281,19 @@ func buildMCPSyntax(name string, schema map[string]any) string {
 	return fmt.Sprintf("[[%s %s]]", name, strings.Join(parts, " "))
 }
 
+// connectAnyMCP connects to an MCP server using the appropriate transport.
+func connectAnyMCP(cfg MCPServerConfig) (MCPConn, error) {
+	if cfg.Transport == "http" || cfg.URL != "" {
+		return connectMCPHTTP(cfg.Name, cfg.URL)
+	}
+	return connectMCP(cfg)
+}
+
 // connectAndRegisterMCP connects to MCP servers from config and registers tools
-func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, memory *MemoryStore) []*MCPServer {
-	var servers []*MCPServer
+func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, memory *MemoryStore) []MCPConn {
+	var servers []MCPConn
 	for _, cfg := range configs {
-		srv, err := connectMCP(cfg)
+		srv, err := connectAnyMCP(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "MCP %s: %v\n", cfg.Name, err)
 			continue
@@ -302,9 +322,9 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, me
 
 		// Embed new tools
 		if memory != nil {
-			go func() {
+			go func(name string, tools []mcpToolDef) {
 				for _, tool := range tools {
-					fullName := cfg.Name + "_" + tool.Name
+					fullName := name + "_" + tool.Name
 					emb, err := memory.embed(fullName + ": " + tool.Description)
 					if err == nil {
 						t := registry.Get(fullName)
@@ -313,11 +333,18 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, me
 						}
 					}
 				}
-			}()
+			}(cfg.Name, tools)
 		}
 
 		servers = append(servers, srv)
-		fmt.Fprintf(os.Stderr, "MCP %s: %d tools registered\n", cfg.Name, len(tools))
+		fmt.Fprintf(os.Stderr, "MCP %s (%s): %d tools registered\n", cfg.Name, cfg.transport(), len(tools))
 	}
 	return servers
+}
+
+func (c MCPServerConfig) transport() string {
+	if c.Transport == "http" || c.URL != "" {
+		return "http"
+	}
+	return "stdio"
 }

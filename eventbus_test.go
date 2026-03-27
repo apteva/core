@@ -179,8 +179,11 @@ func TestThreadDone_MainReceivesEvent(t *testing.T) {
 
 	thread.Thinker.handleTools(thread.Thinker, calls, nil)
 
-	// Wait for cleanup
-	time.Sleep(200 * time.Millisecond)
+	// Wait for cleanup — thread's Run() goroutine needs to notice quit and call onStop
+	deadline := time.Now().Add(5 * time.Second)
+	for thinker.threads.Count() != 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	// Check 1: Thread should be removed
 	if thinker.threads.Count() != 0 {

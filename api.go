@@ -19,6 +19,7 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/status", api.status)
 	mux.HandleFunc("/threads", api.threads)
 	mux.HandleFunc("/events", api.events)
+	mux.HandleFunc("/pause", api.pause)
 	mux.HandleFunc("/event", api.postEvent)
 	mux.HandleFunc("/config", api.config)
 	mux.Handle("/", http.FileServer(http.Dir("web")))
@@ -38,6 +39,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 		"model":          a.thinker.model.String(),
 		"threads":        a.thinker.threads.Count() + 1, // +1 for main
 		"memories":       a.thinker.memory.Count(),
+		"paused":         a.thinker.paused,
 	})
 }
 
@@ -85,22 +87,19 @@ func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Send existing events first
-	events, cursor := a.thinker.APIEvents(0)
-	for _, ev := range events {
-		data, _ := json.Marshal(ev)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-	}
-	flusher.Flush()
+	tel := a.thinker.telemetry
 
-	// Then stream new ones
+	// Skip to current position — only stream new events, no history replay
+	_, cursor := tel.Events(0)
+
+	// Stream new events as they arrive
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-a.thinker.apiNotify:
-			newEvents, newCursor := a.thinker.APIEvents(cursor)
+		case <-tel.notify:
+			newEvents, newCursor := tel.Events(cursor)
 			cursor = newCursor
 			for _, ev := range newEvents {
 				data, _ := json.Marshal(ev)
@@ -111,13 +110,29 @@ func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *APIServer) pause(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	a.thinker.TogglePause()
+	paused := a.thinker.paused
+	if paused {
+		a.thinker.telemetry.Emit("instance.paused", "main", map[string]string{"status": "paused"})
+	} else {
+		a.thinker.telemetry.Emit("instance.resumed", "main", map[string]string{"status": "running"})
+	}
+	writeJSON(w, map[string]bool{"paused": paused})
+}
+
 func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 	var body struct {
-		Message string `json:"message"`
+		Message  string `json:"message"`
+		ThreadID string `json:"thread_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -127,8 +142,15 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "message required", http.StatusBadRequest)
 		return
 	}
-	a.thinker.InjectConsole(body.Message)
-	writeJSON(w, map[string]string{"status": "injected"})
+
+	if body.ThreadID != "" && body.ThreadID != "main" {
+		// Route to specific thread via EventBus
+		a.thinker.bus.Publish(Event{Type: EventInbox, To: body.ThreadID, Text: body.Message})
+		writeJSON(w, map[string]string{"status": "injected", "thread_id": body.ThreadID})
+	} else {
+		a.thinker.InjectConsole(body.Message)
+		writeJSON(w, map[string]string{"status": "injected", "thread_id": "main"})
+	}
 }
 
 func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {

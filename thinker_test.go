@@ -58,15 +58,15 @@ func TestModelTier_String(t *testing.T) {
 	}
 }
 
-func TestModelTier_ID(t *testing.T) {
-	if ModelLarge.ID() == "" {
+func TestModelTier_ProviderID(t *testing.T) {
+	provider := NewFireworksProvider("test")
+	models := provider.Models()
+	if models[ModelLarge] == "" {
 		t.Error("large model ID should not be empty")
 	}
-	if ModelSmall.ID() == "" {
+	if models[ModelSmall] == "" {
 		t.Error("small model ID should not be empty")
 	}
-	_ = ModelLarge.ID()
-	_ = ModelSmall.ID()
 }
 
 func TestModelNames(t *testing.T) {

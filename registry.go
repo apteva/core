@@ -91,6 +91,28 @@ func (tr *ToolRegistry) registerDefaults() {
 		Core:        true,
 		MainOnly:    true,
 	})
+	tr.Register(&ToolDef{
+		Name:        "connect",
+		Description: "Connect to an MCP server at runtime. Supports stdio (command) or Streamable HTTP (url) transport. Discovers and registers all tools from the server.",
+		Syntax:      `[[connect name="server-name" url="http://host:port/mcp/1" transport="http"]]`,
+		Rules:       `For stdio: use command="path" args="arg1,arg2". For HTTP: use url="..." transport="http". Tools become available immediately after connecting.`,
+		Core:        true,
+		MainOnly:    true,
+	})
+	tr.Register(&ToolDef{
+		Name:        "disconnect",
+		Description: "Disconnect from a running MCP server and unregister its tools.",
+		Syntax:      `[[disconnect name="server-name"]]`,
+		Core:        true,
+		MainOnly:    true,
+	})
+	tr.Register(&ToolDef{
+		Name:        "list_connected",
+		Description: "List all MCP servers currently connected to this instance.",
+		Syntax:      `[[list_connected]]`,
+		Core:        true,
+		MainOnly:    true,
+	})
 
 	// Discoverable tools — retrieved by RAG
 	tr.Register(&ToolDef{

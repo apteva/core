@@ -10,6 +10,7 @@ func newTestThinker() *Thinker {
 	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:    "test-key",
+		provider:  NewFireworksProvider("test-key"),
 		messages:  []Message{{Role: "system", Content: "test"}},
 		bus:       bus,
 		sub:       bus.Subscribe("main", 100),
@@ -20,6 +21,7 @@ func newTestThinker() *Thinker {
 		memory:    &MemoryStore{path: "/dev/null"},
 		config:    &Config{Directive: "test"},
 		threadID:  "main",
+		telemetry: &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
 	}
 	t.threads = NewThreadManager(t)
 	return t
@@ -164,14 +166,99 @@ func TestToolRegistry_CoreDocs(t *testing.T) {
 	if !strings.Contains(docs, "[[pace") {
 		t.Error("expected pace in core docs")
 	}
+	if !strings.Contains(docs, "[[connect") {
+		t.Error("expected connect in main core docs")
+	}
+	if !strings.Contains(docs, "[[disconnect") {
+		t.Error("expected disconnect in main core docs")
+	}
+	if !strings.Contains(docs, "[[list_connected") {
+		t.Error("expected list_connected in main core docs")
+	}
 
 	// Without main-only
 	docs = reg.CoreDocs(false)
 	if strings.Contains(docs, "[[spawn") {
 		t.Error("spawn should not be in non-main core docs")
 	}
+	if strings.Contains(docs, "[[connect") {
+		t.Error("connect should not be in non-main core docs")
+	}
 	if !strings.Contains(docs, "[[send") {
 		t.Error("expected send in non-main core docs")
+	}
+}
+
+func TestThread_DoneInjectsToMain(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+
+	// Simulate a thread done message — inject directly to main
+	thinker.Inject("[thread:worker done] task complete")
+
+	// Main should receive it
+	select {
+	case ev := <-thinker.sub.C:
+		if ev.Type != EventInbox {
+			t.Errorf("expected EventInbox, got %s", ev.Type)
+		}
+		if !strings.Contains(ev.Text, "[thread:worker done]") {
+			t.Errorf("expected done message, got %q", ev.Text)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("main did not receive thread done event within 1s")
+	}
+}
+
+func TestThreadDone_WakesMainSleep(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+
+	// Drain any existing events
+	for {
+		select {
+		case <-thinker.sub.C:
+		case <-thinker.sub.Wake:
+		default:
+			goto ready
+		}
+	}
+ready:
+
+	// Start sleeping on main's wake channel
+	woke := make(chan string, 1)
+	go func() {
+		select {
+		case <-thinker.sub.Wake:
+			woke <- "wake"
+		case <-time.After(2 * time.Second):
+			woke <- "timeout"
+		}
+	}()
+
+	// Inject to main (simulating thread done)
+	time.Sleep(50 * time.Millisecond)
+	thinker.Inject("[thread:worker done] finished")
+
+	result := <-woke
+	if result != "wake" {
+		t.Errorf("expected main to wake on inject, got %s", result)
+	}
+}
+
+func TestThreadKill_Cleanup(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+
+	thinker.threads.Spawn("killtest", "test", nil)
+	// Thread's Run() will crash on API call — that's fine, we just test kill
+	time.Sleep(100 * time.Millisecond)
+
+	thinker.threads.Kill("killtest")
+	time.Sleep(200 * time.Millisecond)
+
+	if thinker.threads.Count() != 0 {
+		t.Errorf("expected 0 threads after kill, got %d", thinker.threads.Count())
 	}
 }
 

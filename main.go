@@ -45,14 +45,22 @@ type StreamEvent struct {
 
 func main() {
 	godotenv.Load()
+	initLogger()
 
-	apiKey := os.Getenv("FIREWORKS_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "FIREWORKS_API_KEY not set")
+	provider, err := selectProvider()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stderr, "LLM provider: %s\n", provider.Name())
 
-	thinker := NewThinker(apiKey)
+	// Keep apiKey for backward compat (memory embeddings use it)
+	apiKey := os.Getenv("FIREWORKS_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+
+	thinker := NewThinker(apiKey, provider)
 	go thinker.Run()
 
 	apiPort := os.Getenv("API_PORT")
