@@ -53,12 +53,13 @@ type ThreadInfo struct {
 }
 
 type Thread struct {
-	ID        string
-	Directive string // original directive before tool docs
-	Thinker  *Thinker
-	Parent   *Thinker
-	Tools    map[string]bool
-	Started  time.Time
+	ID           string
+	Directive    string // original directive before tool docs
+	Thinker      *Thinker
+	Parent       *Thinker
+	Tools        map[string]bool
+	Started      time.Time
+	initialParts []ContentPart // media to inject before first Run()
 }
 
 type ThreadManager struct {
@@ -74,7 +75,16 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 	}
 }
 
+// SpawnWithMedia creates a thread and injects media parts before it starts thinking.
+func (tm *ThreadManager) SpawnWithMedia(id, directive string, tools []string, parts []ContentPart, initialMessages ...string) error {
+	return tm.spawnInternal(id, directive, tools, parts, initialMessages...)
+}
+
 func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMessages ...string) error {
+	return tm.spawnInternal(id, directive, tools, nil, initialMessages...)
+}
+
+func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, mediaParts []ContentPart, initialMessages ...string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -101,11 +111,12 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 	threadSystemPrompt := basePrompt + coreDocs + "\n\n[DIRECTIVE]\n" + directive
 
 	thread := &Thread{
-		ID:        id,
-		Directive: directive,
-		Parent:    tm.parent,
-		Tools:     toolSet,
-		Started:   time.Now(),
+		ID:           id,
+		Directive:    directive,
+		Parent:       tm.parent,
+		Tools:        toolSet,
+		Started:      time.Now(),
+		initialParts: mediaParts,
 	}
 
 	// Create a Thinker — same struct as main, shares the bus
@@ -154,6 +165,17 @@ func (tm *ThreadManager) Spawn(id, directive string, tools []string, initialMess
 	// Inject initial messages before starting so first thought picks them up
 	for _, msg := range initialMessages {
 		tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: msg})
+	}
+
+	// Inject initial media parts if provided (before Run starts)
+	if thread.initialParts != nil {
+		tm.parent.bus.Publish(Event{
+			Type:  EventInbox,
+			To:    id,
+			Text:  "[media] attached",
+			Parts: thread.initialParts,
+		})
+		thread.initialParts = nil
 	}
 
 	// Same Run() as the main thinker — no duplicated loop

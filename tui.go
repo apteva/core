@@ -657,21 +657,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if val != "" {
 					switch m.inputMode {
 					case inputChat:
-						if parts := detectImageParts(val); len(parts) > 0 {
-							m.thinker.InjectWithParts(val, parts)
-							m.chat = append(m.chat, chatMessage{isUser: true, text: val + " " + mediaLabel(parts), threadID: m.userID})
-						} else {
-							m.thinker.InjectUserMessage(m.userID, val)
-							m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
-						}
+						// TODO: re-enable media auto-detection later
+						// if parts := detectImageParts(val); len(parts) > 0 {
+						// 	m.thinker.InjectWithParts(val, parts)
+						// 	m.chat = append(m.chat, chatMessage{isUser: true, text: val + " " + mediaLabel(parts), threadID: m.userID})
+						// } else {
+						m.thinker.InjectUserMessage(m.userID, val)
+						m.chat = append(m.chat, chatMessage{isUser: true, text: val, threadID: m.userID})
+						// }
 					case inputConsole:
-						if parts := detectImageParts(val); len(parts) > 0 {
-							m.thinker.InjectWithParts(val, parts)
-							m.consoleHistory = append(m.consoleHistory, val+" "+mediaLabel(parts))
-						} else {
-							m.thinker.InjectConsole(val)
-							m.consoleHistory = append(m.consoleHistory, val)
-						}
+						// TODO: re-enable media auto-detection later
+						m.thinker.InjectConsole(val)
+						m.consoleHistory = append(m.consoleHistory, val)
 					}
 				}
 				m.input.Reset()

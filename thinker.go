@@ -372,17 +372,20 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					tools = strings.Split(toolsStr, ",")
 				}
 				mediaStr := call.Args["media"]
+				mediaParts := parseMediaURLs(mediaStr)
 				if id != "" && directive != "" {
-					if err := t.threads.Spawn(id, directive, tools, consumed...); err != nil {
+					var err error
+					if len(mediaParts) > 0 {
+						err = t.threads.SpawnWithMedia(id, directive, tools, mediaParts, consumed...)
+					} else {
+						err = t.threads.Spawn(id, directive, tools, consumed...)
+					}
+					if err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
 					} else {
 						t.config.SaveThread(PersistentThread{
 							ID: id, Directive: directive, Tools: tools,
 						})
-						// Forward media to the spawned thread as its first event
-						if parts := parseMediaURLs(mediaStr); len(parts) > 0 {
-							t.bus.Publish(Event{Type: EventInbox, To: id, Text: "[media] " + mediaStr, Parts: parts})
-						}
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
