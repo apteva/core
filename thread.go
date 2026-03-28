@@ -307,13 +307,17 @@ func (tm *ThreadManager) KillAll() {
 }
 
 func (tm *ThreadManager) Send(id, message string) bool {
+	return tm.SendWithParts(id, message, nil)
+}
+
+func (tm *ThreadManager) SendWithParts(id, message string, parts []ContentPart) bool {
 	tm.mu.RLock()
 	_, exists := tm.threads[id]
 	tm.mu.RUnlock()
 	if !exists {
 		return false
 	}
-	tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: message})
+	tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: message, Parts: parts})
 	return true
 }
 

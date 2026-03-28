@@ -110,7 +110,7 @@ func TestSubThread_ReceivesEvents(t *testing.T) {
 	thread := thinker.threads.threads["worker"]
 	thinker.threads.mu.RUnlock()
 
-	items := thread.Thinker.drainEvents()
+	items := thread.Thinker.drainEventTexts()
 	if len(items) != 1 || items[0] != "do work" {
 		t.Errorf("expected 'do work' in thread inbox, got %v", items)
 	}
@@ -127,7 +127,7 @@ func TestSubThread_InitialMessages(t *testing.T) {
 	thread := thinker.threads.threads["greeter"]
 	thinker.threads.mu.RUnlock()
 
-	items := thread.Thinker.drainEvents()
+	items := thread.Thinker.drainEventTexts()
 	if len(items) != 2 {
 		t.Fatalf("expected 2 initial messages, got %d", len(items))
 	}

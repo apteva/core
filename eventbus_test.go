@@ -145,7 +145,7 @@ func TestThreadDone_MainReceivesEvent(t *testing.T) {
 
 	// Drain the "started" inbox event from main's subscription
 	time.Sleep(50 * time.Millisecond)
-	startEvents := thinker.drainEvents()
+	startEvents := thinker.drainEventTexts()
 	t.Logf("startup events on main: %v", startEvents)
 
 	foundStarted := false
@@ -191,7 +191,7 @@ func TestThreadDone_MainReceivesEvent(t *testing.T) {
 	}
 
 	// Check 2: Main's subscription should have the done message
-	doneEvents := thinker.drainEvents()
+	doneEvents := thinker.drainEventTexts()
 	t.Logf("done events on main: %v", doneEvents)
 
 	foundDone := false
@@ -226,7 +226,7 @@ func TestDrainEventsConsumesWake(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// drainEvents should consume both events AND wake signals
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 3 {
 		t.Fatalf("expected 3 events, got %d", len(items))
 	}
@@ -250,7 +250,7 @@ func TestThreadSendToMain(t *testing.T) {
 
 	// Drain startup events
 	time.Sleep(50 * time.Millisecond)
-	thinker.drainEvents()
+	thinker.drainEventTexts()
 	select {
 	case <-thinker.sub.Wake:
 	default:
@@ -261,7 +261,7 @@ func TestThreadSendToMain(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	events := thinker.drainEvents()
+	events := thinker.drainEventTexts()
 	t.Logf("events: %v", events)
 
 	if len(events) != 1 || events[0] != "[from:reporter] job done" {

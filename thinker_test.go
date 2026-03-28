@@ -141,7 +141,7 @@ func TestDrainEvents_Empty(t *testing.T) {
 		sub:      bus.Subscribe("test", 10),
 		threadID: "test",
 	}
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 0 {
 		t.Errorf("expected empty, got %d items", len(items))
 	}
@@ -161,7 +161,7 @@ func TestDrainEvents_WithMessages(t *testing.T) {
 	// Small sleep to let publishes land
 	time.Sleep(10 * time.Millisecond)
 
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 3 {
 		t.Fatalf("expected 3 items, got %d", len(items))
 	}
@@ -170,7 +170,7 @@ func TestDrainEvents_WithMessages(t *testing.T) {
 	}
 
 	// Should be empty now
-	items2 := thinker.drainEvents()
+	items2 := thinker.drainEventTexts()
 	if len(items2) != 0 {
 		t.Errorf("expected empty after drain, got %d", len(items2))
 	}
@@ -185,7 +185,7 @@ func TestInject(t *testing.T) {
 	}
 	thinker.Inject("test event")
 	time.Sleep(10 * time.Millisecond)
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 1 || items[0] != "test event" {
 		t.Errorf("unexpected items: %v", items)
 	}
@@ -200,7 +200,7 @@ func TestInjectUserMessage(t *testing.T) {
 	}
 	thinker.InjectUserMessage("marco", "Hello")
 	time.Sleep(10 * time.Millisecond)
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 1 || items[0] != "[user:marco] Hello" {
 		t.Errorf("expected '[user:marco] Hello', got %v", items)
 	}

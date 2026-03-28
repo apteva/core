@@ -22,7 +22,8 @@ type Event struct {
 	From string // source: "main", thread ID, "tui", "api", "tool:name"
 	To   string // target subscriber ID; "" = broadcast
 
-	Text string // message payload
+	Text  string        // message payload
+	Parts []ContentPart // optional media (images, audio) attached to this event
 
 	// Structured fields (populated for ThinkDone events)
 	Iteration      int

@@ -277,8 +277,6 @@ type Thinker struct {
 	pendingMu    sync.Mutex
 
 	// Multimodal — parts waiting to be attached to next message
-	pendingParts []ContentPart
-	partsMu      sync.Mutex
 }
 
 func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
@@ -373,6 +371,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if toolsStr != "" {
 					tools = strings.Split(toolsStr, ",")
 				}
+				mediaStr := call.Args["media"]
 				if id != "" && directive != "" {
 					if err := t.threads.Spawn(id, directive, tools, consumed...); err != nil {
 						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
@@ -380,6 +379,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						t.config.SaveThread(PersistentThread{
 							ID: id, Directive: directive, Tools: tools,
 						})
+						// Forward media to the spawned thread as its first event
+						if parts := parseMediaURLs(mediaStr); len(parts) > 0 {
+							t.bus.Publish(Event{Type: EventInbox, To: id, Text: "[media] " + mediaStr, Parts: parts})
+						}
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -392,8 +395,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "send":
 				id := call.Args["id"]
 				msg := call.Args["message"]
+				mediaStr := call.Args["media"]
 				if id != "" && msg != "" {
-					if !t.threads.Send(id, msg) {
+					parts := parseMediaURLs(mediaStr)
+					if !t.threads.SendWithParts(id, msg, parts) {
 						t.Inject(fmt.Sprintf("[error] thread %q not found", id))
 					}
 				}
@@ -543,9 +548,18 @@ func (t *Thinker) Run() {
 		logMsg("RUN", fmt.Sprintf("[%s] iteration #%d start, rate=%s", t.threadID, t.iteration, t.rate.String()))
 
 		// Drain events from bus, optionally filter/route
-		consumed := t.drainEvents()
+		drained := t.drainEvents()
+
+		// Extract text strings and collect media parts
+		var consumed []string
+		var mediaParts []ContentPart
+		for _, de := range drained {
+			consumed = append(consumed, de.Text)
+			mediaParts = append(mediaParts, de.Parts...)
+		}
+
 		if len(consumed) > 0 {
-			logMsg("RUN", fmt.Sprintf("[%s] drained %d events", t.threadID, len(consumed)))
+			logMsg("RUN", fmt.Sprintf("[%s] drained %d events (media_parts=%d)", t.threadID, len(consumed), len(mediaParts)))
 			for i, ev := range consumed {
 				preview := ev
 				if len(preview) > 100 {
@@ -577,7 +591,6 @@ func (t *Thinker) Run() {
 		}
 
 		now := time.Now().Format("2006-01-02 15:04:05")
-		pendingParts := t.drainParts()
 		if hadEvents {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("[%s] Events:\n", now))
@@ -585,8 +598,8 @@ func (t *Thinker) Run() {
 				sb.WriteString("• " + ev + "\n")
 			}
 			msg := Message{Role: "user", Content: sb.String()}
-			if len(pendingParts) > 0 {
-				msg.Parts = append([]ContentPart{{Type: "text", Text: sb.String()}}, pendingParts...)
+			if len(mediaParts) > 0 {
+				msg.Parts = append([]ContentPart{{Type: "text", Text: sb.String()}}, mediaParts...)
 			}
 			t.messages = append(t.messages, msg)
 		} else {
@@ -768,16 +781,30 @@ func (t *Thinker) think() (string, TokenUsage, error) {
 }
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.
-func (t *Thinker) drainEvents() []string {
-	var items []string
+type drainedEvent struct {
+	Text  string
+	Parts []ContentPart
+}
+
+// drainEventTexts is a convenience for tests — returns just the text strings.
+func (t *Thinker) drainEventTexts() []string {
+	events := t.drainEvents()
+	out := make([]string, len(events))
+	for i, e := range events {
+		out[i] = e.Text
+	}
+	return out
+}
+
+func (t *Thinker) drainEvents() []drainedEvent {
+	var items []drainedEvent
 	for {
 		select {
 		case ev := <-t.sub.C:
 			if ev.Type == EventInbox {
-				items = append(items, ev.Text)
+				items = append(items, drainedEvent{Text: ev.Text, Parts: ev.Parts})
 			}
 		case <-t.sub.Wake:
-			// Consume wake signals alongside their events
 			continue
 		default:
 			return items
@@ -843,24 +870,43 @@ func (t *Thinker) InjectUserMessage(userID, msg string) {
 	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: fmt.Sprintf("[user:%s] %s", userID, msg)})
 }
 
-// InjectWithParts sends a text event and stores multimodal parts for the next thinking iteration.
+// InjectWithParts sends a text event with media parts attached.
 func (t *Thinker) InjectWithParts(text string, parts []ContentPart) {
-	t.partsMu.Lock()
-	t.pendingParts = parts
-	t.partsMu.Unlock()
-	if text != "" {
-		t.InjectConsole(text)
-	} else {
-		t.InjectConsole("[multimodal input]")
+	if text == "" {
+		text = "[multimodal input]"
 	}
+	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: "[console] " + text, Parts: parts})
 }
 
-// drainParts returns and clears any pending multimodal parts.
-func (t *Thinker) drainParts() []ContentPart {
-	t.partsMu.Lock()
-	defer t.partsMu.Unlock()
-	parts := t.pendingParts
-	t.pendingParts = nil
+// parseMediaURLs splits a space-separated list of URLs into ContentParts.
+// Classifies each URL as image or audio by extension.
+func parseMediaURLs(urls string) []ContentPart {
+	if urls == "" {
+		return nil
+	}
+	var parts []ContentPart
+	for _, u := range strings.Fields(urls) {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		ext := ""
+		if idx := strings.LastIndex(u, "."); idx >= 0 {
+			ext = strings.ToLower(u[idx+1:])
+			if qIdx := strings.Index(ext, "?"); qIdx >= 0 {
+				ext = ext[:qIdx]
+			}
+		}
+		switch ext {
+		case "mp3", "wav", "aac", "ogg", "flac", "aiff", "m4a":
+			parts = append(parts, ContentPart{Type: "audio_url", AudioURL: &AudioURL{URL: u}})
+		case "png", "jpg", "jpeg", "gif", "webp":
+			parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: u}})
+		default:
+			// Unknown extension — treat as image (provider will attempt fetch)
+			parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: u}})
+		}
+	}
 	return parts
 }
 

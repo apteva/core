@@ -177,19 +177,20 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If multimodal, store parts for next thinking iteration
-	if len(parts) > 0 {
-		a.thinker.InjectWithParts(text, parts)
-	} else if body.ThreadID != "" && body.ThreadID != "main" {
-		a.thinker.bus.Publish(Event{Type: EventInbox, To: body.ThreadID, Text: text})
-	} else {
-		a.thinker.InjectConsole(text)
-	}
-
 	threadID := body.ThreadID
 	if threadID == "" {
 		threadID = "main"
 	}
+
+	if len(parts) > 0 {
+		// Multimodal: publish event with parts directly on the bus
+		a.thinker.bus.Publish(Event{Type: EventInbox, To: threadID, Text: "[console] " + text, Parts: parts})
+	} else if threadID != "main" {
+		a.thinker.bus.Publish(Event{Type: EventInbox, To: threadID, Text: text})
+	} else {
+		a.thinker.InjectConsole(text)
+	}
+
 	writeJSON(w, map[string]string{"status": "injected", "thread_id": threadID})
 }
 

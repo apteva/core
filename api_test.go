@@ -131,7 +131,7 @@ func TestAPI_PostEvent(t *testing.T) {
 	}
 
 	// Check it was injected
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item in events, got %d", len(items))
 	}
@@ -211,7 +211,7 @@ func TestAPI_PostEvent_ThreadTarget(t *testing.T) {
 	}
 
 	// Main should NOT have received it
-	mainEvents := thinker.drainEvents()
+	mainEvents := thinker.drainEventTexts()
 	if len(mainEvents) != 0 {
 		t.Errorf("main should not receive thread-targeted event, got %d events", len(mainEvents))
 	}
@@ -236,7 +236,7 @@ func TestAPI_PostEvent_NoThreadID_GoesToMain(t *testing.T) {
 		t.Errorf("expected thread_id 'main', got %q", resp["thread_id"])
 	}
 
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 1 {
 		t.Fatalf("expected 1 event on main, got %d", len(items))
 	}
@@ -255,7 +255,7 @@ func TestAPI_PostEvent_MainThreadID_GoesToMain(t *testing.T) {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
 
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 1 {
 		t.Fatalf("expected 1 event on main, got %d", len(items))
 	}
@@ -542,7 +542,7 @@ func TestAPI_PostEvent_PlainString(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	items := thinker.drainEvents()
+	items := thinker.drainEventTexts()
 	if len(items) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(items))
 	}
@@ -562,16 +562,20 @@ func TestAPI_PostEvent_ContentParts(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Should have pending parts
-	parts := thinker.drainParts()
-	if len(parts) != 2 {
-		t.Fatalf("expected 2 pending parts, got %d", len(parts))
+	// Parts now flow through the event bus
+	time.Sleep(50 * time.Millisecond)
+	events := thinker.drainEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
 	}
-	if parts[0].Type != "text" || parts[0].Text != "What is this?" {
-		t.Errorf("unexpected first part: %+v", parts[0])
+	if len(events[0].Parts) != 2 {
+		t.Fatalf("expected 2 parts on event, got %d", len(events[0].Parts))
 	}
-	if parts[1].Type != "image_url" || parts[1].ImageURL == nil {
-		t.Errorf("unexpected second part: %+v", parts[1])
+	if events[0].Parts[0].Type != "text" || events[0].Parts[0].Text != "What is this?" {
+		t.Errorf("unexpected first part: %+v", events[0].Parts[0])
+	}
+	if events[0].Parts[1].Type != "image_url" || events[0].Parts[1].ImageURL == nil {
+		t.Errorf("unexpected second part: %+v", events[0].Parts[1])
 	}
 }
 

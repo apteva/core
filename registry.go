@@ -47,9 +47,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "send",
-		Description: "Send a message to any thread by ID. Use to communicate between threads or report to the main coordinator.",
-		Syntax:      `[[send id="thread-name" message="..."]]`,
-		Rules:       `Use id="main" for the coordinator thread.`,
+		Description: "Send a message to any thread by ID. Optionally attach media (images/audio) via space-separated URLs.",
+		Syntax:      `[[send id="thread-name" message="..." media="url1 url2"]]`,
+		Rules:       `Use id="main" for the coordinator thread. media is optional — space-separated URLs. Supported: .png .jpg .gif .webp .mp3 .wav .aac .ogg .flac .aiff .m4a`,
 		Core:        true,
 	})
 	tr.Register(&ToolDef{
@@ -78,9 +78,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Threads are persistent across restarts.",
-		Syntax:      `[[spawn id="name" directive="What this thread does" tools="reply,web"]]`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated. Thread runs continuously and calls [[done]] when finished.`,
+		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Optionally forward media to the thread.",
+		Syntax:      `[[spawn id="name" directive="What this thread does" tools="reply,web" media="url1 url2"]]`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated. media: optional space-separated URLs forwarded as the thread's first event. Thread runs continuously and calls [[done]] when finished.`,
 		Core:        true,
 		MainOnly:    true,
 	})
