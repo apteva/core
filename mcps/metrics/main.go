@@ -140,7 +140,10 @@ func handleToolCall(id int64, name string, args map[string]string) {
 			respondError(id, -32602, "service is required")
 			return
 		}
-		// Generate current metrics (simulated with some noise)
+		// Reload from disk (test phases may seed metrics.json)
+		loadJSON("metrics.json", &history)
+
+		// Start with random baseline
 		now := time.Now().UTC().Format(time.RFC3339)
 		base := map[string]float64{
 			"cpu":        30 + rand.Float64()*20,
@@ -148,10 +151,10 @@ func handleToolCall(id int64, name string, args map[string]string) {
 			"error_rate": rand.Float64() * 2,
 			"latency_ms": 50 + rand.Float64()*100,
 		}
-		// Check if there's seeded override data
-		for i := len(history) - 1; i >= 0; i-- {
-			if history[i].Service == service {
-				base[history[i].Metric] = history[i].Value
+		// Override with most recent seeded/recorded values for this service
+		for _, pt := range history {
+			if pt.Service == service {
+				base[pt.Metric] = pt.Value
 			}
 		}
 		// Record and check
