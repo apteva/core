@@ -31,6 +31,16 @@ type ProviderConfig struct {
 	Models map[string]string `json:"models,omitempty"` // "large" → model ID, "small" → model ID
 }
 
+// ComputerConfig holds the configuration for a computer use environment.
+type ComputerConfig struct {
+	Type      string `json:"type"`                 // "browserbase", "service"
+	URL       string `json:"url,omitempty"`        // for "service" type
+	APIKey    string `json:"api_key,omitempty"`    // for "browserbase"
+	ProjectID string `json:"project_id,omitempty"` // for "browserbase"
+	Width     int    `json:"width,omitempty"`      // display width (default 1280)
+	Height    int    `json:"height,omitempty"`     // display height (default 800)
+}
+
 type Config struct {
 	mu          sync.RWMutex
 	path        string
@@ -38,6 +48,7 @@ type Config struct {
 	Mode        RunMode            `json:"mode,omitempty"`
 	AutoApprove []string           `json:"auto_approve,omitempty"`
 	Provider    *ProviderConfig    `json:"provider,omitempty"`
+	Computer    *ComputerConfig    `json:"computer,omitempty"`
 	Threads     []PersistentThread `json:"threads,omitempty"`
 	MCPServers  []MCPServerConfig  `json:"mcp_servers,omitempty"`
 }

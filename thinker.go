@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/apteva/core/pkg/computer"
 )
 
 const maxHistory = 20
@@ -264,6 +266,7 @@ type Thinker struct {
 
 	// Live MCP connections — servers connected at runtime
 	mcpServers []MCPConn
+	computer   computer.Computer // screen-based environment (nil = no computer use)
 
 	// Supervised mode — tool approval gate
 	approvalCh   chan bool      // receives true=approve, false=reject
@@ -323,6 +326,26 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.memory)
 		// Rebuild prompt now that servers are connected
 		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", t.mcpServers)}
+	}
+
+	// Initialize computer use environment if configured
+	if config.Computer != nil && config.Computer.Type != "" {
+		comp, err := computer.New(computer.Config{
+			Type:      config.Computer.Type,
+			URL:       config.Computer.URL,
+			APIKey:    config.Computer.APIKey,
+			ProjectID: config.Computer.ProjectID,
+			Display: computer.DisplaySize{
+				Width:  config.Computer.Width,
+				Height: config.Computer.Height,
+			},
+		})
+		if err != nil {
+			logMsg("COMPUTER", fmt.Sprintf("failed to create computer: %v", err))
+		} else if comp != nil {
+			t.computer = comp
+			logMsg("COMPUTER", fmt.Sprintf("connected: type=%s display=%dx%d", config.Computer.Type, comp.DisplaySize().Width, comp.DisplaySize().Height))
+		}
 	}
 
 	// Respawn persistent threads from config
@@ -679,6 +702,11 @@ func (t *Thinker) Run() {
 		var calls []toolCall
 		if len(chatResp.ToolCalls) > 0 {
 			for _, ntc := range chatResp.ToolCalls {
+				// Intercept computer_use calls — execute on Computer interface
+				if isComputerUseTool(ntc.Name) && t.computer != nil {
+					go t.executeComputerAction(ntc)
+					continue
+				}
 				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: ntc.Name, NativeID: ntc.ID})
 			}
 		} else {
@@ -798,6 +826,28 @@ func (t *Thinker) think() (ChatResponse, error) {
 	var nativeTools []NativeTool
 	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
 		nativeTools = t.registry.NativeTools(t.toolAllowlist)
+	}
+
+	// Add computer_use tool if a computer environment is connected
+	if t.computer != nil {
+		display := t.computer.DisplaySize()
+		nativeTools = append(nativeTools, NativeTool{
+			Name:        "computer_use",
+			Description: fmt.Sprintf("Control a computer screen (%dx%d). Actions: click, double_click, type, key, scroll, screenshot, navigate, wait.", display.Width, display.Height),
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"action":    map[string]string{"type": "string", "description": "Action: click, double_click, type, key, scroll, screenshot, navigate, wait"},
+					"x":         map[string]string{"type": "integer", "description": "X coordinate for click/scroll"},
+					"y":         map[string]string{"type": "integer", "description": "Y coordinate for click/scroll"},
+					"text":      map[string]string{"type": "string", "description": "Text to type"},
+					"key":       map[string]string{"type": "string", "description": "Key to press (Enter, Escape, etc.)"},
+					"direction": map[string]string{"type": "string", "description": "Scroll direction: up, down, left, right"},
+					"url":       map[string]string{"type": "string", "description": "URL to navigate to"},
+				},
+				"required": []string{"action"},
+			},
+		})
 	}
 
 	return t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk)
@@ -945,4 +995,94 @@ func (t *Thinker) Stop() {
 	default:
 		close(t.quit)
 	}
+	// Clean up computer session
+	if t.computer != nil {
+		t.computer.Close()
+	}
+}
+
+// isComputerUseTool returns true if the tool name is a computer use tool from any provider.
+func isComputerUseTool(name string) bool {
+	switch name {
+	case "computer_use", "computer_use_2025", "computer_20250124":
+		return true
+	}
+	return false
+}
+
+// normalizeComputerAction converts provider-specific args to a computer.Action.
+func normalizeComputerAction(args map[string]string) computer.Action {
+	action := computer.Action{Type: args["action"]}
+
+	// Parse coordinate — providers use different formats
+	// Anthropic: coordinate=[x, y] as string; OpenAI: x=400, y=300
+	if coord := args["coordinate"]; coord != "" {
+		// Parse "[400, 300]" format
+		coord = strings.Trim(coord, "[] ")
+		parts := strings.Split(coord, ",")
+		if len(parts) == 2 {
+			fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &action.X)
+			fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &action.Y)
+		}
+	}
+	if x := args["x"]; x != "" {
+		fmt.Sscanf(x, "%d", &action.X)
+	}
+	if y := args["y"]; y != "" {
+		fmt.Sscanf(y, "%d", &action.Y)
+	}
+
+	action.Text = args["text"]
+	action.Key = args["key"]
+	action.Direction = args["direction"]
+	action.URL = args["url"]
+
+	if d := args["duration"]; d != "" {
+		fmt.Sscanf(d, "%d", &action.Duration)
+	}
+
+	return action
+}
+
+// executeComputerAction runs a computer_use action and injects the result.
+func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
+	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Args["action"], ntc.Args))
+	start := time.Now()
+
+	action := normalizeComputerAction(ntc.Args)
+	screenshot, err := t.computer.Execute(action)
+
+	duration := time.Since(start)
+	if err != nil {
+		logMsg("COMPUTER", fmt.Sprintf("error (%dms): %v", duration.Milliseconds(), err))
+		t.Inject(fmt.Sprintf("[tool:computer_use] error: %v", err))
+
+		// Emit TUI chunk
+		t.bus.Publish(Event{Type: EventChunk, From: t.threadID,
+			Text: "\n← computer_use: error: " + err.Error() + "\n", Iteration: t.iteration})
+		return
+	}
+
+	logMsg("COMPUTER", fmt.Sprintf("done (%dms) screenshot=%d bytes", duration.Milliseconds(), len(screenshot)))
+
+	// Inject screenshot as a multimodal event (image part)
+	imgPart := ContentPart{
+		Type:     "image_url",
+		ImageURL: &ImageURL{URL: "data:image/png;base64," + encodeBase64(screenshot)},
+	}
+	t.bus.Publish(Event{
+		Type:  EventInbox,
+		To:    t.threadID,
+		Text:  fmt.Sprintf("[tool:computer_use] screenshot (%d bytes, %dms)", len(screenshot), duration.Milliseconds()),
+		Parts: []ContentPart{imgPart},
+	})
+
+	// Emit TUI chunk
+	t.bus.Publish(Event{Type: EventChunk, From: t.threadID,
+		Text: fmt.Sprintf("\n← computer_use: screenshot (%d bytes, %dms)\n", len(screenshot), duration.Milliseconds()),
+		Iteration: t.iteration})
+}
+
+func encodeBase64(data []byte) string {
+	return base64Encode(data)
 }
