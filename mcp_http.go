@@ -155,8 +155,16 @@ func (s *MCPHTTPServer) ListTools() ([]mcpToolDef, error) {
 }
 
 func (s *MCPHTTPServer) CallTool(name string, args map[string]string) (string, error) {
+	// Convert string args to any — parse JSON arrays/objects so they're sent as proper types
 	arguments := make(map[string]any)
 	for k, v := range args {
+		if len(v) > 0 && (v[0] == '[' || v[0] == '{') {
+			var parsed any
+			if json.Unmarshal([]byte(v), &parsed) == nil {
+				arguments[k] = parsed
+				continue
+			}
+		}
 		arguments[k] = v
 	}
 

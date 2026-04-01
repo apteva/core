@@ -31,12 +31,12 @@ When all 3 threads report done, say "ALL TASKS COMPLETE" in your thought.`
 
 	thinker := NewThinker(apiKey, provider)
 	thinker.config = &Config{Directive: directive}
-	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, thinker.registry, "", nil)}
+	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, thinker.registry, "", nil, nil)}
 
 	// Set up event filter and tool handler (same as normal startup)
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
-		return buildSystemPrompt(thinker.config.GetDirective(), thinker.registry, toolDocs, thinker.mcpServers)
+		return buildSystemPrompt(thinker.config.GetDirective(), thinker.registry, toolDocs, thinker.mcpServers, nil)
 	}
 
 	go thinker.Run()

@@ -308,7 +308,14 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(pt.argsJSON.String()), &raw); err == nil {
 			for k, v := range raw {
-				args[k] = fmt.Sprintf("%v", v)
+				switch v.(type) {
+				case string:
+					args[k] = v.(string)
+				default:
+					// Preserve arrays/objects/numbers as JSON strings
+					b, _ := json.Marshal(v)
+					args[k] = string(b)
+				}
 			}
 		}
 		toolCalls = append(toolCalls, NativeToolCall{

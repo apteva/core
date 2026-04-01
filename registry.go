@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -15,6 +16,8 @@ type ToolDef struct {
 	Core        bool   // always in prompt (pace, send, done, evolve)
 	MainOnly    bool   // only for main thread (spawn, kill)
 	ThreadOnly  bool   // only for sub-threads, not main (reply)
+	MCP         bool   // provided by an MCP server — not sent as native tools to main, only to sub-threads
+	MCPServer   string // name of the MCP server that provides this tool
 	Handler     func(args map[string]string) string // nil = handled inline by tool handler
 	Embedding   []float64
 	InputSchema map[string]any // JSON Schema for native tool calling (nil = auto-generated from Syntax)
@@ -26,6 +29,18 @@ type ToolRegistry struct {
 	tools    map[string]*ToolDef
 	apiKey   string
 	embedded bool
+}
+
+// sortedToolKeys returns tool names in deterministic sorted order.
+// This is critical for LLM token caching — non-deterministic ordering
+// breaks prefix caching on every call.
+func (tr *ToolRegistry) sortedToolKeys() []string {
+	keys := make([]string, 0, len(tr.tools))
+	for k := range tr.tools {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func NewToolRegistry(apiKey string) *ToolRegistry {
@@ -168,7 +183,8 @@ func (tr *ToolRegistry) CoreDocs(includeMainOnly bool) string {
 
 	var sb strings.Builder
 	sb.WriteString("CORE TOOLS — always available:\n")
-	for _, tool := range tr.tools {
+	for _, name := range tr.sortedToolKeys() {
+		tool := tr.tools[name]
 		if !tool.Core {
 			continue
 		}
@@ -248,7 +264,8 @@ func (tr *ToolRegistry) getAllowed(allowed map[string]bool) []*ToolDef {
 	defer tr.mu.RUnlock()
 	isMainThread := allowed == nil
 	var out []*ToolDef
-	for _, tool := range tr.tools {
+	for _, name := range tr.sortedToolKeys() {
+		tool := tr.tools[name]
 		if tool.Core {
 			continue
 		}
@@ -294,12 +311,63 @@ func (tr *ToolRegistry) Dispatch(name string, args map[string]string) (string, b
 	return tool.Handler(args), true
 }
 
+// MCPToolSummary returns a compact summary of MCP tools grouped by server.
+// Used in the main thread's system prompt so it knows what's available
+// without sending full tool definitions to the LLM.
+func (tr *ToolRegistry) MCPToolSummary() string {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+
+	servers := make(map[string][]string) // server → ["tool_name — description", ...]
+	for _, name := range tr.sortedToolKeys() {
+		tool := tr.tools[name]
+		if !tool.MCP {
+			continue
+		}
+		srv := tool.MCPServer
+		if srv == "" {
+			srv = "unknown"
+		}
+		// Strip server prefix from display name
+		displayName := tool.Name
+		if len(srv) > 0 && len(tool.Name) > len(srv)+1 {
+			displayName = tool.Name[len(srv)+1:]
+		}
+		servers[srv] = append(servers[srv], fmt.Sprintf("  - %s — %s", displayName, tool.Description))
+	}
+	if len(servers) == 0 {
+		return ""
+	}
+
+	// Sort server names for deterministic output
+	srvNames := make([]string, 0, len(servers))
+	for k := range servers {
+		srvNames = append(srvNames, k)
+	}
+	sort.Strings(srvNames)
+
+	var sb strings.Builder
+	sb.WriteString("\n[MCP TOOLS — available for sub-threads]\n")
+	sb.WriteString("These tools are NOT available to you directly. To use them, spawn a thread with the tool in its tools list.\n")
+	sb.WriteString("When spawning, use the FULL prefixed name (e.g. \"servername_toolname\").\n\n")
+	for _, srv := range srvNames {
+		tools := servers[srv]
+		sb.WriteString(fmt.Sprintf("%s (%d tools):\n", srv, len(tools)))
+		for _, t := range tools {
+			sb.WriteString(t + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 // AllToolNames returns all non-core tool names (for spawn docs).
 func (tr *ToolRegistry) AllToolNames() []string {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
 	var names []string
-	for _, tool := range tr.tools {
+	for _, name := range tr.sortedToolKeys() {
+		tool := tr.tools[name]
 		if !tool.Core && !tool.MainOnly {
 			names = append(names, tool.Name)
 		}
@@ -341,19 +409,25 @@ func (tr *ToolRegistry) Counts() (core, rag, total int) {
 }
 
 // NativeTools returns all tools as NativeTool definitions for the provider API.
-// allowlist filters to specific tools (nil = all non-MainOnly tools).
+// NativeTools returns tool definitions for the LLM provider API.
+// allowlist filters to specific tools (nil = main thread, which excludes MCP tools).
+// Sub-threads pass their allowlist which includes MCP tools they need.
 func (tr *ToolRegistry) NativeTools(allowlist map[string]bool) []NativeTool {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
 	var out []NativeTool
-	for _, tool := range tr.tools {
-		// Filter by allowlist if set
+	for _, name := range tr.sortedToolKeys() {
+		tool := tr.tools[name]
+		// Filter by allowlist if set (sub-threads)
 		if allowlist != nil {
 			if !allowlist[tool.Name] {
 				continue
 			}
-		} else if tool.ThreadOnly {
-			continue
+		} else {
+			// Main thread (nil allowlist): skip MCP tools and thread-only tools
+			if tool.ThreadOnly || tool.MCP {
+				continue
+			}
 		}
 
 		nt := NativeTool{

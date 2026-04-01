@@ -379,7 +379,13 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 					toolCallSeq++
 					args := make(map[string]string)
 					for k, v := range part.FunctionCall.Args {
-						args[k] = fmt.Sprintf("%v", v)
+						switch v.(type) {
+						case string:
+							args[k] = v.(string)
+						default:
+							b, _ := json.Marshal(v)
+							args[k] = string(b)
+						}
 					}
 					toolCalls = append(toolCalls, NativeToolCall{
 						ID:   fmt.Sprintf("gemini_%d", toolCallSeq),

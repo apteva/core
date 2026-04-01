@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -253,6 +254,203 @@ func TestIntegration_WebTool_BadURL(t *testing.T) {
 	if !strings.Contains(result, "error") {
 		t.Error("expected error for bad URL")
 	}
+}
+
+// TestIntegration_NativeToolCallArrayArgs verifies that when the LLM returns
+// tool calls with array/object arguments, the provider preserves them as valid
+// JSON strings (not Go's %v representation). This prevents the bug where
+// account_ids=[33] was sent as "33" or "[33]" with broken nested objects.
+func TestIntegration_NativeToolCallArrayArgs(t *testing.T) {
+	t.Parallel()
+	apiKey := getAPIKey(t)
+
+	provider := NewFireworksProvider(apiKey)
+
+	// Define a tool that requires array and object params
+	tools := []NativeTool{
+		{
+			Name:        "create_post",
+			Description: "Create a social media post. You MUST call this tool with the exact parameters given.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"account_ids": map[string]any{
+						"type":        "array",
+						"description": "Array of account IDs",
+						"items":       map[string]any{"type": "integer"},
+					},
+					"text": map[string]any{
+						"type":        "string",
+						"description": "Post text",
+					},
+					"tags": map[string]any{
+						"type":        "array",
+						"description": "Tags for the post",
+						"items":       map[string]any{"type": "string"},
+					},
+				},
+				"required": []string{"account_ids", "text", "tags"},
+			},
+		},
+	}
+
+	messages := []Message{
+		{Role: "system", Content: "You are a tool-calling assistant. When asked to create a post, call the create_post tool with the exact values provided. Do not add commentary."},
+		{Role: "user", Content: `Call create_post with account_ids [33, 44], text "Hello world", and tags ["social", "test"].`},
+	}
+
+	resp, err := provider.Chat(messages, provider.Models()[ModelLarge], tools, func(s string) {})
+	if err != nil {
+		t.Fatalf("Chat() error: %v", err)
+	}
+
+	if len(resp.ToolCalls) == 0 {
+		t.Fatalf("expected tool calls, got none. Text: %q", resp.Text)
+	}
+
+	tc := resp.ToolCalls[0]
+	t.Logf("Tool call: %s, args: %v", tc.Name, tc.Args)
+
+	// account_ids should be valid JSON array
+	ids := tc.Args["account_ids"]
+	if ids == "" {
+		t.Fatal("account_ids arg is empty")
+	}
+	// Must be valid JSON, not Go's fmt representation like "map[...]"
+	var parsedIDs []any
+	if err := json.Unmarshal([]byte(ids), &parsedIDs); err != nil {
+		t.Errorf("account_ids is not valid JSON: %q (error: %v)", ids, err)
+	} else {
+		t.Logf("account_ids parsed as JSON: %v", parsedIDs)
+		if len(parsedIDs) == 0 {
+			t.Error("expected non-empty account_ids array")
+		}
+	}
+
+	// tags should be valid JSON array
+	tags := tc.Args["tags"]
+	if tags == "" {
+		t.Fatal("tags arg is empty")
+	}
+	var parsedTags []any
+	if err := json.Unmarshal([]byte(tags), &parsedTags); err != nil {
+		t.Errorf("tags is not valid JSON: %q (error: %v)", tags, err)
+	} else {
+		t.Logf("tags parsed as JSON: %v", parsedTags)
+	}
+
+	// text should be a plain string (not JSON-wrapped)
+	text := tc.Args["text"]
+	if text == "" {
+		t.Fatal("text arg is empty")
+	}
+	if strings.HasPrefix(text, `"`) {
+		t.Errorf("text should be a plain string, not JSON-quoted: %q", text)
+	}
+	t.Logf("text: %q", text)
+}
+
+// TestIntegration_NativeToolCallNestedArrayArgs verifies that the LLM correctly
+// produces nested object arrays (like media_urls with {url, type}) when the schema
+// specifies items with object properties. This requires the full JSON schema to be
+// sent to the LLM, not a flattened string schema.
+func TestIntegration_NativeToolCallNestedArrayArgs(t *testing.T) {
+	t.Parallel()
+	apiKey := getAPIKey(t)
+
+	provider := NewFireworksProvider(apiKey)
+
+	// Mimics the socialcast create_post schema with nested objects in arrays
+	tools := []NativeTool{
+		{
+			Name:        "create_post",
+			Description: "Create a social media post with media attachments. You MUST call this tool with the exact parameters given.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"account_ids": map[string]any{
+						"type":        "array",
+						"description": "Array of account IDs to post to",
+						"items":       map[string]any{"type": "integer"},
+					},
+					"text": map[string]any{
+						"type":        "string",
+						"description": "Post text",
+					},
+					"media_urls": map[string]any{
+						"type":        "array",
+						"description": "Media attachments",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"url":  map[string]any{"type": "string", "description": "URL of the media file"},
+								"type": map[string]any{"type": "string", "enum": []string{"image", "video"}, "description": "Media type"},
+							},
+							"required": []string{"url", "type"},
+						},
+					},
+				},
+				"required": []string{"account_ids", "text", "media_urls"},
+			},
+		},
+	}
+
+	messages := []Message{
+		{Role: "system", Content: "You are a tool-calling assistant. Call the tool with the exact values provided. Do not add commentary."},
+		{Role: "user", Content: `Call create_post with account_ids [33], text "Check this out!", and media_urls containing one item: url "https://example.com/video.mp4" with type "video".`},
+	}
+
+	resp, err := provider.Chat(messages, provider.Models()[ModelLarge], tools, func(s string) {})
+	if err != nil {
+		t.Fatalf("Chat() error: %v", err)
+	}
+
+	if len(resp.ToolCalls) == 0 {
+		t.Fatalf("expected tool calls, got none. Text: %q", resp.Text)
+	}
+
+	tc := resp.ToolCalls[0]
+	t.Logf("Tool call: %s", tc.Name)
+	t.Logf("Args: %v", tc.Args)
+
+	// account_ids must be valid JSON array
+	ids := tc.Args["account_ids"]
+	var parsedIDs []any
+	if err := json.Unmarshal([]byte(ids), &parsedIDs); err != nil {
+		t.Errorf("account_ids not valid JSON array: %q (error: %v)", ids, err)
+	} else {
+		t.Logf("account_ids: %v", parsedIDs)
+	}
+
+	// media_urls must be valid JSON array of objects
+	media := tc.Args["media_urls"]
+	if media == "" {
+		t.Fatal("media_urls arg is empty")
+	}
+	var parsedMedia []map[string]any
+	if err := json.Unmarshal([]byte(media), &parsedMedia); err != nil {
+		t.Errorf("media_urls not valid JSON array of objects: %q (error: %v)", media, err)
+	} else {
+		t.Logf("media_urls: %v", parsedMedia)
+		if len(parsedMedia) == 0 {
+			t.Error("expected at least 1 media item")
+		} else {
+			item := parsedMedia[0]
+			if _, ok := item["url"]; !ok {
+				t.Error("media item missing 'url' field")
+			}
+			if _, ok := item["type"]; !ok {
+				t.Error("media item missing 'type' field")
+			}
+		}
+	}
+
+	// text should be a plain string
+	text := tc.Args["text"]
+	if text == "" {
+		t.Fatal("text arg is empty")
+	}
+	t.Logf("text: %q", text)
 }
 
 func TestIntegration_WebTool_MissingURL(t *testing.T) {

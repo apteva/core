@@ -87,7 +87,7 @@ CRITICAL — never hallucinate events:
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
-func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs string, servers []MCPConn) string {
+func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo) string {
 	coreDocs := ""
 	if registry != nil {
 		coreDocs = "\n" + registry.CoreDocs(true)
@@ -97,16 +97,33 @@ func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs s
 		prompt += "\n" + extraToolDocs
 	}
 
-	// Inject connected servers
-	if len(servers) > 0 {
-		prompt += "\n\n[CONNECTED SERVERS]\n"
-		for _, srv := range servers {
-			prompt += "- " + srv.GetName() + "\n"
+	// Inject MCP tool summary — main thread sees what's available but can't call them directly
+	if registry != nil {
+		if summary := registry.MCPToolSummary(); summary != "" {
+			prompt += summary
+		}
+	}
+
+	// Inject active thread state so main always knows what's running
+	if len(activeThreads) > 0 {
+		prompt += "\n\n[ACTIVE THREADS]\n"
+		for _, t := range activeThreads {
+			age := time.Since(t.Started).Truncate(time.Second)
+			prompt += fmt.Sprintf("- %s (running %s, iter #%d, pace %s, model %s)\n  directive: %s\n  tools: %s\n",
+				t.ID, age, t.Iteration, t.Rate.String(), t.Model.String(), truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
 		}
 	}
 
 	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
 	return prompt
+}
+
+func truncateStr(s string, max int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > max {
+		return s[:max-1] + "…"
+	}
+	return s
 }
 
 type TokenUsage struct {
@@ -288,7 +305,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		apiKey:   apiKey,
 		provider: provider,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), nil, "", nil)},
+			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), nil, "", nil, nil)},
 		},
 		config:    config,
 		bus:       bus,
@@ -310,7 +327,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	t.registry = NewToolRegistry(apiKey)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", nil)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", nil, nil)}
 
 	// Embed tool descriptions in background (non-blocking)
 	go t.registry.EmbedAll(t.memory)
@@ -318,14 +335,18 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	// Main thread hooks
 	t.handleTools = mainToolHandler(t)
 	t.rebuildPrompt = func(toolDocs string) string {
-		return buildSystemPrompt(t.config.GetDirective(), t.registry, toolDocs, t.mcpServers)
+		var threads []ThreadInfo
+		if t.threads != nil {
+			threads = t.threads.List()
+		}
+		return buildSystemPrompt(t.config.GetDirective(), t.registry, toolDocs, t.mcpServers, threads)
 	}
 
 	// Connect MCP servers and register their tools
 	if len(config.MCPServers) > 0 {
 		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.memory)
 		// Rebuild prompt now that servers are connected
-		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", t.mcpServers)}
+		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", t.mcpServers, nil)}
 	}
 
 	// Computer use environment is injected externally via SetComputer()
@@ -346,7 +367,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		for _, call := range calls {
 			// Supervised mode gate — applies to all tools
 			if !waitForApproval(t, call) {
-				t.Inject(fmt.Sprintf("[tool:%s] Rejected by user", call.Name))
+				t.Inject(fmt.Sprintf("[rejected] %s was rejected by the user. Do NOT retry the same call. Ask the user what they want instead, or try a different approach.", call.Name))
 				continue
 			}
 			switch call.Name {
@@ -422,8 +443,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					t.config.SetDirective(d)
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry, "", t.mcpServers)}
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry, "", t.mcpServers, nil)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
+					if t.telemetry != nil {
+						t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
+					}
 				}
 			case "remember":
 				if text := call.Args["text"]; text != "" && t.memory != nil {
@@ -477,6 +501,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 									Syntax:      syntax,
 									Rules:       fmt.Sprintf("Provided by MCP server '%s'.", name),
 									Handler:     mcpProxyHandler(srv, tool.Name),
+									InputSchema: tool.InputSchema,
+									MCP:         true,
+									MCPServer:   name,
 								})
 							}
 							if t.memory != nil {
@@ -969,7 +996,7 @@ func (t *Thinker) allowedTools() map[string]bool {
 
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "", t.mcpServers)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "", t.mcpServers, nil)}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 

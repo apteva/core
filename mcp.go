@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,12 +54,13 @@ type mcpCallResult struct {
 
 // MCPServerConfig is stored in config.json
 type MCPServerConfig struct {
-	Name      string            `json:"name"`
-	Command   string            `json:"command,omitempty"`   // stdio transport
-	Args      []string          `json:"args,omitempty"`      // stdio transport
-	Env       map[string]string `json:"env,omitempty"`       // stdio transport
-	Transport string            `json:"transport,omitempty"` // "stdio" (default) or "http"
-	URL       string            `json:"url,omitempty"`       // http transport
+	Name       string            `json:"name"`
+	Command    string            `json:"command,omitempty"`    // stdio transport
+	Args       []string          `json:"args,omitempty"`       // stdio transport
+	Env        map[string]string `json:"env,omitempty"`        // stdio transport
+	Transport  string            `json:"transport,omitempty"`  // "stdio" (default) or "http"
+	URL        string            `json:"url,omitempty"`        // http transport
+	MainAccess bool              `json:"main_access,omitempty"` // if true, tools are callable by main thread (not just sub-threads)
 }
 
 // MCPConn is the interface for any MCP server connection (stdio or HTTP)
@@ -221,8 +223,17 @@ func (s *MCPServer) ListTools() ([]mcpToolDef, error) {
 // CallTool invokes a tool on the MCP server
 func (s *MCPServer) CallTool(name string, args map[string]string) (string, error) {
 	// Convert string args to any for JSON
+	// Parse string values that look like JSON arrays/objects/numbers/booleans
+	// so they're sent as proper JSON types to the MCP server
 	arguments := make(map[string]any)
 	for k, v := range args {
+		if len(v) > 0 && (v[0] == '[' || v[0] == '{') {
+			var parsed any
+			if json.Unmarshal([]byte(v), &parsed) == nil {
+				arguments[k] = parsed
+				continue
+			}
+		}
 		arguments[k] = v
 	}
 
@@ -271,7 +282,12 @@ func mcpProxyHandler(server MCPConn, toolName string) func(args map[string]strin
 func buildMCPSyntax(name string, schema map[string]any) string {
 	var parts []string
 	if props, ok := schema["properties"].(map[string]any); ok {
+		keys := make([]string, 0, len(props))
 		for k := range props {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
 			parts = append(parts, fmt.Sprintf(`%s="..."`, k))
 		}
 	}
@@ -317,6 +333,9 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, me
 				Syntax:      syntax,
 				Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
 				Handler:     mcpProxyHandler(srv, tool.Name),
+				InputSchema: tool.InputSchema,
+				MCP:         !cfg.MainAccess,
+				MCPServer:   cfg.Name,
 			})
 		}
 

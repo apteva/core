@@ -314,7 +314,13 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 				var raw map[string]any
 				if err := json.Unmarshal([]byte(currentTool.json.String()), &raw); err == nil {
 					for k, v := range raw {
-						args[k] = fmt.Sprintf("%v", v)
+						switch v.(type) {
+						case string:
+							args[k] = v.(string)
+						default:
+							b, _ := json.Marshal(v)
+							args[k] = string(b)
+						}
 					}
 				}
 				toolCalls = append(toolCalls, NativeToolCall{

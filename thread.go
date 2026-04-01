@@ -212,7 +212,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			}
 			// Supervised mode gate — applies to all tools
 			if !waitForApproval(t, call) {
-				t.Inject(fmt.Sprintf("[tool:%s] Rejected by user", call.Name))
+				t.Inject(fmt.Sprintf("[rejected] %s was rejected by the user. Do NOT retry the same call. Ask the user what they want instead, or try a different approach.", call.Name))
 				continue
 			}
 			switch call.Name {
