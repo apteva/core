@@ -3,11 +3,19 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	aptcomputer "github.com/apteva/computer"
 	"github.com/joho/godotenv"
 )
+
+func joinOrNone(s []string) string {
+	if len(s) == 0 {
+		return "none"
+	}
+	return strings.Join(s, ",")
+}
 
 // Version is set at build time via -ldflags.
 var Version = "dev"
@@ -132,6 +140,18 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Computer: %s (%dx%d)\n", cfg.Computer.Type, d.Width, d.Height)
 		}
 	}
+
+	// Startup summary
+	var mcpNames []string
+	for _, m := range cfg.MCPServers {
+		mcpNames = append(mcpNames, m.Name)
+	}
+	var threadNames []string
+	for _, t := range cfg.GetThreads() {
+		threadNames = append(threadNames, t.ID)
+	}
+	logMsg("BOOT", fmt.Sprintf("provider=%s mode=%s mcp=[%s] threads=[%s] directive=%d chars",
+		provider.Name(), cfg.GetMode(), joinOrNone(mcpNames), joinOrNone(threadNames), len(cfg.GetDirective())))
 
 	go thinker.Run()
 

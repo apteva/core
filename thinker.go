@@ -43,7 +43,7 @@ func (t *Thinker) modelID() string {
 }
 
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
-const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine (Apteva Core). You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
+const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
 
 THINKING — every thought must contain meaningful text:
 - Always explain what you observe, what you're doing, and why — even briefly.
@@ -535,6 +535,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						if srv.GetName() == name {
 							srv.Close()
 							t.mcpServers = append(t.mcpServers[:i], t.mcpServers[i+1:]...)
+							t.registry.RemoveByMCPServer(name)
 							t.Inject(fmt.Sprintf("[disconnect] disconnected from %s", name))
 							t.config.RemoveMCPServer(name)
 							found = true

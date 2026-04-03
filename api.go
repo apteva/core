@@ -30,6 +30,7 @@ func startAPI(thinker *Thinker, addr string) error {
 }
 
 func (a *APIServer) health(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "GET /health")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -57,7 +58,23 @@ func (a *APIServer) findPendingApproval() *ToolCallData {
 	return nil
 }
 
+// findPendingThinker returns the thinker (main or child) that has a pending tool call.
+func (a *APIServer) findPendingThinker() *Thinker {
+	a.thinker.pendingMu.Lock()
+	if a.thinker.pendingTool != nil {
+		a.thinker.pendingMu.Unlock()
+		return a.thinker
+	}
+	a.thinker.pendingMu.Unlock()
+
+	if a.thinker.threads != nil {
+		return a.thinker.threads.FindPendingThinker()
+	}
+	return nil
+}
+
 func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "GET /status")
 	elapsed := time.Since(a.startTime)
 	pending := a.findPendingApproval()
 
@@ -85,6 +102,7 @@ type threadJSON struct {
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "GET /threads")
 	// Always include main
 	out := []threadJSON{{
 		ID:        "main",
@@ -110,6 +128,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "GET /events (SSE connect)")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -143,6 +162,7 @@ func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) pause(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "POST /pause")
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -158,6 +178,7 @@ func (a *APIServer) pause(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "POST /event")
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -213,6 +234,7 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", fmt.Sprintf("%s /config", r.Method))
 	switch r.Method {
 	case http.MethodGet:
 		// Build live provider info
@@ -239,20 +261,31 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				computerInfo["type"] = a.thinker.config.Computer.Type
 			}
 		}
+		// Build live MCP server info
+		var mcpInfo []map[string]any
+		for _, srv := range a.thinker.mcpServers {
+			mcpInfo = append(mcpInfo, map[string]any{
+				"name":      srv.GetName(),
+				"connected": true,
+			})
+		}
+
 		writeJSON(w, map[string]any{
 			"directive":    a.thinker.config.GetDirective(),
 			"mode":         a.thinker.config.GetMode(),
 			"auto_approve": a.thinker.config.AutoApprove,
 			"provider":     providerInfo,
 			"computer":     computerInfo,
+			"mcp_servers":  mcpInfo,
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive   string           `json:"directive,omitempty"`
-			Mode        RunMode          `json:"mode,omitempty"`
-			AutoApprove []string         `json:"auto_approve,omitempty"`
-			Provider    *ProviderConfig  `json:"provider,omitempty"`
-			Computer    *ComputerConfig  `json:"computer,omitempty"`
+			Directive   string            `json:"directive,omitempty"`
+			Mode        RunMode           `json:"mode,omitempty"`
+			AutoApprove []string          `json:"auto_approve,omitempty"`
+			Provider    *ProviderConfig   `json:"provider,omitempty"`
+			Computer    *ComputerConfig   `json:"computer,omitempty"`
+			MCPServers  []MCPServerConfig `json:"mcp_servers,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -334,6 +367,9 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				a.thinker.config.Save()
 			}
 		}
+		if body.MCPServers != nil {
+			a.reconcileMCP(body.MCPServers)
+		}
 		writeJSON(w, map[string]string{"status": "updated"})
 	default:
 		http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
@@ -341,6 +377,7 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) approve(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "POST /approve")
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -353,15 +390,16 @@ func (a *APIServer) approve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check there's actually a pending tool (main or any child thread)
-	if a.findPendingApproval() == nil {
+	// Find the thinker (main or child) that actually has the pending tool
+	target := a.findPendingThinker()
+	if target == nil {
 		http.Error(w, "no pending approval", http.StatusConflict)
 		return
 	}
 
-	// Non-blocking send
+	// Non-blocking send to the correct thinker's approval channel
 	select {
-	case a.thinker.approvalCh <- body.Approved:
+	case target.approvalCh <- body.Approved:
 	default:
 	}
 
@@ -370,6 +408,90 @@ func (a *APIServer) approve(w http.ResponseWriter, r *http.Request) {
 		action = "approved"
 	}
 	writeJSON(w, map[string]string{"status": action})
+}
+
+// reconcileMCP diffs the desired MCP server list against the live state,
+// connecting new servers and disconnecting removed ones.
+func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
+	logMsg("API", fmt.Sprintf("reconcileMCP: %d desired servers", len(desired)))
+	t := a.thinker
+
+	// Index desired by name
+	want := make(map[string]MCPServerConfig, len(desired))
+	for _, cfg := range desired {
+		want[cfg.Name] = cfg
+	}
+
+	// Disconnect servers not in the desired list
+	var kept []MCPConn
+	for _, srv := range t.mcpServers {
+		if _, ok := want[srv.GetName()]; ok {
+			kept = append(kept, srv)
+		} else {
+			srv.Close()
+			t.config.RemoveMCPServer(srv.GetName())
+			t.registry.RemoveByMCPServer(srv.GetName())
+			if t.telemetry != nil {
+				t.telemetry.Emit("mcp.disconnected", "api", map[string]string{"name": srv.GetName()})
+			}
+		}
+	}
+	t.mcpServers = kept
+
+	// Index live by name
+	live := make(map[string]bool, len(kept))
+	for _, srv := range kept {
+		live[srv.GetName()] = true
+	}
+
+	// Connect new servers
+	for _, cfg := range desired {
+		if live[cfg.Name] {
+			continue
+		}
+		srv, err := connectAnyMCP(cfg)
+		if err != nil {
+			continue
+		}
+		tools, err := srv.ListTools()
+		if err != nil {
+			srv.Close()
+			continue
+		}
+		t.mcpServers = append(t.mcpServers, srv)
+		for _, tool := range tools {
+			fullName := cfg.Name + "_" + tool.Name
+			syntax := buildMCPSyntax(fullName, tool.InputSchema)
+			t.registry.Register(&ToolDef{
+				Name:        fullName,
+				Description: fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
+				Syntax:      syntax,
+				Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
+				Handler:     mcpProxyHandler(srv, tool.Name),
+				InputSchema: tool.InputSchema,
+				MCP:         !cfg.MainAccess,
+				MCPServer:   cfg.Name,
+			})
+		}
+		if t.memory != nil {
+			go func(srvName string, srvTools []mcpToolDef) {
+				for _, tl := range srvTools {
+					fullName := srvName + "_" + tl.Name
+					emb, err := t.memory.embed(fullName + ": " + tl.Description)
+					if err == nil {
+						td := t.registry.Get(fullName)
+						if td != nil {
+							td.Embedding = emb
+						}
+					}
+				}
+			}(cfg.Name, tools)
+		}
+		t.config.SaveMCPServer(cfg)
+		if t.telemetry != nil {
+			t.telemetry.Emit("mcp.connected", "api", map[string]string{"name": cfg.Name, "tools": fmt.Sprintf("%d", len(tools))})
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

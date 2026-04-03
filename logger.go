@@ -31,12 +31,21 @@ func initLogger() {
 	}
 }
 
+// Categories shown on stderr. Everything else is file-only.
+var logStderrCategories = map[string]bool{
+	"BOOT": true,
+	"API":  true,
+}
+
 func logMsg(category, msg string) {
-	if !logReady {
-		return
-	}
 	logMu.Lock()
 	defer logMu.Unlock()
 	ts := time.Now().Format("15:04:05.000")
-	fmt.Fprintf(logFile, "%s [%s] %s\n", ts, category, msg)
+	line := fmt.Sprintf("%s [%s] %s\n", ts, category, msg)
+	if logReady {
+		fmt.Fprint(logFile, line)
+	}
+	if logStderrCategories[category] {
+		fmt.Fprint(os.Stderr, line)
+	}
 }

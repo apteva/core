@@ -160,6 +160,17 @@ func (tr *ToolRegistry) Get(name string) *ToolDef {
 	return tr.tools[name]
 }
 
+// RemoveByMCPServer removes all tools provided by the named MCP server.
+func (tr *ToolRegistry) RemoveByMCPServer(serverName string) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	for name, tool := range tr.tools {
+		if tool.MCPServer == serverName {
+			delete(tr.tools, name)
+		}
+	}
+}
+
 // EmbedAll computes embeddings for all non-core tools. Call once on startup.
 func (tr *ToolRegistry) EmbedAll(ms *MemoryStore) {
 	tr.mu.Lock()

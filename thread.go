@@ -9,7 +9,7 @@ import (
 )
 
 // baseThreadPrompt is a template — %s is replaced with the thread ID at spawn time.
-const baseThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous thinking engine (Apteva Core). You were spawned by the main coordinator thread.
+const baseThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous thinking engine. You were spawned by the main coordinator thread.
 
 IDENTITY:
 - Your ID is "%s". You are NOT the main thread — you are a worker thread with a specific task.
@@ -421,6 +421,21 @@ func (tm *ThreadManager) FindPendingApproval() *toolCall {
 			tc := thread.Thinker.pendingTool
 			thread.Thinker.pendingMu.Unlock()
 			return tc
+		}
+		thread.Thinker.pendingMu.Unlock()
+	}
+	return nil
+}
+
+// FindPendingThinker returns the child thinker that has a pending tool call, or nil.
+func (tm *ThreadManager) FindPendingThinker() *Thinker {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	for _, thread := range tm.threads {
+		thread.Thinker.pendingMu.Lock()
+		if thread.Thinker.pendingTool != nil {
+			thread.Thinker.pendingMu.Unlock()
+			return thread.Thinker
 		}
 		thread.Thinker.pendingMu.Unlock()
 	}
