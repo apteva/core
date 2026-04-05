@@ -21,7 +21,7 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	tr.Register(&ToolDef{
 		Name: "socialcast_create_post", Description: "Create a post",
 		MCP: true, MCPServer: "socialcast",
-		Handler: func(args map[string]string) string { return "ok" },
+		Handler: func(args map[string]string) ToolResponse { return ToolResponse{Text: "ok"} },
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
 			"text": map[string]any{"type": "string"},
 		}},
@@ -29,17 +29,17 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	tr.Register(&ToolDef{
 		Name: "socialcast_list_accounts", Description: "List accounts",
 		MCP: true, MCPServer: "socialcast",
-		Handler: func(args map[string]string) string { return "ok" },
+		Handler: func(args map[string]string) ToolResponse { return ToolResponse{Text: "ok"} },
 	})
 	tr.Register(&ToolDef{
 		Name: "github_list_repos", Description: "List repos",
 		MCP: true, MCPServer: "github",
-		Handler: func(args map[string]string) string { return "ok" },
+		Handler: func(args map[string]string) ToolResponse { return ToolResponse{Text: "ok"} },
 	})
 
 	// Register a non-MCP discoverable tool
 	tr.Register(&ToolDef{Name: "web", Description: "Fetch URL", Syntax: `[[web url="..."]]`,
-		Handler: func(args map[string]string) string { return "ok" },
+		Handler: func(args map[string]string) ToolResponse { return ToolResponse{Text: "ok"} },
 	})
 
 	// Main thread (nil allowlist) — should NOT include MCP tools
@@ -185,7 +185,7 @@ func TestActiveThreadsInjectedInSystemPrompt(t *testing.T) {
 		},
 	}
 
-	prompt := buildSystemPrompt("Test directive", reg, "", nil, threads)
+	prompt := buildSystemPrompt("Test directive", ModeAutonomous, reg, "", nil, threads)
 
 	// Should contain ACTIVE THREADS section
 	if !strings.Contains(prompt, "[ACTIVE THREADS]") {
@@ -222,12 +222,12 @@ func TestActiveThreadsInjectedInSystemPrompt(t *testing.T) {
 // TestNoActiveThreadsNoSection verifies no ACTIVE THREADS section when empty.
 func TestNoActiveThreadsNoSection(t *testing.T) {
 	reg := &ToolRegistry{tools: make(map[string]*ToolDef)}
-	prompt := buildSystemPrompt("Test", reg, "", nil, nil)
+	prompt := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, nil)
 	if strings.Contains(prompt, "[ACTIVE THREADS]") {
 		t.Error("prompt should NOT contain [ACTIVE THREADS] when no threads")
 	}
 
-	prompt2 := buildSystemPrompt("Test", reg, "", nil, []ThreadInfo{})
+	prompt2 := buildSystemPrompt("Test", ModeAutonomous, reg, "", nil, []ThreadInfo{})
 	if strings.Contains(prompt2, "[ACTIVE THREADS]") {
 		t.Error("prompt should NOT contain [ACTIVE THREADS] when empty slice")
 	}

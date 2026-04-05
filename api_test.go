@@ -27,7 +27,6 @@ func newTestAPI() (*APIServer, *Thinker) {
 		apiMu:      &sync.RWMutex{},
 		apiNotify:  make(chan struct{}, 1),
 		threadID:   "main",
-		approvalCh: make(chan bool, 1),
 		telemetry:  NewTelemetry(),
 	}
 	t.threads = NewThreadManager(t)
@@ -388,16 +387,13 @@ func TestAPI_Status_IncludesMode(t *testing.T) {
 	if body["mode"] != "autonomous" {
 		t.Errorf("expected default mode 'autonomous', got %v", body["mode"])
 	}
-	if body["pending_approval"] != nil {
-		t.Errorf("expected no pending approval, got %v", body["pending_approval"])
-	}
 }
 
 func TestAPI_Config_SetMode(t *testing.T) {
 	api, thinker := newTestAPI()
 
-	// Set to supervised
-	payload, _ := json.Marshal(map[string]string{"mode": "supervised"})
+	// Set to cautious
+	payload, _ := json.Marshal(map[string]string{"mode": "cautious"})
 	req := httptest.NewRequest("PUT", "/config", bytes.NewReader(payload))
 	w := httptest.NewRecorder()
 	api.config(w, req)
@@ -405,8 +401,8 @@ func TestAPI_Config_SetMode(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if thinker.config.GetMode() != ModeSupervised {
-		t.Errorf("expected supervised, got %s", thinker.config.GetMode())
+	if thinker.config.GetMode() != ModeCautious {
+		t.Errorf("expected cautious, got %s", thinker.config.GetMode())
 	}
 
 	// Verify via GET
@@ -416,117 +412,8 @@ func TestAPI_Config_SetMode(t *testing.T) {
 
 	var body map[string]any
 	json.Unmarshal(w.Body.Bytes(), &body)
-	if body["mode"] != "supervised" {
-		t.Errorf("expected supervised, got %v", body["mode"])
-	}
-}
-
-func TestAPI_Config_SetAutoApprove(t *testing.T) {
-	api, thinker := newTestAPI()
-
-	payload, _ := json.Marshal(map[string]any{"auto_approve": []string{"think", "done", "web"}})
-	req := httptest.NewRequest("PUT", "/config", bytes.NewReader(payload))
-	w := httptest.NewRecorder()
-	api.config(w, req)
-
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-	if !thinker.config.IsAutoApproved("web") {
-		t.Error("expected 'web' to be auto-approved")
-	}
-	if thinker.config.IsAutoApproved("spawn") {
-		t.Error("expected 'spawn' to NOT be auto-approved")
-	}
-}
-
-func TestAPI_Approve_NoPending(t *testing.T) {
-	api, _ := newTestAPI()
-
-	payload, _ := json.Marshal(map[string]bool{"approved": true})
-	req := httptest.NewRequest("POST", "/approve", bytes.NewReader(payload))
-	w := httptest.NewRecorder()
-	api.approve(w, req)
-
-	if w.Code != 409 {
-		t.Errorf("expected 409 (no pending), got %d", w.Code)
-	}
-}
-
-func TestAPI_Approve_WithPending(t *testing.T) {
-	api, thinker := newTestAPI()
-
-	// Simulate a pending tool
-	thinker.pendingMu.Lock()
-	thinker.pendingTool = &toolCall{Name: "web", Args: map[string]string{"url": "https://example.com"}}
-	thinker.pendingMu.Unlock()
-
-	payload, _ := json.Marshal(map[string]bool{"approved": true})
-	req := httptest.NewRequest("POST", "/approve", bytes.NewReader(payload))
-	w := httptest.NewRecorder()
-	api.approve(w, req)
-
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-
-	var resp map[string]string
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["status"] != "approved" {
-		t.Errorf("expected 'approved', got %q", resp["status"])
-	}
-
-	// Check channel received approval
-	select {
-	case approved := <-thinker.approvalCh:
-		if !approved {
-			t.Error("expected true approval")
-		}
-	default:
-		t.Error("expected approval on channel")
-	}
-}
-
-func TestAPI_Approve_Reject(t *testing.T) {
-	api, thinker := newTestAPI()
-
-	thinker.pendingMu.Lock()
-	thinker.pendingTool = &toolCall{Name: "send_email", Args: map[string]string{}}
-	thinker.pendingMu.Unlock()
-
-	payload, _ := json.Marshal(map[string]bool{"approved": false})
-	req := httptest.NewRequest("POST", "/approve", bytes.NewReader(payload))
-	w := httptest.NewRecorder()
-	api.approve(w, req)
-
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-
-	var resp map[string]string
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["status"] != "rejected" {
-		t.Errorf("expected 'rejected', got %q", resp["status"])
-	}
-
-	select {
-	case approved := <-thinker.approvalCh:
-		if approved {
-			t.Error("expected false (rejection)")
-		}
-	default:
-		t.Error("expected rejection on channel")
-	}
-}
-
-func TestAPI_Approve_WrongMethod(t *testing.T) {
-	api, _ := newTestAPI()
-	req := httptest.NewRequest("GET", "/approve", nil)
-	w := httptest.NewRecorder()
-	api.approve(w, req)
-
-	if w.Code != 405 {
-		t.Errorf("expected 405, got %d", w.Code)
+	if body["mode"] != "cautious" {
+		t.Errorf("expected cautious, got %v", body["mode"])
 	}
 }
 
@@ -591,24 +478,3 @@ func TestAPI_PostEvent_InvalidMessage(t *testing.T) {
 	}
 }
 
-func TestAPI_Status_ShowsPendingApproval(t *testing.T) {
-	api, thinker := newTestAPI()
-
-	thinker.pendingMu.Lock()
-	thinker.pendingTool = &toolCall{Name: "pushover_send", Args: map[string]string{"message": "hello"}}
-	thinker.pendingMu.Unlock()
-
-	req := httptest.NewRequest("GET", "/status", nil)
-	w := httptest.NewRecorder()
-	api.status(w, req)
-
-	var body map[string]any
-	json.Unmarshal(w.Body.Bytes(), &body)
-	pending, ok := body["pending_approval"].(map[string]any)
-	if !ok || pending == nil {
-		t.Fatal("expected pending_approval in status")
-	}
-	if pending["name"] != "pushover_send" {
-		t.Errorf("expected name 'pushover_send', got %v", pending["name"])
-	}
-}

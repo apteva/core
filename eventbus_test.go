@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -150,7 +151,7 @@ func TestThreadDone_MainReceivesEvent(t *testing.T) {
 
 	foundStarted := false
 	for _, ev := range startEvents {
-		if ev == "[thread:worker] started" {
+		if strings.HasPrefix(ev, "[thread:worker] started") {
 			foundStarted = true
 		}
 	}

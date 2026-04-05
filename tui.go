@@ -567,7 +567,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				case pickerMode_:
-					modes := []RunMode{ModeAutonomous, ModeSupervised}
+					modes := []RunMode{ModeAutonomous, ModeCautious, ModeLearn}
 					if m.pickerCursor < len(modes) {
 						m.thinker.config.SetMode(modes[m.pickerCursor])
 						if m.thinker.telemetry != nil {
@@ -652,25 +652,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// ── Supervised mode: handle approval keys ──
-		if m.pendingApproval != nil {
-			switch msg.String() {
-			case "y":
-				select {
-				case m.thinker.approvalCh <- true:
-				default:
-				}
-				m.pendingApproval = nil
-				return m, nil
-			case "n":
-				select {
-				case m.thinker.approvalCh <- false:
-				default:
-				}
-				m.pendingApproval = nil
-				return m, nil
-			}
-		}
 
 		// ── Normal mode: sidebar + global keys ──
 		switch msg.String() {

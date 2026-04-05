@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/apteva/core/pkg/computer"
 )
 
 type AnthropicProvider struct {
@@ -196,22 +198,23 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 	// Convert tools — separate computer_use (builtin) from regular tools
 	var anthropicTools []any
 	hasComputerUse := false
+	computerBeta := ""
 	for _, t := range tools {
 		if t.Name == "computer_use" {
-			// Parse display dimensions from description or parameters
+			// Use the native Anthropic computer use format
+			// Parse display dimensions from parameters or defaults
 			width, height := 1280, 800
-			if params, ok := t.Parameters["_display_width"].(int); ok {
-				width = params
+			if w, ok := t.Parameters["_display_width"].(int); ok {
+				width = w
 			}
-			if params, ok := t.Parameters["_display_height"].(int); ok {
-				height = params
+			if h, ok := t.Parameters["_display_height"].(int); ok {
+				height = h
 			}
-			anthropicTools = append(anthropicTools, anthropicBuiltinTool{
-				Type:            "computer_20250124",
-				Name:            "computer",
-				DisplayWidthPx:  width,
-				DisplayHeightPx: height,
-			})
+			display := computer.DisplaySize{Width: width, Height: height}
+			toolVersion := "20251124" // default to latest
+			spec := computer.GetAnthropicToolSpec(display, toolVersion)
+			anthropicTools = append(anthropicTools, spec)
+			computerBeta = computer.AnthropicBetaHeader(toolVersion)
 			hasComputerUse = true
 		} else {
 			anthropicTools = append(anthropicTools, anthropicTool{
@@ -244,7 +247,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 	req.Header.Set("x-api-key", p.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	if hasComputerUse {
-		req.Header.Set("anthropic-beta", "computer-use-2025-01-24")
+		req.Header.Set("anthropic-beta", computerBeta)
 	}
 
 	resp, err := llmHTTPClient.Do(req)

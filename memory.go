@@ -71,8 +71,16 @@ func (ms *MemoryStore) save(entry MemoryEntry) error {
 }
 
 func (ms *MemoryStore) Store(text string) error {
+	logMsg("MEMORY", fmt.Sprintf("storing: %s", truncateForLog(text, 100)))
+
+	if ms.apiKey == "" {
+		logMsg("MEMORY", "ERROR: no API key set for embeddings")
+		return fmt.Errorf("no API key for embeddings")
+	}
+
 	embedding, err := ms.embed(text)
 	if err != nil {
+		logMsg("MEMORY", fmt.Sprintf("ERROR embedding: %v", err))
 		return fmt.Errorf("embedding failed: %w", err)
 	}
 
@@ -91,7 +99,21 @@ func (ms *MemoryStore) Store(text string) error {
 	}
 	ms.mu.Unlock()
 
-	return ms.save(entry)
+	if err := ms.save(entry); err != nil {
+		logMsg("MEMORY", fmt.Sprintf("ERROR saving: %v", err))
+		return err
+	}
+
+	logMsg("MEMORY", fmt.Sprintf("stored OK (total=%d)", ms.Count()))
+	return nil
+}
+
+func truncateForLog(s string, max int) string {
+	s = fmt.Sprintf("%s", s)
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
 }
 
 func (ms *MemoryStore) Retrieve(query string, n int) []MemoryEntry {
@@ -208,6 +230,7 @@ type embeddingResponse struct {
 }
 
 func (ms *MemoryStore) embed(text string) ([]float64, error) {
+	logMsg("MEMORY", fmt.Sprintf("embed request: model=%s len=%d", embeddingModel, len(text)))
 	reqBody, _ := json.Marshal(embeddingRequest{
 		Model: embeddingModel,
 		Input: text,

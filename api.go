@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	aptcomputer "github.com/apteva/computer"
@@ -20,11 +21,11 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/health", api.health)
 	mux.HandleFunc("/status", api.status)
 	mux.HandleFunc("/threads", api.threads)
+	mux.HandleFunc("/threads/", api.threadAction)
 	mux.HandleFunc("/events", api.events)
 	mux.HandleFunc("/pause", api.pause)
 	mux.HandleFunc("/event", api.postEvent)
 	mux.HandleFunc("/config", api.config)
-	mux.HandleFunc("/approve", api.approve)
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 	return http.ListenAndServe(addr, mux)
 }
@@ -34,60 +35,19 @@ func (a *APIServer) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-// findPendingApproval checks main and all child threads for a pending tool.
-func (a *APIServer) findPendingApproval() *ToolCallData {
-	// Check main
-	a.thinker.pendingMu.Lock()
-	if a.thinker.pendingTool != nil {
-		tc := &ToolCallData{
-			ID:   a.thinker.pendingTool.NativeID,
-			Name: a.thinker.pendingTool.Name,
-			Args: a.thinker.pendingTool.Args,
-		}
-		a.thinker.pendingMu.Unlock()
-		return tc
-	}
-	a.thinker.pendingMu.Unlock()
-
-	// Check child threads
-	if a.thinker.threads != nil {
-		if tc := a.thinker.threads.FindPendingApproval(); tc != nil {
-			return &ToolCallData{ID: tc.NativeID, Name: tc.Name, Args: tc.Args}
-		}
-	}
-	return nil
-}
-
-// findPendingThinker returns the thinker (main or child) that has a pending tool call.
-func (a *APIServer) findPendingThinker() *Thinker {
-	a.thinker.pendingMu.Lock()
-	if a.thinker.pendingTool != nil {
-		a.thinker.pendingMu.Unlock()
-		return a.thinker
-	}
-	a.thinker.pendingMu.Unlock()
-
-	if a.thinker.threads != nil {
-		return a.thinker.threads.FindPendingThinker()
-	}
-	return nil
-}
-
 func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	logMsg("API", "GET /status")
 	elapsed := time.Since(a.startTime)
-	pending := a.findPendingApproval()
 
 	writeJSON(w, map[string]any{
-		"uptime_seconds":   int(elapsed.Seconds()),
-		"iteration":        a.thinker.iteration,
-		"rate":             formatSleep(a.thinker.agentSleep),
-		"model":            a.thinker.model.String(),
-		"threads":          a.thinker.threads.Count() + 1, // +1 for main
-		"memories":         a.thinker.memory.Count(),
-		"paused":           a.thinker.paused,
-		"mode":             a.thinker.config.GetMode(),
-		"pending_approval": pending,
+		"uptime_seconds": int(elapsed.Seconds()),
+		"iteration":      a.thinker.iteration,
+		"rate":           formatSleep(a.thinker.agentSleep),
+		"model":          a.thinker.model.String(),
+		"threads":        a.thinker.threads.Count() + 1, // +1 for main
+		"memories":       a.thinker.memory.Count(),
+		"paused":         a.thinker.paused,
+		"mode":           a.thinker.config.GetMode(),
 	})
 }
 
@@ -125,6 +85,29 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, out)
+}
+
+func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
+	// Extract thread ID from path: /threads/{id}
+	id := strings.TrimPrefix(r.URL.Path, "/threads/")
+	if id == "" {
+		http.Error(w, "thread ID required", http.StatusBadRequest)
+		return
+	}
+	logMsg("API", fmt.Sprintf("%s /threads/%s", r.Method, id))
+
+	switch r.Method {
+	case http.MethodDelete:
+		if id == "main" {
+			http.Error(w, "cannot kill main thread", http.StatusBadRequest)
+			return
+		}
+		a.thinker.threads.Kill(id)
+		a.thinker.config.RemoveThread(id)
+		writeJSON(w, map[string]string{"status": "killed", "id": id})
+	default:
+		http.Error(w, "DELETE only", http.StatusMethodNotAllowed)
+	}
 }
 
 func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
@@ -271,19 +254,17 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSON(w, map[string]any{
-			"directive":    a.thinker.config.GetDirective(),
-			"mode":         a.thinker.config.GetMode(),
-			"auto_approve": a.thinker.config.AutoApprove,
-			"provider":     providerInfo,
-			"computer":     computerInfo,
-			"mcp_servers":  mcpInfo,
+			"directive":   a.thinker.config.GetDirective(),
+			"mode":        a.thinker.config.GetMode(),
+			"provider":    providerInfo,
+			"computer":    computerInfo,
+			"mcp_servers": mcpInfo,
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive   string            `json:"directive,omitempty"`
-			Mode        RunMode           `json:"mode,omitempty"`
-			AutoApprove []string          `json:"auto_approve,omitempty"`
-			Provider    *ProviderConfig   `json:"provider,omitempty"`
+			Directive  string            `json:"directive,omitempty"`
+			Mode       RunMode           `json:"mode,omitempty"`
+			Provider   *ProviderConfig   `json:"provider,omitempty"`
 			Computer    *ComputerConfig   `json:"computer,omitempty"`
 			MCPServers  []MCPServerConfig `json:"mcp_servers,omitempty"`
 		}
@@ -295,17 +276,11 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			a.thinker.config.SetDirective(body.Directive)
 			a.thinker.ReloadDirective()
 		}
-		if body.Mode == ModeAutonomous || body.Mode == ModeSupervised {
+		if body.Mode == ModeAutonomous || body.Mode == ModeCautious || body.Mode == ModeLearn {
 			a.thinker.config.SetMode(body.Mode)
 			if a.thinker.telemetry != nil {
 				a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
 			}
-		}
-		if body.AutoApprove != nil {
-			a.thinker.config.mu.Lock()
-			a.thinker.config.AutoApprove = body.AutoApprove
-			a.thinker.config.mu.Unlock()
-			a.thinker.config.Save()
 		}
 		if body.Provider != nil {
 			// Hot-swap provider if name changed
@@ -374,40 +349,6 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 	}
-}
-
-func (a *APIServer) approve(w http.ResponseWriter, r *http.Request) {
-	logMsg("API", "POST /approve")
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-	var body struct {
-		Approved bool `json:"approved"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Find the thinker (main or child) that actually has the pending tool
-	target := a.findPendingThinker()
-	if target == nil {
-		http.Error(w, "no pending approval", http.StatusConflict)
-		return
-	}
-
-	// Non-blocking send to the correct thinker's approval channel
-	select {
-	case target.approvalCh <- body.Approved:
-	default:
-	}
-
-	action := "rejected"
-	if body.Approved {
-		action = "approved"
-	}
-	writeJSON(w, map[string]string{"status": action})
 }
 
 // reconcileMCP diffs the desired MCP server list against the live state,

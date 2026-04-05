@@ -122,25 +122,6 @@ func main() {
 
 	thinker := NewThinker(apiKey, provider, cfg)
 
-	// Initialize computer use environment if configured
-	if cfg.Computer != nil && cfg.Computer.Type != "" {
-		comp, err := aptcomputer.New(aptcomputer.Config{
-			Type:      cfg.Computer.Type,
-			URL:       cfg.Computer.URL,
-			APIKey:    cfg.Computer.APIKey,
-			ProjectID: cfg.Computer.ProjectID,
-			Width:     cfg.Computer.Width,
-			Height:    cfg.Computer.Height,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "computer: %v\n", err)
-		} else if comp != nil {
-			thinker.SetComputer(comp)
-			d := comp.DisplaySize()
-			fmt.Fprintf(os.Stderr, "Computer: %s (%dx%d)\n", cfg.Computer.Type, d.Width, d.Height)
-		}
-	}
-
 	// Startup summary
 	var mcpNames []string
 	for _, m := range cfg.MCPServers {
@@ -160,6 +141,27 @@ func main() {
 		apiPort = "3210"
 	}
 	go startAPI(thinker, ":"+apiPort)
+
+	// Initialize computer use environment in background
+	if cfg.Computer != nil && cfg.Computer.Type != "" {
+		go func() {
+			comp, err := aptcomputer.New(aptcomputer.Config{
+				Type:      cfg.Computer.Type,
+				URL:       cfg.Computer.URL,
+				APIKey:    cfg.Computer.APIKey,
+				ProjectID: cfg.Computer.ProjectID,
+				Width:     cfg.Computer.Width,
+				Height:    cfg.Computer.Height,
+			})
+			if err != nil {
+				logMsg("BOOT", fmt.Sprintf("computer error: %v", err))
+			} else if comp != nil {
+				thinker.SetComputer(comp)
+				d := comp.DisplaySize()
+				logMsg("BOOT", fmt.Sprintf("computer ready: %s (%dx%d)", cfg.Computer.Type, d.Width, d.Height))
+			}
+		}()
+	}
 
 	// Check for --headless flag or NO_TUI env var
 	headless := os.Getenv("NO_TUI") != ""

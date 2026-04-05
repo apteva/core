@@ -135,6 +135,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, med
 		agentRate:  RateNormal,
 		agentSleep: 10 * time.Second,
 		memory:    tm.parent.memory,
+		session:   NewSession(".", id),
 		onStop:    func() { tm.cleanupThread(id) },
 		handleTools: threadToolHandler(thread, tm),
 		threadID:  id,
@@ -143,7 +144,6 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, med
 		apiNotify:     tm.parent.apiNotify,
 		registry:      tm.parent.registry,
 		toolAllowlist: toolSet,
-		approvalCh:    tm.parent.approvalCh,
 		config:        tm.parent.config,
 		rebuildPrompt: func(toolDocs string) string {
 			cd := ""
@@ -212,11 +212,6 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			if !thread.Tools[call.Name] {
 				continue
 			}
-			// Supervised mode gate — applies to all tools
-			if !waitForApproval(t, call) {
-				t.Inject(fmt.Sprintf("[rejected] %s was rejected by the user. Do NOT retry the same call. Ask the user what they want instead, or try a different approach.", call.Name))
-				continue
-			}
 			switch call.Name {
 			case "send":
 				id := call.Args["id"]
@@ -270,7 +265,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				}
 			case "remember":
 				if text := call.Args["text"]; text != "" && t.memory != nil {
-					go t.memory.Store(text)
+					go func(txt string) {
+						if err := t.memory.Store(txt); err != nil {
+							t.Inject(fmt.Sprintf("[remember] error: %v", err))
+						}
+					}(text)
 				}
 			default:
 				// Dispatch to registry (MCP tools, file tools, web, etc)
@@ -413,37 +412,6 @@ func (tm *ThreadManager) Update(id, directive string, tools []string) error {
 	return nil
 }
 
-// FindPendingApproval checks all child threads for a pending tool call.
-func (tm *ThreadManager) FindPendingApproval() *toolCall {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	for _, thread := range tm.threads {
-		thread.Thinker.pendingMu.Lock()
-		if thread.Thinker.pendingTool != nil {
-			tc := thread.Thinker.pendingTool
-			thread.Thinker.pendingMu.Unlock()
-			return tc
-		}
-		thread.Thinker.pendingMu.Unlock()
-	}
-	return nil
-}
-
-// FindPendingThinker returns the child thinker that has a pending tool call, or nil.
-func (tm *ThreadManager) FindPendingThinker() *Thinker {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	for _, thread := range tm.threads {
-		thread.Thinker.pendingMu.Lock()
-		if thread.Thinker.pendingTool != nil {
-			thread.Thinker.pendingMu.Unlock()
-			return thread.Thinker
-		}
-		thread.Thinker.pendingMu.Unlock()
-	}
-	return nil
-}
-
 // PauseAll pauses or resumes all child threads.
 func (tm *ThreadManager) PauseAll(paused bool) {
 	tm.mu.RLock()
@@ -464,8 +432,13 @@ func (tm *ThreadManager) PauseAll(paused bool) {
 func (tm *ThreadManager) cleanupThread(id string) {
 	logMsg("THREAD", fmt.Sprintf("%s cleanupThread start", id))
 	tm.mu.Lock()
+	thread := tm.threads[id]
 	delete(tm.threads, id)
 	tm.mu.Unlock()
+	// Delete thread session history
+	if thread != nil && thread.Thinker.session != nil {
+		thread.Thinker.session.Delete()
+	}
 	tm.parent.config.RemoveThread(id)
 	logMsg("THREAD", fmt.Sprintf("%s publishing EventThreadDone from cleanup", id))
 	tm.parent.bus.Publish(Event{Type: EventThreadDone, From: id})

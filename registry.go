@@ -7,6 +7,12 @@ import (
 	"sync"
 )
 
+// ToolResponse is the return value from a tool handler.
+type ToolResponse struct {
+	Text  string // text result (always present)
+	Image []byte // optional image (screenshot etc.) — sent as part of tool result to LLM
+}
+
 // ToolDef defines a tool available to threads.
 type ToolDef struct {
 	Name        string
@@ -18,7 +24,7 @@ type ToolDef struct {
 	ThreadOnly  bool   // only for sub-threads, not main (reply)
 	MCP         bool   // provided by an MCP server — not sent as native tools to main, only to sub-threads
 	MCPServer   string // name of the MCP server that provides this tool
-	Handler     func(args map[string]string) string // nil = handled inline by tool handler
+	Handler     func(args map[string]string) ToolResponse // nil = handled inline by tool handler
 	Embedding   []float64
 	InputSchema map[string]any // JSON Schema for native tool calling (nil = auto-generated from Syntax)
 }
@@ -144,14 +150,14 @@ func (tr *ToolRegistry) registerDefaults() {
 		Description: "Fetch a URL from the internet and return its text content. Use for research, looking up information, checking websites.",
 		Syntax:      `[[web url="https://example.com"]]`,
 		Rules:       `Only parameter is url. Results arrive as events in your next thought.`,
-		Handler:     webTool,
+		Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: webTool(args)} },
 	})
 	tr.Register(&ToolDef{
 		Name:        "exec",
 		Description: "Execute a shell command on the host machine and return stdout+stderr. Use for system administration, checking logs, running scripts, managing containers, inspecting files, git operations, deployments.",
 		Syntax:      `[[exec command="ls -la /app" timeout="30" dir="/home"]]`,
 		Rules:       `command: the shell command to run. timeout: seconds (default 30, max 300). dir: optional working directory. No interactive commands (no vim, top, less). Output truncated to 4000 chars.`,
-		Handler:     execTool,
+		Handler:     func(args map[string]string) ToolResponse { return ToolResponse{Text: execTool(args)} },
 	})
 }
 
@@ -318,13 +324,13 @@ func (tr *ToolRegistry) BuildDocs(tools []*ToolDef) string {
 	return sb.String()
 }
 
-// Dispatch executes a tool by name if it has a Handler. Returns result string and whether it was handled.
-func (tr *ToolRegistry) Dispatch(name string, args map[string]string) (string, bool) {
+// Dispatch executes a tool by name if it has a Handler. Returns response and whether it was handled.
+func (tr *ToolRegistry) Dispatch(name string, args map[string]string) (ToolResponse, bool) {
 	tr.mu.RLock()
 	tool, exists := tr.tools[name]
 	tr.mu.RUnlock()
 	if !exists || tool.Handler == nil {
-		return "", false
+		return ToolResponse{}, false
 	}
 	return tool.Handler(args), true
 }

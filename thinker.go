@@ -87,7 +87,7 @@ CRITICAL — never hallucinate events:
 
 You have persistent memory across restarts. Relevant memories appear as [memories] blocks.`
 
-func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo) string {
+func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo) string {
 	coreDocs := ""
 	if registry != nil {
 		coreDocs = "\n" + registry.CoreDocs(true)
@@ -112,6 +112,17 @@ func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs s
 			prompt += fmt.Sprintf("- %s (running %s, iter #%d, pace %s, model %s)\n  directive: %s\n  tools: %s\n",
 				t.ID, age, t.Iteration, t.Rate.String(), t.Model.String(), truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
 		}
+	}
+
+	// Safety guidance based on mode
+	prompt += "\n\n[SAFETY MODE: " + string(mode) + "]\n"
+	switch mode {
+	case ModeCautious:
+		prompt += `Before executing any tool that modifies state (exec, write, deploy, restart, delete), first tell the user what you plan to do and why via channels_respond, then wait for their confirmation in the next message. Read-only tools (web, query, list) can be used freely. If unsure whether an action is safe, ask. Learn from user feedback — use [[remember]] to store their preferences.`
+	case ModeLearn:
+		prompt += `You are learning the user's preferences. For EVERY new type of tool call you haven't done before, ask the user first via channels_respond whether they're comfortable with it. Once they confirm, remember their preference with [[remember]] so you don't need to ask again. Over time you'll build up a profile of what's OK and what needs checking. Always explain what you're about to do.`
+	default: // ModeAutonomous
+		prompt += `You operate freely and make your own decisions about tool use. Assess risk yourself — if something seems dangerous or irreversible, consider asking the user first. Learn from feedback: if a user tells you to stop doing something, remember it with [[remember]]. You are trusted to act independently.`
 	}
 
 	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
@@ -262,6 +273,7 @@ type Thinker struct {
 	model      ModelTier
 	agentModel ModelTier
 	memory     *MemoryStore
+	session    *Session
 	threads    *ThreadManager
 	config     *Config
 	registry   *ToolRegistry
@@ -285,11 +297,6 @@ type Thinker struct {
 	mcpServers []MCPConn
 	computer   computer.Computer // screen-based environment (nil = no computer use)
 
-	// Supervised mode — tool approval gate
-	approvalCh   chan bool      // receives true=approve, false=reject
-	pendingTool  *toolCall     // tool waiting for approval (nil if none)
-	pendingMu    sync.Mutex
-
 	// Multimodal — parts waiting to be attached to next message
 }
 
@@ -305,7 +312,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		apiKey:   apiKey,
 		provider: provider,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), nil, "", nil, nil)},
+			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil)},
 		},
 		config:    config,
 		bus:       bus,
@@ -316,18 +323,18 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		agentRate:  RateSlow,
 		agentSleep: 30 * time.Second,
 		memory:    NewMemoryStore(apiKey),
+		session:   NewSession(".", "main"),
 		apiLog:    &[]APIEvent{},
 		apiMu:     &sync.RWMutex{},
 		apiNotify: make(chan struct{}, 1),
 		threadID:   "main",
 		telemetry:  NewTelemetry(),
-		approvalCh: make(chan bool, 1),
 	}
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", nil, nil)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil)}
 
 	// Embed tool descriptions in background (non-blocking)
 	go t.registry.EmbedAll(t.memory)
@@ -339,14 +346,29 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		if t.threads != nil {
 			threads = t.threads.List()
 		}
-		return buildSystemPrompt(t.config.GetDirective(), t.registry, toolDocs, t.mcpServers, threads)
+		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, toolDocs, t.mcpServers, threads)
 	}
 
 	// Connect MCP servers and register their tools
 	if len(config.MCPServers) > 0 {
 		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.memory)
 		// Rebuild prompt now that servers are connected
-		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", t.mcpServers, nil)}
+		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil)}
+	}
+
+	// Load conversation history from persistent session
+	if saved, summaries := t.session.LoadTail(defaultLoadTail); len(saved) > 0 {
+		// Prepend compacted summaries as context in system prompt
+		if len(summaries) > 0 {
+			contextBlock := "\n\n[PREVIOUS CONTEXT]\n"
+			for _, s := range summaries {
+				contextBlock += s + "\n"
+			}
+			t.messages[0].Content += contextBlock
+		}
+		// Append saved messages after system prompt
+		t.messages = append(t.messages, saved...)
+		logMsg("SESSION", fmt.Sprintf("loaded %d messages from history (%d compacted summaries)", len(saved), len(summaries)))
 	}
 
 	// Computer use environment is injected externally via SetComputer()
@@ -367,11 +389,6 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		for _, call := range calls {
 			// Extract _reason (observability, not passed to handlers)
 			delete(call.Args, "_reason")
-			// Supervised mode gate — applies to all tools
-			if !waitForApproval(t, call) {
-				t.Inject(fmt.Sprintf("[rejected] %s was rejected by the user. Do NOT retry the same call. Ask the user what they want instead, or try a different approach.", call.Name))
-				continue
-			}
 			switch call.Name {
 			case "spawn":
 				id := call.Args["id"]
@@ -445,7 +462,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
 					t.config.SetDirective(d)
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry, "", t.mcpServers, nil)}
+					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 					if t.telemetry != nil {
 						t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
@@ -453,7 +470,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 			case "remember":
 				if text := call.Args["text"]; text != "" && t.memory != nil {
-					go t.memory.Store(text)
+					go func(txt string) {
+						if err := t.memory.Store(txt); err != nil {
+							t.Inject(fmt.Sprintf("[remember] error: %v", err))
+						}
+					}(text)
 				}
 			case "pace":
 				// Freeform sleep duration takes priority
@@ -656,7 +677,11 @@ func (t *Thinker) Run() {
 
 		// If we have tool results, add them as a proper tool_result message first
 		if len(toolResults) > 0 {
-			t.messages = append(t.messages, Message{Role: "user", ToolResults: toolResults})
+			trMsg := Message{Role: "user", ToolResults: toolResults}
+			t.messages = append(t.messages, trMsg)
+			if t.session != nil {
+				t.session.AppendMessage(trMsg, t.iteration, TokenUsage{})
+			}
 		}
 
 		if hadEvents {
@@ -682,6 +707,9 @@ func (t *Thinker) Run() {
 					msg.Parts = append([]ContentPart{{Type: "text", Text: sb.String()}}, mediaParts...)
 				}
 				t.messages = append(t.messages, msg)
+				if t.session != nil {
+					t.session.AppendMessage(msg, t.iteration, TokenUsage{})
+				}
 			}
 		} else if len(toolResults) == 0 {
 			// Only add "no events" if we also have no tool results
@@ -752,6 +780,11 @@ func (t *Thinker) Run() {
 		assistantMsg := Message{Role: "assistant", Content: reply, ToolCalls: chatResp.ToolCalls}
 		t.messages = append(t.messages, assistantMsg)
 
+		// Persist to session history
+		if t.session != nil {
+			t.session.AppendMessage(assistantMsg, t.iteration, usage)
+		}
+
 		// Stream native tool calls to TUI as visual chunks
 		if len(chatResp.ToolCalls) > 0 {
 			for _, ntc := range chatResp.ToolCalls {
@@ -777,7 +810,7 @@ func (t *Thinker) Run() {
 		var calls []toolCall
 		if len(chatResp.ToolCalls) > 0 {
 			for _, ntc := range chatResp.ToolCalls {
-				// Intercept computer_use calls — execute on Computer interface
+				// Intercept computer_use calls — execute via Computer interface with image ToolResults
 				if isComputerUseTool(ntc.Name) && t.computer != nil {
 					go t.executeComputerAction(ntc)
 					continue
@@ -860,6 +893,11 @@ func (t *Thinker) Run() {
 			})
 		}
 
+		// Check if session needs compaction (background, non-blocking)
+		if t.session != nil && t.session.NeedsCompaction() {
+			go t.session.Compact(nil) // nil = simple count-based summary, no LLM call for now
+		}
+
 		// Interruptible sleep — wakes on new event, quit, or pause
 		logMsg("RUN", fmt.Sprintf("[%s] sleeping %s", t.threadID, formatSleep(sleepDur)))
 		select {
@@ -903,26 +941,20 @@ func (t *Thinker) think() (ChatResponse, error) {
 		nativeTools = t.registry.NativeTools(t.toolAllowlist)
 	}
 
-	// Add computer_use tool if a computer environment is connected
-	if t.computer != nil {
+	// For Anthropic: add _display dimensions to computer_use tool params
+	// so the provider can extract them for the native spec
+	if t.computer != nil && t.provider != nil && t.provider.Name() == "anthropic" {
 		display := t.computer.DisplaySize()
-		nativeTools = append(nativeTools, NativeTool{
-			Name:        "computer_use",
-			Description: fmt.Sprintf("Control a computer screen (%dx%d). Actions: click, double_click, type, key, scroll, screenshot, navigate, wait.", display.Width, display.Height),
-			Parameters: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"action":     map[string]string{"type": "string", "description": "Action: click, double_click, type, key, scroll, screenshot, navigate, wait"},
-					"coordinate": map[string]string{"type": "array", "description": "[x, y] coordinate for click/scroll"},
-					"text":       map[string]string{"type": "string", "description": "Text to type"},
-					"key":        map[string]string{"type": "string", "description": "Key to press (Enter, Escape, etc.)"},
-					"url":        map[string]string{"type": "string", "description": "URL to navigate to"},
-				},
-				"required":       []string{"action"},
-				"_display_width":  display.Width,
-				"_display_height": display.Height,
-			},
-		})
+		for i, nt := range nativeTools {
+			if nt.Name == "computer_use" {
+				if nativeTools[i].Parameters == nil {
+					nativeTools[i].Parameters = make(map[string]any)
+				}
+				nativeTools[i].Parameters["_display_width"] = display.Width
+				nativeTools[i].Parameters["_display_height"] = display.Height
+				break
+			}
+		}
 	}
 
 	onToolChunk := func(toolName, chunk string) {
@@ -1008,7 +1040,7 @@ func (t *Thinker) allowedTools() map[string]bool {
 
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "", t.mcpServers, nil)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil)}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 
@@ -1079,8 +1111,45 @@ func (t *Thinker) TogglePause() {
 }
 
 // SetComputer attaches a computer use environment to this thinker.
+// Registers computer_use as a tool in the registry for non-Anthropic providers.
 func (t *Thinker) SetComputer(c computer.Computer) {
 	t.computer = c
+	if c != nil && t.registry != nil {
+		def := computer.GetComputerToolDef(c.DisplaySize())
+		// Register computer_use — screen interaction (no navigate)
+		comp := c
+		t.registry.Register(&ToolDef{
+			Name:        def.Name,
+			Description: def.Description,
+			Syntax:      def.Syntax,
+			Rules:       def.Rules,
+			InputSchema: def.Parameters,
+			Handler: func(args map[string]string) ToolResponse {
+				text, screenshot, err := computer.HandleComputerAction(comp, args)
+				if err != nil {
+					return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
+				}
+				return ToolResponse{Text: text, Image: screenshot}
+			},
+		})
+
+		// Register browser_session — session lifecycle (open/close/resume/status)
+		sessionDef := computer.GetSessionToolDef()
+		t.registry.Register(&ToolDef{
+			Name:        sessionDef.Name,
+			Description: sessionDef.Description,
+			Syntax:      sessionDef.Syntax,
+			Rules:       sessionDef.Rules,
+			InputSchema: sessionDef.Parameters,
+			Handler: func(args map[string]string) ToolResponse {
+				text, screenshot, err := computer.HandleSessionAction(comp, args)
+				if err != nil {
+					return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
+				}
+				return ToolResponse{Text: text, Image: screenshot}
+			},
+		})
+	}
 }
 
 func (t *Thinker) Stop() {
@@ -1170,11 +1239,11 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	// Inject as tool result with screenshot image
 	t.bus.Publish(Event{
 		Type: EventInbox, To: t.threadID,
-		Text: fmt.Sprintf("[tool:computer_use] screenshot (%d bytes, %dms)", len(screenshot), duration.Milliseconds()),
+		Text: fmt.Sprintf("[tool:computer_use] success: %s completed, screenshot attached (%d bytes, %dms)", action.Type, len(screenshot), duration.Milliseconds()),
 		ToolResult: &ToolResult{
-			CallID: ntc.ID,
-			Content: fmt.Sprintf("Screenshot taken after %s action (%dms)", action.Type, duration.Milliseconds()),
-			Image:  screenshot,
+			CallID:  ntc.ID,
+			Content: fmt.Sprintf("Success: %s action completed. A screenshot of the current screen is attached as an image. Examine it to see the result.", action.Type),
+			Image:   screenshot,
 		},
 	})
 

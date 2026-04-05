@@ -165,52 +165,17 @@ func TestConfig_DefaultMode(t *testing.T) {
 
 func TestConfig_SetMode(t *testing.T) {
 	c := &Config{path: "/dev/null"}
-	c.SetMode(ModeSupervised)
-	if c.GetMode() != ModeSupervised {
-		t.Errorf("expected supervised, got %s", c.GetMode())
+	c.SetMode(ModeCautious)
+	if c.GetMode() != ModeCautious {
+		t.Errorf("expected cautious, got %s", c.GetMode())
 	}
 	c.SetMode(ModeAutonomous)
 	if c.GetMode() != ModeAutonomous {
 		t.Errorf("expected autonomous, got %s", c.GetMode())
 	}
-}
-
-func TestConfig_IsAutoApproved_Defaults(t *testing.T) {
-	c := &Config{}
-	// Default auto-approve list
-	if !c.IsAutoApproved("think") {
-		t.Error("expected 'think' to be auto-approved")
-	}
-	if !c.IsAutoApproved("done") {
-		t.Error("expected 'done' to be auto-approved")
-	}
-	if !c.IsAutoApproved("pace") {
-		t.Error("expected 'pace' to be auto-approved")
-	}
-	if !c.IsAutoApproved("send") {
-		t.Error("expected 'send' to be auto-approved")
-	}
-	if !c.IsAutoApproved("recall") {
-		t.Error("expected 'recall' to be auto-approved")
-	}
-	if c.IsAutoApproved("web") {
-		t.Error("expected 'web' to NOT be auto-approved by default")
-	}
-	if c.IsAutoApproved("spawn") {
-		t.Error("expected 'spawn' to NOT be auto-approved by default")
-	}
-}
-
-func TestConfig_IsAutoApproved_Custom(t *testing.T) {
-	c := &Config{AutoApprove: []string{"web", "think"}}
-	if !c.IsAutoApproved("web") {
-		t.Error("expected 'web' to be auto-approved")
-	}
-	if !c.IsAutoApproved("think") {
-		t.Error("expected 'think' to be auto-approved")
-	}
-	if c.IsAutoApproved("spawn") {
-		t.Error("expected 'spawn' to NOT be auto-approved")
+	c.SetMode(ModeLearn)
+	if c.GetMode() != ModeLearn {
+		t.Errorf("expected learn, got %s", c.GetMode())
 	}
 }
 
@@ -228,108 +193,6 @@ func TestToolArgsSummary_Truncated(t *testing.T) {
 	summary := toolArgsSummary(call)
 	if !strings.Contains(summary, "...") {
 		t.Error("expected truncation in summary")
-	}
-}
-
-func TestWaitForApproval_Approved(t *testing.T) {
-	bus := NewEventBus()
-	cfg := &Config{Mode: ModeSupervised, path: "/dev/null"}
-	thinker := &Thinker{
-		bus:        bus,
-		sub:        bus.Subscribe("main", 100),
-		config:     cfg,
-		quit:       make(chan struct{}),
-		approvalCh: make(chan bool, 1),
-		telemetry:  NewTelemetry(),
-		threadID:   "main",
-	}
-
-	call := toolCall{Name: "web", Args: map[string]string{"url": "https://example.com"}}
-
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		thinker.approvalCh <- true
-	}()
-
-	if !waitForApproval(thinker, call) {
-		t.Error("expected approval to succeed")
-	}
-
-	thinker.pendingMu.Lock()
-	if thinker.pendingTool != nil {
-		t.Error("expected pendingTool to be cleared after approval")
-	}
-	thinker.pendingMu.Unlock()
-}
-
-func TestWaitForApproval_Rejected(t *testing.T) {
-	bus := NewEventBus()
-	cfg := &Config{Mode: ModeSupervised, path: "/dev/null"}
-	thinker := &Thinker{
-		bus:        bus,
-		sub:        bus.Subscribe("main", 100),
-		config:     cfg,
-		quit:       make(chan struct{}),
-		approvalCh: make(chan bool, 1),
-		telemetry:  NewTelemetry(),
-		threadID:   "main",
-	}
-
-	call := toolCall{Name: "send_email", Args: map[string]string{"to": "user@test.com"}}
-
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		thinker.approvalCh <- false
-	}()
-
-	if waitForApproval(thinker, call) {
-		t.Error("expected approval to fail (rejected)")
-	}
-}
-
-func TestWaitForApproval_AutoApproved(t *testing.T) {
-	cfg := &Config{Mode: ModeSupervised, path: "/dev/null"}
-	thinker := &Thinker{
-		config:     cfg,
-		quit:       make(chan struct{}),
-		approvalCh: make(chan bool, 1),
-		telemetry:  NewTelemetry(),
-		threadID:   "main",
-	}
-
-	// "think" is in DefaultAutoApprove — should return true immediately
-	call := toolCall{Name: "think", Args: map[string]string{"thought": "testing"}}
-
-	done := make(chan struct{})
-	go func() {
-		if !waitForApproval(thinker, call) {
-			t.Error("expected auto-approved tool to pass")
-		}
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// good — did not block
-	case <-time.After(500 * time.Millisecond):
-		t.Error("waitForApproval blocked on auto-approved tool")
-	}
-}
-
-func TestWaitForApproval_AutonomousMode(t *testing.T) {
-	cfg := &Config{Mode: ModeAutonomous, path: "/dev/null"}
-	thinker := &Thinker{
-		config:     cfg,
-		quit:       make(chan struct{}),
-		approvalCh: make(chan bool, 1),
-		threadID:   "main",
-	}
-
-	call := toolCall{Name: "spawn", Args: map[string]string{"id": "worker"}}
-
-	// Should return true immediately in autonomous mode
-	if !waitForApproval(thinker, call) {
-		t.Error("expected autonomous mode to pass without blocking")
 	}
 }
 
@@ -417,17 +280,16 @@ func TestDetectImageParts_OnlyImage(t *testing.T) {
 	}
 }
 
-func TestExecuteTool_Autonomous_NoBlock(t *testing.T) {
+func TestExecuteTool_NoBlock(t *testing.T) {
 	bus := NewEventBus()
 	cfg := &Config{Mode: ModeAutonomous, path: "/dev/null"}
 	thinker := &Thinker{
-		bus:        bus,
-		sub:        bus.Subscribe("main", 100),
-		config:     cfg,
-		quit:       make(chan struct{}),
-		approvalCh: make(chan bool, 1),
-		telemetry:  NewTelemetry(),
-		threadID:   "main",
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		config:    cfg,
+		quit:      make(chan struct{}),
+		telemetry: NewTelemetry(),
+		threadID:  "main",
 	}
 
 	call := toolCall{Name: "web", Args: map[string]string{"url": "https://example.com"}}
@@ -440,9 +302,9 @@ func TestExecuteTool_Autonomous_NoBlock(t *testing.T) {
 
 	select {
 	case <-done:
-		// good — autonomous mode should not block
+		// good — should not block
 	case <-time.After(500 * time.Millisecond):
-		t.Error("executeTool blocked in autonomous mode")
+		t.Error("executeTool blocked")
 	}
 }
 

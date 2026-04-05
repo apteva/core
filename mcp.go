@@ -268,13 +268,13 @@ func (s *MCPServer) Close() {
 }
 
 // mcpProxyHandler returns a tool handler that proxies calls to an MCP server
-func mcpProxyHandler(server MCPConn, toolName string) func(args map[string]string) string {
-	return func(args map[string]string) string {
+func mcpProxyHandler(server MCPConn, toolName string) func(args map[string]string) ToolResponse {
+	return func(args map[string]string) ToolResponse {
 		result, err := server.CallTool(toolName, args)
 		if err != nil {
-			return fmt.Sprintf("error: %v", err)
+			return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
 		}
-		return result
+		return ToolResponse{Text: result}
 	}
 }
 

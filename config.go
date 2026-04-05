@@ -14,16 +14,14 @@ type PersistentThread struct {
 	Tools     []string `json:"tools"`
 }
 
-// RunMode controls how tool calls are handled.
+// RunMode controls the agent's safety behavior via system prompt guidance.
 type RunMode string
 
 const (
-	ModeAutonomous RunMode = "autonomous" // tools execute immediately
-	ModeSupervised RunMode = "supervised" // tools require user approval
+	ModeAutonomous RunMode = "autonomous" // agent operates freely, asks when it thinks it should
+	ModeCautious   RunMode = "cautious"   // agent asks before destructive/external actions
+	ModeLearn      RunMode = "learn"      // agent actively asks about new tool types, builds safety profile
 )
-
-// DefaultAutoApprove lists tools that never need approval (internal reasoning).
-var DefaultAutoApprove = []string{"think", "done", "pace", "recall", "remember", "send"}
 
 // ProviderConfig persists the active provider and model selections.
 type ProviderConfig struct {
@@ -46,7 +44,6 @@ type Config struct {
 	path        string
 	Directive   string             `json:"directive"`
 	Mode        RunMode            `json:"mode,omitempty"`
-	AutoApprove []string           `json:"auto_approve,omitempty"`
 	Provider    *ProviderConfig    `json:"provider,omitempty"`
 	Computer    *ComputerConfig    `json:"computer,omitempty"`
 	Threads     []PersistentThread `json:"threads,omitempty"`
@@ -236,18 +233,3 @@ func (c *Config) SetProviderModel(tier string, modelID string) {
 	c.Save()
 }
 
-// IsAutoApproved returns true if a tool should skip approval in supervised mode.
-func (c *Config) IsAutoApproved(toolName string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	list := c.AutoApprove
-	if len(list) == 0 {
-		list = DefaultAutoApprove
-	}
-	for _, name := range list {
-		if name == toolName {
-			return true
-		}
-	}
-	return false
-}

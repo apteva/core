@@ -111,7 +111,7 @@ func TestSubThread_HasBasePrompt(t *testing.T) {
 	sysPrompt := thread.Thinker.messages[0].Content
 
 	// Should have base thread prompt
-	if !strings.Contains(sysPrompt, "Core") {
+	if !strings.Contains(sysPrompt, "SUB-THREAD") {
 		t.Error("missing base thread prompt")
 	}
 	// Should have the role

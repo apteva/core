@@ -61,74 +61,6 @@ func toolArgsSummary(call toolCall) string {
 	return argsSummary
 }
 
-const approvalTimeout = 5 * time.Minute
-
-// waitForApproval blocks until the user approves or rejects a tool call.
-// Returns true if approved, false if rejected or timed out.
-// Returns true immediately if not in supervised mode or tool is auto-approved.
-func waitForApproval(t *Thinker, call toolCall) bool {
-	if t.config == nil || t.config.GetMode() != ModeSupervised || t.config.IsAutoApproved(call.Name) {
-		return true
-	}
-
-	logMsg("APPROVAL", fmt.Sprintf("waiting for approval: %s args=%v", call.Name, call.Args))
-
-	// Set pending tool so API/TUI can see what's waiting
-	t.pendingMu.Lock()
-	t.pendingTool = &call
-	t.pendingMu.Unlock()
-
-	// Emit pending event for dashboard/TUI
-	if t.telemetry != nil {
-		t.telemetry.Emit("tool.pending", t.threadID, ToolCallData{
-			ID: call.NativeID, Name: call.Name, Args: call.Args,
-		})
-	}
-
-	// Drain any stale approval
-	select {
-	case <-t.approvalCh:
-	default:
-	}
-
-	// Block until approved, rejected, or timeout
-	var approved bool
-	select {
-	case approved = <-t.approvalCh:
-	case <-time.After(approvalTimeout):
-		logMsg("APPROVAL", fmt.Sprintf("timeout waiting for approval: %s", call.Name))
-		approved = false
-	case <-t.quit:
-		t.pendingMu.Lock()
-		t.pendingTool = nil
-		t.pendingMu.Unlock()
-		return false
-	}
-
-	// Clear pending
-	t.pendingMu.Lock()
-	t.pendingTool = nil
-	t.pendingMu.Unlock()
-
-	if !approved {
-		logMsg("APPROVAL", fmt.Sprintf("rejected: %s", call.Name))
-		if t.telemetry != nil {
-			t.telemetry.Emit("tool.rejected", t.threadID, ToolCallData{
-				ID: call.NativeID, Name: call.Name, Args: call.Args,
-			})
-		}
-		return false
-	}
-
-	logMsg("APPROVAL", fmt.Sprintf("approved: %s", call.Name))
-	if t.telemetry != nil {
-		t.telemetry.Emit("tool.approved", t.threadID, ToolCallData{
-			ID: call.NativeID, Name: call.Name, Args: call.Args,
-		})
-	}
-	return true
-}
-
 func executeTool(t *Thinker, call toolCall) {
 	// Extract _reason before dispatch (observability field, not passed to handler)
 	reason := call.Args["_reason"]
@@ -156,30 +88,30 @@ func executeTool(t *Thinker, call toolCall) {
 				}
 			}
 		}()
-		var result string
+		var resp ToolResponse
 		if t.registry != nil {
 			if res, ok := t.registry.Dispatch(call.Name, call.Args); ok {
-				result = res
+				resp = res
 			} else {
-				result = fmt.Sprintf("unknown tool %q", call.Name)
+				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name)}
 			}
 		} else {
 			// Fallback for tests without registry
 			switch call.Name {
 			case "web":
-				result = webTool(call.Args)
+				resp = ToolResponse{Text: webTool(call.Args)}
 			case "write_file":
-				result = writeFileTool(call.Args)
+				resp = ToolResponse{Text: writeFileTool(call.Args)}
 			case "read_file":
-				result = readFileTool(call.Args)
+				resp = ToolResponse{Text: readFileTool(call.Args)}
 			case "list_files":
-				result = listFilesTool(call.Args)
+				resp = ToolResponse{Text: listFilesTool(call.Args)}
 			default:
-				result = fmt.Sprintf("unknown tool %q", call.Name)
+				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name)}
 			}
 		}
 
-		resultPreview := result
+		resultPreview := resp.Text
 		if len(resultPreview) > 200 {
 			resultPreview = resultPreview[:200] + "..."
 		}
@@ -187,25 +119,34 @@ func executeTool(t *Thinker, call toolCall) {
 
 		// Telemetry: tool.result
 		if t.telemetry != nil {
-			resultSummary := result
+			resultSummary := resp.Text
 			if len(resultSummary) > 1000 {
 				resultSummary = resultSummary[:1000] + "..."
 			}
 			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
 				ID: call.NativeID, Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
-				Success: !strings.HasPrefix(result, "error") && !strings.HasPrefix(result, "unknown"),
+				Success: !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown"),
 				Result: resultSummary,
 			})
 		}
 
-		// Emit visual chunk for TUI so tool results appear in thoughts stream
-		resultPreviewForTUI := result
+		// Emit visual chunk for TUI
+		resultPreviewForTUI := resp.Text
 		if len(resultPreviewForTUI) > 120 {
 			resultPreviewForTUI = resultPreviewForTUI[:120] + "..."
 		}
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI + "\n", Iteration: t.iteration})
 
-		t.Inject(fmt.Sprintf("[tool:%s] %s", call.Name, result))
+		// Inject result as a proper ToolResult event (text + optional image)
+		t.bus.Publish(Event{
+			Type: EventInbox, To: t.threadID,
+			Text: fmt.Sprintf("[tool:%s] %s", call.Name, resp.Text),
+			ToolResult: &ToolResult{
+				CallID:  call.NativeID,
+				Content: resp.Text,
+				Image:   resp.Image, // nil for text-only tools, set for screenshot tools
+			},
+		})
 	}()
 }
 
