@@ -173,8 +173,8 @@ func main() {
 
 	if headless {
 		fmt.Fprintf(os.Stderr, "apteva-core running headless (API on :%s)\n", apiPort)
-		// Start console logger only if NOT managed by server (server has its own ConsoleLogger)
-		if os.Getenv("SERVER_URL") == "" {
+		// Start console logger unless suppressed via NO_CONSOLE
+		if os.Getenv("NO_CONSOLE") == "" {
 			console := NewConsoleLogger(thinker.telemetry)
 			go console.Run()
 		}
