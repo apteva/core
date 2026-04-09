@@ -10,7 +10,12 @@ import (
 	"github.com/apteva/core/pkg/computer"
 )
 
-const maxHistory = 50
+// Default context window sizes by role
+const (
+	maxHistoryMain   = 50 // main coordinator
+	maxHistoryLead   = 50 // team leads (depth 0)
+	maxHistoryWorker = 20 // workers (depth 1+)
+)
 
 // MCPServerInfo is a lightweight catalog entry for an MCP server.
 // Main uses this to show available servers in its prompt without registering all tools.
@@ -316,6 +321,8 @@ type Thinker struct {
 	config     *Config
 	registry   *ToolRegistry
 
+	maxHistory     int // max messages in context window (varies by role)
+
 	// Hooks — set these to customize behavior. nil = defaults.
 	handleTools    ToolHandler
 	rebuildPrompt  func(toolDocs string) string // rebuild system prompt with current tool docs
@@ -392,6 +399,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		apiMu:     &sync.RWMutex{},
 		apiNotify: make(chan struct{}, 1),
 		threadID:   "main",
+		maxHistory: maxHistoryMain,
 		telemetry:  NewTelemetry(),
 	}
 	t.threads = NewThreadManager(t)
@@ -1051,10 +1059,13 @@ func (t *Thinker) Run() {
 		}
 
 		// Sliding window — keep tool_use/tool_result pairs together
-		if len(t.messages) > maxHistory+1 {
-			start := len(t.messages) - maxHistory
+		maxHist := t.maxHistory
+		if maxHist <= 0 {
+			maxHist = maxHistoryMain // fallback
+		}
+		if len(t.messages) > maxHist+1 {
+			start := len(t.messages) - maxHist
 			// Don't start on a tool_result message (orphaned result)
-			// Move start backward to include the assistant message with tool_use
 			for start > 1 && len(t.messages[start].ToolResults) > 0 {
 				start--
 			}

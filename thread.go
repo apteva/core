@@ -339,6 +339,12 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		}
 	}
 
+	// Context window size based on role
+	historyLimit := maxHistoryWorker
+	if canSpawn {
+		historyLimit = maxHistoryLead
+	}
+
 	thinker := &Thinker{
 		apiKey:   tm.parent.apiKey,
 		pool:     tm.parent.pool,
@@ -353,6 +359,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		rate:       RateReactive,
 		agentRate:  RateNormal,
 		agentSleep: 10 * time.Second,
+		maxHistory: historyLimit,
 		memory:    tm.parent.memory,
 		session:   NewSession(".", id),
 		onStop:    func() { tm.cleanupThread(id) },
