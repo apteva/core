@@ -807,6 +807,10 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			SubThreads:   subCount,
 		})
 	}
+	// Sort by ID for deterministic order
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].ID < infos[j].ID
+	})
 	return infos
 }
 
