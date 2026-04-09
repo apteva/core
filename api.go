@@ -77,6 +77,8 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 
 type threadJSON struct {
 	ID        string   `json:"id"`
+	ParentID  string   `json:"parent_id,omitempty"`
+	Depth     int      `json:"depth,omitempty"`
 	Directive string   `json:"directive,omitempty"`
 	Tools     []string `json:"tools,omitempty"`
 	Iteration int      `json:"iteration"`
@@ -97,17 +99,34 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 		Age:       formatAge(time.Since(a.startTime)),
 	}}
 
-	for _, t := range a.thinker.threads.List() {
-		out = append(out, threadJSON{
-			ID:        t.ID,
-			Directive: t.Directive,
-			Tools:     t.Tools,
-			Iteration: t.Iteration,
-			Rate:      t.Rate.String(),
-			Model:     t.Model.String(),
-			Age:       formatAge(time.Since(t.Started)),
-		})
+	// Recursively collect all threads (including sub-threads of leaders)
+	var collectThreads func(tm *ThreadManager)
+	collectThreads = func(tm *ThreadManager) {
+		for _, t := range tm.List() {
+			out = append(out, threadJSON{
+				ID:        t.ID,
+				ParentID:  t.ParentID,
+				Depth:     t.Depth,
+				Directive: t.Directive,
+				Tools:     t.Tools,
+				Iteration: t.Iteration,
+				Rate:      t.Rate.String(),
+				Model:     t.Model.String(),
+				Age:       formatAge(time.Since(t.Started)),
+			})
+			// Recurse into children
+			if t.SubThreads > 0 {
+				tm.mu.RLock()
+				if thread, ok := tm.threads[t.ID]; ok && thread.Children != nil {
+					tm.mu.RUnlock()
+					collectThreads(thread.Children)
+				} else {
+					tm.mu.RUnlock()
+				}
+			}
+		}
 	}
+	collectThreads(a.thinker.threads)
 	writeJSON(w, out)
 }
 
