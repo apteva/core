@@ -173,15 +173,28 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 
 	canSpawn := depth < MaxSpawnDepth
 
+	// Check if this is a system thread (e.g. unconscious)
+	isSystem := false
+	for _, pt := range tm.parent.config.GetThreads() {
+		if pt.ID == id && pt.System {
+			isSystem = true
+			break
+		}
+	}
+
 	// Build tool set
 	toolSet := make(map[string]bool)
 	for _, t := range tools {
 		toolSet[strings.TrimSpace(t)] = true
 	}
-	toolSet["send"] = true
-	toolSet["done"] = true
+	if !isSystem {
+		toolSet["send"] = true
+		toolSet["done"] = true
+	}
 	toolSet["pace"] = true
-	toolSet["evolve"] = true
+	if !isSystem {
+		toolSet["evolve"] = true
+	}
 	// Leaders get spawn/kill/update
 	if canSpawn {
 		toolSet["spawn"] = true

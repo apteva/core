@@ -22,6 +22,7 @@ type ToolDef struct {
 	Core        bool   // always in prompt (pace, send, done, evolve)
 	MainOnly    bool   // only for main thread (spawn, kill)
 	ThreadOnly  bool   // only for sub-threads, not main (reply)
+	SystemOnly  bool   // only for system threads (unconscious)
 	MCP         bool   // provided by an MCP server — not sent as native tools to main, only to sub-threads
 	MCPServer   string // name of the MCP server that provides this tool
 	Handler     func(args map[string]string) ToolResponse // nil = handled inline by tool handler
@@ -227,9 +228,11 @@ func (tr *ToolRegistry) EmbedAll(ms *MemoryStore) {
 }
 
 // CoreDocs returns documentation for core tools, always included in prompts.
-func (tr *ToolRegistry) CoreDocs(includeMainOnly bool) string {
+func (tr *ToolRegistry) CoreDocs(includeMainOnly bool, includeSystemOnly ...bool) string {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
+
+	sysOnly := len(includeSystemOnly) > 0 && includeSystemOnly[0]
 
 	var sb strings.Builder
 	sb.WriteString("CORE TOOLS — always available:\n")
@@ -239,6 +242,9 @@ func (tr *ToolRegistry) CoreDocs(includeMainOnly bool) string {
 			continue
 		}
 		if tool.MainOnly && !includeMainOnly {
+			continue
+		}
+		if tool.SystemOnly && !sysOnly {
 			continue
 		}
 		sb.WriteString(fmt.Sprintf("  %s — %s\n", tool.Syntax, tool.Description))
@@ -474,8 +480,8 @@ func (tr *ToolRegistry) NativeTools(allowlist map[string]bool) []NativeTool {
 				continue
 			}
 		} else {
-			// Main thread (nil allowlist): skip MCP tools and thread-only tools
-			if tool.ThreadOnly || tool.MCP {
+			// Main thread (nil allowlist): skip MCP tools, thread-only, and system-only tools
+			if tool.ThreadOnly || tool.MCP || tool.SystemOnly {
 				continue
 			}
 		}

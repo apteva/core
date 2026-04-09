@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -167,8 +169,35 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += `You operate freely and make your own decisions about tool use. Assess risk yourself — if something seems dangerous or irreversible, consider asking the user first. Learn from feedback: if a user tells you to stop doing something, remember it with [[remember]]. You are trusted to act independently.`
 	}
 
+	// Inject learned skills if any exist
+	if skills := loadSkills(); skills != "" {
+		prompt += "\n\n" + skills
+	}
+
 	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\n\n" + directive
 	return prompt
+}
+
+// loadSkills reads all skills/*.md files and returns them as a prompt block.
+func loadSkills() string {
+	files, err := filepath.Glob("skills/*.md")
+	if err != nil || len(files) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("[LEARNED SKILLS]\n")
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		sb.WriteString(string(data))
+		sb.WriteString("\n\n")
+	}
+	if sb.Len() < 20 {
+		return ""
+	}
+	return sb.String()
 }
 
 func truncateStr(s string, max int) string {
@@ -405,6 +434,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
 
+	// Register system-only tools (for unconscious thread)
+	registerSystemTools(t.registry, t.memory)
+
 	// Rebuild system prompt now that registry exists (with core tool docs)
 	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil, t.pool, nil)}
 
@@ -506,8 +538,39 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 			}
 		}
 	}
+	// Auto-spawn unconscious thread if enabled and not already persisted
+	if config.Unconscious {
+		hasUnconscious := false
+		for _, pt := range persistedThreads {
+			if pt.ID == "unconscious" {
+				hasUnconscious = true
+				break
+			}
+		}
+		if !hasUnconscious {
+			unconsciousDirective := `You are the unconscious. You maintain memory quality and extract skills silently.
+
+Every cycle:
+1. Scan memories with memory_scan. Edit unclear entries with memory_edit. Prune duplicates, stale, or noisy entries with memory_prune.
+2. Review what has been learned. Extract recurring useful patterns as reusable skills with skill_write.
+
+You never communicate with other threads. You never interact with users.
+Your work surfaces naturally through improved recall and loaded skills.
+Sleep 30 minutes between cycles.`
+			t.threads.SpawnWithOpts("unconscious", unconsciousDirective,
+				[]string{"memory_scan", "memory_edit", "memory_prune", "skill_write", "pace"},
+				SpawnOpts{ParentID: "main", Depth: 0, DeferRun: true},
+			)
+			config.SaveThread(PersistentThread{
+				ID: "unconscious", ParentID: "main", Depth: 0, System: true,
+				Directive: unconsciousDirective,
+				Tools:     []string{"memory_scan", "memory_edit", "memory_prune", "skill_write", "pace"},
+			})
+		}
+	}
+
 	// Now start all respawned threads (parents already see their children)
-	if len(persistedThreads) > 0 {
+	if len(persistedThreads) > 0 || config.Unconscious {
 		t.threads.StartAll()
 	}
 

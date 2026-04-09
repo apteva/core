@@ -12,6 +12,7 @@ type PersistentThread struct {
 	ID        string   `json:"id"`
 	ParentID  string   `json:"parent_id,omitempty"` // empty = child of main
 	Depth     int      `json:"depth,omitempty"`      // 0 = main's direct child
+	System    bool     `json:"system,omitempty"`     // system thread (can't be killed by LLM)
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
 	MCPNames  []string `json:"mcp_names,omitempty"` // MCP servers to connect on respawn
@@ -49,6 +50,7 @@ type Config struct {
 	path        string
 	Directive   string             `json:"directive"`
 	Mode        RunMode            `json:"mode,omitempty"`
+	Unconscious bool               `json:"unconscious,omitempty"` // enable background memory consolidation thread
 	Providers   []ProviderConfig   `json:"providers,omitempty"`   // multi-provider pool
 	Provider    *ProviderConfig    `json:"provider,omitempty"`    // legacy single-provider (auto-migrated to Providers on load)
 	Computer    *ComputerConfig    `json:"computer,omitempty"`
