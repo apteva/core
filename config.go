@@ -10,6 +10,8 @@ const configFile = "config.json"
 
 type PersistentThread struct {
 	ID        string   `json:"id"`
+	ParentID  string   `json:"parent_id,omitempty"` // empty = child of main
+	Depth     int      `json:"depth,omitempty"`      // 0 = main's direct child
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
 }

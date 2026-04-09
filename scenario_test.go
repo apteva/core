@@ -336,6 +336,32 @@ func threadIDs(th *Thinker) []string {
 	return ids
 }
 
+// allThreadInfos recursively collects ThreadInfo from main and all sub-ThreadManagers.
+func allThreadInfos(tm *ThreadManager) []ThreadInfo {
+	if tm == nil {
+		return nil
+	}
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	var all []ThreadInfo
+	for _, t := range tm.threads {
+		providerName := ""
+		if t.Thinker.provider != nil {
+			providerName = t.Thinker.provider.Name()
+		}
+		all = append(all, ThreadInfo{
+			ID:       t.ID,
+			ParentID: t.ParentID,
+			Depth:    t.Depth,
+			Provider: providerName,
+		})
+		if t.Children != nil {
+			all = append(all, allThreadInfos(t.Children)...)
+		}
+	}
+	return all
+}
+
 // --- Scenarios ---
 
 var helpdeskScenario = Scenario{
@@ -3281,6 +3307,416 @@ func TestScenario_Emergent(t *testing.T) {
 	t.Logf("built store=%s", storeBin)
 
 	s := emergentScenario
+	s.MCPServers[0].Command = storeBin
+	runScenario(t, s)
+}
+
+// --- Fleet Scenario (tree structure) ---
+
+var fleetScenario = Scenario{
+	Name: "Fleet",
+	Directive: `You are the CEO of a small online electronics store. Your sales are declining and you need to turn things around.
+
+You operate as a FLEET — you do NOT do the work yourself. Instead, you spawn TEAM LEADS who each manage their own workers. You coordinate at the strategic level only.
+
+Spawn exactly 3 team leads:
+
+1. "ops-lead" — Operations lead. Responsible for inventory and supply chain.
+   Give them tools: store_get_inventory, store_check_supplier, store_restock_item, send
+   Their job: investigate stock-outs, find working suppliers, restock critical items.
+   They should spawn their own workers for parallel tasks (e.g. one to check inventory, one to handle restocking).
+
+2. "sales-lead" — Sales & pricing lead. Responsible for revenue optimization.
+   Give them tools: store_get_sales, store_get_competitors, store_adjust_price, store_get_analytics, send
+   Their job: analyze sales trends, compare competitor prices, adjust pricing to be competitive.
+   They should spawn workers to investigate different aspects in parallel.
+
+3. "marketing-lead" — Marketing lead. Responsible for customer engagement and growth.
+   Give them tools: store_get_customer_segments, store_get_traffic_sources, store_get_reviews, store_send_promotion, store_add_product, send
+   Their job: identify customer segments to target, find new product opportunities, run promotions.
+   They should spawn workers for research and execution.
+
+CRITICAL RULES:
+- You ONLY talk to your 3 leads. Never call store tools directly.
+- Leads report findings and actions back to you.
+- Wait for all 3 leads to report before making final strategic decisions.
+- After receiving reports, send a strategic summary to each lead with any cross-team insights.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "store", Command: "", Env: map[string]string{"STORE_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: seedStoreData,
+	Phases: []Phase{
+		{
+			Name:    "Startup — 3 team leads spawned",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				ids := threadIDs(th)
+				t.Logf("  main threads: %v", ids)
+				return len(ids) >= 3
+			},
+		},
+		{
+			Name:    "Tree forms — leads spawn workers (depth 1+)",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				all := allThreadInfos(th.threads)
+				depth0 := 0
+				depth1 := 0
+				for _, info := range all {
+					if info.Depth == 0 {
+						depth0++
+					} else if info.Depth >= 1 {
+						depth1++
+					}
+				}
+				t.Logf("  total threads: %d (leads: %d, workers: %d)", len(all), depth0, depth1)
+				for _, info := range all {
+					t.Logf("    %s (parent=%s, depth=%d)", info.ID, info.ParentID, info.Depth)
+				}
+				// Need at least 3 leads + 3 workers (at least 1 worker per lead)
+				return depth0 >= 3 && depth1 >= 3
+			},
+		},
+		{
+			Name:    "Execution — workers take actions via store tools",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				if err != nil {
+					return false
+				}
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				// Count distinct action types
+				actions := map[string]bool{}
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					if a := entry["action"]; a != "" {
+						actions[a] = true
+					}
+				}
+				t.Logf("  actions taken: %d calls, %d types: %v", len(lines), len(actions), actions)
+				// Need at least 3 different action types (investigation + execution)
+				return len(actions) >= 3
+			},
+		},
+		{
+			Name:    "Coordination — leads report back, real actions taken",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				s := string(data)
+				// Need at least one write action (restock, price change, or promotion)
+				hasRestock := strings.Contains(s, "\"action\":\"restock_item\"")
+				hasPrice := strings.Contains(s, "\"action\":\"adjust_price\"")
+				hasPromo := strings.Contains(s, "\"action\":\"send_promotion\"")
+				hasNewProduct := strings.Contains(s, "\"action\":\"add_product\"")
+				writeActions := 0
+				if hasRestock { writeActions++ }
+				if hasPrice { writeActions++ }
+				if hasPromo { writeActions++ }
+				if hasNewProduct { writeActions++ }
+				t.Logf("  write actions: restock=%v price=%v promo=%v newProduct=%v (%d/4)",
+					hasRestock, hasPrice, hasPromo, hasNewProduct, writeActions)
+				return writeActions >= 2
+			},
+		},
+		{
+			Name:    "Upward reporting — leads report results to main (full chain)",
+			Timeout: 120 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				// Nothing to set up — just need to wait for leads to report
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("Status check: all leads please report what actions you've taken and results so far.")
+						injected = true
+					}
+					// Check if main received messages from leads (main's iteration advanced beyond startup)
+					return th.iteration >= 4
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Final report
+				all := allThreadInfos(th.threads)
+				t.Log("=== FLEET REPORT ===")
+				t.Logf("total threads alive: %d", len(all))
+				for _, info := range all {
+					indent := ""
+					for i := 0; i < info.Depth; i++ {
+						indent += "  "
+					}
+					role := "worker"
+					if info.Depth == 0 {
+						role = "lead"
+					}
+					t.Logf("  %s%s [%s] (parent=%s, depth=%d)", indent, info.ID, role, info.ParentID, info.Depth)
+				}
+
+				// Action summary
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				t.Logf("total store actions: %d", len(lines))
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					t.Logf("  [%s] %v", entry["action"], entry)
+				}
+
+				// Verify tree structure existed
+				maxDepth := 0
+				for _, info := range all {
+					if info.Depth > maxDepth {
+						maxDepth = info.Depth
+					}
+				}
+				if maxDepth < 1 {
+					t.Error("expected tree structure with depth >= 1 (leads spawning workers)")
+				}
+
+				// Check main received lead reports (check iteration count and message history)
+				t.Logf("main iterations: %d", th.iteration)
+				// Log last few messages in main's context to see if leads reported
+				for i, msg := range th.messages {
+					if i == 0 {
+						continue // skip system prompt
+					}
+					preview := msg.Content
+					if len(preview) > 120 {
+						preview = preview[:120] + "..."
+					}
+					if strings.Contains(msg.Content, "[from:") {
+						t.Logf("  main msg[%d] role=%s: %s", i, msg.Role, preview)
+					}
+				}
+			},
+		},
+	},
+	Timeout:    10 * time.Minute,
+	MaxThreads: 15,
+}
+
+func TestScenario_Fleet(t *testing.T) {
+	storeBin := buildMCPBinary(t, "mcps/store")
+	t.Logf("built store=%s", storeBin)
+
+	s := fleetScenario
+	s.MCPServers[0].Command = storeBin
+	runScenario(t, s)
+}
+
+// --- Conglomerate Scenario (3-level tree) ---
+
+var conglomerateScenario = Scenario{
+	Name: "Conglomerate",
+	Directive: `You are the CEO of ByteVentures, a one-person conglomerate running 3 microbusinesses through AI agents. Your store's sales are declining badly and you need all 3 businesses working in parallel to fix it.
+
+YOU MUST BUILD A 3-LEVEL HIERARCHY. You do NOT do any store work yourself. You spawn directors, directors spawn team leads, team leads spawn workers. Workers are the only ones who call store tools.
+
+Spawn exactly 3 DIRECTORS (depth 0):
+
+1. "retail-director" — runs the Electronics Retail business. Responsible for making sure products are in stock and competitively priced.
+   Tools: send (NO store tools — directors delegate, they don't execute)
+   Their job: spawn 2 team leads:
+   - "supply-chain-lead" with tools: store_get_inventory, store_check_supplier, store_restock_item, send
+     This lead should spawn workers to check stock and handle supplier logistics in parallel.
+   - "pricing-lead" with tools: store_get_competitors, store_adjust_price, send
+     This lead should spawn workers to scan competitor prices and execute adjustments.
+
+2. "growth-director" — runs the Customer Growth business. Responsible for retention and acquisition.
+   Tools: send (NO store tools)
+   Their job: spawn 2 team leads:
+   - "retention-lead" with tools: store_get_customer_segments, store_send_promotion, send
+     This lead should spawn workers to analyze churn and send winback campaigns.
+   - "acquisition-lead" with tools: store_get_traffic_sources, store_get_analytics, store_send_promotion, send
+     This lead should spawn workers to find traffic opportunities and launch campaigns.
+
+3. "expansion-director" — runs the New Markets business. Responsible for finding and launching new products.
+   Tools: send (NO store tools)
+   Their job: spawn 2 team leads:
+   - "research-lead" with tools: store_get_reviews, store_get_traffic_sources, store_get_analytics, send
+     This lead should spawn workers to mine reviews and spot trends.
+   - "launch-lead" with tools: store_add_product, store_restock_item, send
+     This lead should spawn workers to list new products when opportunities are found.
+
+WORKFLOW:
+- Directors spawn their team leads immediately.
+- Team leads spawn 1-2 workers each to parallelize their tasks.
+- Workers call store tools, report findings to their team lead.
+- Team leads synthesize worker findings, take action, report to their director.
+- Directors report business summaries to you (the CEO).
+- You synthesize cross-business insights and send strategic directives back down.
+
+CRITICAL: The value of this structure is PARALLELISM and SPECIALIZATION. All 3 businesses investigate simultaneously. Information flows UP (workers→leads→directors→CEO), decisions flow DOWN (CEO→directors→leads→workers).`,
+	MCPServers: []MCPServerConfig{
+		{Name: "store", Command: "", Env: map[string]string{"STORE_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: seedStoreData,
+	Phases: []Phase{
+		{
+			Name:    "Phase 1 — Directors spawned",
+			Timeout: 90 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				ids := threadIDs(th)
+				t.Logf("  main threads: %v", ids)
+				return len(ids) >= 3
+			},
+		},
+		{
+			Name:    "Phase 2 — Team leads spawned (depth 1)",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				all := allThreadInfos(th.threads)
+				byDepth := map[int]int{}
+				for _, info := range all {
+					byDepth[info.Depth]++
+				}
+				t.Logf("  threads by depth: d0=%d d1=%d d2=%d (total %d)",
+					byDepth[0], byDepth[1], byDepth[2], len(all))
+				// Need at least 3 directors + 4 team leads
+				return byDepth[0] >= 3 && byDepth[1] >= 4
+			},
+		},
+		{
+			Name:    "Phase 3 — Workers spawned (depth 2) — full 3-level tree",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				all := allThreadInfos(th.threads)
+				byDepth := map[int]int{}
+				for _, info := range all {
+					byDepth[info.Depth]++
+				}
+				t.Logf("  threads by depth: d0=%d d1=%d d2=%d (total %d)",
+					byDepth[0], byDepth[1], byDepth[2], len(all))
+				for _, info := range all {
+					indent := strings.Repeat("  ", info.Depth)
+					t.Logf("    %s%s (parent=%s, depth=%d)", indent, info.ID, info.ParentID, info.Depth)
+				}
+				// Need depth-2 workers to exist (at least 3)
+				return byDepth[2] >= 3
+			},
+		},
+		{
+			Name:    "Phase 4 — Workers execute store tools",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, err := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				if err != nil {
+					return false
+				}
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				actions := map[string]bool{}
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					if a := entry["action"]; a != "" {
+						actions[a] = true
+					}
+				}
+				t.Logf("  store actions: %d calls, %d types: %v", len(lines), len(actions), actions)
+				// Need at least 4 different data sources explored
+				return len(actions) >= 4
+			},
+		},
+		{
+			Name:    "Phase 5 — Full chain: actions taken + directors report to CEO",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				// Nudge the CEO to demand reports
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("Board meeting in 5 minutes. All directors: submit your business unit reports NOW with findings, actions taken, and recommendations.")
+						injected = true
+					}
+					// Check for write actions (restock, price adjust, promo, or new product)
+					data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+					s := string(data)
+					writeActions := 0
+					if strings.Contains(s, "\"action\":\"restock_item\"") { writeActions++ }
+					if strings.Contains(s, "\"action\":\"adjust_price\"") { writeActions++ }
+					if strings.Contains(s, "\"action\":\"send_promotion\"") { writeActions++ }
+					if strings.Contains(s, "\"action\":\"add_product\"") { writeActions++ }
+					// Also check CEO received at least 2 director reports
+					ceoReports := 0
+					for _, msg := range th.messages {
+						if strings.Contains(msg.Content, "[from:retail-director]") ||
+							strings.Contains(msg.Content, "[from:growth-director]") ||
+							strings.Contains(msg.Content, "[from:expansion-director]") {
+							ceoReports++
+						}
+					}
+					t.Logf("  write actions: %d/4, CEO reports received: %d/3", writeActions, ceoReports)
+					return writeActions >= 2 && ceoReports >= 2
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				all := allThreadInfos(th.threads)
+				t.Log("=== CONGLOMERATE REPORT ===")
+				t.Logf("total threads alive: %d", len(all))
+
+				// Print tree
+				byDepth := map[int]int{}
+				for _, info := range all {
+					byDepth[info.Depth]++
+				}
+				t.Logf("by depth: directors=%d, leads=%d, workers=%d", byDepth[0], byDepth[1], byDepth[2])
+
+				for _, info := range all {
+					indent := strings.Repeat("  ", info.Depth)
+					role := "worker"
+					if info.Depth == 0 {
+						role = "director"
+					} else if info.Depth == 1 {
+						role = "lead"
+					}
+					t.Logf("  %s%s [%s] (parent=%s)", indent, info.ID, role, info.ParentID)
+				}
+
+				// Action summary
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				t.Logf("total store actions: %d", len(lines))
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					t.Logf("  [%s] %v", entry["action"], entry)
+				}
+
+				// Verify 3-level tree
+				if byDepth[2] == 0 {
+					t.Error("expected depth-2 workers (3-level tree)")
+				}
+
+				// Log CEO messages from directors
+				t.Log("--- CEO inbox (director reports) ---")
+				for _, msg := range th.messages {
+					if strings.Contains(msg.Content, "[from:retail-director]") ||
+						strings.Contains(msg.Content, "[from:growth-director]") ||
+						strings.Contains(msg.Content, "[from:expansion-director]") {
+						preview := msg.Content
+						if len(preview) > 200 {
+							preview = preview[:200] + "..."
+						}
+						t.Logf("  %s", preview)
+					}
+				}
+			},
+		},
+	},
+	Timeout:    12 * time.Minute,
+	MaxThreads: 25,
+}
+
+func TestScenario_Conglomerate(t *testing.T) {
+	storeBin := buildMCPBinary(t, "mcps/store")
+	t.Logf("built store=%s", storeBin)
+
+	s := conglomerateScenario
 	s.MCPServers[0].Command = storeBin
 	runScenario(t, s)
 }

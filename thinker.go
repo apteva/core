@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -123,8 +124,12 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += "\n\n[ACTIVE THREADS]\n"
 		for _, t := range activeThreads {
 			age := time.Since(t.Started).Truncate(time.Second)
-			prompt += fmt.Sprintf("- %s (running %s, iter #%d, pace %s, model %s)\n  directive: %s\n  tools: %s\n",
-				t.ID, age, t.Iteration, t.Rate.String(), t.Model.String(), truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
+			subInfo := ""
+			if t.SubThreads > 0 {
+				subInfo = fmt.Sprintf(", sub-threads: %d", t.SubThreads)
+			}
+			prompt += fmt.Sprintf("- %s (running %s, iter #%d, pace %s, model %s%s)\n  directive: %s\n  tools: %s\n",
+				t.ID, age, t.Iteration, t.Rate.String(), t.Model.String(), subInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
 		}
 	}
 
@@ -412,12 +417,53 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 
 	// Computer use environment is injected externally via SetComputer()
 
-	// Respawn persistent threads from config
-	for _, pt := range config.GetThreads() {
-		t.threads.Spawn(pt.ID, pt.Directive, pt.Tools)
+	// Respawn persistent threads from config, sorted by depth (parents before children)
+	persistedThreads := config.GetThreads()
+	sort.Slice(persistedThreads, func(i, j int) bool {
+		return persistedThreads[i].Depth < persistedThreads[j].Depth
+	})
+	for _, pt := range persistedThreads {
+		parentID := pt.ParentID
+		if parentID == "" || parentID == "main" {
+			// Direct child of main
+			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
+				ParentID: "main",
+				Depth:    pt.Depth,
+			})
+		} else {
+			// Find parent thread's Children manager
+			mgr := findThreadManager(t.threads, parentID)
+			if mgr != nil {
+				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
+					ParentID: parentID,
+					Depth:    pt.Depth,
+				})
+			} else {
+				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
+			}
+		}
 	}
 
 	return t
+}
+
+// findThreadManager walks the thread tree to find the ThreadManager that owns the given parent ID.
+// Returns the Children manager of the parent thread, or nil if not found.
+func findThreadManager(root *ThreadManager, parentID string) *ThreadManager {
+	root.mu.RLock()
+	defer root.mu.RUnlock()
+	for _, thread := range root.threads {
+		if thread.ID == parentID {
+			return thread.Children // may be nil if parent is a leaf
+		}
+		// Recurse into children
+		if thread.Children != nil {
+			if found := findThreadManager(thread.Children, parentID); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
 }
 
 // mainToolHandler returns the tool handler for the main coordinating thread.
@@ -455,11 +501,13 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
 						MediaParts:   mediaParts,
 						ProviderName: providerName,
+						ParentID:     "main",
+						Depth:        0,
 					})
 					if err != nil {
 						addResult(fmt.Sprintf("error: %v", err))
 					} else {
-						t.config.SaveThread(PersistentThread{ID: id, Directive: directive, Tools: tools})
+						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools})
 						addResult(fmt.Sprintf("thread %s spawned", id))
 					}
 				}

@@ -8,13 +8,17 @@ import (
 	"time"
 )
 
-// baseThreadPrompt is a template — %s is replaced with the thread ID at spawn time.
-const baseThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous thinking engine. You were spawned by the main coordinator thread.
+// MaxSpawnDepth is the maximum depth for sub-thread spawning.
+// Main = depth -1 (conceptual), its children = 0, grandchildren = 1, etc.
+const MaxSpawnDepth = 2
+
+// baseThreadPromptTemplate is for leaf threads that cannot spawn.
+const baseThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous thinking engine. You were spawned by the %s thread.
 
 IDENTITY:
 - Your ID is "%s". You are NOT the main thread — you are a worker thread with a specific task.
 - You cannot spawn other threads. You cannot restructure the system.
-- You report results back to main via [[send id="main" message="..."]].
+- You report results back to your parent via [[send id="parent" message="..."]].
 - When done with current work, sleep until needed again: [[pace sleep="5m"]] or [[pace sleep="1h"]] etc.
 - Only call [[done]] if you are certain this thread should never run again.
 
@@ -41,8 +45,46 @@ IMPORTANT — tool calls and [[done]]:
 - Always wait for tool results before calling [[done]] — you need to confirm the action succeeded.
 - Example: Thought 1: [[pushover_send_notification ...]]. Thought 2: see result, confirm success, [[done]].`
 
+// leaderThreadPromptTemplate is for threads that CAN spawn sub-threads (depth < MaxSpawnDepth).
+const leaderThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous thinking engine. You were spawned by the %s thread.
+
+IDENTITY:
+- Your ID is "%s". You are a team lead — you can spawn and manage your own sub-threads.
+- You report results back to your parent via [[send id="parent" message="..."]].
+- When done with current work, sleep until needed again: [[pace sleep="5m"]] or [[pace sleep="1h"]] etc.
+- Only call [[done]] if you are certain this thread should never run again.
+
+SPAWNING SUB-THREADS:
+- Use [[spawn id="..." directive="..." tools="..."]] to create workers for parallel or long-running tasks.
+- Use [[kill id="..."]] to stop a sub-thread.
+- Use [[update id="..." directive="..." tools="..."]] to change a sub-thread's directive or tools.
+- Your sub-threads report to YOU, not to main. You coordinate your team.
+- The "directive" must be PLAIN NATURAL LANGUAGE. Never put tool call syntax in directives.
+
+BEHAVIOR:
+- Think out loud — explain what you're doing and why. Never output empty thoughts.
+- Process events when they arrive. Use your tools to accomplish tasks.
+- Stay focused on YOUR directive. Delegate sub-tasks to your workers.
+- Keep each thought concise — 1-2 short paragraphs max.
+
+PACING — this is critical:
+- Tool results (like [[list_files]] or [[web]]) will wake you up for the next thought. Do NOT set [[pace]] in the same thought as a tool call — you'll be woken immediately.
+- Instead: call tools first, THEN in the next thought (after seeing results), set your pace.
+- Set sleep duration based on need: "2s" when actively working, "5m" when monitoring, "1h" for deep idle.
+- Only use [[pace]] when you have NO pending tool calls and are ready to wait.
+
+TIMING:
+- You do NOT have precise timing control. Pace rates are approximate, not exact.
+- For delayed tasks, use [[pace rate="sleep"]] and act on the next wake-up.
+
+IMPORTANT — tool calls and [[done]]:
+- NEVER call [[done]] in the same thought as a tool call. Tool results arrive in your NEXT thought.
+- Always wait for tool results before calling [[done]] — you need to confirm the action succeeded.`
+
 type ThreadInfo struct {
 	ID           string
+	ParentID     string // "main" or parent thread ID
+	Depth        int
 	Directive    string
 	Tools        []string
 	Running      bool
@@ -53,13 +95,17 @@ type ThreadInfo struct {
 	Started      time.Time
 	ContextMsgs  int
 	ContextChars int
+	SubThreads   int // number of direct children
 }
 
 type Thread struct {
 	ID           string
+	ParentID     string // "main" or parent thread ID
+	Depth        int    // 0 = child of main, 1 = grandchild, etc.
 	Directive    string // original directive before tool docs
 	Thinker      *Thinker
 	Parent       *Thinker
+	Children     *ThreadManager // non-nil if this thread can spawn (depth < MaxSpawnDepth)
 	Tools        map[string]bool
 	Started      time.Time
 	initialParts []ContentPart // media to inject before first Run()
@@ -83,6 +129,8 @@ type SpawnOpts struct {
 	MediaParts      []ContentPart
 	ProviderName    string   // override provider from pool (empty = inherit parent)
 	InitialMessages []string
+	ParentID        string   // "main" or parent thread ID (empty = "main")
+	Depth           int      // depth in the spawn tree (0 = child of main)
 }
 
 // SpawnWithMedia creates a thread and injects media parts before it starts thinking.
@@ -107,6 +155,19 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		return fmt.Errorf("thread %q already exists", id)
 	}
 
+	depth := opts.Depth
+	parentID := opts.ParentID
+	if parentID == "" {
+		parentID = tm.parent.threadID // inherit from the owning thinker
+	}
+
+	// Enforce max spawn depth
+	if depth > MaxSpawnDepth {
+		return fmt.Errorf("max spawn depth (%d) exceeded", MaxSpawnDepth)
+	}
+
+	canSpawn := depth < MaxSpawnDepth
+
 	// Build tool set
 	toolSet := make(map[string]bool)
 	for _, t := range tools {
@@ -116,9 +177,24 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	toolSet["done"] = true
 	toolSet["pace"] = true
 	toolSet["evolve"] = true
+	// Leaders get spawn/kill/update
+	if canSpawn {
+		toolSet["spawn"] = true
+		toolSet["kill"] = true
+		toolSet["update"] = true
+	}
 
-	// Build system prompt: core behavior + directive + core tool docs
-	basePrompt := fmt.Sprintf(baseThreadPromptTemplate, id, id)
+	// Build system prompt: use leader or worker template based on depth
+	parentLabel := parentID
+	if parentID == "main" {
+		parentLabel = "main coordinator"
+	}
+	var basePrompt string
+	if canSpawn {
+		basePrompt = fmt.Sprintf(leaderThreadPromptTemplate, id, parentLabel, id)
+	} else {
+		basePrompt = fmt.Sprintf(baseThreadPromptTemplate, id, parentLabel, id)
+	}
 	coreDocs := ""
 	if tm.parent.registry != nil {
 		coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
@@ -128,14 +204,16 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	modeBlock := ""
 	switch mode {
 	case ModeCautious:
-		modeBlock = "\n\n[SAFETY MODE: cautious]\nBefore executing any tool that modifies state, send a message to main explaining what you plan to do. Wait for confirmation before proceeding. Read-only tools can be used freely."
+		modeBlock = "\n\n[SAFETY MODE: cautious]\nBefore executing any tool that modifies state, send a message to your parent explaining what you plan to do. Wait for confirmation before proceeding. Read-only tools can be used freely."
 	case ModeLearn:
-		modeBlock = "\n\n[SAFETY MODE: learn]\nFor every new type of tool call, send a message to main asking if the user is comfortable with it. Remember their preferences."
+		modeBlock = "\n\n[SAFETY MODE: learn]\nFor every new type of tool call, send a message to your parent asking if the user is comfortable with it. Remember their preferences."
 	}
 	threadSystemPrompt := basePrompt + coreDocs + modeBlock + "\n\n[DIRECTIVE]\n" + directive
 
 	thread := &Thread{
 		ID:           id,
+		ParentID:     parentID,
+		Depth:        depth,
 		Directive:    directive,
 		Parent:       tm.parent,
 		Tools:        toolSet,
@@ -168,7 +246,6 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		memory:    tm.parent.memory,
 		session:   NewSession(".", id),
 		onStop:    func() { tm.cleanupThread(id) },
-		handleTools: threadToolHandler(thread, tm),
 		threadID:  id,
 		apiLog:        tm.parent.apiLog,
 		apiMu:         tm.parent.apiMu,
@@ -181,9 +258,27 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			if tm.parent.registry != nil {
 				cd = "\n" + tm.parent.registry.CoreDocs(false)
 			}
-			prompt := fmt.Sprintf(baseThreadPromptTemplate, id, id) + cd
+			var bp string
+			if canSpawn {
+				bp = fmt.Sprintf(leaderThreadPromptTemplate, id, parentLabel, id)
+			} else {
+				bp = fmt.Sprintf(baseThreadPromptTemplate, id, parentLabel, id)
+			}
+			prompt := bp + cd
 			if toolDocs != "" {
 				prompt += "\n" + toolDocs
+			}
+			// Inject active sub-threads for leaders
+			if thread.Children != nil {
+				children := thread.Children.List()
+				if len(children) > 0 {
+					prompt += "\n\n[ACTIVE SUB-THREADS]\n"
+					for _, c := range children {
+						age := time.Since(c.Started).Truncate(time.Second)
+						prompt += fmt.Sprintf("- %s (running %s, iter #%d, pace %s)\n  directive: %s\n",
+							c.ID, age, c.Iteration, c.Rate.String(), truncateStr(c.Directive, 150))
+					}
+				}
 			}
 			prompt += "\n\n[DIRECTIVE]\n" + thread.Directive
 			return prompt
@@ -191,6 +286,15 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	thread.Thinker = thinker
 	thinker.telemetry = tm.parent.telemetry // share telemetry
+
+	// Set up Children ThreadManager for leaders (depth < MaxSpawnDepth)
+	if canSpawn {
+		thread.Children = NewThreadManager(thinker)
+		thinker.threads = thread.Children
+	}
+
+	// Set tool handler AFTER Children is set up (handler references thread.Children)
+	thinker.handleTools = threadToolHandler(thread, tm)
 
 	tm.threads[id] = thread
 
@@ -217,21 +321,58 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if threadProvider != nil {
 		provName = threadProvider.Name()
 	}
-	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned (provider: %s)", id, provName)})
+	role := "worker"
+	if canSpawn {
+		role = "leader"
+	}
+	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned (provider: %s, role: %s, depth: %d)", id, provName, role, depth)})
 	toolList := toolSetToSlice(thread.Tools)
-	tm.parent.Inject(fmt.Sprintf("[thread:%s] started (provider: %s, tools: %s)", id, provName, strings.Join(toolList, ", ")))
+	tm.parent.Inject(fmt.Sprintf("[thread:%s] started (provider: %s, role: %s, tools: %s)", id, provName, role, strings.Join(toolList, ", ")))
 	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
 
 	// Telemetry: thread.spawn
 	if tm.parent.telemetry != nil {
 		tm.parent.telemetry.Emit("thread.spawn", id, ThreadSpawnData{
-			ParentID:  "main",
+			ParentID:  parentID,
 			Directive: directive,
 			Tools:     tools,
 		})
 	}
 
 	return nil
+}
+
+// resolveTarget resolves "parent" to the actual parent ID, and routes the message.
+// Returns the resolved target ID and whether the send succeeded.
+func (thread *Thread) resolveSend(tm *ThreadManager, tagged string, targetID string) bool {
+	// "parent" alias → route to parent thinker
+	if targetID == "parent" || targetID == thread.ParentID {
+		thread.Parent.Inject(tagged)
+		return true
+	}
+	// "main" always goes to main (even from grandchildren)
+	if targetID == "main" {
+		// Walk up to the root thinker
+		t := thread.Parent
+		for t.threadID != "main" {
+			// Find parent's parent — but we don't have a direct ref, so just use the bus
+			break
+		}
+		// Use the bus to deliver to main directly
+		thread.Parent.bus.Publish(Event{Type: EventInbox, To: "main", Text: tagged})
+		return true
+	}
+	// Try own children first
+	if thread.Children != nil {
+		if thread.Children.Send(targetID, tagged) {
+			return true
+		}
+	}
+	// Try sibling threads (same ThreadManager)
+	if tm.Send(targetID, tagged) {
+		return true
+	}
+	return false
 }
 
 // threadToolHandler returns a ToolHandler scoped to a thread's allowed tools.
@@ -261,18 +402,79 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				if id != "" && msg != "" {
 					tagged := fmt.Sprintf("[from:%s] %s", thread.ID, msg)
 					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q", thread.ID, id, msg))
-					if id == "main" {
-						thread.Parent.Inject(tagged)
-					} else {
-						if !tm.Send(id, tagged) {
-							t.Inject(fmt.Sprintf("[error] thread %q not found", id))
-						}
+					if !thread.resolveSend(tm, tagged, id) {
+						t.Inject(fmt.Sprintf("[error] thread %q not found", id))
 					}
 					if t.telemetry != nil {
-						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{From: thread.ID, To: id, Message: msg})
+						resolvedID := id
+						if id == "parent" {
+							resolvedID = thread.ParentID
+						}
+						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{From: thread.ID, To: resolvedID, Message: msg})
 					}
 					addResult(call.NativeID, fmt.Sprintf("sent to %s", id))
 				}
+			case "spawn":
+				// Leaders only (depth < MaxSpawnDepth) — enforced by tool allowlist
+				if thread.Children == nil {
+					addResult(call.NativeID, "error: cannot spawn (not a leader thread)")
+					break
+				}
+				sid := call.Args["id"]
+				directive := call.Args["directive"]
+				if directive == "" {
+					directive = call.Args["prompt"]
+				}
+				toolsStr := call.Args["tools"]
+				var spawnTools []string
+				if toolsStr != "" {
+					spawnTools = strings.Split(toolsStr, ",")
+				}
+				providerName := call.Args["provider"]
+				if sid != "" && directive != "" {
+					err := thread.Children.SpawnWithOpts(sid, directive, spawnTools, SpawnOpts{
+						ProviderName: providerName,
+						ParentID:     thread.ID,
+						Depth:        thread.Depth + 1,
+					})
+					if err != nil {
+						addResult(call.NativeID, fmt.Sprintf("error: %v", err))
+					} else {
+						t.config.SaveThread(PersistentThread{
+							ID: sid, ParentID: thread.ID, Depth: thread.Depth + 1,
+							Directive: directive, Tools: spawnTools,
+						})
+						addResult(call.NativeID, fmt.Sprintf("thread %s spawned (depth %d)", sid, thread.Depth+1))
+					}
+				}
+				toolNames = append(toolNames, call.Raw)
+			case "kill":
+				sid := call.Args["id"]
+				if sid != "" && thread.Children != nil {
+					thread.Children.Kill(sid)
+					t.config.RemoveThread(sid)
+					addResult(call.NativeID, fmt.Sprintf("thread %s killed", sid))
+				}
+				toolNames = append(toolNames, call.Raw)
+			case "update":
+				sid := call.Args["id"]
+				if sid != "" && thread.Children != nil {
+					directive := call.Args["directive"]
+					toolsStr := call.Args["tools"]
+					var updateTools []string
+					if toolsStr != "" {
+						updateTools = strings.Split(toolsStr, ",")
+					}
+					if err := thread.Children.Update(sid, directive, updateTools); err != nil {
+						addResult(call.NativeID, fmt.Sprintf("error: %v", err))
+					} else {
+						if directive != "" {
+							thread.Children.Send(sid, fmt.Sprintf("[directive updated] %s", directive))
+						}
+						addResult(call.NativeID, fmt.Sprintf("thread %s updated", sid))
+					}
+				}
+				toolNames = append(toolNames, call.Raw)
 			case "done":
 				msg := call.Args["message"]
 				doneMsg = &msg
@@ -314,7 +516,8 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
 					}
 					tm.parent.config.SaveThread(PersistentThread{
-						ID: thread.ID, Directive: d, Tools: toolSetToSlice(thread.Tools),
+						ID: thread.ID, ParentID: thread.ParentID, Depth: thread.Depth,
+						Directive: d, Tools: toolSetToSlice(thread.Tools),
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
 					addResult(call.NativeID, "directive updated")
@@ -408,8 +611,14 @@ func (tm *ThreadManager) List() []ThreadInfo {
 		if t.Thinker.provider != nil {
 			providerName = t.Thinker.provider.Name()
 		}
+		subCount := 0
+		if t.Children != nil {
+			subCount = t.Children.Count()
+		}
 		infos = append(infos, ThreadInfo{
 			ID:        t.ID,
+			ParentID:  t.ParentID,
+			Depth:     t.Depth,
 			Directive: t.Directive,
 			Tools:     toolSetToSlice(t.Tools),
 			Running:   true,
@@ -420,6 +629,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Started:      t.Started,
 			ContextMsgs:  len(t.Thinker.messages),
 			ContextChars: func() int { n := 0; for _, m := range t.Thinker.messages { n += len(m.Content) }; return n }(),
+			SubThreads:   subCount,
 		})
 	}
 	return infos
@@ -463,7 +673,8 @@ func (tm *ThreadManager) Update(id, directive string, tools []string) error {
 
 	// Persist
 	tm.parent.config.SaveThread(PersistentThread{
-		ID: id, Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools),
+		ID: id, ParentID: thread.ParentID, Depth: thread.Depth,
+		Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools),
 	})
 
 	return nil
@@ -492,10 +703,23 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	thread := tm.threads[id]
 	delete(tm.threads, id)
 	tm.mu.Unlock()
+
+	// Cascade: kill all children first
+	if thread != nil && thread.Children != nil {
+		logMsg("THREAD", fmt.Sprintf("%s killing %d children", id, thread.Children.Count()))
+		thread.Children.KillAll()
+	}
+
 	// Delete thread session history
 	if thread != nil && thread.Thinker.session != nil {
 		thread.Thinker.session.Delete()
 	}
+
+	parentID := "main"
+	if thread != nil {
+		parentID = thread.ParentID
+	}
+
 	tm.parent.config.RemoveThread(id)
 	logMsg("THREAD", fmt.Sprintf("%s publishing EventThreadDone from cleanup", id))
 	tm.parent.bus.Publish(Event{Type: EventThreadDone, From: id})
@@ -506,7 +730,7 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	// Telemetry: thread.done
 	if tm.parent.telemetry != nil {
 		tm.parent.telemetry.Emit("thread.done", id, ThreadDoneData{
-			ParentID: "main",
+			ParentID: parentID,
 		})
 	}
 }
