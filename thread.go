@@ -15,7 +15,8 @@ IDENTITY:
 - Your ID is "%s". You are NOT the main thread — you are a worker thread with a specific task.
 - You cannot spawn other threads. You cannot restructure the system.
 - You report results back to main via [[send id="main" message="..."]].
-- When your task is complete, call [[done message="..."]].
+- When done with current work, sleep until needed again: [[pace sleep="5m"]] or [[pace sleep="1h"]] etc.
+- Only call [[done]] if you are certain this thread should never run again.
 
 BEHAVIOR:
 - Think out loud — explain what you're doing and why. Never output empty thoughts.
@@ -122,7 +123,16 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if tm.parent.registry != nil {
 		coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
 	}
-	threadSystemPrompt := basePrompt + coreDocs + "\n\n[DIRECTIVE]\n" + directive
+	// Inject safety mode from parent config
+	mode := tm.parent.config.GetMode()
+	modeBlock := ""
+	switch mode {
+	case ModeCautious:
+		modeBlock = "\n\n[SAFETY MODE: cautious]\nBefore executing any tool that modifies state, send a message to main explaining what you plan to do. Wait for confirmation before proceeding. Read-only tools can be used freely."
+	case ModeLearn:
+		modeBlock = "\n\n[SAFETY MODE: learn]\nFor every new type of tool call, send a message to main asking if the user is comfortable with it. Remember their preferences."
+	}
+	threadSystemPrompt := basePrompt + coreDocs + modeBlock + "\n\n[DIRECTIVE]\n" + directive
 
 	thread := &Thread{
 		ID:           id,
@@ -203,7 +213,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// Same Run() as the main thinker — no duplicated loop
 	go thinker.Run()
 
-	provName := threadProvider.Name()
+	provName := "unknown"
+	if threadProvider != nil {
+		provName = threadProvider.Name()
+	}
 	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned (provider: %s)", id, provName)})
 	toolList := toolSetToSlice(thread.Tools)
 	tm.parent.Inject(fmt.Sprintf("[thread:%s] started (provider: %s, tools: %s)", id, provName, strings.Join(toolList, ", ")))
@@ -223,13 +236,20 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 
 // threadToolHandler returns a ToolHandler scoped to a thread's allowed tools.
 func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
-	return func(t *Thinker, calls []toolCall, _ []string) ([]string, []string) {
+	return func(t *Thinker, calls []toolCall, _ []string) ([]string, []string, []ToolResult) {
 		var replies []string
 		var toolNames []string
-		var doneMsg *string // defer done until all tools processed
+		var results []ToolResult
+		var doneMsg *string
+		var doneCallID string
+
+		addResult := func(callID, content string) {
+			if callID != "" {
+				results = append(results, ToolResult{CallID: callID, Content: content})
+			}
+		}
 
 		for _, call := range calls {
-			// Extract _reason (observability, not passed to handlers)
 			delete(call.Args, "_reason")
 			if !thread.Tools[call.Name] {
 				continue
@@ -248,35 +268,44 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							t.Inject(fmt.Sprintf("[error] thread %q not found", id))
 						}
 					}
-					// Telemetry: thread.message
 					if t.telemetry != nil {
-						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{
-							From: thread.ID, To: id, Message: msg,
-						})
+						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{From: thread.ID, To: id, Message: msg})
 					}
+					addResult(call.NativeID, fmt.Sprintf("sent to %s", id))
 				}
 			case "done":
 				msg := call.Args["message"]
-				doneMsg = &msg // defer — process after all other tools
+				doneMsg = &msg
+				doneCallID = call.NativeID
 			case "pace":
+				var parts []string
 				if s := call.Args["sleep"]; s != "" {
 					if d, ok := parseSleepDuration(s); ok {
 						t.agentSleep = d
 						t.agentRate = RateSleep
+						parts = append(parts, "sleep="+s)
 					}
 				} else if r, ok := rateNames[call.Args["rate"]]; ok {
 					t.agentRate = r
 					if d, ok2 := rateAliases[call.Args["rate"]]; ok2 {
 						t.agentSleep = d
 					}
+					parts = append(parts, "rate="+call.Args["rate"])
 				}
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
+					parts = append(parts, "model="+call.Args["model"])
 				}
 				if pn := call.Args["provider"]; pn != "" && t.pool != nil {
 					if p := t.pool.Get(pn); p != nil {
 						t.provider = p
+						parts = append(parts, "provider="+pn)
 					}
+				}
+				if len(parts) > 0 {
+					addResult(call.NativeID, "set "+strings.Join(parts, " "))
+				} else {
+					addResult(call.NativeID, "ok")
 				}
 			case "evolve":
 				if d := call.Args["directive"]; d != "" {
@@ -284,11 +313,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					if t.rebuildPrompt != nil {
 						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
 					}
-					// Persist
 					tm.parent.config.SaveThread(PersistentThread{
 						ID: thread.ID, Directive: d, Tools: toolSetToSlice(thread.Tools),
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
+					addResult(call.NativeID, "directive updated")
 				}
 			case "remember":
 				if text := call.Args["text"]; text != "" && t.memory != nil {
@@ -297,30 +326,26 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							t.Inject(fmt.Sprintf("[remember] error: %v", err))
 						}
 					}(text)
+					addResult(call.NativeID, "stored")
 				}
 			default:
-				// Dispatch to registry (MCP tools, file tools, web, etc)
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
 		}
 
-		// Process done LAST — after all other tools have been dispatched
-		// Stop() triggers cleanupThread which publishes EventThreadDone + logAPI
 		if doneMsg != nil {
+			addResult(doneCallID, "stopping")
 			logMsg("THREAD", fmt.Sprintf("%s calling done, msg=%q", thread.ID, *doneMsg))
 			if *doneMsg != "" {
-				logMsg("THREAD", fmt.Sprintf("%s injecting done message to parent (main)", thread.ID))
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg))
 			} else {
-				logMsg("THREAD", fmt.Sprintf("%s injecting done (no message) to parent", thread.ID))
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
 			}
-			logMsg("THREAD", fmt.Sprintf("%s calling Stop()", thread.ID))
 			t.Stop()
 		}
 
-		return replies, toolNames
+		return replies, toolNames, results
 	}
 }
 

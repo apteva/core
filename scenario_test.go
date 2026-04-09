@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2758,5 +2759,528 @@ func TestScenario_WebsiteBuild(t *testing.T) {
 	s.MCPServers[0].Command = briefBin
 	s.MCPServers[1].Command = codebaseBin
 	s.MCPServers[2].Command = hostingBin
+	runScenario(t, s)
+}
+
+// --- Learning Agent Scenario ---
+
+var learningAgentScenario = Scenario{
+	Name: "LearningAgent",
+	Directive: `You manage a warehouse. You do NOT know the business rules — discover them by trying actions and learning from failures.
+
+CRITICAL RULES FOR LEARNING:
+1. When ANY action fails, you MUST call [[remember text="..."]] with the rule you learned. This is mandatory.
+2. After learning 2+ rules, call [[evolve directive="..."]] to update your directive with all learned rules.
+3. Your memory persists across sessions. Your conversation does NOT. Only remembered facts survive.
+
+Process orders and shipments as requested via console events. When something fails, learn why, remember it, and retry correctly.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "warehouse", Command: "", Env: map[string]string{"WAREHOUSE_DATA_DIR": "{{dataDir}}"}, MainAccess: true},
+	},
+	DataSetup: func(t *testing.T, dir string) {
+		writeJSONFile(t, dir, "stock.json", map[string]int{
+			"widgets":   500,
+			"gadgets":   200,
+			"chemicals": 300,
+			"batteries": 150,
+		})
+		writeJSONFile(t, dir, "orders.json", []any{})
+		writeJSONFile(t, dir, "shipments.json", []any{})
+	},
+	Phases: []Phase{
+		{
+			Name:    "Phase 1: Order fails — learns and remembers max qty rule",
+			Timeout: 120 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("Order 200 widgets immediately.")
+						injected = true
+					}
+					data, _ := os.ReadFile(filepath.Join(dir, "orders.json"))
+					var orders []map[string]any
+					json.Unmarshal(data, &orders)
+					hasFailed := false
+					hasSuccess := false
+					for _, o := range orders {
+						if o["status"] == "failed" {
+							hasFailed = true
+						}
+						if o["status"] == "fulfilled" {
+							hasSuccess = true
+						}
+					}
+					return hasFailed && hasSuccess && th.memory.Count() > 0
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("memory after phase 1: %d entries", th.memory.Count())
+				if th.memory.Count() == 0 {
+					t.Error("agent did not use [[remember]] after learning qty rule")
+				}
+			},
+		},
+		{
+			Name:    "Phase 2: Ship to Japan + remember customs rule",
+			Timeout: 120 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("Ship the fulfilled widgets order to Japan, weight 20kg. Remember any rules you discover.")
+						injected = true
+					}
+					data, _ := os.ReadFile(filepath.Join(dir, "shipments.json"))
+					var shipments []map[string]any
+					json.Unmarshal(data, &shipments)
+					for _, s := range shipments {
+						if s["status"] == "shipped" {
+							return true
+						}
+					}
+					return false
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("memory after phase 2: %d entries", th.memory.Count())
+			},
+		},
+		{
+			Name:    "Phase 2b: Force hazardous rule discovery",
+			Timeout: 120 * time.Second,
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						th.InjectConsole("Order 50 chemicals. Remember any new rules you discover about ordering.")
+						injected = true
+					}
+					data, _ := os.ReadFile(filepath.Join(dir, "orders.json"))
+					var orders []map[string]any
+					json.Unmarshal(data, &orders)
+					for _, o := range orders {
+						if o["item"] == "chemicals" && o["status"] == "fulfilled" {
+							return true
+						}
+					}
+					return false
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Logf("memory after phase 2b: %d entries", th.memory.Count())
+				// Should have at least 2 memories now (qty + hazardous or customs)
+				if th.memory.Count() < 2 {
+					t.Logf("NOTE: expected 2+ memories, got %d", th.memory.Count())
+				}
+			},
+		},
+		{
+			Name:    "Phase 3: Context reset — apply knowledge from memory only",
+			Timeout: 180 * time.Second,
+			Setup: func(t *testing.T, dir string) {
+				// Reset order/shipment files for clean phase 3
+				writeJSONFile(t, dir, "orders.json", []any{})
+				writeJSONFile(t, dir, "shipments.json", []any{})
+			},
+			Wait: func() func(*testing.T, string, *Thinker) bool {
+				injected := false
+				return func(t *testing.T, dir string, th *Thinker) bool {
+					if !injected {
+						// Clear conversation history — agent must rely on memory
+						th.messages = th.messages[:1]
+						t.Logf("conversation reset — %d memory entries available", th.memory.Count())
+						th.InjectConsole("Order 150 chemicals and ship them to Germany, weight 30kg. Apply everything you know about warehouse rules.")
+						injected = true
+					}
+					orderData, _ := os.ReadFile(filepath.Join(dir, "orders.json"))
+					var orders []map[string]any
+					json.Unmarshal(orderData, &orders)
+					chemFulfilled := 0
+					for _, o := range orders {
+						if o["item"] == "chemicals" && o["status"] == "fulfilled" {
+							chemFulfilled++
+						}
+					}
+					shipData, _ := os.ReadFile(filepath.Join(dir, "shipments.json"))
+					var shipments []map[string]any
+					json.Unmarshal(shipData, &shipments)
+					germanyShipped := false
+					for _, s := range shipments {
+						dest, _ := s["destination"].(string)
+						if strings.EqualFold(dest, "germany") && s["status"] == "shipped" {
+							germanyShipped = true
+						}
+					}
+					return chemFulfilled >= 2 && germanyShipped
+				}
+			}(),
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				// Count failures in phase 3 — fewer failures = better memory recall
+				orderData, _ := os.ReadFile(filepath.Join(dir, "orders.json"))
+				var orders []map[string]any
+				json.Unmarshal(orderData, &orders)
+				failures := 0
+				successes := 0
+				for _, o := range orders {
+					if o["status"] == "failed" {
+						failures++
+					}
+					if o["status"] == "fulfilled" {
+						successes++
+					}
+				}
+				t.Logf("phase 3 orders: %d fulfilled, %d failed (fewer failures = better memory)", successes, failures)
+
+				shipData, _ := os.ReadFile(filepath.Join(dir, "shipments.json"))
+				var shipments []map[string]any
+				json.Unmarshal(shipData, &shipments)
+				shipOK := 0
+				shipFail := 0
+				for _, s := range shipments {
+					if s["status"] == "shipped" {
+						shipOK++
+					} else {
+						shipFail++
+					}
+				}
+				t.Logf("phase 3 shipments: %d shipped, %d failed", shipOK, shipFail)
+			},
+		},
+		{
+			Name:    "Phase 4: Final summary",
+			Timeout: 10 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				return true // always pass — just log results
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				directive := th.config.GetDirective()
+				evolved := len(directive) > 700
+				t.Logf("directive evolved: %v (%d chars)", evolved, len(directive))
+				t.Logf("final memory count: %d", th.memory.Count())
+
+				auditData, _ := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(auditData)), "\n")
+				t.Logf("total audit trail: %d entries", len(lines))
+
+				if th.memory.Count() < 2 {
+					t.Error("expected at least 2 memory entries from learning")
+				}
+			},
+		},
+	},
+	Timeout:    10 * time.Minute,
+	MaxThreads: 3,
+}
+
+func TestScenario_LearningAgent(t *testing.T) {
+	warehouseBin := buildMCPBinary(t, "mcps/warehouse")
+	t.Logf("built warehouse=%s", warehouseBin)
+
+	s := learningAgentScenario
+	s.MCPServers[0].Command = warehouseBin
+	runScenario(t, s)
+}
+
+// --- Emergent Behavior Scenario ---
+
+func seedStoreData(t *testing.T, dir string) {
+	t.Helper()
+
+	writeJSONFile(t, dir, "sales.json", map[string]any{
+		"summary": "Revenue down 23% month-over-month. 3 of top 5 products showing sharp decline.",
+		"daily": []map[string]any{
+			{"date": "2026-04-01", "revenue": 3200, "orders": 42},
+			{"date": "2026-04-02", "revenue": 2800, "orders": 38},
+			{"date": "2026-04-03", "revenue": 2100, "orders": 29},
+			{"date": "2026-04-04", "revenue": 1900, "orders": 25},
+			{"date": "2026-04-05", "revenue": 1700, "orders": 22},
+			{"date": "2026-04-06", "revenue": 1500, "orders": 19},
+			{"date": "2026-04-07", "revenue": 1400, "orders": 17},
+		},
+		"by_product": []map[string]any{
+			{"name": "Wireless Earbuds Pro", "units_sold": 0, "revenue": 0, "note": "NO SALES — check inventory"},
+			{"name": "USB-C Hub 7-in-1", "units_sold": 0, "revenue": 0, "note": "NO SALES — check inventory"},
+			{"name": "Laptop Stand Adjustable", "units_sold": 45, "revenue": 2250, "trend": "stable"},
+			{"name": "Mechanical Keyboard RGB", "units_sold": 12, "revenue": 1080, "trend": "declining — was 30/week"},
+			{"name": "Webcam 4K", "units_sold": 0, "revenue": 0, "note": "NO SALES — check inventory"},
+			{"name": "Phone Case Premium", "units_sold": 89, "revenue": 1335, "trend": "stable"},
+			{"name": "Desk Lamp LED", "units_sold": 34, "revenue": 680, "trend": "stable"},
+		},
+	})
+
+	writeJSONFile(t, dir, "inventory.json", map[string]any{
+		"products": []map[string]any{
+			{"name": "Wireless Earbuds Pro", "stock": 0, "price": 79.99, "status": "OUT OF STOCK", "last_restocked": "2026-03-01"},
+			{"name": "USB-C Hub 7-in-1", "stock": 0, "price": 49.99, "status": "OUT OF STOCK", "last_restocked": "2026-03-05"},
+			{"name": "Laptop Stand Adjustable", "stock": 120, "price": 49.99, "status": "in stock"},
+			{"name": "Mechanical Keyboard RGB", "stock": 45, "price": 89.99, "status": "in stock"},
+			{"name": "Webcam 4K", "stock": 0, "price": 129.99, "status": "OUT OF STOCK", "last_restocked": "2026-02-20"},
+			{"name": "Phone Case Premium", "stock": 230, "price": 14.99, "status": "in stock"},
+			{"name": "Desk Lamp LED", "stock": 67, "price": 19.99, "status": "in stock"},
+		},
+	})
+
+	writeJSONFile(t, dir, "reviews.json", map[string]any{
+		"average_rating": 3.2,
+		"recent": []map[string]any{
+			{"product": "Wireless Earbuds Pro", "rating": 1, "text": "Wanted to buy but OUT OF STOCK for over a month! Going to Amazon instead.", "date": "2026-04-05"},
+			{"product": "USB-C Hub 7-in-1", "rating": 1, "text": "Says out of stock. This was my favorite hub. Very disappointing.", "date": "2026-04-04"},
+			{"product": "Mechanical Keyboard RGB", "rating": 3, "text": "Good keyboard but $89.99 is too expensive. Same one is $69 on Amazon.", "date": "2026-04-03"},
+			{"product": "Webcam 4K", "rating": 1, "text": "OUT OF STOCK AGAIN. Third time I've tried to order. Lost a customer.", "date": "2026-04-06"},
+			{"product": "Phone Case Premium", "rating": 5, "text": "Great case, fast shipping, good price!", "date": "2026-04-05"},
+			{"product": "Laptop Stand Adjustable", "rating": 4, "text": "Solid product but shipping was slow — 8 days.", "date": "2026-04-02"},
+			{"product": "Desk Lamp LED", "rating": 4, "text": "Nice lamp. Would buy again.", "date": "2026-04-01"},
+		},
+	})
+
+	writeJSONFile(t, dir, "competitors.json", map[string]any{
+		"comparison": []map[string]any{
+			{"product": "Wireless Earbuds Pro", "our_price": 79.99, "amazon_price": 74.99, "best_buy_price": 79.99},
+			{"product": "USB-C Hub 7-in-1", "our_price": 49.99, "amazon_price": 39.99, "best_buy_price": 44.99},
+			{"product": "Mechanical Keyboard RGB", "our_price": 89.99, "amazon_price": 69.99, "best_buy_price": 74.99},
+			{"product": "Webcam 4K", "our_price": 129.99, "amazon_price": 109.99, "best_buy_price": 119.99},
+			{"product": "Phone Case Premium", "our_price": 14.99, "amazon_price": 14.99, "best_buy_price": 16.99},
+			{"product": "Laptop Stand Adjustable", "our_price": 49.99, "amazon_price": 49.99, "best_buy_price": 54.99},
+		},
+	})
+
+	writeJSONFile(t, dir, "analytics.json", map[string]any{
+		"period":           "last 7 days",
+		"unique_visitors":  12400,
+		"page_views":       34200,
+		"conversion_rate":  "1.4% (was 3.2% last month)",
+		"bounce_rate":      "62% (was 45% last month)",
+		"top_search_terms": []string{"wireless earbuds", "usb-c hub", "webcam 4k", "keyboard", "portable monitor usb-c"},
+		"cart_abandonment": "78% (was 52% last month)",
+		"note":             "Traffic is healthy but conversions dropped. Most searched products are out of stock. Unusual spike in searches for 'portable monitor usb-c' — we don't carry this product. Check traffic sources for details.",
+	})
+
+	writeJSONFile(t, dir, "traffic.json", map[string]any{
+		"period": "last 7 days",
+		"sources": []map[string]any{
+			{"source": "google organic", "visits": 5200, "conversion": "1.8%"},
+			{"source": "direct", "visits": 3100, "conversion": "2.1%"},
+			{"source": "social media", "visits": 1800, "conversion": "0.9%"},
+			{"source": "techgadgetblog.com/best-usb-c-monitors-2026", "visits": 1400, "conversion": "0.1%", "note": "ANOMALY: High traffic, near-zero conversion. Blog recommends 'UltraView Portable Monitor 15.6\" USB-C' at $199 — we don't carry it. 89% of these visitors search our store for it then leave."},
+			{"source": "email campaigns", "visits": 900, "conversion": "3.2%"},
+		},
+		"trending_searches_with_zero_results": []string{"portable monitor", "usb-c monitor", "ultraview monitor"},
+	})
+
+	writeJSONFile(t, dir, "suppliers.json", map[string]any{
+		"suppliers": []map[string]any{
+			{
+				"name": "TechSource Direct", "status": "DELAYED",
+				"products":      []string{"Wireless Earbuds Pro", "USB-C Hub 7-in-1", "Webcam 4K"},
+				"normal_lead":   "3-5 days",
+				"current_lead":  "14-18 days",
+				"reason":        "Warehouse fire at distribution center. Backlog expected until mid-April.",
+				"reliability":   "Usually excellent — this is an unusual event",
+				"recommendation": "Use alt_supplier for urgent restocks (+15% cost, 3-5 day delivery)",
+			},
+			{
+				"name": "AltSupply Express", "status": "OPERATIONAL",
+				"products":     []string{"Wireless Earbuds Pro", "USB-C Hub 7-in-1", "Webcam 4K", "UltraView Portable Monitor"},
+				"normal_lead":  "3-5 days",
+				"current_lead": "3-5 days",
+				"surcharge":    "15%",
+				"note":         "Can also supply UltraView Portable Monitor 15.6\" USB-C at wholesale $120 (MSRP $199)",
+			},
+			{
+				"name": "GenericParts Co", "status": "OPERATIONAL",
+				"products":    []string{"Laptop Stand Adjustable", "Desk Lamp LED", "Phone Case Premium"},
+				"normal_lead": "2-3 days",
+				"current_lead": "2-3 days",
+			},
+		},
+	})
+
+	writeJSONFile(t, dir, "segments.json", map[string]any{
+		"segments": []map[string]any{
+			{"name": "power_buyers", "count": 340, "avg_order": 127, "frequency": "2.3x/month", "note": "Highest value — 40% of revenue. Many have stopped buying (out-of-stock items). 78 haven't purchased in 3 weeks."},
+			{"name": "deal_seekers", "count": 890, "avg_order": 34, "frequency": "1.1x/month", "note": "Price-sensitive. Respond well to promotions. Keyboard price increase lost 40% of this segment."},
+			{"name": "new_visitors", "count": 1200, "avg_order": 0, "frequency": "0", "note": "1,200 new visitors this week, mostly from techgadgetblog.com. Almost none converted — they're looking for a product we don't sell."},
+			{"name": "returning_loyal", "count": 460, "avg_order": 62, "frequency": "1.8x/month", "note": "Stable segment. Good retention. Would respond well to loyalty rewards."},
+		},
+	})
+}
+
+var emergentScenario = Scenario{
+	Name: "Emergent",
+	Directive: `You run a small online electronics store. Sales have been declining. Diagnose the root causes and take action to turn things around. Go deep — surface-level fixes won't be enough.`,
+	MCPServers: []MCPServerConfig{
+		{Name: "store", Command: "", Env: map[string]string{"STORE_DATA_DIR": "{{dataDir}}"}},
+	},
+	DataSetup: seedStoreData,
+	Phases: []Phase{
+		{
+			Name:    "Deep investigation — agent explores multiple data layers",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				tools := map[string]bool{}
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					if a := entry["action"]; a != "" {
+						tools[a] = true
+					}
+				}
+				// Must dig into at least 5 different data sources (not just the obvious ones)
+				return len(tools) >= 5
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				tools := map[string]bool{}
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					if a := entry["action"]; a != "" {
+						tools[a] = true
+					}
+				}
+				t.Logf("data sources explored: %v (%d)", tools, len(tools))
+			},
+		},
+		{
+			Name:    "Multi-layered action — fixes surface + deeper issues",
+			Timeout: 180 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				s := string(data)
+				// Must take at least 3 different ACTION types
+				actionTypes := 0
+				if strings.Contains(s, "\"action\":\"restock_item\"") {
+					actionTypes++
+				}
+				if strings.Contains(s, "\"action\":\"adjust_price\"") {
+					actionTypes++
+				}
+				if strings.Contains(s, "\"action\":\"send_promotion\"") {
+					actionTypes++
+				}
+				if strings.Contains(s, "\"action\":\"add_product\"") {
+					actionTypes++
+				}
+				return actionTypes >= 3
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				var actions []string
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					switch entry["action"] {
+					case "restock_item":
+						actions = append(actions, fmt.Sprintf("RESTOCK: %s ×%s (supplier: %s)", entry["product"], entry["quantity"], entry["supplier"]))
+					case "adjust_price":
+						actions = append(actions, fmt.Sprintf("PRICE: %s → $%s", entry["product"], entry["new_price"]))
+					case "send_promotion":
+						actions = append(actions, fmt.Sprintf("PROMO: \"%s\" (%s to %s)", entry["subject"], entry["discount"], entry["target_segment"]))
+					case "add_product":
+						actions = append(actions, fmt.Sprintf("NEW PRODUCT: %s at $%s", entry["name"], entry["price"]))
+					}
+				}
+				for _, a := range actions {
+					t.Logf("  %s", a)
+				}
+				// Check for smart decisions
+				usedAltSupplier := strings.Contains(string(data), "alt_supplier")
+				addedProduct := strings.Contains(string(data), "add_product")
+				t.Logf("discovered alt supplier: %v", usedAltSupplier)
+				t.Logf("added new product (blog opportunity): %v", addedProduct)
+			},
+		},
+		{
+			Name:    "Emergence score — threads, memory, strategy, creativity",
+			Timeout: 120 * time.Second,
+			Wait: func(t *testing.T, dir string, th *Thinker) bool {
+				score := 0
+				if th.threads != nil && th.threads.Count() > 0 {
+					score += 2
+				}
+				if th.memory.Count() > 0 {
+					score++
+				}
+				directive := th.config.GetDirective()
+				if len(directive) > 200 {
+					score++
+				}
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				s := string(data)
+				if strings.Contains(s, "alt_supplier") {
+					score++ // discovered supply chain workaround
+				}
+				if strings.Contains(s, "add_product") {
+					score++ // spotted market opportunity
+				}
+				actions := strings.Count(s, "\"action\":")
+				if actions >= 6 {
+					score++ // took comprehensive action
+				}
+				return score >= 3
+			},
+			Verify: func(t *testing.T, dir string, th *Thinker) {
+				t.Log("=== EMERGENCE REPORT ===")
+				t.Logf("threads active: %d", th.threads.Count())
+				t.Logf("memory entries: %d", th.memory.Count())
+				directive := th.config.GetDirective()
+				t.Logf("directive evolved: %v (%d chars)", len(directive) > 200, len(directive))
+
+				data, _ := os.ReadFile(filepath.Join(dir, "actions.jsonl"))
+				lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+				s := string(data)
+
+				score := 0
+				if th.threads.Count() > 0 {
+					score += 2
+					t.Log("  ✓ spawned worker threads (self-organization)")
+				}
+				if th.memory.Count() > 0 {
+					score++
+					t.Log("  ✓ remembered findings (persistent learning)")
+				}
+				if len(directive) > 200 {
+					score++
+					t.Log("  ✓ evolved directive (self-improvement)")
+				}
+				if strings.Contains(s, "alt_supplier") {
+					score++
+					t.Log("  ✓ discovered alt supplier workaround (problem-solving)")
+				}
+				if strings.Contains(s, "add_product") {
+					score++
+					t.Log("  ✓ spotted new product opportunity (creativity)")
+				}
+				if len(lines) >= 8 {
+					score++
+					t.Log("  ✓ took comprehensive multi-step action (initiative)")
+				}
+
+				t.Logf("EMERGENCE SCORE: %d/7", score)
+				t.Logf("total tool calls: %d", len(lines))
+
+				for _, line := range lines {
+					var entry map[string]string
+					json.Unmarshal([]byte(line), &entry)
+					t.Logf("  [%s] %s", entry["action"], entry)
+				}
+			},
+		},
+	},
+	Timeout:    10 * time.Minute,
+	MaxThreads: 12,
+}
+
+func TestScenario_Emergent(t *testing.T) {
+	storeBin := buildMCPBinary(t, "mcps/store")
+	t.Logf("built store=%s", storeBin)
+
+	s := emergentScenario
+	s.MCPServers[0].Command = storeBin
 	runScenario(t, s)
 }

@@ -23,15 +23,16 @@ type TelemetryEvent struct {
 
 // Telemetry collects events and forwards them to the server.
 type Telemetry struct {
-	mu         sync.Mutex
-	log        []TelemetryEvent // stored events (forwarded to server)
-	liveLog    []TelemetryEvent // all events including live-only (for SSE)
-	notify     chan struct{}
-	forwardCh  chan TelemetryEvent // serialized queue for live event forwarding
-	serverURL string // server URL (e.g. "http://localhost:5280")
-	instanceID int64
-	seq        int64
-	quit       chan struct{}
+	mu             sync.Mutex
+	log            []TelemetryEvent // stored events (forwarded to server)
+	liveLog        []TelemetryEvent // all events including live-only (for SSE)
+	notify         chan struct{}
+	forwardCh      chan TelemetryEvent // serialized queue for live event forwarding
+	serverURL      string // server URL (e.g. "http://localhost:5280")
+	instanceSecret string // shared secret for telemetry auth
+	instanceID     int64
+	seq            int64
+	quit           chan struct{}
 }
 
 func NewTelemetry() *Telemetry {
@@ -45,6 +46,9 @@ func NewTelemetry() *Telemetry {
 	if id := os.Getenv("INSTANCE_ID"); id != "" {
 		fmt.Sscanf(id, "%d", &t.instanceID)
 	}
+
+	// Read instance secret from env (for telemetry auth)
+	t.instanceSecret = os.Getenv("INSTANCE_SECRET")
 
 	// Configure server URL for fire-and-forget
 	if url := os.Getenv("SERVER_URL"); url != "" {
@@ -145,6 +149,9 @@ func (t *Telemetry) forwardLive(ev TelemetryEvent) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if t.instanceSecret != "" {
+		req.Header.Set("X-Instance-Secret", t.instanceSecret)
+	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -223,6 +230,9 @@ func (t *Telemetry) forwardLoop() {
 				continue
 			}
 			req.Header.Set("Content-Type", "application/json")
+			if t.instanceSecret != "" {
+				req.Header.Set("X-Instance-Secret", t.instanceSecret)
+			}
 
 			resp, err := client.Do(req)
 			if err != nil {
@@ -231,10 +241,11 @@ func (t *Telemetry) forwardLoop() {
 			}
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST /telemetry status=%d body=%s", resp.StatusCode, string(respBody)))
-			if resp.StatusCode == 200 {
-				lastSent = total
+			if resp.StatusCode != 200 {
+				logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST /telemetry status=%d body=%s", resp.StatusCode, string(respBody)))
 			}
+			// Always advance cursor — don't retry failed batches forever
+			lastSent = total
 
 		case <-t.quit:
 			return

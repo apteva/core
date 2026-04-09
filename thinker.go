@@ -9,7 +9,7 @@ import (
 	"github.com/apteva/core/pkg/computer"
 )
 
-const maxHistory = 20
+const maxHistory = 50
 
 type ModelTier int
 
@@ -47,7 +47,7 @@ func (t *Thinker) modelID() string {
 }
 
 // baseSystemPrompt contains the fixed rules/tools. The editable directive is prepended at runtime.
-const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work. You do NOT talk to users directly — you spawn threads for that.
+const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe all events, manage threads, and coordinate work.
 
 THINKING — every thought must contain meaningful text:
 - Always explain what you observe, what you're doing, and why — even briefly.
@@ -62,7 +62,7 @@ EVENT FORMAT:
 - [thread:id done] message — a thread finished and terminated.
 
 BEHAVIOR:
-- Spawn threads for any task — conversations, research, monitoring, timed actions.
+- Spawn threads when needed for parallel or long-running tasks.
 - Additional tools may appear in [available tools] blocks based on context. If you need a tool you don't see, describe what you need.
 
 SPAWNING THREADS — critical rules:
@@ -266,9 +266,9 @@ type APIEvent struct {
 	Duration  string    `json:"duration,omitempty"`
 }
 
-// ToolHandler processes parsed tool calls from a thought. Returns replies and tool names logged.
+// ToolHandler processes parsed tool calls from a thought. Returns replies, tool names logged, and tool results for inline-handled tools.
 // consumed contains the events that were consumed this iteration (for context).
-type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string)
+type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 
 type Thinker struct {
@@ -422,18 +422,26 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 
 // mainToolHandler returns the tool handler for the main coordinating thread.
 func mainToolHandler(t *Thinker) ToolHandler {
-	return func(_ *Thinker, calls []toolCall, consumed []string) ([]string, []string) {
+	return func(_ *Thinker, calls []toolCall, consumed []string) ([]string, []string, []ToolResult) {
 		var replies []string
 		var toolNames []string
+		var results []ToolResult
 		for _, call := range calls {
 			// Extract _reason (observability, not passed to handlers)
 			delete(call.Args, "_reason")
+			// Helper to add inline tool result
+			addResult := func(content string) {
+				if call.NativeID != "" {
+					results = append(results, ToolResult{CallID: call.NativeID, Content: content})
+				}
+			}
+
 			switch call.Name {
 			case "spawn":
 				id := call.Args["id"]
 				directive := call.Args["directive"]
 				if directive == "" {
-					directive = call.Args["prompt"] // backwards compat
+					directive = call.Args["prompt"]
 				}
 				toolsStr := call.Args["tools"]
 				var tools []string
@@ -449,18 +457,19 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						ProviderName: providerName,
 					})
 					if err != nil {
-						t.Inject(fmt.Sprintf("[error] spawn %q: %v", id, err))
+						addResult(fmt.Sprintf("error: %v", err))
 					} else {
-						t.config.SaveThread(PersistentThread{
-							ID: id, Directive: directive, Tools: tools,
-						})
+						t.config.SaveThread(PersistentThread{ID: id, Directive: directive, Tools: tools})
+						addResult(fmt.Sprintf("thread %s spawned", id))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
-				if id := call.Args["id"]; id != "" {
+				id := call.Args["id"]
+				if id != "" {
 					t.threads.Kill(id)
 					t.config.RemoveThread(id)
+					addResult(fmt.Sprintf("thread %s killed", id))
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "update":
@@ -473,12 +482,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						tools = strings.Split(toolsStr, ",")
 					}
 					if err := t.threads.Update(id, directive, tools); err != nil {
-						t.Inject(fmt.Sprintf("[error] update %q: %v", id, err))
+						addResult(fmt.Sprintf("error: %v", err))
 					} else {
-						// Notify the thread about the change
 						if directive != "" {
 							t.threads.Send(id, fmt.Sprintf("[directive updated] %s", directive))
 						}
+						addResult(fmt.Sprintf("thread %s updated", id))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -489,11 +498,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if id != "" && msg != "" {
 					parts := parseMediaURLs(mediaStr)
 					if !t.threads.SendWithParts(id, msg, parts) {
-						t.Inject(fmt.Sprintf("[error] thread %q not found", id))
-					} else if t.telemetry != nil {
-						t.telemetry.Emit("thread.message", "main", ThreadMessageData{
-							From: "main", To: id, Message: msg,
-						})
+						addResult(fmt.Sprintf("error: thread %q not found", id))
+					} else {
+						if t.telemetry != nil {
+							t.telemetry.Emit("thread.message", "main", ThreadMessageData{From: "main", To: id, Message: msg})
+						}
+						addResult(fmt.Sprintf("sent to %s", id))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -505,6 +515,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					if t.telemetry != nil {
 						t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
 					}
+					addResult("directive updated")
 				}
 			case "remember":
 				if text := call.Args["text"]; text != "" && t.memory != nil {
@@ -513,28 +524,37 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							t.Inject(fmt.Sprintf("[remember] error: %v", err))
 						}
 					}(text)
+					addResult("stored")
 				}
 			case "pace":
-				// Freeform sleep duration takes priority
+				var parts []string
 				if s := call.Args["sleep"]; s != "" {
 					if d, ok := parseSleepDuration(s); ok {
 						t.agentSleep = d
-						t.agentRate = RateSleep // fallback enum for display
+						t.agentRate = RateSleep
+						parts = append(parts, "sleep="+s)
 					}
 				} else if r, ok := rateNames[call.Args["rate"]]; ok {
-					// Named rate alias — also set agentSleep from alias
 					t.agentRate = r
 					if d, ok2 := rateAliases[call.Args["rate"]]; ok2 {
 						t.agentSleep = d
 					}
+					parts = append(parts, "rate="+call.Args["rate"])
 				}
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
+					parts = append(parts, "model="+call.Args["model"])
 				}
 				if pn := call.Args["provider"]; pn != "" && t.pool != nil {
 					if p := t.pool.Get(pn); p != nil {
 						t.provider = p
+						parts = append(parts, "provider="+pn)
 					}
+				}
+				if len(parts) > 0 {
+					addResult("set " + strings.Join(parts, " "))
+				} else {
+					addResult("ok")
 				}
 			case "connect":
 				name := call.Args["name"]
@@ -550,11 +570,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					cfg := MCPServerConfig{Name: name, Command: command, Args: mcpArgs, URL: url, Transport: transport}
 					srv, err := connectAnyMCP(cfg)
 					if err != nil {
-						t.Inject(fmt.Sprintf("[connect] error: %v", err))
+						addResult(fmt.Sprintf("error: %v", err))
 					} else {
 						tools, err := srv.ListTools()
 						if err != nil {
-							t.Inject(fmt.Sprintf("[connect] tool discovery error: %v", err))
+							addResult(fmt.Sprintf("error: %v", err))
 							srv.Close()
 						} else {
 							t.mcpServers = append(t.mcpServers, srv)
@@ -586,9 +606,8 @@ func mainToolHandler(t *Thinker) ToolHandler {
 									}
 								}(name, tools)
 							}
-							t.Inject(fmt.Sprintf("[connect] connected to %s: %d tools registered", name, len(tools)))
-							// Persist to config for restart survival
 							t.config.SaveMCPServer(cfg)
+							addResult(fmt.Sprintf("connected to %s: %d tools", name, len(tools)))
 						}
 					}
 				}
@@ -602,14 +621,15 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							srv.Close()
 							t.mcpServers = append(t.mcpServers[:i], t.mcpServers[i+1:]...)
 							t.registry.RemoveByMCPServer(name)
-							t.Inject(fmt.Sprintf("[disconnect] disconnected from %s", name))
 							t.config.RemoveMCPServer(name)
 							found = true
 							break
 						}
 					}
-					if !found {
-						t.Inject(fmt.Sprintf("[disconnect] server %q not found", name))
+					if found {
+						addResult(fmt.Sprintf("disconnected from %s", name))
+					} else {
+						addResult(fmt.Sprintf("server %q not found", name))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -618,14 +638,14 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				for _, srv := range t.mcpServers {
 					names = append(names, srv.GetName())
 				}
-				t.Inject(fmt.Sprintf("[connected] %d servers: %s", len(names), strings.Join(names, ", ")))
+				addResult(fmt.Sprintf("%d servers: %s", len(names), strings.Join(names, ", ")))
 			default:
 				// Dispatch to registry (MCP tools, etc)
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
 		}
-		return replies, toolNames
+		return replies, toolNames, results
 	}
 }
 
@@ -892,13 +912,29 @@ func (t *Thinker) Run() {
 		}
 		var replies []string
 		var toolNames []string
+		var inlineResults []ToolResult
 		if t.handleTools != nil {
-			replies, toolNames = t.handleTools(t, calls, consumed)
+			replies, toolNames, inlineResults = t.handleTools(t, calls, consumed)
 		}
 
-		// Sliding window
+		// Inject results for inline-handled tools (pace, spawn, kill, etc.)
+		// so providers like Anthropic see matching tool_result for every tool_use
+		if len(inlineResults) > 0 {
+			t.messages = append(t.messages, Message{Role: "user", ToolResults: inlineResults})
+			if t.session != nil {
+				t.session.AppendMessage(Message{Role: "user", ToolResults: inlineResults}, t.iteration, TokenUsage{})
+			}
+		}
+
+		// Sliding window — keep tool_use/tool_result pairs together
 		if len(t.messages) > maxHistory+1 {
-			t.messages = append(t.messages[:1], t.messages[len(t.messages)-maxHistory:]...)
+			start := len(t.messages) - maxHistory
+			// Don't start on a tool_result message (orphaned result)
+			// Move start backward to include the assistant message with tool_use
+			for start > 1 && len(t.messages[start].ToolResults) > 0 {
+				start--
+			}
+			t.messages = append(t.messages[:1], t.messages[start:]...)
 		}
 
 		// After processing, fall back to agent's chosen rate/sleep

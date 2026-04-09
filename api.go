@@ -162,8 +162,9 @@ func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
 			for _, ev := range newEvents {
 				data, _ := json.Marshal(ev)
 				fmt.Fprintf(w, "data: %s\n\n", data)
+				// Flush each event immediately for real-time streaming
+				flusher.Flush()
 			}
-			flusher.Flush()
 		}
 	}
 }
@@ -281,6 +282,7 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			"directive":   a.thinker.config.GetDirective(),
 			"mode":        a.thinker.config.GetMode(),
 			"provider":    providerInfo,
+			"providers":   a.thinker.config.GetProviders(),
 			"computer":    computerInfo,
 			"mcp_servers": mcpInfo,
 		})
@@ -289,6 +291,7 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			Directive  string            `json:"directive,omitempty"`
 			Mode       RunMode           `json:"mode,omitempty"`
 			Provider   *ProviderConfig   `json:"provider,omitempty"`
+			Providers  []ProviderConfig  `json:"providers,omitempty"`
 			Computer    *ComputerConfig   `json:"computer,omitempty"`
 			MCPServers  []MCPServerConfig `json:"mcp_servers,omitempty"`
 		}
@@ -304,6 +307,28 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			a.thinker.config.SetMode(body.Mode)
 			if a.thinker.telemetry != nil {
 				a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
+			}
+		}
+		logMsg("API", fmt.Sprintf("PUT /config: providers=%d provider=%v", len(body.Providers), body.Provider != nil))
+		if len(body.Providers) > 0 {
+			// Rebuild provider pool from new config
+			logMsg("API", fmt.Sprintf("rebuilding pool with %d providers", len(body.Providers)))
+			oldDefault := ""
+			if a.thinker.provider != nil {
+				oldDefault = a.thinker.provider.Name()
+			}
+			a.thinker.config.mu.Lock()
+			a.thinker.config.Providers = body.Providers
+			a.thinker.config.mu.Unlock()
+			a.thinker.config.Save()
+			pool, err := buildProviderPool(a.thinker.config)
+			if err == nil && pool != nil {
+				a.thinker.pool = pool
+				a.thinker.provider = pool.Default()
+				// Clear conversation history if provider changed (tool IDs are incompatible across providers)
+				if a.thinker.provider.Name() != oldDefault {
+					a.thinker.messages = a.thinker.messages[:1] // keep system prompt only
+				}
 			}
 		}
 		if body.Provider != nil {

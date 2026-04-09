@@ -138,13 +138,18 @@ func executeTool(t *Thinker, call toolCall) {
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI + "\n", Iteration: t.iteration})
 
 		// Inject result as a proper ToolResult event (text + optional image)
+		// For channels_respond: inject minimal result so thinker wakes, but don't echo the full text
+		resultText := resp.Text
+		if call.Name == "channels_respond" {
+			resultText = "ok"
+		}
 		t.bus.Publish(Event{
 			Type: EventInbox, To: t.threadID,
-			Text: fmt.Sprintf("[tool:%s] %s", call.Name, resp.Text),
+			Text: fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
 			ToolResult: &ToolResult{
 				CallID:  call.NativeID,
-				Content: resp.Text,
-				Image:   resp.Image, // nil for text-only tools, set for screenshot tools
+				Content: resultText,
+				Image:   resp.Image,
 			},
 		})
 	}()

@@ -13,6 +13,23 @@ import (
 	"github.com/apteva/core/pkg/computer"
 )
 
+// sanitizeToolID ensures tool call IDs only contain characters Anthropic accepts: [a-zA-Z0-9_-]
+func sanitizeToolID(id string) string {
+	var b strings.Builder
+	for _, c := range id {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' {
+			b.WriteRune(c)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	s := b.String()
+	if s == "" {
+		s = "tool_0"
+	}
+	return s
+}
+
 type AnthropicProvider struct {
 	apiKey       string
 	models       map[ModelTier]string
@@ -24,7 +41,7 @@ func NewAnthropicProvider(apiKey string) LLMProvider {
 		apiKey: apiKey,
 		models: map[ModelTier]string{
 			ModelLarge:  "claude-opus-4-6",
-			ModelMedium: "claude-sonnet-4-20250514",
+			ModelMedium: "claude-sonnet-4-6",
 			ModelSmall:  "claude-haiku-4-5-20251001",
 		},
 	}
@@ -157,7 +174,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 			for _, tr := range m.ToolResults {
 				block := anthropicContentBlock{
 					Type:      "tool_result",
-					ToolUseID: tr.CallID,
+					ToolUseID: sanitizeToolID(tr.CallID),
 					IsError:   tr.IsError,
 				}
 				if tr.Image != nil {
@@ -191,7 +208,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 				}
 				blocks = append(blocks, anthropicContentBlock{
 					Type:  "tool_use",
-					ID:    tc.ID,
+					ID:    sanitizeToolID(tc.ID),
 					Name:  tc.Name,
 					Input: input,
 				})
@@ -234,7 +251,11 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 				height = h
 			}
 			display := computer.DisplaySize{Width: width, Height: height}
-			toolVersion := "20251124" // default to latest
+			// Computer tool version depends on model
+			toolVersion := "20250124" // default for older models
+			if strings.Contains(model, "opus-4-6") || strings.Contains(model, "sonnet-4-6") || strings.Contains(model, "opus-4-5") {
+				toolVersion = "20251124" // enhanced computer use for 4.5+ models
+			}
 			spec := computer.GetAnthropicToolSpec(display, toolVersion)
 			anthropicTools = append(anthropicTools, spec)
 			computerBeta = computer.AnthropicBetaHeader(toolVersion)
@@ -380,6 +401,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 					}
 				}
 				if event.Delta.Type == "input_json_delta" && currentTool != nil {
+					logMsg("ANTHROPIC-STREAM", fmt.Sprintf("tool=%s chunk_len=%d chunk=%q", currentTool.name, len(event.Delta.PartialJSON), truncateStr(event.Delta.PartialJSON, 80)))
 					currentTool.json.WriteString(event.Delta.PartialJSON)
 					if onToolChunk != nil {
 						onToolChunk(currentTool.name, event.Delta.PartialJSON)
