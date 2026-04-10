@@ -1508,7 +1508,8 @@ func isComputerUseTool(name string) bool {
 	case "computer_use", "computer_use_2025", "computer_20250124":
 		return true
 	}
-	return false
+	// Gemini native Computer Use actions
+	return computer.IsGeminiComputerAction(name)
 }
 
 // normalizeComputerAction converts provider-specific args to a computer.Action.
@@ -1547,11 +1548,25 @@ func normalizeComputerAction(args map[string]string) computer.Action {
 
 // executeComputerAction runs a computer_use action and injects the result as a proper ToolResult.
 func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
-	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Args["action"], ntc.Args))
+	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Name, ntc.Args))
 	start := time.Now()
 
-	action := normalizeComputerAction(ntc.Args)
-	screenshot, err := t.computer.Execute(action)
+	var screenshot []byte
+	var err error
+	var actionLabel string
+
+	// Gemini native Computer Use actions (click_at, type_text_at, etc.)
+	if computer.IsGeminiComputerAction(ntc.Name) {
+		var text string
+		text, screenshot, err = computer.HandleGeminiComputerAction(t.computer, ntc.Name, ntc.Args)
+		_ = text
+		actionLabel = ntc.Name
+	} else {
+		// Anthropic/generic computer_use (single tool with "action" arg)
+		action := normalizeComputerAction(ntc.Args)
+		actionLabel = action.Type
+		screenshot, err = t.computer.Execute(action)
+	}
 
 	duration := time.Since(start)
 
@@ -1577,10 +1592,10 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	// Inject as tool result with screenshot image
 	t.bus.Publish(Event{
 		Type: EventInbox, To: t.threadID,
-		Text: fmt.Sprintf("[tool:computer_use] success: %s completed, screenshot attached (%d bytes, %dms)", action.Type, len(screenshot), duration.Milliseconds()),
+		Text: fmt.Sprintf("[tool:computer_use] success: %s completed, screenshot attached (%d bytes, %dms)", actionLabel, len(screenshot), duration.Milliseconds()),
 		ToolResult: &ToolResult{
 			CallID:  ntc.ID,
-			Content: fmt.Sprintf("Success: %s action completed. A screenshot of the current screen is attached as an image. Examine it to see the result.", action.Type),
+			Content: fmt.Sprintf("Success: %s action completed. A screenshot of the current screen is attached as an image. Examine it to see the result.", actionLabel),
 			Image:   screenshot,
 		},
 	})

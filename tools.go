@@ -111,16 +111,6 @@ func executeTool(t *Thinker, call toolCall) {
 			}
 		}
 
-		// Trim large tool outputs before they enter context
-		// Workers get tighter limits to save tokens
-		maxOutput := 4000
-		if t.maxHistory > 0 && t.maxHistory <= maxHistoryWorker {
-			maxOutput = 2000
-		}
-		if len(resp.Text) > maxOutput {
-			resp.Text = resp.Text[:maxOutput] + fmt.Sprintf("\n... (truncated, %d chars total)", len(resp.Text))
-		}
-
 		resultPreview := resp.Text
 		if len(resultPreview) > 200 {
 			resultPreview = resultPreview[:200] + "..."

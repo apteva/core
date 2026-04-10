@@ -244,6 +244,101 @@ type Resumable interface {
 	Resume(sessionID string) error
 }
 
+// geminiComputerUseActions maps Gemini native Computer Use function names.
+var geminiComputerUseActions = map[string]bool{
+	"click_at": true, "type_text_at": true, "hover_at": true,
+	"scroll_at": true, "scroll_document": true, "key_combination": true,
+	"drag_and_drop": true, "wait_5_seconds": true, "navigate": true,
+	"go_back": true, "go_forward": true, "search": true,
+	"open_web_browser": true,
+}
+
+// IsGeminiComputerAction returns true if the function name is a Gemini Computer Use predefined action.
+func IsGeminiComputerAction(name string) bool {
+	return geminiComputerUseActions[name]
+}
+
+// HandleGeminiComputerAction translates a Gemini Computer Use action to our Computer interface.
+// Gemini uses normalized 0-999 coordinates; we denormalize to actual pixels.
+func HandleGeminiComputerAction(comp Computer, name string, args map[string]string) (text string, screenshot []byte, err error) {
+	display := comp.DisplaySize()
+
+	denormX := func(s string) int {
+		v, _ := strconv.Atoi(s)
+		return int(float64(v) / 1000.0 * float64(display.Width))
+	}
+	denormY := func(s string) int {
+		v, _ := strconv.Atoi(s)
+		return int(float64(v) / 1000.0 * float64(display.Height))
+	}
+
+	var action Action
+	switch name {
+	case "click_at":
+		action = Action{Type: "click", X: denormX(args["x"]), Y: denormY(args["y"])}
+	case "type_text_at":
+		action = Action{Type: "click", X: denormX(args["x"]), Y: denormY(args["y"])}
+		// Click first, then type
+		screenshot, err = comp.Execute(action)
+		if err != nil {
+			return fmt.Sprintf("Error clicking: %v", err), nil, err
+		}
+		action = Action{Type: "type", Text: args["text"]}
+		screenshot, err = comp.Execute(action)
+		if err != nil {
+			return fmt.Sprintf("Error typing: %v", err), nil, err
+		}
+		if args["press_enter"] == "true" {
+			action = Action{Type: "key", Key: "Enter"}
+			screenshot, err = comp.Execute(action)
+			if err != nil {
+				return fmt.Sprintf("Error pressing enter: %v", err), nil, err
+			}
+		}
+		return fmt.Sprintf("Typed %q at (%s,%s)", args["text"], args["x"], args["y"]), screenshot, nil
+	case "hover_at":
+		action = Action{Type: "mouse_move", X: denormX(args["x"]), Y: denormY(args["y"])}
+	case "scroll_at":
+		amt, _ := strconv.Atoi(args["magnitude"])
+		if amt == 0 {
+			amt = 3
+		} else {
+			amt = int(float64(amt) / 1000.0 * 10) // normalize magnitude
+		}
+		action = Action{Type: "scroll", X: denormX(args["x"]), Y: denormY(args["y"]), Direction: args["direction"], Amount: amt}
+	case "scroll_document":
+		action = Action{Type: "scroll", Direction: args["direction"], Amount: 3}
+	case "key_combination":
+		action = Action{Type: "key", Key: args["keys"]}
+	case "drag_and_drop":
+		// Execute as click-drag: click start, drag to end
+		action = Action{Type: "click", X: denormX(args["x"]), Y: denormY(args["y"])}
+		// Note: actual drag requires CDP-level implementation; this is simplified
+	case "wait_5_seconds":
+		action = Action{Type: "wait", Duration: 5000}
+	case "navigate":
+		action = Action{Type: "navigate", URL: args["url"]}
+	case "go_back":
+		action = Action{Type: "key", Key: "Alt+Left"}
+	case "go_forward":
+		action = Action{Type: "key", Key: "Alt+Right"}
+	case "search":
+		action = Action{Type: "navigate", URL: "https://www.google.com"}
+	case "open_web_browser":
+		return "Browser already open.", nil, nil
+	default:
+		return "", nil, fmt.Errorf("unknown Gemini action: %s", name)
+	}
+
+	start := time.Now()
+	screenshot, err = comp.Execute(action)
+	duration := time.Since(start)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err), nil, err
+	}
+	return fmt.Sprintf("Success: %s completed (%dms)", name, duration.Milliseconds()), screenshot, nil
+}
+
 // parseCoordinate parses "x,y" or [x,y] format into action X/Y fields.
 func parseCoordinate(coord string, action *Action) {
 	if coord == "" {

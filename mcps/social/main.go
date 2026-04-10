@@ -34,7 +34,8 @@ type Post struct {
 	Content       string `json:"content"`
 	Image         string `json:"image,omitempty"`
 	ScheduledTime string `json:"scheduled_time,omitempty"`
-	PostedAt      string `json:"posted_at"`
+	Status        string `json:"status"` // "posted" or "scheduled"
+	PostedAt      string `json:"posted_at,omitempty"`
 }
 
 type AuditEntry struct {
@@ -45,6 +46,17 @@ type AuditEntry struct {
 
 var dataDir string
 var postCounter int
+
+func initPostCounter() {
+	posts := loadPosts()
+	for _, p := range posts {
+		var id int
+		fmt.Sscanf(p.ID, "post-%d", &id)
+		if id >= postCounter {
+			postCounter = id + 1
+		}
+	}
+}
 
 func respond(id int64, result any) {
 	data, _ := json.Marshal(jsonRPCResponse{JSONRPC: "2.0", ID: id, Result: result})
@@ -104,20 +116,47 @@ func handleToolCall(id int64, name string, args map[string]string) {
 			respondError(id, -32602, "channel and content are required")
 			return
 		}
-		time.Sleep(500 * time.Millisecond) // simulate API call to social platform
+		// Check daily limit: max 1 post per channel per day (posted or scheduled)
+		today := time.Now().UTC().Format("2006-01-02")
+		posts := loadPosts()
+		for _, p := range posts {
+			if p.Channel != channel {
+				continue
+			}
+			// Check posted today
+			if p.PostedAt != "" && len(p.PostedAt) >= 10 && p.PostedAt[:10] == today {
+				textResult(id, fmt.Sprintf("REJECTED: Already posted to %s today (post %s). Limit is 1 per channel per day.", channel, p.ID))
+				return
+			}
+			// Check scheduled today
+			if p.ScheduledTime != "" && len(p.ScheduledTime) >= 10 && p.ScheduledTime[:10] == today {
+				textResult(id, fmt.Sprintf("REJECTED: Already scheduled on %s for today (post %s at %s). Limit is 1 per channel per day.", channel, p.ID, p.ScheduledTime))
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond) // simulate API call
 		postCounter++
+		scheduledTime := args["scheduled_time"]
 		post := Post{
 			ID:            fmt.Sprintf("post-%d", postCounter),
 			Channel:       channel,
 			Content:       content,
 			Image:         args["image"],
-			ScheduledTime: args["scheduled_time"],
-			PostedAt:      time.Now().UTC().Format(time.RFC3339),
+			ScheduledTime: scheduledTime,
 		}
-		posts := loadPosts()
+		if scheduledTime != "" {
+			post.Status = "scheduled"
+		} else {
+			post.Status = "posted"
+			post.PostedAt = time.Now().UTC().Format(time.RFC3339)
+		}
 		posts = append(posts, post)
 		savePosts(posts)
-		textResult(id, fmt.Sprintf("Published to %s: post ID %s", channel, post.ID))
+		if scheduledTime != "" {
+			textResult(id, fmt.Sprintf("Scheduled on %s for %s: post ID %s", channel, scheduledTime, post.ID))
+		} else {
+			textResult(id, fmt.Sprintf("Published to %s: post ID %s", channel, post.ID))
+		}
 
 	case "get_channels":
 		channels := []map[string]string{
@@ -136,6 +175,53 @@ func handleToolCall(id int64, name string, args map[string]string) {
 		data, _ := json.Marshal(posts)
 		textResult(id, string(data))
 
+	case "get_todays_posts":
+		today := time.Now().UTC().Format("2006-01-02")
+		posts := loadPosts()
+		var todayPosts []Post
+		for _, p := range posts {
+			isToday := false
+			if p.PostedAt != "" && len(p.PostedAt) >= 10 && p.PostedAt[:10] == today {
+				isToday = true
+			}
+			if p.ScheduledTime != "" && len(p.ScheduledTime) >= 10 && p.ScheduledTime[:10] == today {
+				isToday = true
+			}
+			if isToday {
+				todayPosts = append(todayPosts, p)
+			}
+		}
+		// Build summary per channel
+		channelsDone := map[string]string{} // channel → status (posted/scheduled)
+		for _, p := range todayPosts {
+			channelsDone[p.Channel] = p.Status
+		}
+		summary := fmt.Sprintf("%d posts today. ", len(todayPosts))
+		for _, ch := range []string{"twitter", "linkedin", "instagram"} {
+			status, ok := channelsDone[ch]
+			if !ok {
+				summary += fmt.Sprintf("%s: ⬜ not yet. ", ch)
+			} else if status == "scheduled" {
+				summary += fmt.Sprintf("%s: 📅 scheduled. ", ch)
+			} else {
+				summary += fmt.Sprintf("%s: ✅ posted. ", ch)
+			}
+		}
+		result, _ := json.Marshal(map[string]any{
+			"summary": summary,
+			"posts":   todayPosts,
+			"channels_remaining": func() []string {
+				var remaining []string
+				for _, ch := range []string{"twitter", "linkedin", "instagram"} {
+					if _, done := channelsDone[ch]; !done {
+						remaining = append(remaining, ch)
+					}
+				}
+				return remaining
+			}(),
+		})
+		textResult(id, string(result))
+
 	default:
 		respondError(id, -32601, fmt.Sprintf("unknown tool: %s", name))
 	}
@@ -146,6 +232,7 @@ func main() {
 	if dataDir == "" {
 		dataDir = "."
 	}
+	initPostCounter()
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -195,6 +282,11 @@ func main() {
 					{
 						"name":        "get_posts",
 						"description": "Get all published and scheduled posts.",
+						"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+					},
+					{
+						"name":        "get_todays_posts",
+						"description": "Check what's been posted today. Shows per-channel status (posted/not yet) and which channels still need a post. Limit: 1 post per channel per day.",
 						"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 					},
 				},

@@ -27,6 +27,7 @@ BEHAVIOR:
 - Process events when they arrive. Use your tools to accomplish tasks.
 - Stay focused on YOUR directive. Do not try to take over coordination duties.
 - Keep each thought concise — 1-2 short paragraphs max.
+- If you have no events to process, just sleep. Silence is normal — do not invent emergencies or report false failures.
 
 PACING — this is critical:
 - Tool results (like [[list_files]] or [[web]]) will wake you up for the next thought. Do NOT set [[pace]] in the same thought as a tool call — you'll be woken immediately.
@@ -60,6 +61,9 @@ SPAWNING SUB-THREADS:
 - Use [[update id="..." directive="..." tools="..."]] to change a sub-thread's directive or tools.
 - Your sub-threads report to YOU, not to main. You coordinate your team.
 - The "directive" must be PLAIN NATURAL LANGUAGE. Never put tool call syntax in directives.
+- NEVER spawn a replacement for a thread that already exists. Threads sleep — silence is normal, not a crash.
+- NEVER spawn threads with new IDs to "work around" a slow thread. Wait patiently or send it a message.
+- Only spawn threads that are defined in your team. Do not invent new thread IDs.
 
 BEHAVIOR:
 - Think out loud — explain what you're doing and why. Never output empty thoughts.
@@ -523,32 +527,33 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 
 // resolveTarget resolves "parent" to the actual parent ID, and routes the message.
 // Returns the resolved target ID and whether the send succeeded.
-func (thread *Thread) resolveSend(tm *ThreadManager, tagged string, targetID string) bool {
+func (thread *Thread) resolveSend(tm *ThreadManager, tagged string, targetID string, parts ...[]ContentPart) bool {
+	var mediaParts []ContentPart
+	if len(parts) > 0 {
+		mediaParts = parts[0]
+	}
 	// "parent" alias → route to parent thinker
 	if targetID == "parent" || targetID == thread.ParentID {
-		thread.Parent.Inject(tagged)
+		if len(mediaParts) > 0 {
+			thread.Parent.InjectWithParts(tagged, mediaParts)
+		} else {
+			thread.Parent.Inject(tagged)
+		}
 		return true
 	}
 	// "main" always goes to main (even from grandchildren)
 	if targetID == "main" {
-		// Walk up to the root thinker
-		t := thread.Parent
-		for t.threadID != "main" {
-			// Find parent's parent — but we don't have a direct ref, so just use the bus
-			break
-		}
-		// Use the bus to deliver to main directly
-		thread.Parent.bus.Publish(Event{Type: EventInbox, To: "main", Text: tagged})
+		thread.Parent.bus.Publish(Event{Type: EventInbox, To: "main", Text: tagged, Parts: mediaParts})
 		return true
 	}
 	// Try own children first
 	if thread.Children != nil {
-		if thread.Children.Send(targetID, tagged) {
+		if thread.Children.SendWithParts(targetID, tagged, mediaParts) {
 			return true
 		}
 	}
 	// Try sibling threads (same ThreadManager)
-	if tm.Send(targetID, tagged) {
+	if tm.SendWithParts(targetID, tagged, mediaParts) {
 		return true
 	}
 	return false
@@ -594,10 +599,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			case "send":
 				id := call.Args["id"]
 				msg := call.Args["message"]
+				mediaStr := call.Args["media"]
 				if id != "" && msg != "" {
 					tagged := fmt.Sprintf("[from:%s] %s", thread.ID, msg)
-					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q", thread.ID, id, msg))
-					if !thread.resolveSend(tm, tagged, id) {
+					mediaParts := parseMediaURLs(mediaStr)
+					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q media=%d", thread.ID, id, msg, len(mediaParts)))
+					if !thread.resolveSend(tm, tagged, id, mediaParts) {
 						t.Inject(fmt.Sprintf("[error] thread %q not found", id))
 					}
 					if t.telemetry != nil {

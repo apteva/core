@@ -108,7 +108,7 @@ func createProviderByName(name string) LLMProvider {
 		}
 	case "openai":
 		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-			return NewOpenAIProvider(key)
+			return NewOpenAINativeProvider(key)
 		}
 	case "anthropic":
 		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {

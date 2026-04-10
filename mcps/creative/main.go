@@ -70,30 +70,30 @@ func audit(tool string, args map[string]string, result string) {
 	}
 }
 
-// simulatePost generates a fake social media post based on channel and topic.
+// simulatePost generates a social media post based on channel and topic.
 func simulatePost(channel, topic, style string) string {
 	channel = strings.ToLower(channel)
 	if style == "" {
-		style = "engaging and friendly"
+		style = "engaging and professional"
 	}
 	switch channel {
 	case "twitter":
-		return fmt.Sprintf("☕ %s! Come visit Bean & Brew today. #coffee #coffeeshop #beanandbrew", topic)
+		return fmt.Sprintf("🚀 %s\n\nThread below 👇 #AI #agents #automation", topic)
 	case "instagram":
-		return fmt.Sprintf("✨ %s ✨\n\nNothing beats the aroma of freshly brewed coffee. Stop by Bean & Brew and treat yourself!\n\n#coffeelover #beanandbrew #coffeeart #%s", topic, strings.ReplaceAll(strings.ToLower(topic), " ", ""))
+		return fmt.Sprintf("✨ %s ✨\n\nBuilding the future of AI automation, one agent at a time.\n\n#AIagents #automation #tech #buildinpublic", topic)
 	case "linkedin":
-		return fmt.Sprintf("Exciting news from Bean & Brew! %s\n\nWe're passionate about great coffee and building our community. If you share our values, we'd love to connect.\n\n#smallbusiness #coffeeshop", topic)
+		return fmt.Sprintf("%s\n\nI've been working on this for the past few months and the results have been incredible. Here's what I learned and why it matters for the industry.\n\n#AI #agents #entrepreneurship #buildinpublic", topic)
 	default:
-		return fmt.Sprintf("Check out what's new at Bean & Brew: %s", topic)
+		return fmt.Sprintf("%s — check out the full post for details.", topic)
 	}
 }
 
 // simulateImage generates a fake image description/URL.
 func simulateImage(topic, style string) string {
 	if style == "" {
-		style = "warm, inviting coffee shop aesthetic"
+		style = "modern tech aesthetic"
 	}
-	return fmt.Sprintf("[Generated image: %s — style: %s — url: https://cdn.beanandbrew.fake/img/%d.jpg]",
+	return fmt.Sprintf("[Generated image: %s — style: %s — url: https://cdn.apteva.ai/media/%d.jpg]",
 		topic, style, time.Now().UnixNano()%10000)
 }
 

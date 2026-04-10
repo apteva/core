@@ -44,6 +44,10 @@ var geminiModels = map[string]GoogleModel{
 	"gemini-2.5-flash": {
 		ID: "gemini-2.5-flash", InputPer1M: 0.30, CachedPer1M: 0.03, OutputPer1M: 2.50, MaxOutputTokens: 65536,
 	},
+	// Computer Use model
+	"gemini-2.5-computer-use-preview-10-2025": {
+		ID: "gemini-2.5-computer-use-preview-10-2025", InputPer1M: 1.00, CachedPer1M: 0.10, OutputPer1M: 4.00, MaxOutputTokens: 64000,
+	},
 }
 
 // GeminiModelOrder defines the cycle order for model switching in the TUI.
@@ -124,6 +128,13 @@ type geminiRequest struct {
 
 type geminiToolDecl struct {
 	FunctionDeclarations []geminiFunctionDecl `json:"functionDeclarations,omitempty"`
+	ComputerUse          *geminiComputerUse   `json:"computerUse,omitempty"`
+}
+
+// geminiComputerUse is the native Gemini Computer Use tool config.
+type geminiComputerUse struct {
+	Environment                string   `json:"environment"`                          // "ENVIRONMENT_BROWSER"
+	ExcludedPredefinedFunctions []string `json:"excludedPredefinedFunctions,omitempty"` // e.g. ["drag_and_drop"]
 }
 
 type geminiFunctionDecl struct {
@@ -208,15 +219,21 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 			var parts []geminiPart
 			for _, tr := range m.ToolResults {
 				response := map[string]any{"result": tr.Content}
-				if tr.Image != nil {
-					response["screenshot"] = base64Encode(tr.Image)
-				}
 				parts = append(parts, geminiPart{
 					FunctionResponse: &geminiFunctionResponse{
 						Name:     tr.CallID,
 						Response: response,
 					},
 				})
+				// Gemini Computer Use: screenshots go as separate inlineData parts
+				if tr.Image != nil {
+					parts = append(parts, geminiPart{
+						InlineData: &geminiInline{
+							MimeType: "image/png",
+							Data:     base64Encode(tr.Image),
+						},
+					})
+				}
 			}
 			if len(contents) > 0 && contents[len(contents)-1].Role == "user" {
 				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, parts...)
@@ -314,18 +331,38 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 	}
 
 	// Convert native tools to Gemini function declarations
+	// Separate computer_use (native) from regular tools
 	var geminiTools []geminiToolDecl
+	hasComputerUse := false
 	if len(tools) > 0 {
 		var funcs []geminiFunctionDecl
 		for _, t := range tools {
-			funcs = append(funcs, geminiFunctionDecl{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.Parameters,
-			})
+			if t.Name == "computer_use" {
+				// Use native Gemini Computer Use tool
+				geminiTools = append(geminiTools, geminiToolDecl{
+					ComputerUse: &geminiComputerUse{
+						Environment: "ENVIRONMENT_BROWSER",
+					},
+				})
+				hasComputerUse = true
+				logMsg("GEMINI", "native computer_use tool enabled")
+			} else if t.Name == "browser_session" {
+				// browser_session is handled by Gemini's native navigate/search/go_back etc.
+				// Skip — these are built into the Computer Use tool
+				continue
+			} else {
+				funcs = append(funcs, geminiFunctionDecl{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  t.Parameters,
+				})
+			}
 		}
-		geminiTools = []geminiToolDecl{{FunctionDeclarations: funcs}}
+		if len(funcs) > 0 {
+			geminiTools = append(geminiTools, geminiToolDecl{FunctionDeclarations: funcs})
+		}
 	}
+	_ = hasComputerUse
 
 	reqBody := geminiRequest{
 		Contents:          contents,

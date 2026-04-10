@@ -124,14 +124,16 @@ func toOpenAIMessages(messages []Message) []any {
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
 				if tr.Image != nil {
-					// Tool result with image — send as multimodal content
+					// Tool result with image (screenshot) — send as multimodal content
+					// Use "original" detail for computer use to preserve full resolution
 					out = append(out, map[string]any{
 						"role":         "tool",
 						"tool_call_id": tr.CallID,
 						"content": []map[string]any{
 							{"type": "text", "text": tr.Content},
-							{"type": "image_url", "image_url": map[string]string{
-								"url": "data:image/png;base64," + base64Encode(tr.Image),
+							{"type": "image_url", "image_url": map[string]any{
+								"url":    "data:image/png;base64," + base64Encode(tr.Image),
+								"detail": "original",
 							}},
 						},
 					})
@@ -194,6 +196,12 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 	}
 
 	// Add tools if provider supports them
+	// OpenAI native Computer Use uses the Responses API (computer_call/computer_call_output),
+	// which is a different API shape from Chat Completions. For Chat Completions (what we use),
+	// computer_use is handled as a regular function tool via SetComputer() — gpt-5.4 works
+	// well with custom tool harnesses (Option 2 in their docs).
+	// We skip computer_use/browser_session from the tools list for native OpenAI since
+	// they're handled by the thinker's computer interceptor.
 	if len(tools) > 0 && p.SupportsNativeTools() {
 		var defs []openaiToolDef
 		for _, t := range tools {
