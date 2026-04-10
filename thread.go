@@ -176,7 +176,15 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		return fmt.Errorf("max spawn depth (%d) exceeded", MaxSpawnDepth)
 	}
 
-	canSpawn := depth < MaxSpawnDepth
+	// canSpawn only if depth allows AND spawn was explicitly in the tools list
+	wantsSpawn := false
+	for _, t := range tools {
+		if strings.TrimSpace(t) == "spawn" {
+			wantsSpawn = true
+			break
+		}
+	}
+	canSpawn := depth < MaxSpawnDepth && wantsSpawn
 
 	// Check if this is a system thread (e.g. unconscious)
 	isSystem := false
@@ -200,11 +208,13 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if !isSystem {
 		toolSet["evolve"] = true
 	}
-	// Leaders get spawn/kill/update
-	if canSpawn {
-		toolSet["spawn"] = true
+	// Leaders get kill/update only if spawn was explicitly requested
+	if canSpawn && toolSet["spawn"] {
 		toolSet["kill"] = true
 		toolSet["update"] = true
+	} else {
+		// Not a leader — remove spawn even if canSpawn by depth
+		delete(toolSet, "spawn")
 	}
 
 	// Build system prompt: use leader or worker template based on depth
