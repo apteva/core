@@ -605,7 +605,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		for _, call := range calls {
 			reason := call.Args["_reason"]
 			delete(call.Args, "_reason")
-			// Emit tool.call telemetry for inline tools (same as MCP tools)
+			// Emit tool.call telemetry for all inline tools
 			if t.telemetry != nil {
 				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
 					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
