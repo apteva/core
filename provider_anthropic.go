@@ -14,6 +14,19 @@ import (
 )
 
 // sanitizeToolID ensures tool call IDs only contain characters Anthropic accepts: [a-zA-Z0-9_-]
+// toMap converts a struct to map[string]any via JSON round-trip.
+func toMap(v any) (map[string]any, bool) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, false
+	}
+	var m map[string]any
+	if json.Unmarshal(data, &m) != nil {
+		return nil, false
+	}
+	return m, true
+}
+
 func sanitizeToolID(id string) string {
 	var b strings.Builder
 	for _, c := range id {
@@ -78,15 +91,26 @@ type anthropicRequest struct {
 	Model     string             `json:"model"`
 	MaxTokens int                `json:"max_tokens"`
 	Stream    bool               `json:"stream"`
-	System    string             `json:"system,omitempty"`
+	System    any                `json:"system,omitempty"` // string or []anthropicSystemBlock
 	Messages  []anthropicMessage `json:"messages"`
 	Tools     []any              `json:"tools,omitempty"` // mixed: anthropicTool or anthropicBuiltinTool
 }
 
+type anthropicSystemBlock struct {
+	Type         string                  `json:"type"`
+	Text         string                  `json:"text"`
+	CacheControl *anthropicCacheControl  `json:"cache_control,omitempty"`
+}
+
+type anthropicCacheControl struct {
+	Type string `json:"type"` // "ephemeral"
+}
+
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
+	Name         string                  `json:"name"`
+	Description  string                  `json:"description"`
+	InputSchema  map[string]any          `json:"input_schema"`
+	CacheControl *anthropicCacheControl  `json:"cache_control,omitempty"`
 }
 
 // anthropicBuiltinTool is for Anthropic-specific tool types (computer_use, text_editor, bash).
@@ -108,7 +132,7 @@ type anthropicContentBlock struct {
 	Source     *anthropicSource `json:"source,omitempty"`        // type=image
 	ID         string           `json:"id,omitempty"`            // type=tool_use
 	Name       string           `json:"name,omitempty"`          // type=tool_use
-	Input      map[string]any   `json:"input,omitempty"`         // type=tool_use
+	Input      json.RawMessage  `json:"input,omitempty"`         // type=tool_use — use RawMessage to preserve empty {}
 	ToolUseID  string           `json:"tool_use_id,omitempty"`   // type=tool_result
 	Content    any              `json:"content,omitempty"`       // type=tool_result (string or blocks)
 	IsError    bool             `json:"is_error,omitempty"`      // type=tool_result
@@ -130,14 +154,17 @@ type anthropicStreamEvent struct {
 	ContentBlock *anthropicBlockStart `json:"content_block,omitempty"`
 	Message      *struct {
 		Usage *struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-			CacheRead    int `json:"cache_read_input_tokens"`
+			InputTokens   int `json:"input_tokens"`
+			OutputTokens  int `json:"output_tokens"`
+			CacheRead     int `json:"cache_read_input_tokens"`
+			CacheCreation int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 	} `json:"message,omitempty"`
 	Usage *struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens   int `json:"input_tokens"`
+		OutputTokens  int `json:"output_tokens"`
+		CacheRead     int `json:"cache_read_input_tokens"`
+		CacheCreation int `json:"cache_creation_input_tokens"`
 	} `json:"usage,omitempty"`
 }
 
@@ -152,7 +179,7 @@ type anthropicBlockStart struct {
 	Text  string `json:"text,omitempty"`
 	ID    string `json:"id,omitempty"`    // tool_use
 	Name  string `json:"name,omitempty"`  // tool_use / server_tool_use
-	Input map[string]any `json:"input,omitempty"` // tool_use (may be empty at start)
+	Input map[string]any `json:"input"` // tool_use (may be empty at start)
 	// code_execution_tool_result fields
 	Content []struct {
 		Type   string `json:"type"`
@@ -216,15 +243,16 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
 			}
 			for _, tc := range m.ToolCalls {
-				input := make(map[string]any)
+				input := map[string]any{}
 				for k, v := range tc.Args {
 					input[k] = v
 				}
+				inputJSON, _ := json.Marshal(input)
 				blocks = append(blocks, anthropicContentBlock{
 					Type:  "tool_use",
 					ID:    sanitizeToolID(tc.ID),
 					Name:  tc.Name,
-					Input: input,
+					Input: inputJSON,
 				})
 			}
 			anthropicMsgs = append(anthropicMsgs, anthropicMessage{Role: "assistant", Content: blocks})
@@ -297,11 +325,36 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 		}
 	}
 
+	// System prompt as cacheable block
+	var systemContent any
+	if system != "" {
+		systemContent = []anthropicSystemBlock{
+			{Type: "text", Text: system, CacheControl: &anthropicCacheControl{Type: "ephemeral"}},
+		}
+	}
+
+	// Mark last tool as cacheable (tools rarely change between calls)
+	// Must handle all tool types: anthropicTool, map[string]string (builtin), AnthropicToolSpec (computer)
+	if len(anthropicTools) > 0 {
+		idx := len(anthropicTools) - 1
+		switch last := anthropicTools[idx].(type) {
+		case anthropicTool:
+			last.CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+			anthropicTools[idx] = last
+		default:
+			// For builtins/computer spec (maps), inject cache_control via generic map
+			if m, ok := toMap(last); ok {
+				m["cache_control"] = map[string]string{"type": "ephemeral"}
+				anthropicTools[idx] = m
+			}
+		}
+	}
+
 	reqBody := anthropicRequest{
 		Model:     model,
 		MaxTokens: 4096,
 		Stream:    true,
-		System:    system,
+		System:    systemContent,
 		Messages:  anthropicMsgs,
 		Tools:     anthropicTools,
 	}
@@ -450,10 +503,17 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 			if event.Message != nil && event.Message.Usage != nil {
 				usage.PromptTokens = event.Message.Usage.InputTokens
 				usage.CachedTokens = event.Message.Usage.CacheRead
+				if usage.CachedTokens > 0 || event.Message.Usage.CacheCreation > 0 {
+					logMsg("ANTHROPIC", fmt.Sprintf("cache: read=%d creation=%d input=%d", event.Message.Usage.CacheRead, event.Message.Usage.CacheCreation, event.Message.Usage.InputTokens))
+				}
 			}
 		case "message_delta":
 			if event.Usage != nil {
 				usage.CompletionTokens = event.Usage.OutputTokens
+				// Cache tokens can also appear in message_delta
+				if event.Usage.CacheRead > 0 {
+					usage.CachedTokens = event.Usage.CacheRead
+				}
 			}
 		}
 	}

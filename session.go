@@ -153,7 +153,68 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 		messages = append(messages, msg)
 	}
 
+	// Sanitize: remove orphaned tool_results that have no matching tool_use
+	messages = sanitizeToolPairs(messages)
+
 	return messages, compactedSummaries
+}
+
+// sanitizeToolPairs fixes mismatched tool_use/tool_result pairs that cause
+// Anthropic API errors. Handles both directions:
+// - tool_result without matching tool_use → remove the tool_result
+// - tool_use without matching tool_result → remove the tool_use from the assistant message
+func sanitizeToolPairs(messages []Message) []Message {
+	// Collect all tool_use IDs and tool_result IDs
+	toolUseIDs := make(map[string]bool)
+	toolResultIDs := make(map[string]bool)
+	for _, m := range messages {
+		for _, tc := range m.ToolCalls {
+			toolUseIDs[tc.ID] = true
+		}
+		for _, tr := range m.ToolResults {
+			toolResultIDs[tr.CallID] = true
+		}
+	}
+
+	var result []Message
+	removed := 0
+	for _, m := range messages {
+		// Remove orphaned tool_results (no matching tool_use)
+		if len(m.ToolResults) > 0 {
+			var valid []ToolResult
+			for _, tr := range m.ToolResults {
+				if toolUseIDs[tr.CallID] {
+					valid = append(valid, tr)
+				}
+			}
+			if len(valid) == 0 {
+				removed++
+				continue
+			}
+			m.ToolResults = valid
+		}
+
+		// Remove orphaned tool_uses (no matching tool_result)
+		if len(m.ToolCalls) > 0 && m.Role == "assistant" {
+			var valid []NativeToolCall
+			for _, tc := range m.ToolCalls {
+				if toolResultIDs[tc.ID] {
+					valid = append(valid, tc)
+				}
+			}
+			if len(valid) != len(m.ToolCalls) {
+				removed += len(m.ToolCalls) - len(valid)
+				m.ToolCalls = valid
+			}
+		}
+
+		result = append(result, m)
+	}
+
+	if removed > 0 {
+		logMsg("SESSION", fmt.Sprintf("sanitized: fixed %d orphaned tool pairs", removed))
+	}
+	return result
 }
 
 // NeedsCompaction returns true if the file is large enough to compact.

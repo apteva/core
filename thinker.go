@@ -1166,6 +1166,26 @@ func (t *Thinker) Run() {
 				start--
 			}
 			t.messages = append(t.messages[:1], t.messages[start:]...)
+			// Sanitize any remaining orphaned tool_results after trimming
+			if len(t.messages) > 1 {
+				t.messages = append(t.messages[:1], sanitizeToolPairs(t.messages[1:])...)
+			}
+		}
+
+		// Evict old screenshots — only keep the most recent image
+		latestImageFound := false
+		for i := len(t.messages) - 1; i >= 1; i-- {
+			for j := range t.messages[i].ToolResults {
+				if t.messages[i].ToolResults[j].Image != nil {
+					if latestImageFound {
+						// Replace old screenshot with text placeholder
+						t.messages[i].ToolResults[j].Image = nil
+						t.messages[i].ToolResults[j].Content = "[previous screenshot replaced — see latest for current screen state]"
+					} else {
+						latestImageFound = true
+					}
+				}
+			}
 		}
 
 		// Compact session history if it's grown too large
@@ -1278,6 +1298,12 @@ func (t *Thinker) think() (ChatResponse, error) {
 	if t.provider == nil {
 		return ChatResponse{}, fmt.Errorf("no provider configured")
 	}
+
+	// Sanitize messages before every API call — removes orphaned tool_use/tool_result pairs
+	if len(t.messages) > 1 {
+		t.messages = append(t.messages[:1], sanitizeToolPairs(t.messages[1:])...)
+	}
+
 	onChunk := func(chunk string) {
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
 		if t.telemetry != nil && chunk != "" {
