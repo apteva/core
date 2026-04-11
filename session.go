@@ -163,7 +163,12 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 // Anthropic API errors. Handles both directions:
 // - tool_result without matching tool_use → remove the tool_result
 // - tool_use without matching tool_result → remove the tool_use from the assistant message
-func sanitizeToolPairs(messages []Message) []Message {
+// pendingIDs are tool call IDs with async results still in flight — never strip those.
+func sanitizeToolPairs(messages []Message, pendingIDs ...map[string]bool) []Message {
+	pending := map[string]bool{}
+	if len(pendingIDs) > 0 && pendingIDs[0] != nil {
+		pending = pendingIDs[0]
+	}
 	// Collect all tool_use IDs and tool_result IDs
 	toolUseIDs := make(map[string]bool)
 	toolResultIDs := make(map[string]bool)
@@ -201,11 +206,11 @@ func sanitizeToolPairs(messages []Message) []Message {
 		}
 
 		// Remove orphaned tool_uses (no matching tool_result)
-		// BUT keep tool calls whose results have images (computer screenshots)
+		// BUT keep: tool calls with image results, and tool calls still pending
 		if len(m.ToolCalls) > 0 && m.Role == "assistant" {
 			var valid []NativeToolCall
 			for _, tc := range m.ToolCalls {
-				if toolResultIDs[tc.ID] || imageResultIDs[tc.ID] {
+				if toolResultIDs[tc.ID] || imageResultIDs[tc.ID] || pending[tc.ID] {
 					valid = append(valid, tc)
 				}
 			}

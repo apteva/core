@@ -73,9 +73,19 @@ func executeTool(t *Thinker, call toolCall) {
 		})
 	}
 
+	// Track pending async tool call
+	if call.NativeID != "" {
+		t.pendingTools.Store(call.NativeID, true)
+	}
+
 	go func() {
 		logMsg("TOOL", fmt.Sprintf("dispatch %s reason=%q args=%v", call.Name, reason, call.Args))
 		start := time.Now()
+		defer func() {
+			if call.NativeID != "" {
+				t.pendingTools.Delete(call.NativeID)
+			}
+		}()
 		defer func() {
 			if r := recover(); r != nil {
 				logMsg("TOOL", fmt.Sprintf("PANIC %s: %v", call.Name, r))

@@ -371,7 +371,8 @@ type Thinker struct {
 	mcpServers []MCPConn
 	// MCP server catalog — lightweight metadata for prompt (name + tool count)
 	mcpCatalog []MCPServerInfo
-	computer   computer.Computer // screen-based environment (nil = no computer use)
+	computer     computer.Computer // screen-based environment (nil = no computer use)
+	pendingTools sync.Map         // tool call IDs with pending async results
 
 	// Multimodal — parts waiting to be attached to next message
 }
@@ -1171,9 +1172,7 @@ func (t *Thinker) Run() {
 			}
 			t.messages = append(t.messages[:1], t.messages[start:]...)
 			// Sanitize any remaining orphaned tool_results after trimming
-			if len(t.messages) > 1 {
-				t.messages = append(t.messages[:1], sanitizeToolPairs(t.messages[1:])...)
-			}
+			// (no pending IDs needed here — this runs during the same iteration)
 		}
 
 		// Evict old screenshots — keep the 3 most recent images
@@ -1303,9 +1302,17 @@ func (t *Thinker) think() (ChatResponse, error) {
 		return ChatResponse{}, fmt.Errorf("no provider configured")
 	}
 
-	// Sanitize messages before every API call — removes orphaned tool_use/tool_result pairs
+	// Sanitize messages before every API call �� removes orphaned tool_use/tool_result pairs
+	// Pass pending tool IDs so the sanitizer doesn't strip in-flight async results
 	if len(t.messages) > 1 {
-		t.messages = append(t.messages[:1], sanitizeToolPairs(t.messages[1:])...)
+		pending := map[string]bool{}
+		t.pendingTools.Range(func(k, v any) bool {
+			if id, ok := k.(string); ok {
+				pending[id] = true
+			}
+			return true
+		})
+		t.messages = append(t.messages[:1], sanitizeToolPairs(t.messages[1:], pending)...)
 	}
 
 	onChunk := func(chunk string) {
@@ -1593,6 +1600,10 @@ func normalizeComputerAction(args map[string]string) computer.Action {
 
 // executeComputerAction runs a computer_use action and injects the result as a proper ToolResult.
 func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
+	if ntc.ID != "" {
+		t.pendingTools.Store(ntc.ID, true)
+		defer t.pendingTools.Delete(ntc.ID)
+	}
 	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Name, ntc.Args))
 	reason := ntc.Args["_reason"]
 	delete(ntc.Args, "_reason")
