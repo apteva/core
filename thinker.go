@@ -14,8 +14,8 @@ import (
 
 // Default context window sizes by role
 const (
-	maxHistoryMain   = 50 // main coordinator
-	maxHistoryLead   = 50 // team leads (depth 0)
+	maxHistoryMain   = 100 // main coordinator
+	maxHistoryLead   = 100 // team leads (depth 0)
 	maxHistoryWorker = 20 // workers (depth 1+)
 )
 
@@ -1172,17 +1172,17 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		// Evict old screenshots — only keep the most recent image
-		latestImageFound := false
+		// Evict old screenshots — keep the 3 most recent images
+		imageCount := 0
+		maxImages := 3
 		for i := len(t.messages) - 1; i >= 1; i-- {
 			for j := range t.messages[i].ToolResults {
 				if t.messages[i].ToolResults[j].Image != nil {
-					if latestImageFound {
+					imageCount++
+					if imageCount > maxImages {
 						// Replace old screenshot with text placeholder
 						t.messages[i].ToolResults[j].Image = nil
 						t.messages[i].ToolResults[j].Content = "[previous screenshot replaced — see latest for current screen state]"
-					} else {
-						latestImageFound = true
 					}
 				}
 			}

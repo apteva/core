@@ -167,12 +167,17 @@ func sanitizeToolPairs(messages []Message) []Message {
 	// Collect all tool_use IDs and tool_result IDs
 	toolUseIDs := make(map[string]bool)
 	toolResultIDs := make(map[string]bool)
+	// Also track which tool_results have images (must be preserved)
+	imageResultIDs := make(map[string]bool)
 	for _, m := range messages {
 		for _, tc := range m.ToolCalls {
 			toolUseIDs[tc.ID] = true
 		}
 		for _, tr := range m.ToolResults {
 			toolResultIDs[tr.CallID] = true
+			if tr.Image != nil {
+				imageResultIDs[tr.CallID] = true
+			}
 		}
 	}
 
@@ -180,10 +185,11 @@ func sanitizeToolPairs(messages []Message) []Message {
 	removed := 0
 	for _, m := range messages {
 		// Remove orphaned tool_results (no matching tool_use)
+		// BUT keep results with images — computer screenshots must survive
 		if len(m.ToolResults) > 0 {
 			var valid []ToolResult
 			for _, tr := range m.ToolResults {
-				if toolUseIDs[tr.CallID] {
+				if toolUseIDs[tr.CallID] || tr.Image != nil {
 					valid = append(valid, tr)
 				}
 			}
@@ -195,10 +201,11 @@ func sanitizeToolPairs(messages []Message) []Message {
 		}
 
 		// Remove orphaned tool_uses (no matching tool_result)
+		// BUT keep tool calls whose results have images (computer screenshots)
 		if len(m.ToolCalls) > 0 && m.Role == "assistant" {
 			var valid []NativeToolCall
 			for _, tc := range m.ToolCalls {
-				if toolResultIDs[tc.ID] {
+				if toolResultIDs[tc.ID] || imageResultIDs[tc.ID] {
 					valid = append(valid, tc)
 				}
 			}
