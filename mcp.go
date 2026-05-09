@@ -330,6 +330,38 @@ func connectAnyMCP(cfg MCPServerConfig) (MCPConn, error) {
 	return connectMCP(cfg)
 }
 
+// connectAnyMCPWithRetry wraps connectAnyMCP with a bounded retry
+// schedule. Defense in depth against transient startup races: when
+// apteva-server restarts both the agent and the app sidecars, the
+// agent can boot a fraction of a second before the app MCP proxy is
+// ready. Without this, that race silently drops the MCP server from
+// the agent's connected list for the rest of the process lifetime.
+//
+// Retry budget: 4 attempts at 0s, 1s, 2s, 4s — total ~7s wait worst
+// case, which is well under any reasonable user-perceivable boot
+// pause and well over the 0.1–0.5s window where transient failures
+// typically resolve. A genuinely broken URL still fails fast on the
+// final attempt.
+func connectAnyMCPWithRetry(cfg MCPServerConfig) (MCPConn, error) {
+	delays := []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second}
+	var lastErr error
+	for i, d := range delays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		srv, err := connectAnyMCP(cfg)
+		if err == nil {
+			if i > 0 {
+				fmt.Fprintf(os.Stderr, "MCP %s: connected on attempt %d/%d\n", cfg.Name, i+1, len(delays))
+			}
+			return srv, nil
+		}
+		lastErr = err
+		fmt.Fprintf(os.Stderr, "MCP %s: attempt %d/%d failed: %v\n", cfg.Name, i+1, len(delays), err)
+	}
+	return nil, lastErr
+}
+
 // connectAndRegisterMCP connects to MCP servers from config and registers
 // tools. If blobs is non-nil, every registered tool is wrapped so that
 // binary arguments and results flow through the blob store (see
@@ -337,7 +369,7 @@ func connectAnyMCP(cfg MCPServerConfig) (MCPConn, error) {
 func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, memory *MemoryStore, blobs *BlobStore) []MCPConn {
 	var servers []MCPConn
 	for _, cfg := range configs {
-		srv, err := connectAnyMCP(cfg)
+		srv, err := connectAnyMCPWithRetry(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "MCP %s: %v\n", cfg.Name, err)
 			continue

@@ -2,6 +2,8 @@ package core
 
 import (
 	"os"
+	"os/signal"
+	"syscall"
 	"testing"
 )
 
@@ -26,5 +28,32 @@ func TestMain(m *testing.M) {
 	// this, debugging an agent that stalls mid-loop is impossible
 	// because provider.Chat enter/exit traces are silently dropped.
 	initLogger()
+
+	// Emergency-cleanup signal handler. If a developer Ctrl-C's the
+	// test binary mid-run (or sends SIGTERM via `kill <pid>`), Go's
+	// default behaviour is to exit immediately without running any
+	// `defer comp.Close()` in the test functions. On cloud backends
+	// (Browserbase, Steel, BrowserEngine) that means the session
+	// stays alive — and billed — until the provider's idle timeout
+	// (typically 30+ minutes per leaked session).
+	//
+	// Solution: catch SIGINT/SIGTERM here, walk the live-Computer
+	// registry that buildComputerFromEnv populates, and Close every
+	// session in parallel before letting the process exit. SIGKILL
+	// (`kill -9`) still leaks — that's unavoidable — but Ctrl-C and
+	// `kill <pid>`, the common dev-loop kills, now release cleanly.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		closeAllLiveComputers()
+		// Re-raise the default behaviour so Go test reports the
+		// signal in its exit code rather than silently returning 0.
+		signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+		// Exit code 130 = 128 + SIGINT, the conventional code for
+		// "killed by SIGINT" — matches what bash uses.
+		os.Exit(130)
+	}()
+
 	os.Exit(m.Run())
 }

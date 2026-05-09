@@ -198,6 +198,78 @@ func TestSupersede_RejectsUnknownID(t *testing.T) {
 	}
 }
 
+// ---- RememberWithID + HasID (deterministic-id path) -------------------
+
+func TestRememberWithID_InsertsWithSuppliedID(t *testing.T) {
+	ms := newOfflineStore(t)
+	id, err := ms.RememberWithID("skill_abc_0", "playbook body", []string{"skill", "skill:storage:upload"}, 0.9)
+	if err != nil {
+		t.Fatalf("RememberWithID: %v", err)
+	}
+	if id != "skill_abc_0" {
+		t.Errorf("returned id = %q, want skill_abc_0", id)
+	}
+	if !ms.HasID("skill_abc_0") {
+		t.Error("HasID should be true after RememberWithID")
+	}
+	active := ms.Active()
+	if len(active) != 1 || active[0].ID != "skill_abc_0" {
+		t.Errorf("Active record mismatch: %+v", active)
+	}
+}
+
+func TestRememberWithID_RejectsEmptyID(t *testing.T) {
+	ms := newOfflineStore(t)
+	if _, err := ms.RememberWithID("", "x", nil, 0.5); err == nil {
+		t.Error("empty id should error")
+	}
+	if _, err := ms.RememberWithID("   ", "x", nil, 0.5); err == nil {
+		t.Error("whitespace-only id should error")
+	}
+}
+
+func TestRememberWithID_RejectsDuplicateID(t *testing.T) {
+	ms := newOfflineStore(t)
+	if _, err := ms.RememberWithID("dup", "first", nil, 0.5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.RememberWithID("dup", "second", nil, 0.5); err == nil {
+		t.Error("duplicate id should error (caller must use Supersede)")
+	}
+	// Original record is still active and untouched.
+	active := ms.Active()
+	if len(active) != 1 || active[0].Content != "first" {
+		t.Errorf("expected original 'first' to remain, got %+v", active)
+	}
+}
+
+func TestRememberWithID_RequiresContent(t *testing.T) {
+	ms := newOfflineStore(t)
+	if _, err := ms.RememberWithID("id", "", nil, 0.5); err == nil {
+		t.Error("empty content should error")
+	}
+}
+
+func TestHasID_FalseForUnknown(t *testing.T) {
+	ms := newOfflineStore(t)
+	if ms.HasID("nope") {
+		t.Error("HasID should be false for never-seen id")
+	}
+}
+
+func TestHasID_TrueAfterDrop(t *testing.T) {
+	// Tombstoned ids still register as "seen" — HasID is about the
+	// journal, not the active set. Callers route to Supersede when
+	// HasID is true; the supersede path would then fail on a dropped
+	// record (its way of saying "you can't bring back the dead").
+	ms := newOfflineStore(t)
+	id, _ := ms.RememberWithID("zombie", "body", nil, 0.5)
+	_ = ms.Drop(id, "test")
+	if !ms.HasID(id) {
+		t.Error("HasID should remain true after Drop (the id was seen)")
+	}
+}
+
 // ---- load + supersede chain reconstruction ----------------------------
 
 func TestLoad_ReconstructsActiveSet(t *testing.T) {

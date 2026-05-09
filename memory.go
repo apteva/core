@@ -412,6 +412,64 @@ func (ms *MemoryStore) Remember(content string, tags []string, weight float64) (
 	return rec.ID, nil
 }
 
+// RememberWithID is Remember with a caller-supplied id instead of a
+// freshly-minted ULID. Required for deterministic ids — the platform
+// uses this to push skill-as-memory records keyed by the skill's
+// primary key, so re-pushing the same skill upserts via Supersede
+// rather than creating a duplicate row.
+//
+// Errors if id is empty (use Remember) or if the id already exists
+// (caller should call HasID first and route to Supersede). Refusing
+// silent overwrite keeps the journal append-only semantics intact.
+func (ms *MemoryStore) RememberWithID(id, content string, tags []string, weight float64) (string, error) {
+	if strings.TrimSpace(id) == "" {
+		return "", errors.New("memory_remember: id required (use Remember for autogen)")
+	}
+	if strings.TrimSpace(content) == "" {
+		return "", errors.New("memory_remember: content required")
+	}
+	ms.mu.RLock()
+	_, exists := ms.byID[id]
+	ms.mu.RUnlock()
+	if exists {
+		return "", fmt.Errorf("memory_remember: id %q already exists (use Supersede to replace)", id)
+	}
+	if weight <= 0 {
+		weight = 0.7
+	}
+	if weight > 1 {
+		weight = 1
+	}
+	rec := MemoryRecord{
+		ID:      id,
+		TS:      time.Now().UTC(),
+		Content: content,
+		Tags:    tags,
+		Weight:  weight,
+	}
+	if ms.backend != nil {
+		if emb, err := ms.embed(content); err == nil {
+			rec.Embedding = emb
+		}
+	}
+	if err := ms.append(rec); err != nil {
+		return "", err
+	}
+	logMsg("MEMORY", fmt.Sprintf("remember-with-id: id=%s w=%.2f tags=%v len=%d", rec.ID, rec.Weight, rec.Tags, len(content)))
+	return rec.ID, nil
+}
+
+// HasID reports whether a record with this id exists in the journal
+// (active, tombstoned, or superseded — anything that was ever written).
+// Used by callers that want to decide between RememberWithID (insert)
+// and Supersede (update) without racing on the not-found error.
+func (ms *MemoryStore) HasID(id string) bool {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	_, ok := ms.byID[id]
+	return ok
+}
+
 // Supersede writes a NEW memory and a tombstone for oldID, linking
 // them via the new record's Supersedes field. Both records are
 // appended atomically (one after the other, no other writer in

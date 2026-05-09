@@ -123,6 +123,35 @@ type Config struct {
 	// cluttering their tool list.
 	IncludeAptevaServer bool
 	IncludeChannels     bool
+
+	// Computer enables the browser/computer-use tool surface
+	// (browser_session + computer_use) on the instance. When non-nil
+	// testkit forwards this block to PUT /api/instances/:id/config in
+	// the same call that lands the real directive + MCPs, so core
+	// spins up its computer backend before the agent's first real
+	// iteration. nil = no computer mode (default).
+	//
+	// Type=="browserbase"/"steel" relies on a saved provider in the
+	// project for credentials — the server enriches the block before
+	// forwarding to core. Type=="local" runs against a local Chrome
+	// (or an existing CDP endpoint if the matching `browser` provider
+	// has CDP_URL set). Type=="service" points at a custom HTTP
+	// browser service (URL required).
+	Computer *ComputerConfig
+}
+
+// ComputerConfig mirrors core.ComputerConfig (we restate the shape
+// here so testkit users don't have to import core just to flip on
+// browser tools). Only Type is required; Width/Height/URL/APIKey/
+// ProjectID are optional and the server fills in credentials from
+// saved providers when Type is "browserbase" or "steel".
+type ComputerConfig struct {
+	Type      string `json:"type"`                 // "local" | "browserbase" | "steel" | "browser-engine" | "service"
+	URL       string `json:"url,omitempty"`        // for "service", or local CDP endpoint
+	APIKey    string `json:"api_key,omitempty"`    // override saved provider API key (rare)
+	ProjectID string `json:"project_id,omitempty"` // for "browserbase"
+	Width     int    `json:"width,omitempty"`      // 0 = core default per LLM
+	Height    int    `json:"height,omitempty"`
 }
 
 // New wires up a Session against the URL in APTEVA_SERVER_URL (or
@@ -1078,8 +1107,16 @@ func (s *Session) createFreshInstance(c Config) (int64, error) {
 		time.Sleep(300 * time.Millisecond)
 	}
 
-	// Build the update payload: real directive + MCP list (if any).
+	// Build the update payload: real directive + MCP list (if any) +
+	// computer config (if any). The server's PUT /config handler
+	// forwards mcp_servers / computer / providers / threads /
+	// unconscious to core; everything else stays at the server layer.
 	update := map[string]any{"directive": realDirective}
+
+	if c.Computer != nil {
+		update["computer"] = c.Computer
+		s.t.Logf("testkit: enabling computer mode (type=%q)", c.Computer.Type)
+	}
 
 	if len(c.AttachMCPs) > 0 || len(c.AttachMCPsMainAccess) > 0 {
 		mcps, err := s.fetchMCPServers()

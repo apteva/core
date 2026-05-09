@@ -50,10 +50,16 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/pause", api.apiAuth(api.pause))
 	mux.HandleFunc("/event", api.apiAuth(api.postEvent))
 	mux.HandleFunc("/config", api.apiAuth(api.config))
-	// Memory inspection/editing. GET lists, DELETE + PUT target a
-	// single entry by zero-based index (matching memory_scan output
-	// so UI indices line up with the agent's internal view).
-	mux.HandleFunc("/memory", api.apiAuth(api.memoryList))
+	// Memory inspection/editing.
+	//   GET  /memory               — list active memories
+	//   POST /memory               — insert / upsert by id (used by the
+	//                                 platform to push skill-as-memory)
+	//   DELETE /memory/{idx}       — drop by zero-based index (legacy,
+	//                                 still used by the dashboard)
+	//   PUT    /memory/{idx}       — supersede by index
+	//   DELETE /memory/by-id/{id}  — drop by ULID (preferred for
+	//                                 platform-driven cleanup)
+	mux.HandleFunc("/memory", api.apiAuth(api.memoryRoot))
 	mux.HandleFunc("/memory/", api.apiAuth(api.memoryItem))
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 	return http.ListenAndServe(addr, mux)
@@ -760,7 +766,7 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 		if live[cfg.Name] {
 			continue
 		}
-		srv, err := connectAnyMCP(cfg)
+		srv, err := connectAnyMCPWithRetry(cfg)
 		if err != nil {
 			logMsg("MCP-RECONCILE", fmt.Sprintf("%s: connect error: %v", cfg.Name, err))
 			continue
@@ -844,12 +850,25 @@ type memoryListItem struct {
 	Time    time.Time `json:"time"`           // = MemoryRecord.TS
 }
 
+// memoryRoot dispatches /memory by method:
+//   GET  → list active memories (legacy memoryList behaviour)
+//   POST → insert or upsert by id
+// The platform uses POST to push skill-as-memory records with
+// deterministic ids, so re-pushing the same skill upserts via
+// Supersede instead of duplicating.
+func (a *APIServer) memoryRoot(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.memoryList(w, r)
+	case http.MethodPost:
+		a.memoryUpsert(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // GET /memory — return every memory entry in store order.
 func (a *APIServer) memoryList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET only", http.StatusMethodNotAllowed)
-		return
-	}
 	if a.thinker.memory == nil {
 		writeJSON(w, []memoryListItem{})
 		return
@@ -869,18 +888,115 @@ func (a *APIServer) memoryList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// /memory/{index} — DELETE prunes, PUT rewrites + recomputes embedding.
+// POST /memory — insert or upsert.
+//
+// Body: {id?, content, tags?, weight?}
+//
+// If id is present and matches an existing record, supersede it.
+// If id is present and unused, insert with that id.
+// If id is absent, insert with a freshly-minted ULID.
+//
+// Returns {id, action: "inserted"|"upserted"}. The action field lets
+// the platform tell whether a push created a new record or replaced
+// an existing one — useful for logging and drift dashboards.
+func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
+	if a.thinker.memory == nil {
+		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		ID      string   `json:"id"`
+		Content string   `json:"content"`
+		Tags    []string `json:"tags"`
+		Weight  float64  `json:"weight"`
+		Reason  string   `json:"reason"` // optional supersede reason
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		http.Error(w, "content required", http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(body.ID)
+	if id == "" {
+		newID, err := a.thinker.memory.Remember(body.Content, body.Tags, body.Weight)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"id": newID, "action": "inserted"})
+		return
+	}
+	if a.thinker.memory.HasID(id) {
+		reason := body.Reason
+		if reason == "" {
+			reason = "upsert via POST /memory"
+		}
+		newID, err := a.thinker.memory.Supersede(id, body.Content, body.Tags, body.Weight, reason)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"id": newID, "supersedes": id, "action": "upserted"})
+		return
+	}
+	newID, err := a.thinker.memory.RememberWithID(id, body.Content, body.Tags, body.Weight)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"id": newID, "action": "inserted"})
+}
+
+// /memory/{index}            — DELETE prunes by index, PUT supersedes by index
+// /memory/by-id/{id}         — DELETE drops by ULID
 func (a *APIServer) memoryItem(w http.ResponseWriter, r *http.Request) {
 	if a.thinker.memory == nil {
 		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
 		return
 	}
-	idxStr := strings.TrimPrefix(r.URL.Path, "/memory/")
-	idxStr = strings.TrimSuffix(idxStr, "/")
-	if idxStr == "" {
-		http.Error(w, "index required", http.StatusBadRequest)
+	rest := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/memory/"), "/")
+	if rest == "" {
+		http.Error(w, "index or id required", http.StatusBadRequest)
 		return
 	}
+
+	// /memory/by-id/{id} — id-addressed delete. The platform uses this
+	// to remove specific skill-as-memory records without racing against
+	// concurrent index shifts.
+	if strings.HasPrefix(rest, "by-id/") {
+		id := strings.TrimPrefix(rest, "by-id/")
+		if id == "" {
+			http.Error(w, "id required", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "DELETE only", http.StatusMethodNotAllowed)
+			return
+		}
+		if !a.thinker.memory.HasID(id) {
+			// Idempotent: deleting a non-existent id is a no-op success.
+			// The platform may push DELETEs after a record was already
+			// dropped (e.g. by an operator); a 404 here would force
+			// callers to track state we already track.
+			writeJSON(w, map[string]any{"ok": true, "count": a.thinker.memory.Count(), "noop": true})
+			return
+		}
+		reason := r.URL.Query().Get("reason")
+		if reason == "" {
+			reason = "deleted via DELETE /memory/by-id"
+		}
+		if err := a.thinker.memory.Drop(id, reason); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "count": a.thinker.memory.Count()})
+		return
+	}
+
+	idxStr := rest
 	var idx int
 	if _, err := fmt.Sscanf(idxStr, "%d", &idx); err != nil {
 		http.Error(w, "invalid index", http.StatusBadRequest)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -475,6 +476,215 @@ func TestAPI_PostEvent_InvalidMessage(t *testing.T) {
 
 	if w.Code != 400 {
 		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+// ---- POST /memory + DELETE /memory/by-id ------------------------------
+
+// withWritableMemory swaps the test thinker's stub MemoryStore for one
+// that writes to a temp memory.jsonl in a fresh temp dir. The stub at
+// path=/dev/null + nil byID can't handle writes; this gives the upsert
+// path a real journal to append to.
+func withWritableMemory(t *testing.T, api *APIServer) {
+	t.Helper()
+	dir := t.TempDir()
+	prev, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	api.thinker.memory = &MemoryStore{
+		path: memoryFile,
+		byID: map[string]int{},
+	}
+}
+
+func TestAPI_MemoryPost_InsertsWithoutID(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	payload, _ := json.Marshal(map[string]any{
+		"content": "the agent should know X",
+		"tags":    []string{"skill", "skill:foo:bar"},
+		"weight":  0.85,
+	})
+	req := httptest.NewRequest("POST", "/memory", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.memoryRoot(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d (body=%s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["action"] != "inserted" {
+		t.Errorf("expected action=inserted, got %v", resp["action"])
+	}
+	if id, _ := resp["id"].(string); id == "" {
+		t.Error("expected non-empty id")
+	}
+	if api.thinker.memory.Count() != 1 {
+		t.Errorf("expected 1 active memory, got %d", api.thinker.memory.Count())
+	}
+}
+
+func TestAPI_MemoryPost_InsertsWithSuppliedID(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	payload, _ := json.Marshal(map[string]any{
+		"id":      "skill_42_0",
+		"content": "first version",
+		"tags":    []string{"skill"},
+	})
+	req := httptest.NewRequest("POST", "/memory", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.memoryRoot(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d (body=%s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["id"] != "skill_42_0" {
+		t.Errorf("expected id=skill_42_0, got %v", resp["id"])
+	}
+	if resp["action"] != "inserted" {
+		t.Errorf("expected action=inserted, got %v", resp["action"])
+	}
+	if !api.thinker.memory.HasID("skill_42_0") {
+		t.Error("expected store to have id skill_42_0")
+	}
+}
+
+func TestAPI_MemoryPost_UpsertsExistingID(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	// Insert first.
+	first, _ := json.Marshal(map[string]any{
+		"id":      "skill_42_0",
+		"content": "first version",
+	})
+	req1 := httptest.NewRequest("POST", "/memory", bytes.NewReader(first))
+	w1 := httptest.NewRecorder()
+	api.memoryRoot(w1, req1)
+	if w1.Code != 200 {
+		t.Fatalf("first POST: expected 200, got %d (%s)", w1.Code, w1.Body.String())
+	}
+
+	// Re-POST same id with new content → should supersede.
+	second, _ := json.Marshal(map[string]any{
+		"id":      "skill_42_0",
+		"content": "second version",
+		"reason":  "skill body changed",
+	})
+	req2 := httptest.NewRequest("POST", "/memory", bytes.NewReader(second))
+	w2 := httptest.NewRecorder()
+	api.memoryRoot(w2, req2)
+	if w2.Code != 200 {
+		t.Fatalf("second POST: expected 200, got %d (%s)", w2.Code, w2.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w2.Body.Bytes(), &resp)
+	if resp["action"] != "upserted" {
+		t.Errorf("expected action=upserted, got %v", resp["action"])
+	}
+	if resp["supersedes"] != "skill_42_0" {
+		t.Errorf("expected supersedes=skill_42_0, got %v", resp["supersedes"])
+	}
+	// Active count should still be 1 (the new record), not 2.
+	if api.thinker.memory.Count() != 1 {
+		t.Errorf("expected 1 active after upsert, got %d", api.thinker.memory.Count())
+	}
+	// And the active record's content is the new content.
+	active := api.thinker.memory.Active()
+	if len(active) != 1 || active[0].Content != "second version" {
+		t.Errorf("expected active to be 'second version', got %+v", active)
+	}
+}
+
+func TestAPI_MemoryPost_RequiresContent(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	payload, _ := json.Marshal(map[string]any{"id": "x", "content": ""})
+	req := httptest.NewRequest("POST", "/memory", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.memoryRoot(w, req)
+	if w.Code != 400 {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestAPI_MemoryPost_InvalidJSON(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+	req := httptest.NewRequest("POST", "/memory", bytes.NewReader([]byte("{not json")))
+	w := httptest.NewRecorder()
+	api.memoryRoot(w, req)
+	if w.Code != 400 {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestAPI_MemoryDeleteByID_DropsRecord(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	id, _ := api.thinker.memory.RememberWithID("skill_42_0", "body", []string{"skill"}, 0.7)
+	if !api.thinker.memory.HasID(id) {
+		t.Fatal("setup: id should exist")
+	}
+
+	req := httptest.NewRequest("DELETE", "/memory/by-id/"+id, nil)
+	w := httptest.NewRecorder()
+	api.memoryItem(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d (body=%s)", w.Code, w.Body.String())
+	}
+	if api.thinker.memory.Count() != 0 {
+		t.Errorf("expected 0 active after delete, got %d", api.thinker.memory.Count())
+	}
+}
+
+func TestAPI_MemoryDeleteByID_IdempotentOnMissing(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	req := httptest.NewRequest("DELETE", "/memory/by-id/never-existed", nil)
+	w := httptest.NewRecorder()
+	api.memoryItem(w, req)
+	if w.Code != 200 {
+		t.Errorf("expected 200 (idempotent no-op), got %d (body=%s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["noop"] != true {
+		t.Errorf("expected noop=true, got %v", resp["noop"])
+	}
+}
+
+func TestAPI_MemoryDeleteByID_RejectsNonDelete(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	req := httptest.NewRequest("GET", "/memory/by-id/abc", nil)
+	w := httptest.NewRecorder()
+	api.memoryItem(w, req)
+	if w.Code != 405 {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestAPI_MemoryRoot_RejectsBadMethod(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+	req := httptest.NewRequest("PATCH", "/memory", nil)
+	w := httptest.NewRecorder()
+	api.memoryRoot(w, req)
+	if w.Code != 405 {
+		t.Errorf("expected 405, got %d", w.Code)
 	}
 }
 

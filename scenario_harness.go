@@ -126,6 +126,15 @@ func getTestProvider(t *testing.T) testProvider {
 	}
 	godotenv.Load()
 
+	// Wipe persistent agent state BEFORE handing back a provider.
+	// NewThinker() loads ./history/<threadID>.jsonl on construction —
+	// a previous run that crashed or was killed mid-flight can leave
+	// a broken tool_call/tool_result chain on disk, which then makes
+	// every subsequent test infinite-retry on a 400 from any
+	// tools-strict provider (Moonshot, Anthropic, OpenAI strict mode).
+	// We burned hours debugging this once; never again.
+	resetPersistentAgentState(t)
+
 	if k := os.Getenv("OPENCODE_GO_API_KEY"); k != "" {
 		// memory store still talks to Fireworks for embeddings if a
 		// FIREWORKS_API_KEY is also set; otherwise it disables itself.
@@ -144,6 +153,29 @@ func getTestProvider(t *testing.T) testProvider {
 	}
 	t.Skip("no LLM provider key set (OPENCODE_GO_API_KEY or FIREWORKS_API_KEY) — skipping integration test")
 	return testProvider{} // unreachable; t.Skip aborts
+}
+
+// resetPersistentAgentState wipes the on-disk Thinker state files so
+// each test starts from a known-empty conversation history. Called by
+// getTestProvider before any LLM provider is handed back. Re-wipes on
+// t.Cleanup so the next test process also starts clean (otherwise a
+// passing run would leave its own history behind for the next one).
+//
+// What gets wiped:
+//   ./history/         per-thread JSONL conversation logs (main.jsonl etc.)
+//   ./memory.jsonl     cross-session user memories surfaced into the prompt
+func resetPersistentAgentState(t *testing.T) {
+	t.Helper()
+	paths := []string{"history", "memory.jsonl"}
+	wipe := func() {
+		for _, p := range paths {
+			if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
+				t.Logf("resetPersistentAgentState: could not remove %s: %v", p, err)
+			}
+		}
+	}
+	wipe()
+	t.Cleanup(wipe)
 }
 
 func firstNonEmptyEnv(keys ...string) string {
