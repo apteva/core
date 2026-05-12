@@ -83,7 +83,9 @@ func startServerReusingLocalDB(t *testing.T, timeout time.Duration) *serverProc 
 		if apiKey == "" {
 			apiKey = cfg.APIKey
 		}
-		if instanceID == 0 && os.Getenv("APTEVA_TEST_INSTANCE_ID") == "" {
+		if instanceID == 0 &&
+			os.Getenv("APTEVA_TEST_AGENT_ID") == "" &&
+			os.Getenv("APTEVA_TEST_INSTANCE_ID") == "" {
 			instanceID = cfg.InstanceID
 		}
 		if projectID == "" {

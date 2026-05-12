@@ -177,7 +177,14 @@ func New(t *testing.T, cfg ...Config) *Session {
 		c.APIKey = os.Getenv("APTEVA_API_KEY")
 	}
 	if c.InstanceID == 0 {
-		if s := os.Getenv("APTEVA_TEST_INSTANCE_ID"); s != "" {
+		// APTEVA_TEST_AGENT_ID is the canonical post-rename env var;
+		// APTEVA_TEST_INSTANCE_ID remains accepted during the
+		// deprecation window so existing test scripts keep working.
+		s := os.Getenv("APTEVA_TEST_AGENT_ID")
+		if s == "" {
+			s = os.Getenv("APTEVA_TEST_INSTANCE_ID")
+		}
+		if s != "" {
 			fmt.Sscanf(s, "%d", &c.InstanceID)
 		}
 	}
