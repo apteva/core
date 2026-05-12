@@ -54,13 +54,24 @@ func NewTelemetry() *Telemetry {
 		quit:      make(chan struct{}),
 	}
 
-	// Read instance ID from env (set by server when spawning)
-	if id := os.Getenv("INSTANCE_ID"); id != "" {
+	// Read agent ID from env (set by server when spawning).
+	// AGENT_ID is the canonical name from the platform's rename
+	// (Phase 2); INSTANCE_ID stays accepted so an older server build
+	// that hasn't dual-written the new var still launches us cleanly.
+	id := os.Getenv("AGENT_ID")
+	if id == "" {
+		id = os.Getenv("INSTANCE_ID")
+	}
+	if id != "" {
 		fmt.Sscanf(id, "%d", &t.instanceID)
 	}
 
-	// Read instance secret from env (for telemetry auth)
-	t.instanceSecret = os.Getenv("INSTANCE_SECRET")
+	// Read agent secret from env (for telemetry auth). Same dual-name
+	// fallback as AGENT_ID above.
+	t.instanceSecret = os.Getenv("AGENT_SECRET")
+	if t.instanceSecret == "" {
+		t.instanceSecret = os.Getenv("INSTANCE_SECRET")
+	}
 
 	// Telemetry endpoints are provided by the server via env vars.
 	// Core doesn't need to know the server's route layout — fire-and-forget
@@ -187,7 +198,10 @@ func (t *Telemetry) forwardLive(ev TelemetryEvent) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if t.instanceSecret != "" {
-		req.Header.Set("X-Instance-Secret", t.instanceSecret)
+		// X-Agent-Secret is the post-rename header name; the server
+		// accepts X-Instance-Secret as a fallback during the
+		// deprecation window so the order of upgrades doesn't matter.
+		req.Header.Set("X-Agent-Secret", t.instanceSecret)
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Do(req)
@@ -329,7 +343,10 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if t.instanceSecret != "" {
-		req.Header.Set("X-Instance-Secret", t.instanceSecret)
+		// X-Agent-Secret is the post-rename header name; the server
+		// accepts X-Instance-Secret as a fallback during the
+		// deprecation window so the order of upgrades doesn't matter.
+		req.Header.Set("X-Agent-Secret", t.instanceSecret)
 	}
 
 	resp, err := client.Do(req)
