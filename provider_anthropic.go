@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -229,7 +230,7 @@ type anthropicBlockStart struct {
 
 // --- Chat implementation ---
 
-func (p *AnthropicProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Convert messages: extract system prompt, convert rest to Anthropic format
 	var system string
 	var anthropicMsgs []anthropicMessage
@@ -409,7 +410,7 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 		return ChatResponse{}, err
 	}
 
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -445,7 +446,14 @@ func (p *AnthropicProvider) Chat(messages []Message, model string, tools []Nativ
 	}
 	var currentTool *pendingTool
 
-	scanner := bufio.NewScanner(resp.Body)
+	// Wrap resp.Body so a silent stream is killed after the idle window
+	// instead of hanging the thinker indefinitely. Each byte received
+	// resets the timer, so healthy slow streams are unaffected; only a
+	// fully silent stall (no SSE events, not even keepalives) trips it.
+	streamBody := newIdleReader(resp.Body, streamIdleTimeout(), nil)
+	defer streamBody.Close()
+
+	scanner := bufio.NewScanner(streamBody)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	for scanner.Scan() {

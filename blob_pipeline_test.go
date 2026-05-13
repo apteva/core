@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -86,7 +87,7 @@ func TestIntegration_BlobPipeline(t *testing.T) {
 	var transcribeCalled bool
 
 	for iter := 0; iter < 6; iter++ {
-		resp, err := provider.Chat(messages, model, tools, func(string) {}, nil, nil)
+		resp, err := provider.Chat(context.Background(), messages, model, tools, func(string) {}, nil, nil)
 		if err != nil {
 			t.Fatalf("iter %d Chat error: %v", iter, err)
 		}

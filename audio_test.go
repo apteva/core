@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -54,7 +55,7 @@ func TestAudioInput(t *testing.T) {
 	start := time.Now()
 
 	var fullText strings.Builder
-	resp, err := provider.Chat(messages, model, nil, func(chunk string) {
+	resp, err := provider.Chat(context.Background(), messages, model, nil, func(chunk string) {
 		fullText.WriteString(chunk)
 	}, nil, nil)
 	duration := time.Since(start)

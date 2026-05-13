@@ -249,9 +249,81 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 		a.thinker.threads.Kill(id)
 		a.thinker.config.RemoveThread(id)
 		writeJSON(w, map[string]string{"status": "killed", "id": id})
+	case http.MethodPost:
+		a.spawnThread(w, r, id)
 	default:
-		http.Error(w, "DELETE only", http.StatusMethodNotAllowed)
+		http.Error(w, "DELETE or POST only", http.StatusMethodNotAllowed)
 	}
+}
+
+// spawnThread handles POST /threads/{id}. Idempotent: if the thread
+// already exists, returns its current state with status="exists"
+// without mutating it; if not, spawns a new one with the given
+// directive + tools + mcp and returns status="created". Missing
+// fields fall back to inherit-from-main: directive=main's directive,
+// tools=[] (spawnInternal supplies the safe baseline: send, done,
+// pace, evolve), mcp=[].
+func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "main" {
+		http.Error(w, "cannot spawn over main", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Directive        string   `json:"directive"`
+		DirectiveSuffix  string   `json:"directive_suffix"`
+		Tools            []string `json:"tools"`
+		MCP              []string `json:"mcp"`
+	}
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+	}
+
+	if t := findThinkerByID(a.thinker, id); t != nil {
+		writeJSON(w, map[string]any{
+			"status":    "exists",
+			"id":        id,
+			"iteration": t.iteration,
+		})
+		return
+	}
+
+	// Directive precedence:
+	//   1. body.Directive non-empty → use verbatim
+	//   2. body.DirectiveSuffix non-empty → main's directive + suffix
+	//      (the inherit-with-tweak path: lets a caller add a role hint
+	//      without having to fetch main's directive first)
+	//   3. neither → main's directive verbatim (pure inherit)
+	directive := body.Directive
+	if directive == "" {
+		directive = a.thinker.config.GetDirective()
+		if body.DirectiveSuffix != "" {
+			directive = directive + body.DirectiveSuffix
+		}
+	}
+	// API-initiated spawns are privileged: the caller authenticated
+	// with the core API key, so this is the system itself asking for
+	// a sub-thread (e.g. channelchat's chat-handling thread needs the
+	// `channels` MCP, which is no_spawn-flagged to keep LLM-driven
+	// spawn tool calls from grabbing it). BypassNoSpawn lets the
+	// requested MCPs through; the LLM's spawn-tool path doesn't set
+	// this, so in-agent workers still can't escalate.
+	opts := SpawnOpts{MCPNames: body.MCP, BypassNoSpawn: true}
+	if err := a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts); err != nil {
+		// Race: another caller spawned the same id between our
+		// findThinkerByID check and the lock inside Spawn. Treat as
+		// success — the caller's intent (a live thread by this name)
+		// is satisfied.
+		if strings.Contains(err.Error(), "already exists") {
+			writeJSON(w, map[string]any{"status": "exists", "id": id})
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"status": "created", "id": id})
 }
 
 // findThinkerByID returns main or any sub-thread's Thinker by id, or nil.
@@ -374,6 +446,31 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	threadID := body.ThreadID
 	if threadID == "" {
 		threadID = "main"
+	}
+
+	// Lazy auto-spawn: if the event addresses a non-main thread that
+	// doesn't exist (yet), spawn it with inherit-from-main defaults
+	// before publishing. Without this the bus silently drops the event
+	// because nothing is subscribed under that id. Two cases this
+	// handles:
+	//   - a caller that addresses threads by name without first calling
+	//     POST /threads/{id} (slack/email channels, ad-hoc scripts).
+	//   - post-restart recovery: a persisted thread id (e.g. channelchat's
+	//     stored chat-<id>) survives in the caller's DB but core's
+	//     in-memory thread tree is empty after restart.
+	// The "already exists" race is handled the same way as in
+	// spawnThread — treat as success.
+	if threadID != "main" && findThinkerByID(a.thinker, threadID) == nil {
+		directive := a.thinker.config.GetDirective()
+		if err := a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}); err != nil {
+			if !strings.Contains(err.Error(), "already exists") {
+				logMsg("API", fmt.Sprintf("lazy spawn %q failed: %v", threadID, err))
+				http.Error(w, "failed to spawn thread: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			logMsg("API", fmt.Sprintf("lazy-spawned thread %q for inbound event", threadID))
+		}
 	}
 
 	if len(parts) > 0 {

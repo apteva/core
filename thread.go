@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -114,6 +115,7 @@ type Thread struct {
 	Directive    string // original directive before tool docs
 	MCPNames     []string // MCP server names this thread connected to
 	Thinker      *Thinker
+	Realtime     *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
 	Parent       *Thinker
 	Children     *ThreadManager // non-nil if this thread can spawn (depth < MaxSpawnDepth)
 	Tools        map[string]bool
@@ -155,6 +157,34 @@ type SpawnOpts struct {
 	//     instruction rather than acting on the directive alone
 	//   - debugging — inspect the worker before it does anything
 	Paused bool
+	// BypassNoSpawn skips the no_spawn MCP filter. Set by the
+	// authenticated HTTP spawn endpoint (POST /threads/{id}) where
+	// the caller has the core API key — the system itself is asking
+	// for a privileged sub-thread (e.g. channelchat's chat thread
+	// needs the `channels` MCP to reply to users). The LLM-driven
+	// spawn tool path never sets this, so an in-agent worker still
+	// can't escalate by attaching a no_spawn MCP.
+	BypassNoSpawn bool
+	// Realtime: if true, construct a realtime (voice/audio) thread
+	// driven by a RealtimeProvider session instead of the standard
+	// request/response Thinker. ProviderName must resolve to a
+	// registered RealtimeProvider (e.g. "openai-realtime"); when
+	// empty, the pool's RealtimeDefault is used. SpawnWithOpts will
+	// refuse with a clear error if no realtime provider is available.
+	Realtime bool
+	// Voice: realtime voice id (e.g. "alloy"). Empty = provider's
+	// default. Ignored when Realtime is false.
+	Voice string
+	// AudioIn: PCM audio chunks pushed by the caller (telephony
+	// bridge, browser WebRTC, mic source). The realtime thread reads
+	// these and forwards to session.SendAudio. nil = no inbound audio
+	// (text-only realtime — useful for tests). Ignored when
+	// Realtime is false.
+	AudioIn <-chan []byte
+	// AudioOut: PCM audio chunks the realtime thread writes when the
+	// model speaks. Caller plays/streams them. nil = audio output
+	// silently dropped. Ignored when Realtime is false.
+	AudioOut chan<- []byte
 }
 
 // SpawnWithMedia creates a thread and injects media parts before it starts thinking.
@@ -187,6 +217,31 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		return fmt.Errorf("thread %q already exists in tree", id)
 	}
 	logMsg("SPAWN", fmt.Sprintf("passed existence checks id=%q", id))
+
+	// Realtime: pre-validate provider availability. Actual session
+	// opening + RealtimeThinker construction happens after the
+	// regular Thinker is built (we reuse its registry, bus
+	// subscription, telemetry, etc.). Resolving the provider here
+	// means we fail fast before doing the expensive Thinker setup if
+	// the request is misconfigured.
+	var realtimeProvider RealtimeProvider
+	if opts.Realtime {
+		pool := tm.parent.pool
+		if pool == nil || !pool.HasRealtimeProvider() {
+			return fmt.Errorf("realtime spawn refused: no realtime provider registered in pool")
+		}
+		if opts.ProviderName != "" {
+			realtimeProvider = pool.RealtimeByName(opts.ProviderName)
+			if realtimeProvider == nil {
+				return fmt.Errorf("realtime spawn refused: provider %q not registered as a realtime provider", opts.ProviderName)
+			}
+		} else {
+			realtimeProvider = pool.RealtimeDefault()
+			if realtimeProvider == nil {
+				return fmt.Errorf("realtime spawn refused: no default realtime provider")
+			}
+		}
+	}
 
 	depth := opts.Depth
 	parentID := opts.ParentID
@@ -317,7 +372,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// attaching them via spawn(mcp="..."). Core has no opinion about
 	// which names are privileged — it only honors the flag.
 	mcpNames := opts.MCPNames
-	if len(mcpNames) > 0 && tm.parent.config != nil {
+	if !opts.BypassNoSpawn && len(mcpNames) > 0 && tm.parent.config != nil {
 		noSpawn := map[string]bool{}
 		for _, sc := range tm.parent.config.GetMCPServers() {
 			if sc.NoSpawn {
@@ -556,7 +611,35 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		} else {
 			logMsg("SPAWN", fmt.Sprintf("starting Run() for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
 		}
-		go thinker.Run()
+		// Realtime threads run an event-driven loop against a live
+		// WebSocket session instead of the standard request/response
+		// iteration. The Thinker remains constructed (shared state:
+		// registry, bus, telemetry) so all the late-result and
+		// tool-dispatch machinery works identically.
+		if opts.Realtime && realtimeProvider != nil {
+			rt, err := startRealtimeThinker(
+				context.Background(),
+				thinker,
+				realtimeProvider,
+				directive,
+				opts.Voice,
+				opts.AudioIn,
+				opts.AudioOut,
+			)
+			if err != nil {
+				logMsg("REALTIME", fmt.Sprintf("[%s] open failed: %v", id, err))
+				// Tear down the Thinker shell we built — its session
+				// goroutines never started, but we registered the
+				// thread in tm.threads above and that lookup needs
+				// cleanup so a retry with the same id succeeds.
+				delete(tm.threads, id)
+				return fmt.Errorf("realtime open: %w", err)
+			}
+			thread.Realtime = rt
+			go rt.Run()
+		} else {
+			go thinker.Run()
+		}
 	} else {
 		logMsg("SPAWN", fmt.Sprintf("deferred Run() for id=%q (batch respawn)", id))
 	}

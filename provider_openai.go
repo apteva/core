@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -222,7 +223,7 @@ func toOpenAIMessages(messages []Message) []any {
 	return out
 }
 
-func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Build request
 	reqMap := map[string]any{
 		"model":    model,
@@ -271,7 +272,7 @@ func (p *OpenAICompatProvider) Chat(messages []Message, model string, tools []Na
 		}
 	}
 
-	req, err := http.NewRequest("POST", p.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.url, bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, err
 	}

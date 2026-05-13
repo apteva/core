@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
@@ -278,7 +279,7 @@ func TestIntegration_NativeToolCallArrayArgs(t *testing.T) {
 		{Role: "user", Content: `Call create_post with account_ids [33, 44], text "Hello world", and tags ["social", "test"].`},
 	}
 
-	resp, err := provider.Chat(messages, provider.Models()[ModelLarge], tools, func(s string) {}, nil, nil)
+	resp, err := provider.Chat(context.Background(), messages, provider.Models()[ModelLarge], tools, func(s string) {}, nil, nil)
 	if err != nil {
 		t.Fatalf("Chat() error: %v", err)
 	}
@@ -378,7 +379,7 @@ func TestIntegration_NativeToolCallNestedArrayArgs(t *testing.T) {
 		{Role: "user", Content: `Call create_post with account_ids [33], text "Check this out!", and media_urls containing one item: url "https://example.com/video.mp4" with type "video".`},
 	}
 
-	resp, err := provider.Chat(messages, provider.Models()[ModelLarge], tools, func(s string) {}, nil, nil)
+	resp, err := provider.Chat(context.Background(), messages, provider.Models()[ModelLarge], tools, func(s string) {}, nil, nil)
 	if err != nil {
 		t.Fatalf("Chat() error: %v", err)
 	}

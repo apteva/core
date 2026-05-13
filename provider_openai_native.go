@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -146,7 +147,7 @@ type oaiComputerAction struct {
 	Keys      []string `json:"keys,omitempty"`   // modifier keys
 }
 
-func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Convert messages to Responses API input items
 	input := p.buildInput(messages)
 
@@ -221,7 +222,7 @@ func (p *OpenAINativeProvider) Chat(messages []Message, model string, tools []Na
 		logMsg("OPENAI-NATIVE", fmt.Sprintf("model=%s input_items=%d tools=0", model, len(input)))
 	}
 
-	req, err := http.NewRequest("POST", "https://api.openai.com/v1/responses", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/responses", bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, err
 	}

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -190,6 +191,8 @@ type ChatResponse struct {
 // The provider only handles: send messages → get streaming response.
 type LLMProvider interface {
 	// Chat sends messages and streams the response.
+	// ctx is propagated to the underlying HTTP request so cancellation
+	// (user abort, shutdown) unblocks an in-flight stream cleanly.
 	// tools: native tool definitions to include in the request (nil = no tools).
 	// onChunk is called for each text token chunk as it arrives.
 	// onThinking is called for each reasoning/thinking token (separate from output).
@@ -199,7 +202,7 @@ type LLMProvider interface {
 	// stable per-call id (tc.Index for OpenAI, content_block id for
 	// Anthropic). Empty string is acceptable.
 	// Returns ChatResponse with text, tool calls, and usage.
-	Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(toolName, callID, chunk string)) (ChatResponse, error)
+	Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(toolName, callID, chunk string)) (ChatResponse, error)
 
 	// Models returns model IDs for each tier.
 	Models() map[ModelTier]string
@@ -222,6 +225,32 @@ type LLMProvider interface {
 	// WithBuiltins returns a shallow clone of this provider with only the specified builtins enabled.
 	// If builtins is nil, returns the provider unchanged (inherit all).
 	WithBuiltins(builtins []string) LLMProvider
+}
+
+// createRealtimeProviderByName creates a RealtimeProvider by name,
+// returning nil if the required API key is missing or the name is
+// unknown. Mirrors createProviderByName but for the realtime
+// interface. Realtime providers are NEVER auto-detected — callers
+// must opt in explicitly via config (cfg.Providers[] + RealtimeEnabled).
+func createRealtimeProviderByName(name string) RealtimeProvider {
+	switch name {
+	case "openai-realtime":
+		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+			return NewOpenAIRealtimeProvider(key)
+		}
+	}
+	return nil
+}
+
+// isRealtimeProviderName returns true if the given name belongs to a
+// known realtime provider. Used to route registration in
+// buildProviderPool without trying both factories blindly.
+func isRealtimeProviderName(name string) bool {
+	switch name {
+	case "openai-realtime":
+		return true
+	}
+	return false
 }
 
 // createProviderByName creates a provider by name, returning nil if the required API key is missing.
@@ -325,10 +354,19 @@ func applyModelOverrides(provider LLMProvider, models map[string]string) {
 
 // ProviderPool holds multiple LLM providers keyed by name.
 // Supports default selection and fallback on error.
+//
+// Realtime providers (RealtimeProvider) live in a separate map so the
+// existing LLM-provider plumbing (Default, Fallback, ProviderSummary,
+// etc.) stays untouched. A name can in principle appear in both maps
+// if a vendor offers both APIs, though in practice they're distinct
+// (e.g. "openai" text vs "openai-realtime").
 type ProviderPool struct {
-	providers map[string]LLMProvider // "fireworks" → instance
-	order     []string              // provider names in config order (fallback order)
-	default_  string                // default provider name
+	providers         map[string]LLMProvider      // "fireworks" → instance
+	order             []string                    // provider names in config order (fallback order)
+	default_          string                      // default provider name
+	realtimeProviders map[string]RealtimeProvider // "openai-realtime" → instance
+	realtimeOrder     []string                    // realtime names in registration order
+	realtimeDefault   string                      // default realtime provider name
 }
 
 // Get returns a provider by name, or nil if not found.
@@ -393,6 +431,46 @@ func (pp *ProviderPool) Count() int {
 	return len(pp.providers)
 }
 
+// HasRealtimeProvider reports whether any RealtimeProvider is
+// registered. Used as one half of the realtime feature gate (the
+// other being Config.RealtimeEnabled): if no provider is registered,
+// the main thread is never told realtime exists and spawn rejects
+// realtime=true.
+func (pp *ProviderPool) HasRealtimeProvider() bool {
+	return pp != nil && len(pp.realtimeProviders) > 0
+}
+
+// RealtimeDefault returns the default RealtimeProvider, or nil if
+// none registered.
+func (pp *ProviderPool) RealtimeDefault() RealtimeProvider {
+	if pp == nil {
+		return nil
+	}
+	if p, ok := pp.realtimeProviders[pp.realtimeDefault]; ok {
+		return p
+	}
+	if len(pp.realtimeOrder) > 0 {
+		return pp.realtimeProviders[pp.realtimeOrder[0]]
+	}
+	return nil
+}
+
+// RealtimeByName returns a RealtimeProvider by name, or nil.
+func (pp *ProviderPool) RealtimeByName(name string) RealtimeProvider {
+	if pp == nil {
+		return nil
+	}
+	return pp.realtimeProviders[name]
+}
+
+// RealtimeNames returns all registered realtime provider names.
+func (pp *ProviderPool) RealtimeNames() []string {
+	if pp == nil {
+		return nil
+	}
+	return pp.realtimeOrder
+}
+
 // ProviderSummary returns a description of a provider for system prompt injection.
 func (pp *ProviderPool) ProviderSummary(name string) string {
 	p, ok := pp.providers[name]
@@ -423,11 +501,33 @@ func (pp *ProviderPool) ProviderSummary(name string) string {
 // buildProviderPool creates a ProviderPool from config + env vars.
 // Priority: CORE_PROVIDER env → config.json providers → auto-detect from API keys.
 func buildProviderPool(cfg *Config) (*ProviderPool, error) {
-	pool := &ProviderPool{providers: map[string]LLMProvider{}}
+	pool := &ProviderPool{
+		providers:         map[string]LLMProvider{},
+		realtimeProviders: map[string]RealtimeProvider{},
+	}
 
 	// 1. Config providers array
 	configs := cfg.GetProviders()
 	for _, pc := range configs {
+		// Route realtime providers to their own map. Gated on
+		// Config.RealtimeEnabled: when off, realtime entries are
+		// silently skipped so HasRealtimeProvider() returns false and
+		// the feature is completely invisible to main.
+		if isRealtimeProviderName(pc.Name) {
+			if !cfg.RealtimeEnabled {
+				continue
+			}
+			rp := createRealtimeProviderByName(pc.Name)
+			if rp == nil {
+				continue
+			}
+			pool.realtimeProviders[pc.Name] = rp
+			pool.realtimeOrder = append(pool.realtimeOrder, pc.Name)
+			if pc.Default {
+				pool.realtimeDefault = pc.Name
+			}
+			continue
+		}
 		p := createProviderByName(pc.Name)
 		if p == nil {
 			continue
@@ -549,4 +649,20 @@ func calculateCostForProvider(provider LLMProvider, usage TokenUsage) float64 {
 	return (float64(uncached)*inputPer1M +
 		float64(usage.CachedTokens)*cachedPer1M +
 		float64(usage.CompletionTokens)*outputPer1M) / 1_000_000
+}
+
+// calculateCostForRealtimeProvider mirrors calculateCostForProvider
+// but uses the 4-arg pricing tuple (the audio rate is separate from
+// text I/O on realtime APIs). Returned value is in dollars assuming
+// the per-1M figures are dollar-denominated, same as the text path.
+func calculateCostForRealtimeProvider(provider RealtimeProvider, usage TokenUsage) float64 {
+	inputPer1M, cachedPer1M, outputPer1M, audioPer1M := provider.CostPer1M()
+	uncached := usage.PromptTokens - usage.CachedTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	return (float64(uncached)*inputPer1M +
+		float64(usage.CachedTokens)*cachedPer1M +
+		float64(usage.CompletionTokens)*outputPer1M +
+		float64(usage.AudioTokens)*audioPer1M) / 1_000_000
 }

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -231,6 +232,7 @@ EVENTS:
 SPAWNING THREADS — critical rules:
 - Before spawning, check [ACTIVE THREADS]: if an existing thread has matching tools and directive, send(id="...") to it instead. Spawn only when no existing thread fits, or when you need parallelism over independent inputs.
 - tools= lists which tools the worker can use. ALWAYS include EVERY tool the worker needs to carry out its directive — if the directive says "run a script", include exec; if "transcribe audio", include the deepgram tool. A missing tool = worker reports failure and can't act. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
+- Spawn for heavy output, not inline tool args. If a single tool call would carry >1KB of model-generated content (article body, multi-section report, generated code), instead spawn(id="...", directive="<focused write task — what to produce, where to store it, what to return>", tools="<storage/etc.>") and continue with other work. The sub-thread streams the content in its own context; you read its [thread:id done] notification when it finishes. Inlining large content in tool args blocks this loop while the model streams it.
 - directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
   GOOD: directive="Check for new support tickets periodically. Report findings to main."
@@ -277,6 +279,21 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 	// extraToolDocs intentionally NOT rendered here anymore — see
 	// buildDynamicTurnContext. Kept in the signature for back-compat.
 	_ = extraToolDocs
+
+	// Realtime spawn capability — only surfaced when a realtime
+	// provider is registered. The pool's HasRealtimeProvider already
+	// reflects Config.RealtimeEnabled (registration is gated on the
+	// flag in buildProviderPool), so this single check is the whole
+	// visibility gate. When off, main never learns the capability
+	// exists and won't try spawn(realtime=true).
+	if pool != nil && pool.HasRealtimeProvider() {
+		voiceList := strings.Join(pool.RealtimeNames(), ", ")
+		prompt += "\n\n[REALTIME THREADS]\n"
+		prompt += "- Spawn realtime=true for voice/audio conversations (live phone call, kiosk interaction, voice booking, etc.). The worker holds the WebSocket session and handles audio; you handle backend tools and decisions. Reach the worker via send(id,text) — it speaks your text aloud. The worker escalates via send(id=\"main\",text=...) and reports completion via done(text=...). Audio never crosses into your context — you only see what the worker explicitly relays.\n"
+		prompt += "- Scope tools tightly: give the realtime worker only the tools it needs to converse and act in the moment (telephony, channels). Keep state-owning tools (calendar, storage, billing) on yourself so the worker has to escalate decisions to you.\n"
+		prompt += fmt.Sprintf("- Available realtime providers: %s. Set provider=\"<name>\" when spawning; default is used otherwise. Voice via voice=\"<id>\" (e.g. voice=\"alloy\").\n", voiceList)
+		prompt += "- Example: spawn(id=\"call-clinic\", realtime=true, voice=\"alloy\", directive=\"Call Dr. Patel's office to book a cleaning. Escalate scheduling decisions to main. done() with the confirmed slot.\", tools=\"channels_telephony_place\")\n"
+	}
 
 	// Inject lightweight MCP server catalog — just names and tool counts
 	if len(mcpCatalog) > 0 {
@@ -462,6 +479,7 @@ type TokenUsage struct {
 	PromptTokens     int
 	CachedTokens     int
 	CompletionTokens int
+	AudioTokens      int // realtime providers only; billed at a separate rate
 }
 
 type ThinkRate int
@@ -804,12 +822,22 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	})
 	for _, pt := range persistedThreads {
 		parentID := pt.ParentID
+		// Skip persistent realtime threads on respawn when the feature
+		// is off. Without this, an instance that previously had
+		// realtime enabled would try to bring those threads back even
+		// after the user disabled the flag.
+		if pt.Realtime && !config.RealtimeEnabled {
+			logMsg("RESPAWN", fmt.Sprintf("skipping realtime thread %q: realtime_enabled=false", pt.ID))
+			continue
+		}
 		if parentID == "" || parentID == "main" {
 			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
 				ParentID: "main",
 				Depth:    pt.Depth,
 				DeferRun: true,
 				MCPNames: pt.MCPNames,
+				Realtime: pt.Realtime,
+				Voice:    pt.Voice,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
@@ -819,6 +847,8 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					Depth:    pt.Depth,
 					DeferRun: true,
 					MCPNames: pt.MCPNames,
+					Realtime: pt.Realtime,
+					Voice:    pt.Voice,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -1042,12 +1072,29 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					}
 				}
 				paused := parseTruthy(call.Args["paused"])
+				realtime := parseTruthy(call.Args["realtime"])
+				voice := call.Args["voice"]
+				// Refuse realtime spawn cleanly when the feature gate is
+				// off OR no realtime provider is available. The model
+				// only sees realtime in the prompt when both are true,
+				// so a request reaching here with neither is either
+				// stale-prompt drift or a hand-crafted call — return a
+				// clear error rather than a silent fail.
+				if realtime {
+					if t.config == nil || !t.config.RealtimeEnabledFlag() || t.pool == nil || !t.pool.HasRealtimeProvider() {
+						logMsg("SPAWN", fmt.Sprintf("reject realtime id=%q: feature off (enabled=%v has_provider=%v)",
+							id, t.config != nil && t.config.RealtimeEnabledFlag(), t.pool != nil && t.pool.HasRealtimeProvider()))
+						addResult("error: realtime threads are not enabled on this instance")
+						toolNames = append(toolNames, call.Raw)
+						continue
+					}
+				}
 				if id == "" || directive == "" {
 					logMsg("SPAWN", fmt.Sprintf("skip: missing id=%q or directive_len=%d in LLM call", id, len(directive)))
 					addResult(fmt.Sprintf("error: spawn requires both id and directive (got id=%q, directive_len=%d)", id, len(directive)))
 				} else {
-					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v paused=%v directive_len=%d",
-						id, tools, mcpNames, providerName, builtinTools, paused, len(directive)))
+					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v paused=%v realtime=%v voice=%q directive_len=%d",
+						id, tools, mcpNames, providerName, builtinTools, paused, realtime, voice, len(directive)))
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
 						MediaParts:   mediaParts,
 						ProviderName: providerName,
@@ -1056,16 +1103,21 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						MCPNames:     mcpNames,
 						BuiltinTools: builtinTools,
 						Paused:       paused,
+						Realtime:     realtime,
+						Voice:        voice,
 					})
 					if err != nil {
 						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
 						addResult(fmt.Sprintf("error: %v", err))
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
-						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames})
-						if paused {
+						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Realtime: realtime, Voice: voice})
+						switch {
+						case paused:
 							addResult(fmt.Sprintf("thread %s spawned (paused — send a message to wake it)", id))
-						} else {
+						case realtime:
+							addResult(fmt.Sprintf("realtime thread %s spawned", id))
+						default:
 							addResult(fmt.Sprintf("thread %s spawned", id))
 						}
 					}
@@ -1917,7 +1969,11 @@ func (t *Thinker) think() (ChatResponse, error) {
 	callStart := time.Now()
 	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat enter model=%s msgs=%d tools=%d",
 		t.threadID, t.modelID(), len(t.messages), len(nativeTools)))
-	resp, err := t.provider.Chat(t.messages, t.modelID(), nativeTools, onChunk, onThinking, onToolChunk)
+	// TODO: thread a cancellable ctx here (from a thinker-scoped run ctx or
+	// a user-abort channel) so a slow stream can be unblocked from outside.
+	// For now context.Background() preserves prior behaviour — the request
+	// is now cancellable in principle, just nothing is wired to cancel it.
+	resp, err := t.provider.Chat(context.Background(), t.messages, t.modelID(), nativeTools, onChunk, onThinking, onToolChunk)
 	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat exit model=%s dur=%s tool_calls=%d err=%v",
 		t.threadID, t.modelID(), time.Since(callStart).Round(time.Millisecond), len(resp.ToolCalls), err))
 	return resp, err

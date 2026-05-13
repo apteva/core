@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -48,7 +49,7 @@ func TestIntegration_OpenCodeGo_NativeToolCalls(t *testing.T) {
 	}
 
 	model := prov.Models()[ModelLarge]
-	resp, err := prov.Chat(messages, model, tools, nil, nil, nil)
+	resp, err := prov.Chat(context.Background(), messages, model, tools, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Chat error: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestIntegration_OpenCodeGo_MultiTurnToolCall(t *testing.T) {
 		{Role: "system", Content: "You are an agent. Use the calc tool when the user asks for arithmetic."},
 		{Role: "user", Content: "What's 17 * 23?"},
 	}
-	resp1, err := prov.Chat(turn1, prov.Models()[ModelLarge], tools, nil, nil, nil)
+	resp1, err := prov.Chat(context.Background(), turn1, prov.Models()[ModelLarge], tools, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("turn1 Chat error: %v", err)
 	}
@@ -156,7 +157,7 @@ func TestIntegration_OpenCodeGo_MultiTurnToolCall(t *testing.T) {
 		},
 		{Role: "user", Content: "Thanks. Now what's 391 + 9?"},
 	}
-	resp2, err := prov.Chat(turn2, prov.Models()[ModelLarge], tools, nil, nil, nil)
+	resp2, err := prov.Chat(context.Background(), turn2, prov.Models()[ModelLarge], tools, nil, nil, nil)
 	if err != nil {
 		// This is the failure mode we're pinning. If we ever see
 		// HTTP 400 here, the assistant-content omission has come back.
@@ -183,7 +184,7 @@ func TestIntegration_OpenCodeGo_BasicChat(t *testing.T) {
 	messages := []Message{
 		{Role: "user", Content: "Reply with exactly one word: pong"},
 	}
-	resp, err := prov.Chat(messages, prov.Models()[ModelLarge], nil, nil, nil, nil)
+	resp, err := prov.Chat(context.Background(), messages, prov.Models()[ModelLarge], nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Chat error: %v", err)
 	}

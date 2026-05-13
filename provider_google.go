@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -185,7 +186,7 @@ type geminiStreamResponse struct {
 	} `json:"usageMetadata"`
 }
 
-func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Track active model for cost calculation
 	p.activeModel = model
 
@@ -397,7 +398,7 @@ func (p *GoogleProvider) Chat(messages []Message, model string, tools []NativeTo
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", model, p.apiKey)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, err
 	}

@@ -17,6 +17,8 @@ type PersistentThread struct {
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
 	MCPNames  []string `json:"mcp_names,omitempty"`  // MCP servers to connect on respawn
+	Realtime  bool     `json:"realtime,omitempty"`   // spawn as a realtime (voice/audio) thread
+	Voice     string   `json:"voice,omitempty"`      // realtime voice id (e.g. "alloy"); empty = provider default
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
@@ -30,10 +32,11 @@ const (
 
 // ProviderConfig persists a provider and its model selections.
 type ProviderConfig struct {
-	Name         string            `json:"name"`                    // "google", "openai", "anthropic", "fireworks", "ollama"
-	Default      bool              `json:"default,omitempty"`       // true = default provider (first match wins)
-	Models       map[string]string `json:"models,omitempty"`        // "large" → model ID, "medium" → ..., "small" → ...
-	BuiltinTools []string          `json:"builtin_tools,omitempty"` // e.g. ["code_execution"]
+	Name           string            `json:"name"`                      // "google", "openai", "anthropic", "fireworks", "ollama", "openai-realtime"
+	Default        bool              `json:"default,omitempty"`         // true = default provider (first match wins)
+	Models         map[string]string `json:"models,omitempty"`          // "large" → model ID, "medium" → ..., "small" → ...
+	BuiltinTools   []string          `json:"builtin_tools,omitempty"`   // e.g. ["code_execution"]
+	RealtimeVoice  string            `json:"realtime_voice,omitempty"`  // default voice for realtime providers (e.g. "alloy")
 }
 
 // ComputerConfig holds the configuration for a computer use environment.
@@ -47,16 +50,17 @@ type ComputerConfig struct {
 }
 
 type Config struct {
-	mu          sync.RWMutex
-	path        string
-	Directive   string             `json:"directive"`
-	Mode        RunMode            `json:"mode,omitempty"`
-	Unconscious bool               `json:"unconscious,omitempty"` // enable background memory consolidation thread
-	Providers   []ProviderConfig   `json:"providers,omitempty"`   // multi-provider pool
-	Provider    *ProviderConfig    `json:"provider,omitempty"`    // legacy single-provider (auto-migrated to Providers on load)
-	Computer    *ComputerConfig    `json:"computer,omitempty"`
-	Threads     []PersistentThread `json:"threads,omitempty"`
-	MCPServers  []MCPServerConfig  `json:"mcp_servers,omitempty"`
+	mu              sync.RWMutex
+	path            string
+	Directive       string             `json:"directive"`
+	Mode            RunMode            `json:"mode,omitempty"`
+	Unconscious     bool               `json:"unconscious,omitempty"`      // enable background memory consolidation thread
+	RealtimeEnabled bool               `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
+	Providers       []ProviderConfig   `json:"providers,omitempty"`        // multi-provider pool
+	Provider        *ProviderConfig    `json:"provider,omitempty"`         // legacy single-provider (auto-migrated to Providers on load)
+	Computer        *ComputerConfig    `json:"computer,omitempty"`
+	Threads         []PersistentThread `json:"threads,omitempty"`
+	MCPServers      []MCPServerConfig  `json:"mcp_servers,omitempty"`
 }
 
 func NewConfig() *Config {
@@ -99,6 +103,19 @@ func (c *Config) GetDirective() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Directive
+}
+
+// RealtimeEnabledFlag returns whether realtime (voice/audio) threads
+// are enabled on this instance. Read under the config lock so it
+// reflects the current value if toggled at runtime via the HTTP
+// config endpoint. Naming avoids collision with the bare field.
+func (c *Config) RealtimeEnabledFlag() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.RealtimeEnabled
 }
 
 func (c *Config) SetDirective(d string) {
