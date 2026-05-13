@@ -10,23 +10,25 @@ import (
 	"testing"
 )
 
-// TestSpawn_WithMCP_RegistersToolsPrefixed verifies the spawn → MCP wiring
-// in isolation, without a real LLM. It covers the exact code path whose
-// failure produces the "sub-thread got 0 tools" symptom we just fixed in
-// prod (mcp_http.go allowed_tools filter drift):
+// TestSpawn_WithMCP_RegistersToolsPrefixed verifies spawn → activeTools
+// preload wiring in isolation. In the post-refactor model the parent
+// owns the MCP connection and the index; sub-thread spawn with
+// MCPNames=[...] preloads the child's activeTools so the schemas
+// appear in its tool list from turn 1 without the child making its
+// own connection.
 //
-//   1. Parent has an HTTP MCP named "catalog-mcp" in its config.
+//   1. Parent connects an HTTP MCP "catalog-mcp" and registers its
+//      tools into the registry + index (mirrors what main startup
+//      does in production).
 //   2. We spawn a sub-thread with MCPNames=["catalog-mcp"] and
-//      tools=["send"] (core tool; MCP tools get auto-added).
+//      tools=["send"].
 //   3. Post-spawn we assert:
-//      - The thread registered the MCP's two tools with a "catalog-mcp_"
-//        prefix (matches how registration writes them).
-//      - Thread.Tools contains the prefixed names (so spawn/allowlist
-//        tracking sees them) and the original "send".
-//      - Calling the registered tool round-trips through the mock server.
+//      - The shared registry has both prefixed tools (catalog-mcp_*).
+//      - The child's activeTools contains both names.
+//      - The shared registry dispatches them correctly.
 //
 // No Fireworks, no subprocesses — a single httptest.Server and the
-// ThreadManager code path we care about.
+// real connectAndRegisterMCP path.
 func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
 	var callsReceived atomic.Int64
 
@@ -99,8 +101,9 @@ func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	// Parent thinker wired with the MCP config + a real registry (spawn
-	// skips the MCP block entirely when registry is nil).
+	// Parent thinker wired with the MCP config + a real registry, then
+	// we manually run the same connectAndRegisterMCP path main's
+	// startup uses — this populates registry + index in one shot.
 	thinker := newTestThinker()
 	defer thinker.Stop()
 	thinker.registry = NewToolRegistry("test")
@@ -110,6 +113,15 @@ func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
 			{Name: "catalog-mcp", Transport: "http", URL: srv.URL + "/mcp"},
 		},
 	}
+	thinker.mcpServers = connectAndRegisterMCP(thinker.config.MCPServers, thinker.registry, thinker.toolIndex, nil, nil)
+	if len(thinker.mcpServers) == 0 {
+		t.Fatal("parent failed to connect catalog-mcp")
+	}
+	defer func() {
+		for _, s := range thinker.mcpServers {
+			s.Close()
+		}
+	}()
 
 	err := thinker.threads.SpawnWithOpts("worker", "worker directive", []string{"send"}, SpawnOpts{
 		MCPNames: []string{"catalog-mcp"},
@@ -119,35 +131,26 @@ func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
 		t.Fatalf("spawn: %v", err)
 	}
 
-	// Find the spawned thread.
-	var thread *Thread
-	for _, th := range thinker.threads.List() {
-		if th.ID == "worker" {
-			// thinker.threads.List() returns a snapshot type; reach in
-			// through the manager for the concrete Thread.
-		}
-	}
 	thinker.threads.mu.RLock()
-	thread = thinker.threads.threads["worker"]
+	thread := thinker.threads.threads["worker"]
 	thinker.threads.mu.RUnlock()
 	if thread == nil {
 		t.Fatal("thread not in manager")
 	}
 
-	// Tool names should be namespaced with the MCP server name.
-	for _, want := range []string{"catalog-mcp_ping", "catalog-mcp_echo", "send"} {
-		if !thread.Tools[want] {
-			t.Errorf("thread.Tools missing %q; have: %v", want, keys(thread.Tools))
+	// MCPNames preload should land each tool in the child's activeTools.
+	for _, want := range []string{"catalog-mcp_ping", "catalog-mcp_echo"} {
+		if !thread.Thinker.activeTools[want] {
+			t.Errorf("activeTools missing %q; have: %v", want, keys(thread.Thinker.activeTools))
 		}
 	}
-
-	// The registry used by the sub-thread must actually resolve and
-	// dispatch the registered tool. Look up echo and call it.
-	threadThinker := thread.Thinker
-	if threadThinker == nil {
-		t.Fatal("thread has no thinker")
+	if !thread.Tools["send"] {
+		t.Errorf("thread.Tools missing send; have: %v", keys(thread.Tools))
 	}
-	def := threadThinker.registry.Get("catalog-mcp_echo")
+
+	// The shared registry must dispatch the registered tool. Look it
+	// up and call it directly — same handler the child would invoke.
+	def := thread.Thinker.registry.Get("catalog-mcp_echo")
 	if def == nil {
 		t.Fatal("registry lookup for catalog-mcp_echo failed")
 	}

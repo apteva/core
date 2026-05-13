@@ -53,7 +53,7 @@ offers.`,
 			Name:       "gateway",
 			Command:    "", // filled in by test
 			Env:        map[string]string{"FAKE_GATEWAY_DATA_DIR": "{{dataDir}}"},
-			MainAccess: true,
+			
 		},
 		{
 			// Non-main-access: cataloged, so spawned workers can connect

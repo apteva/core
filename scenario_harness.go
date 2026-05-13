@@ -472,6 +472,8 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 	}
 	thinker.threads = NewThreadManager(thinker)
 	thinker.registry = NewToolRegistry(apiKey)
+	thinker.toolIndex = NewToolIndex()
+	thinker.activeTools = map[string]bool{}
 
 	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, pool, nil)}
 
@@ -482,47 +484,20 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil, thinker.pool, thinker.mcpCatalog)
 	}
 
-	// Mirror production MCP wiring (thinker.go::Run init): main_access
-	// servers are fully registered (main can call them directly);
-	// catalog servers expose only their name + tool count via the
-	// [AVAILABLE MCP SERVERS] block, forcing main to `spawn(mcp="…")` a
-	// worker to actually use those tools. The previous shortcut here
-	// registered everything, which let main bypass spawning entirely
-	// and made any test that asserted on spawning Kimi-flaky.
+	// Mirror production MCP wiring (thinker.go::Run init): every MCP
+	// configured for the scenario gets connected and indexed. Tools
+	// register as MCP=true so they stay hidden from main's per-turn
+	// tool list until activated via search_tools or spawn-time
+	// MCPNames preload — same behavior the production path now uses.
 	if len(mcpServers) > 0 {
-		var mainServers, catalogServers []MCPServerConfig
-		for _, cfg := range mcpServers {
-			if cfg.MainAccess {
-				mainServers = append(mainServers, cfg)
-			} else {
-				catalogServers = append(catalogServers, cfg)
+		thinker.mcpServers = connectAndRegisterMCP(mcpServers, thinker.registry, thinker.toolIndex, memStore, thinker.blobs)
+		thinker.mcpCatalog = computeMCPCatalog(thinker.toolIndex)
+		t.Cleanup(func() {
+			for _, s := range thinker.mcpServers {
+				s.Close()
 			}
-		}
-		if len(mainServers) > 0 {
-			thinker.mcpServers = connectAndRegisterMCP(mainServers, thinker.registry, memStore, thinker.blobs)
-			t.Cleanup(func() {
-				for _, s := range thinker.mcpServers {
-					s.Close()
-				}
-			})
-		}
-		for _, cfg := range catalogServers {
-			srv, err := connectAnyMCP(cfg)
-			if err != nil {
-				t.Logf("MCP-CATALOG %s: connect error: %v", cfg.Name, err)
-				continue
-			}
-			tools, err := srv.ListTools()
-			if err != nil {
-				t.Logf("MCP-CATALOG %s: list tools error: %v", cfg.Name, err)
-				srv.Close()
-				continue
-			}
-			thinker.mcpCatalog = append(thinker.mcpCatalog, MCPServerInfo{Name: cfg.Name, ToolCount: len(tools)})
-			srv.Close() // workers reconnect on demand
-		}
-		// Rebuild messages[0] now that mcpServers + mcpCatalog are
-		// populated — same final-step pattern as production init.
+		})
+		// Rebuild messages[0] now that mcpServers + index are populated.
 		thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", thinker.mcpServers, nil, pool, thinker.mcpCatalog)}
 	}
 

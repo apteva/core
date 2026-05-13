@@ -114,11 +114,11 @@ workers, wait for three "PRODUCED" reports from the producers and three
 "DONE" reports from the posters. When you have all six, your work is
 finished.`,
 	MCPServers: []MCPServerConfig{
-		// MainAccess=false — the studio director is a pure orchestrator
-		// and must delegate all real work. Sub-threads get access via the
-		// spawn allowlist (mcp="creative,media,social", tools="..."). This
-		// matches the team/producer hierarchy where each level has the
-		// minimum tools it needs.
+		// MCP tools register MCP=true so the studio director sees only
+		// scaffolding (spawn, send, done, search_tools, pace) by default.
+		// The director's directive forces it to delegate via spawn; the
+		// workers boot hot with mcps="creative" / "media" / "social"
+		// preloading the full surface they need.
 		{Name: "creative", Command: "", Env: map[string]string{"CREATIVE_DATA_DIR": "{{dataDir}}"}},
 		{Name: "media", Command: "", Env: map[string]string{"MEDIA_DATA_DIR": "{{dataDir}}"}},
 		{Name: "social", Command: "", Env: map[string]string{"SOCIAL_DATA_DIR": "{{dataDir}}"}},

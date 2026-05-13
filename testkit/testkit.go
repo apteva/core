@@ -109,12 +109,11 @@ type Config struct {
 	// DB — tests never see them.
 	AttachMCPs []string
 
-	// AttachMCPsMainAccess is the escape hatch for tests that
-	// specifically want to validate main-thread direct tool use
-	// (e.g. testing a single lightweight tool call without spawn
-	// overhead). Entries listed here are attached with main_access=true;
-	// entries in AttachMCPs are catalog-only. Most tests should leave
-	// this empty — exercising spawn is the point.
+	// AttachMCPsMainAccess is a deprecated alias for AttachMCPs kept
+	// to avoid churning every existing test in one go. The legacy
+	// main_access flag is gone — every attached MCP is now searchable
+	// by main, and sub-thread visibility is governed by no_spawn.
+	// Tests written against this field should migrate to AttachMCPs.
 	AttachMCPsMainAccess []string
 
 	// IncludeAptevaServer / IncludeChannels match the same flags on
@@ -1130,18 +1129,15 @@ func (s *Session) createFreshInstance(c Config) (int64, error) {
 		if err != nil {
 			return resp.ID, fmt.Errorf("fetch mcp-servers: %w", err)
 		}
-		// mainAccess[name]=true → main can call the tool directly.
-		// Anything present in AttachMCPs but not in AttachMCPsMainAccess
-		// is catalog-only, which forces the agent through the spawn
-		// path to use it.
+		// Both fields now feed the same flat attached list. The legacy
+		// AttachMCPsMainAccess split is preserved as a deprecation
+		// shim — see field doc.
 		wanted := map[string]bool{}
-		mainAccess := map[string]bool{}
 		for _, n := range c.AttachMCPs {
 			wanted[n] = true
 		}
 		for _, n := range c.AttachMCPsMainAccess {
 			wanted[n] = true
-			mainAccess[n] = true
 		}
 		var entries []map[string]any
 		found := map[string]bool{}
@@ -1156,9 +1152,8 @@ func (s *Session) createFreshInstance(c Config) (int64, error) {
 			found[m.Name] = true
 			found[m.ProxyConfig.Name] = true
 			entry := map[string]any{
-				"name":        m.ProxyConfig.Name,
-				"transport":   m.ProxyConfig.Transport,
-				"main_access": mainAccess[m.Name] || mainAccess[m.ProxyConfig.Name],
+				"name":      m.ProxyConfig.Name,
+				"transport": m.ProxyConfig.Transport,
 			}
 			if m.ProxyConfig.URL != "" {
 				entry["url"] = m.ProxyConfig.URL
@@ -1177,8 +1172,7 @@ func (s *Session) createFreshInstance(c Config) (int64, error) {
 			}
 		}
 		update["mcp_servers"] = entries
-		s.t.Logf("testkit: attached %d MCPs on live core (catalog: %v, main_access: %v)",
-			len(entries), c.AttachMCPs, c.AttachMCPsMainAccess)
+		s.t.Logf("testkit: attached %d MCPs on live core: %v", len(entries), append(c.AttachMCPs, c.AttachMCPsMainAccess...))
 	}
 
 	if err := s.putConfig(update); err != nil {

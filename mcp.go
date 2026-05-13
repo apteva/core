@@ -52,21 +52,34 @@ type mcpCallResult struct {
 	IsError bool `json:"isError"`
 }
 
-// MCPServerConfig is stored in config.json
+// MCPServerConfig is stored in config.json.
+//
+// Note: the legacy `main_access` field is intentionally absent. Earlier
+// versions of core split MCPs into "main" (tools eagerly registered to
+// the main thread) and "catalog" (tools held off main, attachable only
+// by spawning a sub-thread with mcp="name"). That distinction is gone:
+// every MCP attached here is connected and indexed, every thread
+// activates the subset it needs via search_tools or spawn-time MCPNames.
+// Old configs containing main_access:true|false deserialize cleanly —
+// json.Unmarshal silently drops the unknown field.
 type MCPServerConfig struct {
-	Name       string            `json:"name"`
-	Command    string            `json:"command,omitempty"`    // stdio transport
-	Args       []string          `json:"args,omitempty"`       // stdio transport
-	Env        map[string]string `json:"env,omitempty"`        // stdio transport
-	Transport  string            `json:"transport,omitempty"`  // "stdio" (default) or "http"
-	URL        string            `json:"url,omitempty"`        // http transport
-	MainAccess bool              `json:"main_access,omitempty"` // if true, tools are callable by main thread (not just sub-threads)
-	// NoSpawn, when true, forbids sub-threads from attaching this MCP via
-	// spawn(mcp="..."). Used for infrastructure-level servers the host
-	// wires in for main-thread-only responsibilities (management gateway,
-	// outbound channel bridges) where letting a worker attach would be a
-	// privilege escalation. Core has no knowledge of which names are
-	// "system" — the host sets this flag when registering those entries.
+	Name      string            `json:"name"`
+	Command   string            `json:"command,omitempty"`   // stdio transport
+	Args      []string          `json:"args,omitempty"`      // stdio transport
+	Env       map[string]string `json:"env,omitempty"`       // stdio transport
+	Transport string            `json:"transport,omitempty"` // "stdio" (default) or "http"
+	URL       string            `json:"url,omitempty"`       // http transport
+	// NoSpawn, when true, hides this server's tools from sub-thread
+	// search_tools results and refuses sub-thread spawn(mcps=[...])
+	// attachments. Used for infrastructure-level servers the host
+	// wires in for main-thread-only responsibilities (management
+	// gateway, outbound channel bridges) where letting a worker
+	// invoke them would be a privilege escalation. Core has no
+	// knowledge of which names are "system" — the host sets this
+	// flag when registering those entries. The privileged HTTP spawn
+	// path (POST /threads/{id}) sets SpawnOpts.BypassNoSpawn to
+	// punch through this filter for system-initiated workers
+	// (channelchat's chat-handling thread needs `channels`).
 	NoSpawn bool `json:"no_spawn,omitempty"`
 }
 
@@ -362,11 +375,17 @@ func connectAnyMCPWithRetry(cfg MCPServerConfig) (MCPConn, error) {
 	return nil, lastErr
 }
 
-// connectAndRegisterMCP connects to MCP servers from config and registers
-// tools. If blobs is non-nil, every registered tool is wrapped so that
-// binary arguments and results flow through the blob store (see
+// connectAndRegisterMCP connects to MCP servers from config and
+// registers tools into the registry and (if non-nil) the index. Every
+// MCP tool is registered with MCP=true so it stays hidden from the
+// per-turn provider tool list until a thread explicitly activates it
+// via search_tools or spawn-time MCPNames preload. The index supplies
+// the searchable surface for those activations.
+//
+// If blobs is non-nil, every registered tool is wrapped so that binary
+// arguments and results flow through the blob store (see
 // mcpProxyHandler). Pass nil for blobs to register plain proxies.
-func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, memory *MemoryStore, blobs *BlobStore) []MCPConn {
+func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, index *ToolIndex, memory *MemoryStore, blobs *BlobStore) []MCPConn {
 	var servers []MCPConn
 	for _, cfg := range configs {
 		srv, err := connectAnyMCPWithRetry(cfg)
@@ -394,9 +413,16 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, me
 				Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
 				Handler:     mcpProxyHandler(srv, tool.Name, blobs),
 				InputSchema: tool.InputSchema,
-				MCP:         !cfg.MainAccess,
+				MCP:         true, // hidden until activated; old MainAccess flag is gone
 				MCPServer:   cfg.Name,
 			})
+		}
+
+		// Mirror into the searchable index. Done after registry.Register
+		// so the index's "this tool exists" claim is always consistent
+		// with what the registry can actually dispatch.
+		if index != nil {
+			index.Add(cfg.Name, tools, cfg.NoSpawn)
 		}
 
 		// Embed new tools

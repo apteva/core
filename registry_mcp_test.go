@@ -43,7 +43,7 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	})
 
 	// Main thread (nil allowlist) — should NOT include MCP tools
-	mainTools := tr.NativeTools(nil)
+	mainTools := tr.NativeTools(nil, nil)
 	mainToolNames := make(map[string]bool)
 	for _, nt := range mainTools {
 		mainToolNames[nt.Name] = true
@@ -83,7 +83,7 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 		"done":                  true,
 		"pace":                  true,
 	}
-	threadTools := tr.NativeTools(allowlist)
+	threadTools := tr.NativeTools(allowlist, nil)
 	threadToolNames := make(map[string]bool)
 	for _, nt := range threadTools {
 		threadToolNames[nt.Name] = true

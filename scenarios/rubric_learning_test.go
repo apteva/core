@@ -60,7 +60,7 @@ CRITICAL for sub-threads: pass center="<center_id>" on EVERY tool call.
 The MCP rejects calls missing the center arg. The dimension set varies
 per center — never copy heuristics or dimension names across centers.`,
 	MCPServers: []MCPServerConfig{
-		{Name: "sales_qa", Command: "", Env: map[string]string{"SALES_QA_DATA_DIR": "{{dataDir}}"}, MainAccess: true},
+		{Name: "sales_qa", Command: "", Env: map[string]string{"SALES_QA_DATA_DIR": "{{dataDir}}"}},
 	},
 	DataSetup: func(t *testing.T, dir string) {
 		// Nothing to seed — the MCP bakes its own data. We just create

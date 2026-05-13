@@ -118,7 +118,7 @@ func buildComposition(t *Thinker, msgs []Message) PromptComposition {
 
 	// Native tools — same code path the provider uses on the next call.
 	if t.registry != nil && t.provider != nil && t.provider.SupportsNativeTools() {
-		nativeTools := t.registry.NativeTools(t.toolAllowlist)
+		nativeTools := t.registry.NativeTools(t.toolAllowlist, t.activeTools)
 		for _, nt := range nativeTools {
 			size := nativeToolSize(nt)
 			kind := classifyToolKind(t, nt.Name)

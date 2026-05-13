@@ -60,6 +60,10 @@ func NewToolRegistry(apiKey string) *ToolRegistry {
 }
 
 func (tr *ToolRegistry) registerDefaults() {
+	// Scaffolding meta-tools — search + (eventually) load_tool. Listed
+	// first so they sort to the top of the registry for readers and
+	// so the LLM's tool-list always opens with the discovery surface.
+	registerSearchTool(tr)
 	// Core tools — always in prompt
 	tr.Register(&ToolDef{
 		Name:        "pace",
@@ -600,26 +604,32 @@ func (tr *ToolRegistry) Counts() (core, rag, total int) {
 	return
 }
 
-// NativeTools returns all tools as NativeTool definitions for the provider API.
 // NativeTools returns tool definitions for the LLM provider API.
-// allowlist filters to specific tools (nil = main thread, which excludes MCP tools).
-// Sub-threads pass their allowlist which includes MCP tools they need.
-func (tr *ToolRegistry) NativeTools(allowlist map[string]bool) []NativeTool {
+//
+// Visibility model:
+//   - Core / non-MCP tools: always visible unless excluded by an
+//     allowlist (sub-thread restriction) or by role flags
+//     (MainOnly / ThreadOnly / SystemOnly applied at caller via
+//     RetrieveTools — this method trusts what's in the registry).
+//   - MCP tools (ToolDef.MCP == true): hidden by default — they only
+//     appear when their name is in `active`. That's how the
+//     "agent-driven discovery" model works: spawn-time MCPNames
+//     preload, search_tools, and per-turn BM25 preload all push
+//     names into the active set; nothing else gets MCP tools on
+//     the wire.
+//
+// allowlist is the boot-time per-thread allowlist (sub-threads pass
+// their tool set; main passes nil). active is the live per-turn set
+// of MCP tools the thread has surfaced for use. Either argument may
+// be nil.
+func (tr *ToolRegistry) NativeTools(allowlist, active map[string]bool) []NativeTool {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
 	var out []NativeTool
 	for _, name := range tr.sortedToolKeys() {
 		tool := tr.tools[name]
-		// Filter by allowlist if set (sub-threads)
-		if allowlist != nil {
-			if !allowlist[tool.Name] {
-				continue
-			}
-		} else {
-			// Main thread (nil allowlist): skip MCP tools, thread-only, and system-only tools
-			if tool.ThreadOnly || tool.MCP || tool.SystemOnly {
-				continue
-			}
+		if !toolVisible(tool, allowlist, active) {
+			continue
 		}
 
 		nt := NativeTool{
@@ -639,6 +649,33 @@ func (tr *ToolRegistry) NativeTools(allowlist map[string]bool) []NativeTool {
 		out = append(out, nt)
 	}
 	return out
+}
+
+// toolVisible centralises the per-turn visibility check so callers
+// can apply the same rules without duplicating the logic. Order
+// matters: allowlist gates first (it's a hard boundary set at spawn
+// time), then non-MCP defaults, then MCP requires explicit activation.
+func toolVisible(tool *ToolDef, allowlist, active map[string]bool) bool {
+	if tool.SystemOnly {
+		return false
+	}
+	if allowlist != nil {
+		// Sub-thread / scoped path: only the allowed names. activeTools
+		// can still surface a name that wasn't in the boot allowlist —
+		// the LLM searched for it at runtime.
+		if !allowlist[tool.Name] && !active[tool.Name] {
+			return false
+		}
+		return true
+	}
+	// Main thread (no allowlist).
+	if tool.ThreadOnly {
+		return false
+	}
+	if tool.MCP && !active[tool.Name] {
+		return false
+	}
+	return true
 }
 
 // copyAndInjectReason adds the _reason field to a tool's JSON Schema.

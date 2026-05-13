@@ -144,7 +144,15 @@ type SpawnOpts struct {
 	InitialMessages []string
 	ParentID        string   // "main" or parent thread ID (empty = "main")
 	Depth           int      // depth in the spawn tree (0 = child of main)
-	MCPNames        []string // MCP server names to connect (thread gets own connections)
+	MCPNames        []string // MCP servers whose tools preload into the child's activeTools at boot
+	// Tools, when set, preloads specific tool names (across any server)
+	// into the child's activeTools at boot. Complements MCPNames:
+	// MCPNames = "give me everything from these servers", Tools =
+	// "give me exactly these names". Both are additive. Used by the
+	// privileged HTTP spawn endpoint (POST /threads/{id}) for system
+	// callers that know which tools they need; the LLM-driven spawn
+	// tool path leaves this nil and uses mcps=[…] instead.
+	Tools           []string
 	BuiltinTools    []string // provider builtin overrides (nil = inherit, empty = none)
 	DeferRun        bool     // if true, don't start Run() — call StartAll() later
 	// Paused: if true, the thread spawns in paused state. Run() loop
@@ -288,6 +296,12 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	toolSet["pace"] = true
 	if !isSystem {
 		toolSet["evolve"] = true
+		// search_tools is scaffolding for normal threads — they can
+		// discover MCP tools at runtime even if the spawner didn't
+		// list it explicitly. no_spawn filtering inside runSearchTools
+		// keeps sub-threads from seeing tools they can't call. System
+		// threads (unconscious) are tightly scoped and don't get it.
+		toolSet["search_tools"] = true
 	}
 	// Leaders get kill/update only if spawn was explicitly requested
 	if canSpawn && toolSet["spawn"] {
@@ -413,77 +427,35 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		}
 	}
 
+	// Sub-threads share the main registry and the live MCP connections
+	// it points at. Previous design opened a fresh connection per
+	// sub-thread per MCP — wasteful and unsafe for ephemeral servers
+	// (channels MCP holds a port; doubling it conflicts). Now visibility
+	// is expressed through activeTools instead of separate registries.
 	threadRegistry := tm.parent.registry
 	threadAllowlist := toolSet
-	var threadMCPServers []MCPConn
+	var threadMCPServers []MCPConn // intentionally empty — main owns the live set
 
-	if len(mcpNames) > 0 && tm.parent.registry != nil {
-		// Create scoped registry with only core + allowed local tools
-		threadRegistry = tm.parent.registry.NewScopedRegistry(toolSet)
-		threadAllowlist = nil // not needed — registry IS the scope
-
-		// Connect to each specified MCP server
+	// Expand MCPNames into the child's initial activeTools so the
+	// thread boots hot with those servers' tools visible. Skipped
+	// silently for any name not in the index (e.g. typo, or
+	// connect-time failure earlier).
+	preloadActive := map[string]bool{}
+	if len(mcpNames) > 0 && tm.parent.toolIndex != nil {
 		for _, mcpName := range mcpNames {
-			// Look up MCP config from parent's config
-			var cfg *MCPServerConfig
-			for _, sc := range tm.parent.config.GetMCPServers() {
-				if sc.Name == mcpName {
-					c := sc
-					cfg = &c
-					break
-				}
+			for _, tn := range tm.parent.toolIndex.ToolsForServer(mcpName) {
+				preloadActive[tn] = true
+				toolSet[tn] = true // surface to allowlist/spawn-tracking
 			}
-			// Also check parent's live MCP connections for runtime-connected servers
-			if cfg == nil {
-				for _, srv := range tm.parent.mcpServers {
-					if srv.GetName() == mcpName {
-						// Already connected on parent — look up config
-						for _, sc := range tm.parent.config.MCPServers {
-							if sc.Name == mcpName {
-								c := sc
-								cfg = &c
-								break
-							}
-						}
-						break
-					}
-				}
-			}
-			if cfg == nil {
-				logMsg("THREAD-MCP", fmt.Sprintf("%s: MCP server %q not found in config", id, mcpName))
-				continue
-			}
-
-			srv, err := connectAnyMCP(*cfg)
-			if err != nil {
-				logMsg("THREAD-MCP", fmt.Sprintf("%s: connect %q: %v", id, mcpName, err))
-				continue
-			}
-			mcpTools, err := srv.ListTools()
-			if err != nil {
-				logMsg("THREAD-MCP", fmt.Sprintf("%s: list tools %q: %v", id, mcpName, err))
-				srv.Close()
-				continue
-			}
-			// Register MCP tools into the thread's scoped registry
-			for _, tool := range mcpTools {
-				fullName := mcpName + "_" + tool.Name
-				threadRegistry.Register(&ToolDef{
-					Name:        fullName,
-					Description: fmt.Sprintf("[%s] %s", mcpName, tool.Description),
-					Syntax:      buildMCPSyntax(fullName, tool.InputSchema),
-					Rules:       fmt.Sprintf("Provided by MCP server '%s'.", mcpName),
-					Handler:     mcpProxyHandler(srv, tool.Name, tm.parent.blobs),
-					InputSchema: tool.InputSchema,
-					MCP:         false, // not filtered — this IS the thread's registry
-					MCPServer:   mcpName,
-				})
-				// Add to tool set so spawn/allowlist tracking sees it
-				toolSet[fullName] = true
-			}
-			threadMCPServers = append(threadMCPServers, srv)
-			logMsg("THREAD-MCP", fmt.Sprintf("%s: connected %q (%d tools)", id, mcpName, len(mcpTools)))
 		}
+	}
+	// Explicit per-tool preload (SpawnOpts.Tools) lets a caller hand-pick
+	// individual tool names across any server, without listing the whole
+	// server. Currently only populated by the privileged HTTP spawn path;
+	// the LLM-driven spawn tool uses mcps=[…] which feeds MCPNames above.
+	for _, tn := range opts.Tools {
+		preloadActive[tn] = true
+		toolSet[tn] = true
 	}
 
 	// Context window size based on role
@@ -518,6 +490,8 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		toolAllowlist: threadAllowlist,
 		config:        tm.parent.config,
 		mcpServers:    threadMCPServers,
+		toolIndex:     tm.parent.toolIndex,
+		activeTools:   preloadActive,
 		rebuildPrompt: func(_ string) string {
 			cd := ""
 			if threadRegistry != nil {
@@ -539,16 +513,19 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			// in the per-turn user message via buildDynamicTurnContext
 			// (same path as main thread's Run loop), keeping leader
 			// messages[0] cache-stable.
-			// Show available MCP servers so leaders know what to assign when spawning
+			// Show available MCP servers so leaders know what to attach
+			// when spawning. Servers flagged no_spawn (gateway, channels)
+			// are filtered out — sub-threads can't see or attach them.
 			if canSpawn {
 				var mcpList []string
 				for _, cfg := range tm.parent.config.GetMCPServers() {
-					if !cfg.MainAccess {
-						mcpList = append(mcpList, cfg.Name)
+					if cfg.NoSpawn {
+						continue
 					}
+					mcpList = append(mcpList, cfg.Name)
 				}
 				if len(mcpList) > 0 {
-					prompt += "\n\n[AVAILABLE MCP SERVERS — use mcp=\"name\" when spawning]\n"
+					prompt += "\n\n[AVAILABLE MCP SERVERS — use mcps=[\"name\"] when spawning]\n"
 					for _, name := range mcpList {
 						prompt += "- " + name + "\n"
 					}
@@ -734,7 +711,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			// Check if inline or registry tool
 			isInline := true
 			switch call.Name {
-			case "send", "spawn", "kill", "update", "evolve", "remember", "pace", "done":
+			case "send", "spawn", "kill", "update", "evolve", "remember", "pace", "done", "search_tools":
 				// inline
 			default:
 				isInline = false // executeTool handles _reason and telemetry
@@ -794,9 +771,15 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					spawnTools = strings.Split(toolsStr, ",")
 				}
 				providerName := call.Args["provider"]
-				// MCP scoping
+				// MCP scoping — preload these servers' tools into the
+				// child's activeTools at boot. Accept `mcps` (new) or
+				// `mcp` (transitional alias) for the same effect.
 				var mcpNames []string
-				if mcpStr := call.Args["mcp"]; mcpStr != "" {
+				mcpStr := call.Args["mcps"]
+				if mcpStr == "" {
+					mcpStr = call.Args["mcp"]
+				}
+				if mcpStr != "" {
 					for _, name := range strings.Split(mcpStr, ",") {
 						if n := strings.TrimSpace(name); n != "" {
 							mcpNames = append(mcpNames, n)
@@ -896,6 +879,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				msg := call.Args["message"]
 				doneMsg = &msg
 				doneCallID = call.NativeID
+			case "search_tools":
+				// Sub-threads search the same index but with no_spawn
+				// filtering on — they must not discover or load gateway
+				// or channels tools, which only main is authorised for.
+				emitResult(call, runSearchTools(t, call.Args, false))
+				toolNames = append(toolNames, call.Raw)
 			case "pace":
 				var parts []string
 				if s := call.Args["sleep"]; s != "" {

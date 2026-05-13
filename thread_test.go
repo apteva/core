@@ -21,7 +21,9 @@ func newTestThinker() *Thinker {
 		memory:    &MemoryStore{path: "/dev/null"},
 		config:    &Config{Directive: "test"},
 		threadID:  "main",
-		telemetry: &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
+		telemetry:   &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
+		toolIndex:   NewToolIndex(),
+		activeTools: map[string]bool{},
 	}
 	t.threads = NewThreadManager(t)
 	return t

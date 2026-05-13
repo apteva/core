@@ -295,19 +295,17 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += "- Example: spawn(id=\"call-clinic\", realtime=true, voice=\"alloy\", directive=\"Call Dr. Patel's office to book a cleaning. Escalate scheduling decisions to main. done() with the confirmed slot.\", tools=\"channels_telephony_place\")\n"
 	}
 
-	// Inject lightweight MCP server catalog — just names and tool counts
+	// Inject the lightweight MCP server catalog — names + tool counts.
+	// Schemas are intentionally not in the prompt: the LLM discovers
+	// individual tools at runtime via search_tools (preferred) or
+	// spawn(mcps=[...]) for a sub-thread that boots hot with a server's
+	// surface preloaded.
 	if len(mcpCatalog) > 0 {
 		prompt += "\n\n[AVAILABLE MCP SERVERS]\n"
-		prompt += "These servers provide tools for sub-threads. Use mcp=\"servername\" when spawning to give the thread its own connection.\n"
-		prompt += "The thread will auto-discover all tools from that server. You do NOT need to list individual tool names.\n"
-		prompt += "Example: spawn(id=\"ops\", directive=\"Manage inventory\", mcp=\"store\", tools=\"web\")\n\n"
+		prompt += "These servers are attached. Their tools are NOT in your tool list by default — search_tools(query=\"...\") loads the ones you need, on demand. Repeat uses stay loaded.\n"
+		prompt += "When spawning a worker that should boot hot with a server's full surface: spawn(id=\"ops\", directive=\"Manage inventory\", mcps=\"store\", tools=\"\")\n\n"
 		for _, info := range mcpCatalog {
 			prompt += fmt.Sprintf("- %s (%d tools)\n", info.Name, info.ToolCount)
-		}
-	} else if registry != nil {
-		// Fallback: show old-style MCP summary from registry (for main_access tools still registered)
-		if summary := registry.MCPToolSummary(); summary != "" {
-			prompt += summary
 		}
 	}
 
@@ -642,7 +640,24 @@ type Thinker struct {
 	// can reference) and to rehydrate those references on outbound
 	// tool calls. Nil = passthrough (no binary-handle indirection).
 	blobs *BlobStore
-	// MCP server catalog — lightweight metadata for prompt (name + tool count)
+	// toolIndex is the process-wide searchable catalog of every MCP
+	// tool currently registered. Owned by main; sub-threads share a
+	// pointer. Backs search_tools and per-turn BM25 preload.
+	toolIndex *ToolIndex
+	// activeTools is the per-thread set of MCP tool names whose
+	// schemas should be visible to the LLM this turn, overriding the
+	// MCP=true "hidden by default" flag. Populated by:
+	//   - spawn-time preload (SpawnOpts.MCPNames expansion)
+	//   - search_tools meta-tool results
+	//   - explicit tool calls (warm-cache: a tool the model actually
+	//     invoked stays in activeTools so re-use needs no re-search)
+	// Bounded by context-window compaction (entries beyond what fits
+	// are evicted in the same pass that drops the corresponding
+	// tool_result messages).
+	activeTools map[string]bool
+	// MCP server catalog — lightweight metadata for prompt (name +
+	// tool count). Derived from toolIndex; kept as a Thinker field
+	// for buildSystemPrompt back-compat.
 	mcpCatalog []MCPServerInfo
 	computer     computer.Computer // screen-based environment (nil = no computer use)
 	pendingTools sync.Map         // tool call IDs with pending async results
@@ -735,6 +750,8 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	}
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
+	t.toolIndex = NewToolIndex()
+	t.activeTools = map[string]bool{}
 
 	// Register system-only tools (for unconscious thread)
 	registerSystemTools(t.registry, t.memory)
@@ -758,40 +775,15 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)
 	}
 
-	// Connect MCP servers:
-	// - main_access servers: fully registered (main can call them directly)
-	// - non-main_access servers: catalog only (name + tool count for prompt, threads connect on demand)
+	// Connect every configured MCP server up-front and register their
+	// tools with MCP=true (hidden from the per-turn provider tool list
+	// until a thread activates them via search_tools or spawn-time
+	// MCPNames preload). The old main_access/catalog split is gone —
+	// there is one connection pool and one index; visibility is a
+	// per-thread decision, not a per-server one.
 	if len(config.MCPServers) > 0 {
-		var mainServers []MCPServerConfig
-		var catalogServers []MCPServerConfig
-		for _, cfg := range config.MCPServers {
-			if cfg.MainAccess {
-				mainServers = append(mainServers, cfg)
-			} else {
-				catalogServers = append(catalogServers, cfg)
-			}
-		}
-		// Fully connect main_access servers (gateway, channels, etc.)
-		if len(mainServers) > 0 {
-			t.mcpServers = connectAndRegisterMCP(mainServers, t.registry, t.memory, t.blobs)
-		}
-		// Discover catalog servers (connect, count tools, keep connection for thread reuse)
-		for _, cfg := range catalogServers {
-			srv, err := connectAnyMCP(cfg)
-			if err != nil {
-				logMsg("MCP-CATALOG", fmt.Sprintf("%s: connect error: %v", cfg.Name, err))
-				continue
-			}
-			tools, err := srv.ListTools()
-			if err != nil {
-				logMsg("MCP-CATALOG", fmt.Sprintf("%s: list tools error: %v", cfg.Name, err))
-				srv.Close()
-				continue
-			}
-			t.mcpCatalog = append(t.mcpCatalog, MCPServerInfo{Name: cfg.Name, ToolCount: len(tools)})
-			srv.Close() // don't keep connection — threads connect on demand
-			logMsg("MCP-CATALOG", fmt.Sprintf("%s: %d tools cataloged (threads connect on demand)", cfg.Name, len(tools)))
-		}
+		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.toolIndex, t.memory, t.blobs)
+		t.mcpCatalog = computeMCPCatalog(t.toolIndex)
 		// Rebuild prompt with catalog
 		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 	}
@@ -1003,7 +995,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			// Check if this is an inline tool (handled here) or registry tool (handled by executeTool)
 			isInline := true
 			switch call.Name {
-			case "spawn", "kill", "update", "send", "evolve", "remember", "pace", "connect", "disconnect", "list_connected", "done":
+			case "spawn", "kill", "update", "send", "evolve", "remember", "pace", "connect", "disconnect", "list_connected", "done", "search_tools":
 				// inline — we handle _reason and telemetry here
 			default:
 				isInline = false // executeTool handles _reason and telemetry
@@ -1049,9 +1041,18 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				mediaStr := call.Args["media"]
 				mediaParts := parseMediaURLs(mediaStr)
 				providerName := call.Args["provider"]
-				// MCP scoping: thread connects only to listed servers
+				// MCP scoping: child thread preloads tools from these
+				// servers into its activeTools at boot. Accept both
+				// `mcps` (new, plural, preferred) and `mcp` (legacy
+				// singular-ish — actually always parsed as a list)
+				// so an old prompt or downstream consumer that hasn't
+				// migrated still works during transition.
 				var mcpNames []string
-				if mcpStr := call.Args["mcp"]; mcpStr != "" {
+				mcpStr := call.Args["mcps"]
+				if mcpStr == "" {
+					mcpStr = call.Args["mcp"]
+				}
+				if mcpStr != "" {
 					for _, name := range strings.Split(mcpStr, ",") {
 						if n := strings.TrimSpace(name); n != "" {
 							mcpNames = append(mcpNames, n)
@@ -1220,6 +1221,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				// was stored — silent no-op would just hide the wiring
 				// problem.
 				addResult("error: remember is not available — memory writes are owned by the unconscious thread")
+			case "search_tools":
+				addResult(runSearchTools(t, call.Args, true /* main allows no_spawn results */))
+				toolNames = append(toolNames, call.Raw)
+				continue
 			case "pace":
 				var parts []string
 				if s := call.Args["sleep"]; s != "" {
@@ -1914,10 +1919,26 @@ func (t *Thinker) think() (ChatResponse, error) {
 		}
 	}
 
-	// Build native tools from registry if provider supports it
+	// Build native tools from registry if provider supports it. The
+	// per-turn "preload" is a transient BM25 search against the most
+	// recent user-turn text — top hits get their schemas surfaced
+	// for THIS call only, not appended to activeTools. That bias keeps
+	// topic shifts cheap: next turn's preload re-derives from fresh
+	// context instead of accumulating.
 	var nativeTools []NativeTool
 	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
-		nativeTools = t.registry.NativeTools(t.toolAllowlist)
+		active := t.activeTools
+		if preload := t.computePreloadTools(5); len(preload) > 0 {
+			merged := make(map[string]bool, len(t.activeTools)+len(preload))
+			for k := range t.activeTools {
+				merged[k] = true
+			}
+			for _, n := range preload {
+				merged[n] = true
+			}
+			active = merged
+		}
+		nativeTools = t.registry.NativeTools(t.toolAllowlist, active)
 	}
 
 	// For Anthropic: add _display dimensions to computer_use tool params

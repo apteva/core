@@ -22,7 +22,7 @@ CRITICAL RULES FOR LEARNING:
 
 Process orders and shipments as requested via console events. When something fails, learn why, remember it, and retry correctly.`,
 	MCPServers: []MCPServerConfig{
-		{Name: "warehouse", Command: "", Env: map[string]string{"WAREHOUSE_DATA_DIR": "{{dataDir}}"}, MainAccess: true},
+		{Name: "warehouse", Command: "", Env: map[string]string{"WAREHOUSE_DATA_DIR": "{{dataDir}}"}},
 	},
 	DataSetup: func(t *testing.T, dir string) {
 		WriteJSONFile(t, dir, "stock.json", map[string]int{

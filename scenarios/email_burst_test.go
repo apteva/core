@@ -40,7 +40,7 @@ When every real message has been replied to AND archived, report
 			Name:       "email",
 			Command:    "", // filled in by test
 			Env:        map[string]string{"FAKE_EMAIL_DATA_DIR": "{{dataDir}}"},
-			MainAccess: true,
+			
 		},
 	},
 	DataSetup: func(t *testing.T, dir string) {
