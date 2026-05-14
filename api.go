@@ -844,7 +844,7 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 		toConnect = append(toConnect, cfg)
 	}
 	if len(toConnect) > 0 {
-		connected := connectAndRegisterMCP(toConnect, t.registry, t.toolIndex, t.memory, t.blobs)
+		connected := connectAndRegisterMCP(toConnect, t.registry, t.toolIndex, t.blobs)
 		t.mcpServers = append(t.mcpServers, connected...)
 		for _, cfg := range toConnect {
 			t.config.SaveMCPServer(cfg)

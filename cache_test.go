@@ -139,15 +139,15 @@ func TestPromptStability(t *testing.T) {
 	// Sanity: buildDynamicTurnContext IS allowed to vary — that's its job.
 	// Just verify it produces non-empty output when state is non-empty,
 	// and that the output is deterministic given the same input.
-	dyn1 := buildDynamicTurnContext(activeThreads, "", "[CANDIDATE TOOL]\nfoo: …")
-	dyn2 := buildDynamicTurnContext(activeThreads, "", "[CANDIDATE TOOL]\nfoo: …")
+	dyn1 := buildDynamicTurnContext(activeThreads, "")
+	dyn2 := buildDynamicTurnContext(activeThreads, "")
 	if dyn1 != dyn2 {
 		t.Errorf("buildDynamicTurnContext is non-deterministic")
 	}
 	if dyn1 == "" {
-		t.Errorf("buildDynamicTurnContext returned empty when active threads + tool docs were provided")
+		t.Errorf("buildDynamicTurnContext returned empty when active threads were provided")
 	}
-	t.Logf("[dynamic context size with 1 worker + tool docs] %d bytes", len(dyn1))
+	t.Logf("[dynamic context size with 1 worker] %d bytes", len(dyn1))
 }
 
 // TestIntegration_CacheHitRatio_Kimi exercises a multi-turn session

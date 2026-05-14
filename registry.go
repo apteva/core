@@ -16,26 +16,24 @@ type ToolResponse struct {
 // ToolDef defines a tool available to threads.
 type ToolDef struct {
 	Name        string
-	Description string // human-readable, used for RAG embedding
+	Description string // human-readable
 	Syntax      string // example usage
 	Rules       string // usage rules for the prompt
-	Core        bool   // always in prompt (pace, send, done, evolve)
+	Core        bool   // always in prompt (pace, send, done, evolve, search_tools)
 	MainOnly    bool   // only for main thread (spawn, kill)
 	ThreadOnly  bool   // only for sub-threads, not main (reply)
 	SystemOnly  bool   // only for system threads (unconscious)
-	MCP         bool   // provided by an MCP server — not sent as native tools to main, only to sub-threads
+	MCP         bool   // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
 	MCPServer   string // name of the MCP server that provides this tool
 	Handler     func(args map[string]string) ToolResponse // nil = handled inline by tool handler
-	Embedding   []float64
 	InputSchema map[string]any // JSON Schema for native tool calling (nil = auto-generated from Syntax)
 }
 
-// ToolRegistry holds all tool definitions with embeddings for RAG retrieval.
+// ToolRegistry holds all tool definitions.
 type ToolRegistry struct {
-	mu       sync.RWMutex
-	tools    map[string]*ToolDef
-	apiKey   string
-	embedded bool
+	mu     sync.RWMutex
+	tools  map[string]*ToolDef
+	apiKey string
 }
 
 // sortedToolKeys returns tool names in deterministic sorted order.
@@ -262,32 +260,6 @@ func (tr *ToolRegistry) registerDefaults() {
 	// instance config when enabled.
 }
 
-// NewScopedRegistry creates a minimal registry containing only the specified tools
-// copied from the parent. Core tools are always included. Local tools (web, exec, etc.)
-// are included if they appear in localTools. MCP tools are NOT copied — they should be
-// registered separately from thread-local MCP connections.
-func (tr *ToolRegistry) NewScopedRegistry(localTools map[string]bool) *ToolRegistry {
-	scoped := &ToolRegistry{
-		tools:  make(map[string]*ToolDef),
-		apiKey: tr.apiKey,
-	}
-
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
-
-	for name, tool := range tr.tools {
-		if tool.Core {
-			// Always include core tools
-			scoped.tools[name] = tool
-		} else if !tool.MCP && localTools[name] {
-			// Include allowed local tools (web, exec, read_file, etc.)
-			scoped.tools[name] = tool
-		}
-	}
-	scoped.embedded = tr.embedded // inherit embedding state
-	return scoped
-}
-
 func (tr *ToolRegistry) Register(tool *ToolDef) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
@@ -309,22 +281,6 @@ func (tr *ToolRegistry) RemoveByMCPServer(serverName string) {
 			delete(tr.tools, name)
 		}
 	}
-}
-
-// EmbedAll computes embeddings for all non-core tools. Call once on startup.
-func (tr *ToolRegistry) EmbedAll(ms *MemoryStore) {
-	tr.mu.Lock()
-	defer tr.mu.Unlock()
-	for _, tool := range tr.tools {
-		if tool.Core {
-			continue // core tools don't need embeddings — always in prompt
-		}
-		emb, err := ms.embed(tool.Name + ": " + tool.Description)
-		if err == nil {
-			tool.Embedding = emb
-		}
-	}
-	tr.embedded = true
 }
 
 // CoreDocsSummary returns a one-line summary of core tool names,
@@ -395,107 +351,6 @@ func (tr *ToolRegistry) CoreDocs(includeMainOnly bool, includeSystemOnly ...bool
 	return sb.String()
 }
 
-// Retrieve finds the most relevant non-core tools for the given context.
-// Returns up to n tools, filtered by the allowed set.
-func (tr *ToolRegistry) Retrieve(query string, n int, allowed map[string]bool, ms *MemoryStore) []*ToolDef {
-	if !tr.embedded || query == "" {
-		// Fallback: return all allowed non-core tools
-		return tr.getAllowed(allowed)
-	}
-
-	queryEmb, err := ms.embed(query)
-	if err != nil {
-		return tr.getAllowed(allowed)
-	}
-
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
-
-	type scored struct {
-		tool  *ToolDef
-		score float64
-	}
-
-	isMainThread := allowed == nil
-	var results []scored
-	for _, tool := range tr.tools {
-		if tool.Core || len(tool.Embedding) == 0 {
-			continue
-		}
-		if allowed != nil && !allowed[tool.Name] {
-			continue
-		}
-		if isMainThread && tool.ThreadOnly {
-			continue
-		}
-		if !isMainThread && tool.MainOnly {
-			continue
-		}
-		sim := cosineSimilarity(queryEmb, tool.Embedding)
-		results = append(results, scored{tool: tool, score: sim})
-	}
-
-	// Sort descending
-	for i := 0; i < len(results)-1; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].score > results[i].score {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
-
-	// Be generous — low threshold, include anything remotely relevant
-	const minScore = 0.1
-	var out []*ToolDef
-	for i := 0; i < len(results) && len(out) < n; i++ {
-		if results[i].score >= minScore {
-			out = append(out, results[i].tool)
-		}
-	}
-	return out
-}
-
-func (tr *ToolRegistry) getAllowed(allowed map[string]bool) []*ToolDef {
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
-	isMainThread := allowed == nil
-	var out []*ToolDef
-	for _, name := range tr.sortedToolKeys() {
-		tool := tr.tools[name]
-		if tool.Core {
-			continue
-		}
-		if allowed != nil && !allowed[tool.Name] {
-			continue
-		}
-		if isMainThread && tool.ThreadOnly {
-			continue
-		}
-		if !isMainThread && tool.MainOnly {
-			continue
-		}
-		out = append(out, tool)
-	}
-	return out
-}
-
-// BuildDocs generates tool documentation for a set of discovered tools.
-func (tr *ToolRegistry) BuildDocs(tools []*ToolDef) string {
-	if len(tools) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString("\n[available tools — matched to your current context]\n")
-	for _, tool := range tools {
-		sb.WriteString(fmt.Sprintf("  %s — %s\n", tool.Name, tool.Description))
-		if tool.Rules != "" {
-			sb.WriteString(fmt.Sprintf("    %s\n", tool.Rules))
-		}
-	}
-	sb.WriteString("If you need a different tool, describe what you need and it may appear next thought.\n")
-	return sb.String()
-}
-
 // Dispatch executes a tool by name if it has a Handler. Returns response and whether it was handled.
 func (tr *ToolRegistry) Dispatch(name string, args map[string]string) (ToolResponse, bool) {
 	tr.mu.RLock()
@@ -507,55 +362,6 @@ func (tr *ToolRegistry) Dispatch(name string, args map[string]string) (ToolRespo
 	return tool.Handler(args), true
 }
 
-// MCPToolSummary returns a compact summary of MCP tools grouped by server.
-// Used in the main thread's system prompt so it knows what's available
-// without sending full tool definitions to the LLM.
-func (tr *ToolRegistry) MCPToolSummary() string {
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
-
-	servers := make(map[string][]string) // server → ["tool_name — description", ...]
-	for _, name := range tr.sortedToolKeys() {
-		tool := tr.tools[name]
-		if !tool.MCP {
-			continue
-		}
-		srv := tool.MCPServer
-		if srv == "" {
-			srv = "unknown"
-		}
-		// Strip server prefix from display name
-		displayName := tool.Name
-		if len(srv) > 0 && len(tool.Name) > len(srv)+1 {
-			displayName = tool.Name[len(srv)+1:]
-		}
-		servers[srv] = append(servers[srv], fmt.Sprintf("  - %s — %s", displayName, tool.Description))
-	}
-	if len(servers) == 0 {
-		return ""
-	}
-
-	// Sort server names for deterministic output
-	srvNames := make([]string, 0, len(servers))
-	for k := range servers {
-		srvNames = append(srvNames, k)
-	}
-	sort.Strings(srvNames)
-
-	var sb strings.Builder
-	sb.WriteString("\n[MCP TOOLS — available for sub-threads]\n")
-	sb.WriteString("These tools are NOT available to you directly. To use them, spawn a thread with the tool in its tools list.\n")
-	sb.WriteString("When spawning, use the FULL prefixed name (e.g. \"servername_toolname\").\n\n")
-	for _, srv := range srvNames {
-		tools := servers[srv]
-		sb.WriteString(fmt.Sprintf("%s (%d tools):\n", srv, len(tools)))
-		for _, t := range tools {
-			sb.WriteString(t + "\n")
-		}
-		sb.WriteString("\n")
-	}
-	return sb.String()
-}
 
 // AllToolNames returns all non-core tool names (for spawn docs).
 func (tr *ToolRegistry) AllToolNames() []string {

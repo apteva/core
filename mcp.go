@@ -385,7 +385,7 @@ func connectAnyMCPWithRetry(cfg MCPServerConfig) (MCPConn, error) {
 // If blobs is non-nil, every registered tool is wrapped so that binary
 // arguments and results flow through the blob store (see
 // mcpProxyHandler). Pass nil for blobs to register plain proxies.
-func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, index *ToolIndex, memory *MemoryStore, blobs *BlobStore) []MCPConn {
+func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, index *ToolIndex, blobs *BlobStore) []MCPConn {
 	var servers []MCPConn
 	for _, cfg := range configs {
 		srv, err := connectAnyMCPWithRetry(cfg)
@@ -423,22 +423,6 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 		// with what the registry can actually dispatch.
 		if index != nil {
 			index.Add(cfg.Name, tools, cfg.NoSpawn)
-		}
-
-		// Embed new tools
-		if memory != nil {
-			go func(name string, tools []mcpToolDef) {
-				for _, tool := range tools {
-					fullName := name + "_" + tool.Name
-					emb, err := memory.embed(fullName + ": " + tool.Description)
-					if err == nil {
-						t := registry.Get(fullName)
-						if t != nil {
-							t.Embedding = emb
-						}
-					}
-				}
-			}(cfg.Name, tools)
 		}
 
 		servers = append(servers, srv)

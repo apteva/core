@@ -477,8 +477,6 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 
 	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, pool, nil)}
 
-	go thinker.registry.EmbedAll(memStore)
-
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
 		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil, thinker.pool, thinker.mcpCatalog)
@@ -490,7 +488,7 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 	// tool list until activated via search_tools or spawn-time
 	// MCPNames preload — same behavior the production path now uses.
 	if len(mcpServers) > 0 {
-		thinker.mcpServers = connectAndRegisterMCP(mcpServers, thinker.registry, thinker.toolIndex, memStore, thinker.blobs)
+		thinker.mcpServers = connectAndRegisterMCP(mcpServers, thinker.registry, thinker.toolIndex, thinker.blobs)
 		thinker.mcpCatalog = computeMCPCatalog(thinker.toolIndex)
 		t.Cleanup(func() {
 			for _, s := range thinker.mcpServers {

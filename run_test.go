@@ -24,12 +24,33 @@ func newTestThinkerFull() *Thinker {
 		config:    &Config{Directive: "test"},
 		apiLog:    &[]APIEvent{},
 		apiMu:     &sync.RWMutex{},
-		apiNotify: make(chan struct{}, 1),
-		threadID:  "main",
-		telemetry: &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
+		apiNotify:   make(chan struct{}, 1),
+		threadID:    "main",
+		telemetry:   &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
+		toolIndex:   NewToolIndex(),
+		activeTools: map[string]bool{},
 	}
 	t.threads = NewThreadManager(t)
 	return t
+}
+
+// drainEventTextsWait polls a thread's inbox until it has accumulated
+// `want` events or the deadline expires, then returns whatever it
+// drained. Spawn / Send publish onto the bus asynchronously, so a bare
+// drainEventTexts() immediately after is a race — this is the
+// synchronized form for tests that assert on inbox contents.
+func drainEventTextsWait(t *testing.T, th *Thinker, want int, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var acc []string
+	for time.Now().Before(deadline) {
+		acc = append(acc, th.drainEventTexts()...)
+		if len(acc) >= want {
+			return acc
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return acc
 }
 
 
@@ -57,7 +78,13 @@ func TestSubThread_ReceivesEvents(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("worker", "test worker", []string{"web"})
+	// DeferRun: the test inspects the inbox directly, so the thread's
+	// own Run() loop must NOT start — otherwise it races the test to
+	// drain sub.C and whoever wins is nondeterministic.
+	err := thinker.threads.SpawnWithOpts("worker", "test worker", []string{"web"}, SpawnOpts{DeferRun: true})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
 	defer thinker.threads.Kill("worker")
 
 	// Send to the thread
@@ -71,7 +98,7 @@ func TestSubThread_ReceivesEvents(t *testing.T) {
 	thread := thinker.threads.threads["worker"]
 	thinker.threads.mu.RUnlock()
 
-	items := thread.Thinker.drainEventTexts()
+	items := drainEventTextsWait(t, thread.Thinker, 1, time.Second)
 	if len(items) != 1 || items[0] != "do work" {
 		t.Errorf("expected 'do work' in thread inbox, got %v", items)
 	}
@@ -81,14 +108,21 @@ func TestSubThread_InitialMessages(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 
-	thinker.threads.Spawn("greeter", "test", nil, "[user] Hello", "[user] How are you?")
+	// DeferRun so Run() doesn't drain the inbox before the test does.
+	err := thinker.threads.SpawnWithOpts("greeter", "test", nil, SpawnOpts{
+		DeferRun:        true,
+		InitialMessages: []string{"[user] Hello", "[user] How are you?"},
+	})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
 	defer thinker.threads.Kill("greeter")
 
 	thinker.threads.mu.RLock()
 	thread := thinker.threads.threads["greeter"]
 	thinker.threads.mu.RUnlock()
 
-	items := thread.Thinker.drainEventTexts()
+	items := drainEventTextsWait(t, thread.Thinker, 2, time.Second)
 	if len(items) != 2 {
 		t.Fatalf("expected 2 initial messages, got %d", len(items))
 	}

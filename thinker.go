@@ -382,17 +382,16 @@ ACT, DON'T NARRATE. You have no live audience between thoughts — every tool re
 
 // buildDynamicTurnContext returns the per-turn volatile context block
 // — the part of the prompt that MUST change between iterations:
-// active sub-threads (whose state changes constantly), recalled
-// memories (computed against this turn's query), and RAG-retrieved
-// candidate tools (also computed per turn).
+// active sub-threads (whose state changes constantly) and recalled
+// memories (computed against this turn's query).
 //
 // This block is prepended to the current user turn's content rather
 // than rewritten into messages[0], so the prefix cache stays warm and
 // only the new turn's bytes are uncached.
 //
-// Returns "" when nothing dynamic applies (no threads, no memory, no
-// extra tool docs) so the user message stays clean.
-func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext, toolDocs string) string {
+// Returns "" when nothing dynamic applies (no threads, no memory) so
+// the user message stays clean.
+func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext string) string {
 	var sb strings.Builder
 
 	// Active threads — only id, name, directive, tools. Wall-clock /
@@ -420,13 +419,6 @@ func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext, toolDocs
 			sb.WriteString("\n")
 		}
 		sb.WriteString(recallContext)
-	}
-
-	if toolDocs != "" {
-		if sb.Len() > 0 {
-			sb.WriteString("\n\n")
-		}
-		sb.WriteString(toolDocs)
 	}
 
 	return sb.String()
@@ -759,17 +751,13 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	// Rebuild system prompt now that registry exists (with core tool docs)
 	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil, t.pool, nil)}
 
-	// Embed tool descriptions in background (non-blocking)
-	go t.registry.EmbedAll(t.memory)
-
 	// Main thread hooks
 	t.handleTools = mainToolHandler(t)
 	// rebuildPrompt produces the static portion of messages[0] only.
-	// Active threads, RAG-retrieved tools, and recalled memories are
-	// dynamic and pushed into the current user turn via
-	// buildDynamicTurnContext — so messages[0] doesn't change between
-	// iterations and the prefix cache stays warm. The toolDocs arg
-	// is intentionally ignored; kept for back-compat with the function
+	// Active threads and recalled memories are dynamic and pushed into
+	// the current user turn via buildDynamicTurnContext — so messages[0]
+	// doesn't change between iterations and the prefix cache stays warm.
+	// The string arg is unused; kept for back-compat with the function
 	// type signature used by sub-thread instantiation.
 	t.rebuildPrompt = func(_ string) string {
 		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)
@@ -782,7 +770,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	// there is one connection pool and one index; visibility is a
 	// per-thread decision, not a per-server one.
 	if len(config.MCPServers) > 0 {
-		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.toolIndex, t.memory, t.blobs)
+		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.toolIndex, t.blobs)
 		t.mcpCatalog = computeMCPCatalog(t.toolIndex)
 		// Rebuild prompt with catalog
 		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
@@ -1336,19 +1324,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							MCPServer:   name,
 						})
 					}
-					if t.memory != nil && t.memory.Enabled() {
-						go func(srvName string, srvTools []mcpToolDef) {
-							for _, tl := range srvTools {
-								fullName := srvName + "_" + tl.Name
-								emb, err := t.memory.embed(fullName + ": " + tl.Description)
-								if err == nil {
-									td := t.registry.Get(fullName)
-									if td != nil {
-										td.Embedding = emb
-									}
-								}
-							}
-						}(name, tools)
+					// Feed the search index so the freshly-connected
+					// server's tools are discoverable via search_tools
+					// and per-turn preload, same as startup-connected MCPs.
+					if t.toolIndex != nil {
+						t.toolIndex.Add(name, tools, cfg.NoSpawn)
+						t.mcpCatalog = computeMCPCatalog(t.toolIndex)
 					}
 					t.config.SaveMCPServer(cfg)
 					addResult(fmt.Sprintf("connected to %s: %d tools", name, len(tools)))
@@ -1362,6 +1343,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							srv.Close()
 							t.mcpServers = append(t.mcpServers[:i], t.mcpServers[i+1:]...)
 							t.registry.RemoveByMCPServer(name)
+							if t.toolIndex != nil {
+								t.toolIndex.Remove(name)
+								t.mcpCatalog = computeMCPCatalog(t.toolIndex)
+							}
 							t.config.RemoveMCPServer(name)
 							found = true
 							break
@@ -1539,18 +1524,26 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		// Compute the per-turn dynamic context: active threads + recall
-		// + RAG-retrieved candidate tools. All three were previously
-		// poisoning messages[0] every iteration; now they ride along on
-		// the current user-turn message so messages[0] stays cache-stable.
-		var memQuery, toolQuery string
+		// Compute the per-turn dynamic context: active threads + recall.
+		// Both were previously poisoning messages[0] every iteration; now
+		// they ride along on the current user-turn message so messages[0]
+		// stays cache-stable.
+		//
+		// RAG tool retrieval used to live here too — it embedded tool
+		// descriptions and injected the top-5 as text docs. It's gone:
+		// MCP tool discovery is now search_tools + per-turn BM25 preload
+		// + activeTools, and for native-tool providers every non-MCP
+		// tool main can use is already in the NativeTools array. The RAG
+		// path's only remaining effect was leaking MCP tools as text
+		// (bypassing the MCP=true visibility gate) and feeding its own
+		// injected text back into the preload query.
+		var memQuery string
 		if hadEvents {
-			q := strings.Join(consumed, " ")
-			memQuery, toolQuery = q, q
+			memQuery = strings.Join(consumed, " ")
 		} else {
 			for i := len(t.messages) - 1; i >= 0; i-- {
 				if t.messages[i].Role == "assistant" {
-					memQuery, toolQuery = t.messages[i].Content, t.messages[i].Content
+					memQuery = t.messages[i].Content
 					break
 				}
 			}
@@ -1568,16 +1561,11 @@ func (t *Thinker) Run() {
 			recalled := t.memory.Recall(memQuery, 5)
 			recallContext = t.memory.BuildContext(recalled)
 		}
-		var toolDocs string
-		if t.registry != nil && toolQuery != "" {
-			tools := t.registry.Retrieve(toolQuery, 5, t.allowedTools(), t.memory)
-			toolDocs = t.registry.BuildDocs(tools)
-		}
 		var activeThreads []ThreadInfo
 		if t.threads != nil {
 			activeThreads = t.threads.List()
 		}
-		dynCtx := buildDynamicTurnContext(activeThreads, recallContext, toolDocs)
+		dynCtx := buildDynamicTurnContext(activeThreads, recallContext)
 
 		if hadEvents {
 			// Filter out tool result text from the events text (they're already in ToolResults)
@@ -2208,11 +2196,6 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 	events := make([]APIEvent, len(*t.apiLog)-since)
 	copy(events, (*t.apiLog)[since:])
 	return events, len(*t.apiLog)
-}
-
-// allowedTools returns the tool allowlist for this thinker. nil = all tools allowed.
-func (t *Thinker) allowedTools() map[string]bool {
-	return t.toolAllowlist
 }
 
 func (t *Thinker) ReloadDirective() {

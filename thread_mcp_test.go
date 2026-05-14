@@ -113,7 +113,7 @@ func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
 			{Name: "catalog-mcp", Transport: "http", URL: srv.URL + "/mcp"},
 		},
 	}
-	thinker.mcpServers = connectAndRegisterMCP(thinker.config.MCPServers, thinker.registry, thinker.toolIndex, nil, nil)
+	thinker.mcpServers = connectAndRegisterMCP(thinker.config.MCPServers, thinker.registry, thinker.toolIndex, nil)
 	if len(thinker.mcpServers) == 0 {
 		t.Fatal("parent failed to connect catalog-mcp")
 	}

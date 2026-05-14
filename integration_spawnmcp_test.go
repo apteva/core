@@ -136,7 +136,7 @@ func runSpawnMCPModelTest(t *testing.T, apiKey, model string) {
 	directive := `You coordinate a single worker. On your first turn, spawn ONE
 sub-thread:
 
-[[spawn id="w" mcp="mock" tools="mock_echo,done" directive="Call mock_echo once with text='ok'. Then call done. Nothing else."]]
+[[spawn id="w" mcps="mock" tools="mock_echo,done" directive="Call mock_echo once with text='ok'. Then call done. Nothing else."]]
 
 After spawning, pace down and wait. Do not call mock_echo yourself.`
 

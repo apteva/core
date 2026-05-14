@@ -102,60 +102,6 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	t.Logf("Thread native tools (%d): %v", len(threadTools), threadToolNames)
 }
 
-// TestMCPToolSummaryGenerated verifies that the MCP tool summary is generated
-// correctly for the system prompt.
-func TestMCPToolSummaryGenerated(t *testing.T) {
-	tr := &ToolRegistry{tools: make(map[string]*ToolDef)}
-
-	tr.Register(&ToolDef{Name: "pace", Description: "Set pace", Core: true})
-	tr.Register(&ToolDef{
-		Name: "socialcast_create_post", Description: "[socialcast] Create a post",
-		MCP: true, MCPServer: "socialcast",
-	})
-	tr.Register(&ToolDef{
-		Name: "socialcast_list_accounts", Description: "[socialcast] List accounts",
-		MCP: true, MCPServer: "socialcast",
-	})
-	tr.Register(&ToolDef{
-		Name: "github_list_repos", Description: "[github] List repos",
-		MCP: true, MCPServer: "github",
-	})
-
-	summary := tr.MCPToolSummary()
-
-	if summary == "" {
-		t.Fatal("expected non-empty MCP tool summary")
-	}
-
-	// Should mention both servers
-	if !strings.Contains(summary, "socialcast") {
-		t.Error("summary should mention socialcast")
-	}
-	if !strings.Contains(summary, "github") {
-		t.Error("summary should mention github")
-	}
-
-	// Should contain tool names
-	if !strings.Contains(summary, "create_post") {
-		t.Error("summary should mention create_post")
-	}
-	if !strings.Contains(summary, "list_repos") {
-		t.Error("summary should mention list_repos")
-	}
-
-	// Should instruct to use full prefixed names
-	if !strings.Contains(summary, "servername_toolname") {
-		t.Error("summary should mention full prefixed naming convention")
-	}
-
-	// Should say tools are NOT directly available
-	if !strings.Contains(summary, "NOT available to you directly") {
-		t.Error("summary should say tools are not directly callable")
-	}
-
-	t.Logf("Summary:\n%s", summary)
-}
-
 // TestActiveThreadsInjectedInDynamicContext verifies that active thread
 // info reaches the agent via the per-turn dynamic context block — NOT
 // via the system prompt (where it used to live and busted the cache
@@ -197,7 +143,7 @@ func TestActiveThreadsInjectedInDynamicContext(t *testing.T) {
 	}
 
 	// The agent still has to see them — just via the dynamic-context path.
-	dyn := buildDynamicTurnContext(threads, "", "")
+	dyn := buildDynamicTurnContext(threads, "")
 
 	if !strings.Contains(dyn, "[ACTIVE THREADS]") {
 		t.Error("dynamic context should contain [ACTIVE THREADS] section")
@@ -237,21 +183,10 @@ func TestActiveThreadsInjectedInDynamicContext(t *testing.T) {
 // The system prompt naturally never contains a rendered section after
 // the cache fix; the meaningful assertion is on buildDynamicTurnContext.
 func TestNoActiveThreadsNoSection(t *testing.T) {
-	if dyn := buildDynamicTurnContext(nil, "", ""); strings.Contains(dyn, "[ACTIVE THREADS]") {
+	if dyn := buildDynamicTurnContext(nil, ""); strings.Contains(dyn, "[ACTIVE THREADS]") {
 		t.Error("dynamic context should NOT contain [ACTIVE THREADS] when no threads")
 	}
-	if dyn := buildDynamicTurnContext([]ThreadInfo{}, "", ""); strings.Contains(dyn, "[ACTIVE THREADS]") {
+	if dyn := buildDynamicTurnContext([]ThreadInfo{}, ""); strings.Contains(dyn, "[ACTIVE THREADS]") {
 		t.Error("dynamic context should NOT contain [ACTIVE THREADS] when empty slice")
-	}
-}
-
-func TestNoMCPToolsEmptySummary(t *testing.T) {
-	tr := &ToolRegistry{tools: make(map[string]*ToolDef)}
-	tr.Register(&ToolDef{Name: "pace", Description: "Set pace", Core: true})
-	tr.Register(&ToolDef{Name: "web", Description: "Fetch URL"})
-
-	summary := tr.MCPToolSummary()
-	if summary != "" {
-		t.Errorf("expected empty summary with no MCP tools, got: %q", summary)
 	}
 }
