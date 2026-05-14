@@ -311,8 +311,7 @@ Constraints:
 			},
 		},
 	},
-	Timeout:    8 * time.Minute,
-	MaxThreads: 6,
+	Timeout: 8 * time.Minute,
 }
 
 func TestScenario_DailyProspection(t *testing.T) {

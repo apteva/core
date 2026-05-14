@@ -45,12 +45,12 @@ You stay at normal pace and coordinate.`,
 	},
 	Phases: []Phase{
 		{
-			Name:    "Startup — pilot spawned and reading sensors",
+			Name:    "Startup — reading sensors",
 			Timeout: 60 * time.Second,
 			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				if th.Threads().Count() == 0 {
-					return false
-				}
+				// Outcome only: the agent started reading sensors.
+				// Whether it pilots from a dedicated sub-thread or
+				// inline on main is its own call.
 				entries := ReadAuditEntries(dir)
 				reads := CountTool(entries, "read_sensors")
 				t.Logf("  ... read_sensors=%d threads=%v", reads, ThreadIDs(th))
@@ -157,20 +157,22 @@ You stay at normal pace and coordinate.`,
 			},
 		},
 		{
-			Name:    "Quiescence — pilot still alive",
+			Name:    "Quiescence — agent still on task",
 			Timeout: 15 * time.Second,
 			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				return th.Threads().Count() >= 1
+				// The agent stayed alive and did robot work — that's
+				// the goal. Whether the work ran in a "pilot"
+				// sub-thread or on main doesn't matter; a dead agent
+				// is caught by the scenario's hard timeout anyway.
+				entries := ReadAuditEntries(dir)
+				return CountTool(entries, "read_sensors") > 0
 			},
 			Verify: func(t *testing.T, dir string, th *Thinker) {
-				if th.Threads().Count() < 1 {
-					t.Errorf("expected pilot still alive, got %d threads", th.Threads().Count())
-				}
+				t.Logf("quiescence: %d sub-threads alive", th.Threads().Count())
 			},
 		},
 	},
-	Timeout:    5 * time.Minute,
-	MaxThreads: 3,
+	Timeout: 5 * time.Minute,
 }
 
 func TestScenario_Robot(t *testing.T) {

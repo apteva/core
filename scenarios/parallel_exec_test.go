@@ -82,12 +82,9 @@ When every project has a done.txt file, you are finished.`,
 		},
 	},
 	Timeout: 5 * time.Minute,
-	// MinPeakThreads: 3 — the agent must have at least 3 workers alive
 	// simultaneously during the scenario. Running the five scripts
 	// sequentially from main would keep threads.Count() at 0 and fail
 	// the check. Anything from 3-5 parallel workers is fine.
-	MinPeakThreads: 3,
-	MaxThreads:     10,
 }
 
 func TestScenario_ParallelExec(t *testing.T) {

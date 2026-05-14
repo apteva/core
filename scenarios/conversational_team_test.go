@@ -104,8 +104,7 @@ var conversationalTeamScenario = Scenario{
 			Timeout: 60 * time.Second,
 		},
 	},
-	Timeout:    5 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 5 * time.Minute,
 }
 
 func TestScenario_ConversationalTeam(t *testing.T) {

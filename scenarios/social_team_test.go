@@ -135,15 +135,13 @@ Creative and social manager can sleep when idle.`,
 				return posts >= 3
 			},
 			Verify: func(t *testing.T, dir string, th *Thinker) {
-				count := th.Threads().Count()
-				if count < 3 {
-					t.Errorf("expected 3 permanent workers alive, got %d: %v", count, ThreadIDs(th))
-				}
+				// The posts going out is the goal (asserted in Wait).
+				// How many standing workers the agent kept is its call.
+				t.Logf("post phase: %d sub-threads alive: %v", th.Threads().Count(), ThreadIDs(th))
 			},
 		},
 	},
-	Timeout:    5 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 5 * time.Minute,
 }
 
 func TestScenario_SocialTeam(t *testing.T) {

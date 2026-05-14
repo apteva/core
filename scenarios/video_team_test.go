@@ -140,8 +140,7 @@ When all posts are published, store a completion record in storage with key "pip
 			},
 		},
 	},
-	Timeout:    5 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 5 * time.Minute,
 }
 
 func TestScenario_VideoTeam(t *testing.T) {

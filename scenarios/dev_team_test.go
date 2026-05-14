@@ -37,13 +37,10 @@ Workflow:
 		seedTodoApp(t, dir)
 	},
 	Phases: []Phase{
-		{
-			Name:    "Startup — 3 threads spawned",
-			Timeout: 90 * time.Second,
-			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				return len(ThreadIDs(th)) >= 3
-			},
-		},
+		// No "startup — N threads spawned" phase: how the agent
+		// organises itself (a standing team vs. handling tickets
+		// inline) is its call. The phases below assert on the code
+		// that lands and the tests that pass.
 		{
 			Name:    "Feature request — add priority field",
 			Timeout: 180 * time.Second,
@@ -111,8 +108,7 @@ Workflow:
 			},
 		},
 	},
-	Timeout:    8 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 8 * time.Minute,
 }
 
 func TestScenario_DevTeam(t *testing.T) {

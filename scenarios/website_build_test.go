@@ -152,8 +152,7 @@ IMPORTANT: All files go in the "app/" directory. package.json must include "reac
 			},
 		},
 	},
-	Timeout:    10 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 10 * time.Minute,
 }
 
 func TestScenario_WebsiteBuild(t *testing.T) {

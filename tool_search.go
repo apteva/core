@@ -3,8 +3,60 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"sort"
 	"strconv"
+	"strings"
 )
+
+// toolSearchAutoThreshold: at or below this many indexed tools,
+// APTEVA_TOOL_SEARCH=auto loads everything eagerly. The A/B runs put
+// the crossover above ~21 tools (discovery lost there) and well below
+// 113 (discovery won big); 30 is a conservative pick that keeps small
+// agents on the cheaper eager path.
+const toolSearchAutoThreshold = 30
+
+// activeToolsCap bounds the sticky active-tool set in discovery mode.
+// Sticky preload makes the per-turn tool list grow then STABILISE,
+// which is what lets the prompt prefix cache. The cap stops an
+// unbounded set on a long, topic-hopping conversation from creeping
+// toward "everything"; evictActiveToolsLRU trims to ~70% when hit.
+const activeToolsCap = 40
+
+// toolSearchMode resolves APTEVA_TOOL_SEARCH: "auto" (default) | "on"
+// | "off". "on" forces the discovery model (search + preload); "off"
+// forces eager (every attached tool, every turn); "auto" decides by
+// the size of the attached surface. Mirrors Anthropic's own
+// ENABLE_TOOL_SEARCH knob.
+func toolSearchMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APTEVA_TOOL_SEARCH"))) {
+	case "on":
+		return "on"
+	case "off":
+		return "off"
+	default:
+		return "auto"
+	}
+}
+
+// useEagerTools reports whether this thinker should load every
+// attached tool every turn (eager) rather than the discovery model.
+// Resolved per-turn so a runtime connect / app-install that pushes the
+// surface past the auto threshold flips the mode without a restart.
+func (t *Thinker) useEagerTools() bool {
+	switch toolSearchMode() {
+	case "off":
+		return true
+	case "on":
+		return false
+	default: // auto
+		n := 0
+		if t.toolIndex != nil {
+			n = t.toolIndex.Count()
+		}
+		return n <= toolSearchAutoThreshold
+	}
+}
 
 // search_tools is the meta-tool every thread has in its scaffolding.
 // It searches the process-wide ToolIndex for MCP tools matching the
@@ -72,56 +124,89 @@ type searchToolHit struct {
 	Summary string `json:"summary"`
 }
 
-// computePreloadTools runs a BM25 search against the most recent
-// user turn's text and returns up to k tool names whose schemas
-// should be transiently surfaced this turn. Sub-threads pass
-// allowNoSpawn=false implicitly (their thread-id is not "main");
-// main passes allowNoSpawn=true.
+// applyPreload runs a BM25 search against the thread's DIRECTIVE and
+// stickily activates up to k matching tools — they join t.activeTools
+// and stay (subject to the LRU cap). Called every turn in discovery
+// mode, but idempotent after the first.
 //
-// Returns nil silently when there's no index, no last user text, or
-// no matches — preload is best-effort context biasing, never a
-// hard requirement.
-func (t *Thinker) computePreloadTools(k int) []string {
+// Two design choices, both for prompt caching:
+//
+//  1. STICKY, not transient. An early draft merged the preload
+//     transiently each turn — that churned the `tools` array, which
+//     sits in the cacheable prompt prefix, busting the cache wholesale
+//     (~0.1% hit measured).
+//  2. DIRECTIVE-ONLY query, not directive+lastUserText. The directive
+//     is stable; the last user turn is not. Including the user turn
+//     made preload surface different tools every turn, so the active
+//     set never stopped growing and the array never stabilised — even
+//     sticky, monotonic growth still busts the cache each turn it
+//     grows. With a directive-only query the set seeds once and then
+//     holds: same query → same hits → already-active → no-op. The
+//     array goes stable as soon as explicit search_tools calls stop,
+//     and from there every turn caches.
+//
+// The cost of (2): per-turn task adaptivity moves to search_tools — if
+// the agent needs something the directive doesn't imply, it searches.
+// A bounded one-time round-trip per new capability beats a permanent
+// per-turn cache bust.
+//
+// Sub-threads run with allowNoSpawn=false (their thread-id is not
+// "main"); main runs with allowNoSpawn=true.
+func (t *Thinker) applyPreload(k int) {
 	if t == nil || t.toolIndex == nil {
-		return nil
+		return
 	}
-	text := t.lastUserText()
-	if text == "" {
-		return nil
+	query := strings.TrimSpace(t.directive)
+	if query == "" {
+		return
 	}
 	allowNoSpawn := t.threadID == "main"
-	hits := t.toolIndex.Search(text, k, allowNoSpawn)
-	if len(hits) == 0 {
-		return nil
+	for _, h := range t.toolIndex.Search(query, k, allowNoSpawn) {
+		t.touchActiveTool(h.Name)
 	}
-	out := make([]string, 0, len(hits))
-	for _, h := range hits {
-		out = append(out, h.Name)
-	}
-	return out
 }
 
-// lastUserText returns the most recent user-role message's text, or
-// empty string if no user message exists yet. The first user turn
-// after a system message is what bootstraps the preload signal; on
-// subsequent iterations the most recent tool_result-bearing user
-// message also feeds in (it's the running record of the work).
-func (t *Thinker) lastUserText() string {
-	if t == nil {
-		return ""
+// touchActiveTool marks a tool active and refreshes its recency to
+// the current iteration. Every path that surfaces a tool — spawn-time
+// preload, search_tools, per-turn applyPreload — goes through here so
+// evictActiveToolsLRU has a consistent recency key. Lazily inits both
+// maps so bare test thinkers don't need to.
+func (t *Thinker) touchActiveTool(name string) {
+	if t.activeTools == nil {
+		t.activeTools = map[string]bool{}
 	}
-	for i := len(t.messages) - 1; i >= 0; i-- {
-		m := t.messages[i]
-		if m.Role != "user" {
-			continue
-		}
-		if m.Content != "" {
-			return m.Content
-		}
-		// tool_result-only user turns have empty Content; we want the
-		// user's actual prose. Walk further back.
+	if t.activeToolAge == nil {
+		t.activeToolAge = map[string]int{}
 	}
-	return ""
+	t.activeTools[name] = true
+	t.activeToolAge[name] = t.iteration
+}
+
+// evictActiveToolsLRU bounds the sticky active-tool set. Sticky preload
+// is what makes the tool list cache-friendly (grow then stabilise),
+// but an unbounded set on a long, topic-hopping conversation would
+// creep toward "everything" and lose the token win. When the set
+// exceeds limit, drop the least-recently-surfaced tools down to ~70%
+// of limit — batched so the next turn doesn't immediately re-evict
+// (each eviction is itself a one-turn cache bust).
+func (t *Thinker) evictActiveToolsLRU(limit int) {
+	if limit <= 0 || len(t.activeTools) <= limit {
+		return
+	}
+	type aged struct {
+		name string
+		age  int
+	}
+	all := make([]aged, 0, len(t.activeTools))
+	for n := range t.activeTools {
+		all = append(all, aged{n, t.activeToolAge[n]})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].age < all[j].age })
+	keep := limit * 7 / 10
+	for i := 0; i < len(all)-keep; i++ {
+		delete(t.activeTools, all[i].name)
+		delete(t.activeToolAge, all[i].name)
+	}
 }
 
 // runSearchTools executes the search and mutates t.activeTools. Used
@@ -146,12 +231,9 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 		return `{"error":"tool index not initialised — no MCPs attached"}`
 	}
 	hits := t.toolIndex.Search(query, k, allowNoSpawn)
-	if t.activeTools == nil {
-		t.activeTools = map[string]bool{}
-	}
 	res := searchToolsResult{Query: query}
 	for _, h := range hits {
-		t.activeTools[h.Name] = true
+		t.touchActiveTool(h.Name)
 		summary := h.Description
 		if len(summary) > 240 {
 			summary = summary[:237] + "..."

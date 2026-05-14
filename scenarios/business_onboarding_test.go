@@ -132,8 +132,7 @@ should already know who this business is and how they talk.`,
 			},
 		},
 	},
-	Timeout:    15 * time.Minute,
-	MaxThreads: 1,
+	Timeout: 15 * time.Minute,
 }
 
 func TestScenario_BusinessOnboarding(t *testing.T) {

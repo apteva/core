@@ -59,13 +59,9 @@ Workflow:
 		})
 	},
 	Phases: []Phase{
-		{
-			Name:    "Startup — 3 threads spawned",
-			Timeout: 90 * time.Second,
-			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				return len(ThreadIDs(th)) >= 3
-			},
-		},
+		// No "startup — N threads spawned" phase: the phases below
+		// assert on orders getting placed and stop-losses firing,
+		// not on the agent's thread layout.
 		{
 			Name:    "Trading — buy signal and execution",
 			Timeout: 180 * time.Second,
@@ -124,8 +120,7 @@ Workflow:
 			},
 		},
 	},
-	Timeout:    8 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 8 * time.Minute,
 }
 
 func TestScenario_Trading(t *testing.T) {

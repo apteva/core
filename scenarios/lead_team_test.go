@@ -166,8 +166,7 @@ When file-processor finishes, tell ad-monitor to check performance.`,
 			},
 		},
 	},
-	Timeout:    5 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 5 * time.Minute,
 }
 
 func TestScenario_LeadTeam(t *testing.T) {

@@ -36,6 +36,12 @@ import (
 // --- Public types ---
 
 // Scenario defines a complete agent behavior test.
+//
+// Note: there are deliberately no thread-count knobs here. Scenarios
+// assert on OUTCOMES — the goal got done — not on HOW the agent got
+// there. Whether it spawned five workers or did the work inline on
+// main is the agent's call; the harness only tracks peak threads as
+// an informational line in the run summary.
 type Scenario struct {
 	Name       string
 	Directive  string
@@ -44,11 +50,6 @@ type Scenario struct {
 	DataSetup  func(t *testing.T, dir string)
 	Phases     []Phase
 	Timeout    time.Duration // hard cap for entire scenario
-	MaxThreads int           // peak thread count limit (0 = no limit)
-	// MinPeakThreads asserts the agent autonomously spawned at least this
-	// many concurrent threads at some point. Used by scenarios that test
-	// whether the agent parallelises work on its own without being told to.
-	MinPeakThreads int
 }
 
 // Phase is a step in a scenario.
@@ -85,7 +86,7 @@ func getAPIKey(t *testing.T) string {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
-	godotenv.Load() // load .env only when integration tests actually need it
+	loadIntegrationEnv() // load .env only when integration tests actually need it
 	key := os.Getenv("FIREWORKS_API_KEY")
 	if key == "" {
 		t.Skip("FIREWORKS_API_KEY not set, skipping integration test")
@@ -112,9 +113,9 @@ type testProvider struct {
 // budget on every CI / dev run.
 //
 // Skip rules, in order:
-//   1. -short → skip (any integration test).
-//   2. Neither key set → skip with a message listing both.
-//   3. Otherwise: OpenCode Go > Fireworks.
+//  1. -short → skip (any integration test).
+//  2. Neither key set → skip with a message listing both.
+//  3. Otherwise: OpenCode Go > Fireworks.
 //
 // Tests that need a *specific* provider (cache test, MiniMax stall,
 // embedding tests) should keep using getAPIKey + NewFireworksProvider
@@ -124,7 +125,7 @@ func getTestProvider(t *testing.T) testProvider {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
-	godotenv.Load()
+	loadIntegrationEnv()
 
 	// Wipe persistent agent state BEFORE handing back a provider.
 	// NewThinker() loads ./history/<threadID>.jsonl on construction —
@@ -162,8 +163,9 @@ func getTestProvider(t *testing.T) testProvider {
 // passing run would leave its own history behind for the next one).
 //
 // What gets wiped:
-//   ./history/         per-thread JSONL conversation logs (main.jsonl etc.)
-//   ./memory.jsonl     cross-session user memories surfaced into the prompt
+//
+//	./history/         per-thread JSONL conversation logs (main.jsonl etc.)
+//	./memory.jsonl     cross-session user memories surfaced into the prompt
 func resetPersistentAgentState(t *testing.T) {
 	t.Helper()
 	paths := []string{"history", "memory.jsonl"}
@@ -209,6 +211,20 @@ func moduleRoot() (string, error) {
 	}
 }
 
+// loadIntegrationEnv loads the .env file for integration tests. Plain
+// godotenv.Load() only checks the current working directory — fine
+// when tests run from core/, but the scenarios package runs from
+// core/scenarios/ where there is no .env. Try cwd first (cheap, and
+// lets a local override win), then fall back to the module root.
+func loadIntegrationEnv() {
+	if err := godotenv.Load(); err == nil {
+		return
+	}
+	if root, err := moduleRoot(); err == nil {
+		godotenv.Load(filepath.Join(root, ".env"))
+	}
+}
+
 // --- Public funcs ---
 
 // RunScenario executes a scenario end-to-end against a freshly-built
@@ -218,7 +234,14 @@ func moduleRoot() (string, error) {
 func RunScenario(t *testing.T, s Scenario) {
 	t.Helper()
 	scenarioStart := time.Now()
-	apiKey := getAPIKey(t)
+	// Use whichever real provider is available (opencode-go preferred,
+	// Fireworks fallback) — same gate the other integration tests use.
+	// newScenarioThinker's buildProviderPool env-detects the same
+	// provider; the apiKey here only feeds memory-store embeddings,
+	// which disable themselves cleanly when it's empty.
+	tp := getTestProvider(t)
+	apiKey := tp.APIKey
+	t.Logf("scenario provider: %s", tp.Source)
 
 	if s.Timeout == 0 {
 		s.Timeout = 3 * time.Minute
@@ -342,7 +365,7 @@ func RunScenario(t *testing.T, s Scenario) {
 		t.Logf("Phase %d PASSED", i+1)
 	}
 
-	// Check peak threads
+	// Peak threads — informational only, never asserted on.
 	peak := int(peakThreads.Load())
 
 	// Token/cost summary
@@ -367,13 +390,6 @@ func RunScenario(t *testing.T, s Scenario) {
 	t.Logf("Cache:    %.1f%% hit ratio (cached / prompt across all iterations)", cacheRatio)
 	t.Logf("Cost:     $%.4f | Provider: %s", totalCost, thinker.provider.Name())
 	t.Logf("────────────────────────────────────────")
-
-	if s.MaxThreads > 0 && peak > s.MaxThreads {
-		t.Errorf("peak thread count %d exceeded limit of %d", peak, s.MaxThreads)
-	}
-	if s.MinPeakThreads > 0 && peak < s.MinPeakThreads {
-		t.Errorf("peak thread count %d below required minimum of %d — agent did not parallelise work via spawn", peak, s.MinPeakThreads)
-	}
 
 	t.Logf("=== Scenario %q PASSED ===", s.Name)
 }
@@ -400,6 +416,13 @@ func BuildMCPBinary(t *testing.T, dir string) string {
 	bin := filepath.Join(t.TempDir(), filepath.Base(resolved))
 	cmd := exec.Command("go", "build", "-o", bin, ".")
 	cmd.Dir = resolved
+	// GOWORK=off: the fake MCP servers under core/mcps/* are each their
+	// own self-contained module (module mcp-<name>), and the workspace
+	// go.work does NOT list them. With workspace mode on, `go build .`
+	// here resolves `.` against go.work and fails with "main module
+	// does not contain package …". Disabling workspace mode makes the
+	// build use the directory's own go.mod, which is what we want.
+	cmd.Env = append(os.Environ(), "GOWORK=off")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build %s: %v\n%s", dir, err, out)
 	}
@@ -474,6 +497,7 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 	thinker.registry = NewToolRegistry(apiKey)
 	thinker.toolIndex = NewToolIndex()
 	thinker.activeTools = map[string]bool{}
+	thinker.directive = directive
 
 	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, pool, nil)}
 

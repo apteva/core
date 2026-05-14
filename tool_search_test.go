@@ -2,12 +2,13 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
 
 // indexedThinker returns a bare Thinker with a populated ToolIndex —
-// enough surface to exercise runSearchTools / computePreloadTools
+// enough surface to exercise runSearchTools / applyPreload
 // without standing up the full agent loop.
 func indexedThinker(threadID string) *Thinker {
 	ix := NewToolIndex()
@@ -131,75 +132,102 @@ func TestRunSearchTools_KClamp(t *testing.T) {
 	}
 }
 
-func TestLastUserText(t *testing.T) {
-	th := &Thinker{
-		messages: []Message{
-			{Role: "system", Content: "sys"},
-			{Role: "user", Content: "first user message"},
-			{Role: "assistant", Content: "reply"},
-			{Role: "user", Content: "most recent user message"},
-			{Role: "assistant", Content: "another reply"},
-		},
-	}
-	if got := th.lastUserText(); got != "most recent user message" {
-		t.Errorf("lastUserText = %q, want most recent user message", got)
-	}
-
-	// No user messages → empty string, no panic.
-	thNoUser := &Thinker{messages: []Message{{Role: "system", Content: "sys"}}}
-	if got := thNoUser.lastUserText(); got != "" {
-		t.Errorf("lastUserText with no user msg = %q, want empty", got)
-	}
-
-	// nil receiver → empty, no panic.
-	var nilTh *Thinker
-	if got := nilTh.lastUserText(); got != "" {
-		t.Errorf("nil thinker lastUserText = %q, want empty", got)
-	}
-}
-
-func TestComputePreloadTools(t *testing.T) {
+func TestApplyPreload(t *testing.T) {
+	// applyPreload queries the DIRECTIVE only (not the user turn) — that's
+	// the cache fix: a stable query → stable hits → the active set seeds
+	// once and then holds, so the tools array stops churning.
 	th := indexedThinker("main")
-	th.messages = append(th.messages, Message{Role: "user", Content: "I need to upload a file"})
+	th.directive = "Keep the storage folder tidy — upload new files as they arrive and list what's there."
 
-	preload := th.computePreloadTools(5)
-	if len(preload) == 0 {
-		t.Fatal("computePreloadTools returned nothing for an upload-related message")
+	th.applyPreload(5)
+	if len(th.activeTools) == 0 {
+		t.Fatal("applyPreload activated nothing for a storage-related directive")
 	}
-	found := false
-	for _, n := range preload {
-		if n == "storage_files_upload" {
-			found = true
-		}
+	if !th.activeTools["storage_files_upload"] {
+		t.Errorf("activeTools %v should include storage_files_upload", keysOf(th.activeTools))
 	}
-	if !found {
-		t.Errorf("preload %v should include storage_files_upload", preload)
+	if _, ok := th.activeToolAge["storage_files_upload"]; !ok {
+		t.Error("applyPreload did not record activeToolAge for the surfaced tool")
 	}
-	// Preload must NOT mutate activeTools — it's transient per-turn.
-	if len(th.activeTools) != 0 {
-		t.Error("computePreloadTools mutated activeTools — it must stay transient")
+
+	// Idempotent: same directive → same hits → already active → the set
+	// neither grows nor shrinks. This is what lets the tools array go
+	// stable and the prompt cache start hitting.
+	before := len(th.activeTools)
+	th.applyPreload(5)
+	if len(th.activeTools) != before {
+		t.Errorf("applyPreload not idempotent: %d → %d on a repeat call with the same directive", before, len(th.activeTools))
 	}
 
 	// Sub-thread preload excludes no_spawn servers.
 	sub := indexedThinker("worker-9")
-	sub.messages = append(sub.messages, Message{Role: "user", Content: "create and upload"})
-	for _, n := range sub.computePreloadTools(5) {
-		if n == "apteva-server_create_agent" {
-			t.Error("sub-thread preload leaked a no_spawn tool")
-		}
+	sub.directive = "Create and upload things for the team."
+	sub.applyPreload(5)
+	if sub.activeTools["apteva-server_create_agent"] {
+		t.Error("sub-thread preload leaked a no_spawn tool into activeTools")
 	}
 
-	// No user text → nil.
+	// No directive → no-op (the user turn is deliberately NOT consulted).
 	bare := indexedThinker("main")
-	if got := bare.computePreloadTools(5); got != nil {
-		t.Errorf("computePreloadTools with no user text = %v, want nil", got)
+	bare.messages = append(bare.messages, Message{Role: "user", Content: "I need to upload a file"})
+	bare.applyPreload(5)
+	if len(bare.activeTools) != 0 {
+		t.Errorf("applyPreload with no directive activated %v — must ignore the user turn", keysOf(bare.activeTools))
 	}
 
-	// No index → nil, no panic.
-	noIx := &Thinker{threadID: "main", messages: []Message{{Role: "user", Content: "upload"}}}
-	if got := noIx.computePreloadTools(5); got != nil {
-		t.Errorf("computePreloadTools with no index = %v, want nil", got)
+	// No index → no-op, no panic.
+	noIx := &Thinker{threadID: "main", directive: "upload files"}
+	noIx.applyPreload(5)
+	if len(noIx.activeTools) != 0 {
+		t.Error("applyPreload with no index should be a no-op")
 	}
+}
+
+// TestEvictActiveToolsLRU pins the cache-bounding behaviour: the sticky
+// set grows freely up to the cap, then drops the least-recently-touched
+// tools in a batch (to ~70% of cap) so the next turn doesn't re-evict.
+func TestEvictActiveToolsLRU(t *testing.T) {
+	th := &Thinker{threadID: "main", activeTools: map[string]bool{}, activeToolAge: map[string]int{}}
+	// Touch 50 tools across iterations 1..50 — tool-N touched at iter N.
+	for i := 1; i <= 50; i++ {
+		th.iteration = i
+		th.touchActiveTool(fmt.Sprintf("srv_tool%02d", i))
+	}
+	if len(th.activeTools) != 50 {
+		t.Fatalf("setup: expected 50 active tools, got %d", len(th.activeTools))
+	}
+
+	th.evictActiveToolsLRU(40)
+	// 50 > 40 → evict down to 70% of 40 = 28.
+	if len(th.activeTools) != 28 {
+		t.Errorf("after eviction expected 28 tools, got %d", len(th.activeTools))
+	}
+	// The OLDEST (lowest iteration) must be gone; the NEWEST kept.
+	if th.activeTools["srv_tool01"] {
+		t.Error("evictActiveToolsLRU kept the oldest tool (tool01)")
+	}
+	if !th.activeTools["srv_tool50"] {
+		t.Error("evictActiveToolsLRU dropped the newest tool (tool50)")
+	}
+	// activeToolAge stays in lockstep with activeTools.
+	if len(th.activeToolAge) != len(th.activeTools) {
+		t.Errorf("activeToolAge (%d) out of sync with activeTools (%d)", len(th.activeToolAge), len(th.activeTools))
+	}
+
+	// Under the cap → no-op.
+	before := len(th.activeTools)
+	th.evictActiveToolsLRU(40)
+	if len(th.activeTools) != before {
+		t.Errorf("evictActiveToolsLRU under cap should be a no-op, %d → %d", before, len(th.activeTools))
+	}
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // TestToolVisible_Matrix exercises every branch of the visibility

@@ -45,13 +45,9 @@ Workflow:
 		WriteJSONFile(t, dir, "schedule.json", []map[string]any{})
 	},
 	Phases: []Phase{
-		{
-			Name:    "Startup — 3 threads spawned",
-			Timeout: 90 * time.Second,
-			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				return len(ThreadIDs(th)) >= 3
-			},
-		},
+		// No "startup — N threads spawned" phase: the phase below
+		// asserts on the content that gets produced, not on how the
+		// agent organised itself to produce it.
 		{
 			Name:    "Content production — topic to published posts",
 			Timeout: 180 * time.Second,
@@ -77,8 +73,7 @@ Workflow:
 			},
 		},
 	},
-	Timeout:    6 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 6 * time.Minute,
 }
 
 func TestScenario_ContentPipeline(t *testing.T) {

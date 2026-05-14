@@ -234,8 +234,7 @@ Note finale sur 10.`
 			},
 		},
 	},
-	Timeout:    8 * time.Minute,
-	MaxThreads: 6,
+	Timeout: 8 * time.Minute,
 }
 
 func readVentesRow(t *testing.T, dir, contract string) map[string]string {
@@ -299,7 +298,6 @@ func TestScenario_AudioCallPipeline_Stress(t *testing.T) {
 	// DataSetup here so we don't touch the single-call scenario.
 	s := audioCallPipelineScenario
 	s.Name = "AudioCallPipelineStress"
-	s.MaxThreads = 12
 	s.Timeout = 15 * time.Minute
 	s.Directive = strings.Replace(s.Directive,
 		"There is exactly one audio file",

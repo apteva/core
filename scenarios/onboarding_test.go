@@ -36,13 +36,9 @@ When you receive a signup file URL, tell intake to fetch and read it. Then tell 
 		os.WriteFile(filepath.Join(dir, "signups-batch-1.csv"), []byte(csv), 0644)
 	},
 	Phases: []Phase{
-		{
-			Name:    "Startup — 3 threads spawned",
-			Timeout: 90 * time.Second,
-			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				return len(ThreadIDs(th)) >= 3
-			},
-		},
+		// No "startup — N threads spawned" phase: the phase below
+		// asserts on accounts getting provisioned, not on how the
+		// agent structured the work.
 		{
 			Name:    "Onboarding — signup to welcome message",
 			Timeout: 180 * time.Second,
@@ -73,8 +69,7 @@ When you receive a signup file URL, tell intake to fetch and read it. Then tell 
 			},
 		},
 	},
-	Timeout:    6 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 6 * time.Minute,
 }
 
 func TestScenario_Onboarding(t *testing.T) {

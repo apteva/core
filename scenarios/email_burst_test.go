@@ -37,10 +37,9 @@ When every real message has been replied to AND archived, report
 "INBOX HANDLED" and stop acting.`,
 	MCPServers: []MCPServerConfig{
 		{
-			Name:       "email",
-			Command:    "", // filled in by test
-			Env:        map[string]string{"FAKE_EMAIL_DATA_DIR": "{{dataDir}}"},
-			
+			Name:    "email",
+			Command: "", // filled in by test
+			Env:     map[string]string{"FAKE_EMAIL_DATA_DIR": "{{dataDir}}"},
 		},
 	},
 	DataSetup: func(t *testing.T, dir string) {
@@ -245,8 +244,7 @@ When every real message has been replied to AND archived, report
 	// every notification would still eventually finish all 3 real replies
 	// and pass the correctness checks — we use the scenario's Timeout to
 	// catch runaway burn.
-	Timeout:    6 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 6 * time.Minute,
 }
 
 func TestScenario_EmailBurst(t *testing.T) {

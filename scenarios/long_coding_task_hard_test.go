@@ -303,17 +303,17 @@ func TestEvaluate_DivisionByZero(t *testing.T) {
 			},
 		},
 		{
-			Name:    "Soak — worker and main still alive",
+			Name:    "Soak — agent still alive",
 			Timeout: 20 * time.Second,
 			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				alive := th.Threads().Count()
-				t.Logf("  ... alive=%d", alive)
-				return alive >= 1
+				// A dead agent is caught by the scenario hard timeout;
+				// here we just let the soak window elapse. Sub-thread
+				// count is informational.
+				t.Logf("  ... sub-threads alive=%d", th.Threads().Count())
+				return true
 			},
 			Verify: func(t *testing.T, dir string, th *Thinker) {
-				if th.Threads().Count() < 1 {
-					t.Errorf("expected at least 1 thread still alive, got %d", th.Threads().Count())
-				}
+				t.Logf("soak: %d sub-threads alive", th.Threads().Count())
 				data, _ := os.ReadFile(filepath.Join(dir, "main.go"))
 				t.Logf("final main.go: %d bytes, %d lines",
 					len(data), strings.Count(string(data), "\n"))
@@ -323,8 +323,7 @@ func TestEvaluate_DivisionByZero(t *testing.T) {
 	// Hard budget: 8 minutes. Phases 2+3 together give ~5 minutes of polling;
 	// bootstrap + soak add ~1.5 minutes headroom. Most of the time will be
 	// spent in Phase 3 as the worker iterates on test failures.
-	Timeout:    8 * time.Minute,
-	MaxThreads: 3,
+	Timeout: 8 * time.Minute,
 }
 
 func TestScenario_LongCodingTaskHard(t *testing.T) {

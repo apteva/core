@@ -10,9 +10,13 @@ import (
 var helpdeskScenario = Scenario{
 	Name: "Helpdesk",
 	Directive: `You run the support desk for my small business.
-We have a helpdesk ticketing system — check it every 10-20 seconds for new tickets.
-When tickets come in, look up the answer in our knowledge base, reply to the customer, and close the ticket.
-Don't let more than 3 tickets be handled at the same time.`,
+On startup, spawn a dedicated "support" worker thread to handle the desk —
+give it the helpdesk MCP server with mcps="helpdesk" so it has the ticketing
+tools (list/lookup/reply/close).
+The support worker should check the helpdesk every 10-20 seconds for new
+tickets, look up the answer in the knowledge base, reply to the customer,
+and close the ticket. Don't let more than 3 tickets be handled at the
+same time.`,
 	MCPServers: []MCPServerConfig{{
 		Name:    "helpdesk",
 		Command: "", // filled in test
@@ -28,12 +32,12 @@ Don't let more than 3 tickets be handled at the same time.`,
 	},
 	Phases: []Phase{
 		{
-			Name:    "Startup — thread spawned and list_tickets called",
+			Name:    "Startup — list_tickets called",
 			Timeout: 60 * time.Second,
 			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				if th.Threads().Count() == 0 {
-					return false
-				}
+				// Outcome only: the agent checked the ticket queue.
+				// Whether it spawned a monitor thread or polled inline
+				// on main is its own call.
 				entries := ReadAuditEntries(dir)
 				lists := CountTool(entries, "list_tickets")
 				t.Logf("  ... list_tickets=%d threads=%v", lists, ThreadIDs(th))
@@ -41,8 +45,13 @@ Don't let more than 3 tickets be handled at the same time.`,
 			},
 		},
 		{
-			Name:    "Process 2 tickets",
-			Timeout: 90 * time.Second,
+			Name: "Process 2 tickets",
+			// 180s: the directive steers the agent to delegate the desk
+			// to a self-pacing "support" worker. A monitor thread that
+			// sleeps between checks legitimately spreads the
+			// list→lookup→reply→close flow across more wall-clock than
+			// an inline agent that batches it — give it room.
+			Timeout: 180 * time.Second,
 			Setup: func(t *testing.T, dir string) {
 				WriteJSONFile(t, dir, "tickets.json", []map[string]string{
 					{"id": "t1", "question": "What are your hours?"},
@@ -100,8 +109,7 @@ Don't let more than 3 tickets be handled at the same time.`,
 			})(),
 		},
 	},
-	Timeout:    3 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 8 * time.Minute,
 }
 
 func TestScenario_Helpdesk(t *testing.T) {

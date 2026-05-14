@@ -157,6 +157,39 @@ func computeMCPCatalog(ix *ToolIndex) []MCPServerInfo {
 	return out
 }
 
+// AllNames returns every indexed tool's fully-qualified name. Backs
+// the APTEVA_EAGER_TOOLS escape hatch, which makes the whole attached
+// surface visible every turn (the pre-discovery behaviour). When
+// allowNoSpawn is false, no_spawn entries are excluded — a sub-thread
+// in eager mode still must not see gateway/channels tools.
+func (ix *ToolIndex) AllNames(allowNoSpawn bool) []string {
+	if ix == nil {
+		return nil
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	out := make([]string, 0, len(ix.entries))
+	for _, e := range ix.entries {
+		if !allowNoSpawn && e.NoSpawn {
+			continue
+		}
+		out = append(out, e.Name)
+	}
+	return out
+}
+
+// Count returns the number of tools currently indexed. Backs the
+// APTEVA_TOOL_SEARCH=auto decision: below a threshold the surface is
+// small enough that eager-loading beats the search round-trip.
+func (ix *ToolIndex) Count() int {
+	if ix == nil {
+		return 0
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return len(ix.entries)
+}
+
 // Servers returns every server name currently indexed.
 func (ix *ToolIndex) Servers() []string {
 	if ix == nil {

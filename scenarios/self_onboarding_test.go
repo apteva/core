@@ -50,10 +50,9 @@ schedule_post if they mention both) — not every tool the integration
 offers.`,
 	MCPServers: []MCPServerConfig{
 		{
-			Name:       "gateway",
-			Command:    "", // filled in by test
-			Env:        map[string]string{"FAKE_GATEWAY_DATA_DIR": "{{dataDir}}"},
-			
+			Name:    "gateway",
+			Command: "", // filled in by test
+			Env:     map[string]string{"FAKE_GATEWAY_DATA_DIR": "{{dataDir}}"},
 		},
 		{
 			// Non-main-access: cataloged, so spawned workers can connect
@@ -269,8 +268,7 @@ offers.`,
 			},
 		},
 	},
-	Timeout:    6 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 6 * time.Minute,
 }
 
 func TestScenario_SelfOnboarding(t *testing.T) {

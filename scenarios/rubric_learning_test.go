@@ -203,7 +203,6 @@ per center — never copy heuristics or dimension names across centers.`,
 	},
 	Timeout: 30 * time.Minute,
 	// 1 main + 1 sub per center. Sub-threads run in parallel.
-	MaxThreads: 4,
 }
 
 func TestScenario_RubricLearning(t *testing.T) {

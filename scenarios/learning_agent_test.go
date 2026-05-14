@@ -216,8 +216,7 @@ Process orders and shipments as requested via console events. When something fai
 			},
 		},
 	},
-	Timeout:    10 * time.Minute,
-	MaxThreads: 3,
+	Timeout: 10 * time.Minute,
 }
 
 func TestScenario_LearningAgent(t *testing.T) {

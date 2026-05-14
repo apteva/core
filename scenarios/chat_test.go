@@ -103,8 +103,7 @@ Be concise, accurate, and helpful. Answer questions directly.`,
 			},
 		},
 	},
-	Timeout:    3 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 3 * time.Minute,
 }
 
 func TestScenario_Chat(t *testing.T) {

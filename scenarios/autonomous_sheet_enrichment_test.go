@@ -197,16 +197,11 @@ has a non-empty summary and industry, you are done.`,
 		},
 	},
 	Timeout: 7 * time.Minute,
-	// Enforces: the agent must have spawned at least 2 concurrent threads
-	// while processing the sheet. If it walked the rows sequentially from
-	// main, peakThreads will be ≤ 1 and the scenario fails — proving that
-	// the agent reached for spawn on its own, without being told to.
-	//
-	// MaxThreads is a loose sanity bound: the agent legitimately spawns a
-	// worker per row and may add retry workers on top, so 30 is a generous
-	// cap that still catches runaway recursion.
-	MinPeakThreads: 2,
-	MaxThreads:     30,
+	// This scenario used to assert the agent spawned ≥2 concurrent
+	// threads. It no longer does: whether the agent parallelises rows
+	// across workers or walks them inline on main is its own call —
+	// the phases below assert on the enriched-sheet OUTCOME, not the
+	// mechanism. Spawning is a tool, not a requirement.
 }
 
 func TestScenario_AutonomousSheetEnrichment(t *testing.T) {

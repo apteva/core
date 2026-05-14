@@ -178,8 +178,7 @@ var emergentScenario = Scenario{
 			},
 		},
 	},
-	Timeout:    10 * time.Minute,
-	MaxThreads: 12,
+	Timeout: 10 * time.Minute,
 }
 
 func TestScenario_Emergent(t *testing.T) {

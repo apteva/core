@@ -218,8 +218,7 @@ CRITICAL: The value of this structure is PARALLELISM and SPECIALIZATION. All 3 b
 			},
 		},
 	},
-	Timeout:    12 * time.Minute,
-	MaxThreads: 25,
+	Timeout: 12 * time.Minute,
 }
 
 func TestScenario_Conglomerate(t *testing.T) {

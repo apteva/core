@@ -96,8 +96,7 @@ Keep it lean — one director branch is enough.`,
 			Timeout: 180 * time.Second,
 		},
 	},
-	Timeout:    6 * time.Minute,
-	MaxThreads: 6,
+	Timeout: 6 * time.Minute,
 }
 
 func TestScenario_CloneTeam(t *testing.T) {

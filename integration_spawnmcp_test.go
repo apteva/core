@@ -34,9 +34,20 @@ import (
 // loudly with the metric log. Gate with FIREWORKS_API_KEY +
 // RUN_SPAWN_MCP_TEST=1 so it stays out of the default CI matrix.
 func TestIntegration_SpawnWithMCP_PerModel(t *testing.T) {
-	apiKey := getAPIKey(t)
 	if os.Getenv("RUN_SPAWN_MCP_TEST") == "" {
-		t.Skip("set RUN_SPAWN_MCP_TEST=1 to run real-LLM spawn/MCP model comparison")
+		t.Skip("set RUN_SPAWN_MCP_TEST=1 to run the real-LLM spawn/MCP test")
+	}
+	tp := getTestProvider(t)
+
+	// On opencode-go there's a single model — run one pass with no
+	// provider pinning (the pool env-detects opencode-go). On Fireworks
+	// keep the per-model comparison: that's the regression surface the
+	// test was originally built for (minimax-m2p7 hanging on spawn).
+	if tp.Source != "fireworks" {
+		t.Run(tp.Source, func(t *testing.T) {
+			runSpawnMCPModelTest(t, tp.APIKey, "")
+		})
+		return
 	}
 
 	// Default model list — the two Fireworks models we're comparing.
@@ -61,11 +72,14 @@ func TestIntegration_SpawnWithMCP_PerModel(t *testing.T) {
 			name = name[idx+1:]
 		}
 		t.Run(name, func(t *testing.T) {
-			runSpawnMCPModelTest(t, apiKey, model)
+			runSpawnMCPModelTest(t, tp.APIKey, model)
 		})
 	}
 }
 
+// runSpawnMCPModelTest runs one spawn-with-MCP pass. When model is
+// empty the scenario thinker env-detects its provider (opencode-go);
+// when set, providers pins that Fireworks model across all tiers.
 func runSpawnMCPModelTest(t *testing.T, apiKey, model string) {
 	t.Helper()
 
@@ -146,17 +160,24 @@ After spawning, pace down and wait. Do not call mock_echo yourself.`
 		URL:       srv.URL + "/mcp",
 	}}
 
-	providers := []ProviderConfig{{
-		Name:    "fireworks",
-		Default: true,
-		Models: map[string]string{
-			"large":  model,
-			"medium": model,
-			"small":  model,
-		},
-	}}
-
-	thinker := newScenarioThinker(t, apiKey, directive, mcpCfg, providers)
+	// model == "" → no provider pinning, let newScenarioThinker
+	// env-detect (opencode-go). model set → pin that Fireworks model
+	// across all tiers for the per-model comparison run.
+	var thinker *Thinker
+	if model == "" {
+		thinker = newScenarioThinker(t, apiKey, directive, mcpCfg)
+	} else {
+		providers := []ProviderConfig{{
+			Name:    "fireworks",
+			Default: true,
+			Models: map[string]string{
+				"large":  model,
+				"medium": model,
+				"small":  model,
+			},
+		}}
+		thinker = newScenarioThinker(t, apiKey, directive, mcpCfg, providers)
+	}
 	defer thinker.Stop()
 
 	// Observer: track tokens, cost, and whether the worker actually
@@ -228,8 +249,12 @@ After spawning, pace down and wait. Do not call mock_echo yourself.`
 		CompletionTokens: int(totalCompletion.Load()),
 	})
 
+	modelLabel := model
+	if modelLabel == "" {
+		modelLabel = thinker.provider.Name() + " (default model)"
+	}
 	t.Logf("────────────────────────────────────────")
-	t.Logf("model: %s", model)
+	t.Logf("model: %s", modelLabel)
 	t.Logf("duration: %s | iterations: %d | spawn seen: %v | worker called mock_echo: %v",
 		duration.Round(time.Second), iterCount.Load(), spawnSeen.Load(), echoFromWorker.Load())
 	if firstToolAt.Load() > 0 {
@@ -241,12 +266,12 @@ After spawning, pace down and wait. Do not call mock_echo yourself.`
 	t.Logf("────────────────────────────────────────")
 
 	if !spawnSeen.Load() {
-		t.Errorf("model %q never emitted a spawn tool call within 90s", model)
+		t.Errorf("%s never emitted a spawn tool call within 90s", modelLabel)
 	}
 	if !echoFromWorker.Load() {
-		t.Errorf("model %q: worker thread never called mock_echo", model)
+		t.Errorf("%s: worker thread never called mock_echo", modelLabel)
 	}
 	if echoCalls.Load() == 0 {
-		t.Errorf("model %q: mock MCP server never received a tools/call", model)
+		t.Errorf("%s: mock MCP server never received a tools/call", modelLabel)
 	}
 }

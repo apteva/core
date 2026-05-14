@@ -233,8 +233,7 @@ Process all leads. Do not skip any.`,
 			},
 		},
 	},
-	Timeout:    6 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 6 * time.Minute,
 }
 
 func TestScenario_LeadEnrichment(t *testing.T) {

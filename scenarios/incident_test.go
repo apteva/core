@@ -45,13 +45,12 @@ Workflow:
 	},
 	Phases: []Phase{
 		{
-			Name:    "Startup — 3 threads and thresholds set",
+			Name:    "Startup — thresholds set",
 			Timeout: 120 * time.Second,
 			Wait: func(t *testing.T, dir string, th *Thinker) bool {
-				if len(ThreadIDs(th)) < 3 {
-					return false
-				}
-				// Check if thresholds were set
+				// Outcome only: thresholds got configured. Whether the
+				// agent spawned a monitoring team to do it or set them
+				// inline is its own call.
 				data, err := os.ReadFile(filepath.Join(dir, "thresholds.json"))
 				if err != nil {
 					return false
@@ -94,8 +93,7 @@ Workflow:
 			},
 		},
 	},
-	Timeout:    6 * time.Minute,
-	MaxThreads: 5,
+	Timeout: 6 * time.Minute,
 }
 
 func TestScenario_Incident(t *testing.T) {

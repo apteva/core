@@ -610,6 +610,17 @@ type Thinker struct {
 
 	maxHistory     int // max messages in context window (varies by role)
 
+	// directive is this thread's mission text — main's directive for
+	// the main thinker, the spawn directive for a sub-thread. Fed into
+	// the per-turn BM25 tool preload (see computePreloadTools): it's
+	// the stable "what this agent is FOR" signal, which matters
+	// because most agents run off a standing directive with no
+	// inbound chat — without it, preload has nothing to match on and
+	// the agent is forced to search_tools for its own obvious tools.
+	// Kept in sync on evolve / ReloadDirective; best-effort, so brief
+	// staleness is harmless.
+	directive string
+
 	// Hooks — set these to customize behavior. nil = defaults.
 	handleTools    ToolHandler
 	rebuildPrompt  func(toolDocs string) string // rebuild system prompt with current tool docs
@@ -641,12 +652,16 @@ type Thinker struct {
 	// MCP=true "hidden by default" flag. Populated by:
 	//   - spawn-time preload (SpawnOpts.MCPNames expansion)
 	//   - search_tools meta-tool results
-	//   - explicit tool calls (warm-cache: a tool the model actually
-	//     invoked stays in activeTools so re-use needs no re-search)
-	// Bounded by context-window compaction (entries beyond what fits
-	// are evicted in the same pass that drops the corresponding
-	// tool_result messages).
+	//   - per-turn BM25 preload (applyPreload — sticky)
+	// Sticky on purpose: the set grows then stabilises, which keeps
+	// the `tools` array (a cached prompt-prefix component) stable
+	// turn-to-turn. Bounded by evictActiveToolsLRU + context-window
+	// compaction.
 	activeTools map[string]bool
+	// activeToolAge tracks the iteration each active tool was last
+	// surfaced — the recency key for evictActiveToolsLRU. Lazily
+	// initialised by touchActiveTool.
+	activeToolAge map[string]int
 	// MCP server catalog — lightweight metadata for prompt (name +
 	// tool count). Derived from toolIndex; kept as a Thinker field
 	// for buildSystemPrompt back-compat.
@@ -744,6 +759,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	t.registry = NewToolRegistry(apiKey)
 	t.toolIndex = NewToolIndex()
 	t.activeTools = map[string]bool{}
+	t.directive = config.GetDirective()
 
 	// Register system-only tools (for unconscious thread)
 	registerSystemTools(t.registry, t.memory)
@@ -1194,6 +1210,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					addResult("error: evolve requires directive")
 				} else {
 					t.config.SetDirective(d)
+					t.directive = d
 					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 					if t.telemetry != nil {
@@ -1907,24 +1924,38 @@ func (t *Thinker) think() (ChatResponse, error) {
 		}
 	}
 
-	// Build native tools from registry if provider supports it. The
-	// per-turn "preload" is a transient BM25 search against the most
-	// recent user-turn text — top hits get their schemas surfaced
-	// for THIS call only, not appended to activeTools. That bias keeps
-	// topic shifts cheap: next turn's preload re-derives from fresh
-	// context instead of accumulating.
+	// Build native tools from registry if provider supports it.
+	//
+	// Two modes (resolved per-turn by useEagerTools — see toolSearchMode):
+	//   - eager: every attached tool, every turn. The list is stable
+	//     turn-to-turn, so the `tools` prompt prefix caches well — the
+	//     right call for a small surface where the search round-trip
+	//     would cost more than it saves.
+	//   - discovery: applyPreload STICKILY activates the BM25 top-5 for
+	//     this turn's directive+context; search_tools adds more on
+	//     demand. The active set grows then stabilises (then caches),
+	//     bounded by evictActiveToolsLRU.
 	var nativeTools []NativeTool
 	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
 		active := t.activeTools
-		if preload := t.computePreloadTools(5); len(preload) > 0 {
-			merged := make(map[string]bool, len(t.activeTools)+len(preload))
-			for k := range t.activeTools {
-				merged[k] = true
+		if t.useEagerTools() {
+			all := t.toolIndex.AllNames(t.threadID == "main")
+			if len(all) > 0 {
+				// Transient merge — eager's "everything" set is already
+				// stable, no need to pollute the sticky activeTools.
+				merged := make(map[string]bool, len(t.activeTools)+len(all))
+				for k := range t.activeTools {
+					merged[k] = true
+				}
+				for _, n := range all {
+					merged[n] = true
+				}
+				active = merged
 			}
-			for _, n := range preload {
-				merged[n] = true
-			}
-			active = merged
+		} else {
+			t.applyPreload(5)
+			t.evictActiveToolsLRU(activeToolsCap)
+			active = t.activeTools
 		}
 		nativeTools = t.registry.NativeTools(t.toolAllowlist, active)
 	}
@@ -2200,6 +2231,7 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 
 func (t *Thinker) ReloadDirective() {
 	directive := t.config.GetDirective()
+	t.directive = directive
 	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }

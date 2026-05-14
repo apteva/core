@@ -79,20 +79,33 @@ POSTER BRIEFS (the directive you put on each poster)
 Each poster's directive MUST start with:
 
     "You are the <network> poster. You will receive PUBLISH messages
-     from producers. The moment a PUBLISH message lands, your VERY FIRST
-     action — before any reasoning — is to call social_post with
-     channel=<network>, project=<project from message>, content=<the
-     caption from the message>. Do not think. Do not plan. Call
-     social_post immediately.
+     from producers. Each PUBLISH message has the exact form:
+       PUBLISH project=<id> theme=<word> caption=<text>
+
+     The moment a PUBLISH message lands, your VERY FIRST action — before
+     any reasoning — is to call social_post with THREE arguments, every
+     time, no exceptions:
+       - channel = <network>
+       - project = the <id> that appears right after 'project=' in the
+         PUBLISH message. Copy it VERBATIM. This argument is MANDATORY —
+         a social_post call without project= is routed to a 1-per-channel
+         daily limit and your 2nd and 3rd posts will be REJECTED. Never
+         omit project=.
+       - content = the caption from the message
+     Do not think. Do not plan. Call social_post immediately.
 
      The caption MUST contain the theme word from the PUBLISH message
      (recipe / lifestyle / workout).
 
-     You expect exactly THREE PUBLISH messages — one per producer. After
-     you have posted three times, send 'DONE' to main and call done.
+     You expect exactly THREE PUBLISH messages — one per producer, each
+     with a DIFFERENT project. After you have posted three times (three
+     distinct projects, each carrying its own project=), send 'DONE' to
+     main and call done.
 
-     If social_post returns a REJECTED error for a duplicate, do not retry,
-     just move on to the next project."
+     If social_post returns 'REJECTED: Already posted project ... Duplicate'
+     you genuinely sent that (project,channel) twice — skip it, move on.
+     If it returns 'REJECTED: ... 1 per channel per day' you FORGOT
+     project= — re-send the SAME post WITH project= set."
 
 ═══════════════════════════════════════════════════════════════════════
 HARD CORRECTNESS RULES
@@ -234,13 +247,11 @@ finished.`,
 		},
 	},
 	Timeout: 9 * time.Minute,
-	// Forces the full team to be alive simultaneously: 3 producers
-	// (one per show) + 3 posters (one per social network) = 6 sub-threads.
-	// threads.Count() excludes main, so 6 is the precise minimum that
-	// proves the agent spawned the whole team before starting to route
-	// work. Anything less means producers/posters ran sequentially.
-	MinPeakThreads: 6,
-	MaxThreads:     15,
+	// The directive steers the agent to spawn a 6-worker team (3
+	// producers + 3 posters). We no longer assert on thread count —
+	// the Verify above checks the real outcome: exactly 9 correct
+	// posts (3 shows × 3 networks), themed and de-duplicated. However
+	// the agent organises itself, that's what has to be true.
 }
 
 func TestScenario_MediaStudio(t *testing.T) {

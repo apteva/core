@@ -492,6 +492,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		mcpServers:    threadMCPServers,
 		toolIndex:     tm.parent.toolIndex,
 		activeTools:   preloadActive,
+		directive:     directive,
 		rebuildPrompt: func(_ string) string {
 			cd := ""
 			if threadRegistry != nil {
@@ -921,6 +922,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, "error: evolve requires directive")
 				} else {
 					thread.Directive = d
+					t.directive = d
 					if t.rebuildPrompt != nil {
 						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
 					}

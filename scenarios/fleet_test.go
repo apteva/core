@@ -200,8 +200,7 @@ CRITICAL RULES:
 			},
 		},
 	},
-	Timeout:    10 * time.Minute,
-	MaxThreads: 15,
+	Timeout: 10 * time.Minute,
 }
 
 func TestScenario_Fleet(t *testing.T) {

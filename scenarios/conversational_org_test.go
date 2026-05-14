@@ -127,8 +127,7 @@ var conversationalOrgScenario = Scenario{
 			Timeout: 90 * time.Second,
 		},
 	},
-	Timeout:    5 * time.Minute,
-	MaxThreads: 8,
+	Timeout: 5 * time.Minute,
 }
 
 func TestScenario_ConversationalOrg(t *testing.T) {
