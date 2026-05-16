@@ -46,6 +46,11 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/status", api.apiAuth(api.status))
 	mux.HandleFunc("/threads", api.apiAuth(api.threads))
 	mux.HandleFunc("/threads/", api.apiAuth(api.threadAction))
+	// Realtime audio bridge — external callers (telephony sidecar,
+	// browser bridge) connect with a single-use token issued at
+	// realtime-spawn time. PCM16 binary WebSocket frames in both
+	// directions.
+	mux.HandleFunc("/realtime/audio", api.apiAuth(api.realtimeAudioHandler))
 	mux.HandleFunc("/events", api.apiAuth(api.events))
 	mux.HandleFunc("/pause", api.apiAuth(api.pause))
 	mux.HandleFunc("/event", api.apiAuth(api.postEvent))
@@ -273,6 +278,9 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		DirectiveSuffix  string   `json:"directive_suffix"`
 		Tools            []string `json:"tools"`
 		MCP              []string `json:"mcp"`
+		Realtime         bool     `json:"realtime,omitempty"`
+		Voice            string   `json:"voice,omitempty"`
+		ProviderName     string   `json:"provider,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -310,20 +318,56 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	// spawn tool calls from grabbing it). BypassNoSpawn lets the
 	// requested MCPs through; the LLM's spawn-tool path doesn't set
 	// this, so in-agent workers still can't escalate.
-	opts := SpawnOpts{MCPNames: body.MCP, BypassNoSpawn: true}
+	opts := SpawnOpts{
+		MCPNames:      body.MCP,
+		BypassNoSpawn: true,
+		Realtime:      body.Realtime,
+		Voice:         body.Voice,
+		ProviderName:  body.ProviderName,
+	}
+
+	// Realtime spawns also need audio channels so an external caller
+	// (telephony sidecar, browser bridge) can feed/drain PCM. We
+	// create the channels here and stash them by thread id so the
+	// audio bridge handler can pick them up when its WebSocket
+	// connects. The single-use token returned in the response gates
+	// that lookup.
+	var audioToken string
+	if body.Realtime {
+		if a.thinker.config == nil || !a.thinker.config.RealtimeEnabledFlag() {
+			http.Error(w, "realtime spawn refused: realtime_enabled=false on this instance", http.StatusForbidden)
+			return
+		}
+		audioIn := make(chan []byte, 64)
+		audioOut := make(chan []byte, 64)
+		opts.AudioIn = audioIn
+		opts.AudioOut = audioOut
+		audioToken = registerAudioBridge(id, audioIn, audioOut)
+	}
+
 	if err := a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts); err != nil {
 		// Race: another caller spawned the same id between our
 		// findThinkerByID check and the lock inside Spawn. Treat as
 		// success — the caller's intent (a live thread by this name)
 		// is satisfied.
 		if strings.Contains(err.Error(), "already exists") {
+			if body.Realtime {
+				unregisterAudioBridge(id)
+			}
 			writeJSON(w, map[string]any{"status": "exists", "id": id})
 			return
+		}
+		if body.Realtime {
+			unregisterAudioBridge(id)
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{"status": "created", "id": id})
+	resp := map[string]any{"status": "created", "id": id}
+	if body.Realtime {
+		resp["audio_token"] = audioToken
+	}
+	writeJSON(w, resp)
 }
 
 // findThinkerByID returns main or any sub-thread's Thinker by id, or nil.
