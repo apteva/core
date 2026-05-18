@@ -296,14 +296,25 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 	}
 
 	// Inject the lightweight MCP server catalog — names + tool counts.
-	// Schemas are intentionally not in the prompt: the LLM discovers
-	// individual tools at runtime via search_tools (preferred) or
-	// spawn(mcps=[...]) for a sub-thread that boots hot with a server's
-	// surface preloaded.
+	// Wording depends on the eager-vs-discovery mode the per-turn
+	// tool-list builder will use (resolved per-turn from the same env
+	// vars + total count, so what we tell the LLM matches what we'll
+	// actually send in `tools`).
 	if len(mcpCatalog) > 0 {
+		totalTools := 0
+		for _, info := range mcpCatalog {
+			totalTools += info.ToolCount
+		}
 		prompt += "\n\n[AVAILABLE MCP SERVERS]\n"
-		prompt += "These servers are attached. Their tools are NOT in your tool list by default — search_tools(query=\"...\") loads the ones you need, on demand. Repeat uses stay loaded.\n"
-		prompt += "When spawning a worker that should boot hot with a server's full surface: spawn(id=\"ops\", directive=\"Manage inventory\", mcps=\"store\", tools=\"\")\n\n"
+		if isEagerMode(totalTools) {
+			// Eager: every tool's schema is in `tools` already — telling
+			// the model to search_tools first would cost a wasted round-
+			// trip per request.
+			prompt += "These servers are attached and ALL their tools are already in your tool list — call them directly.\n\n"
+		} else {
+			prompt += "These servers are attached. Their tools are NOT in your tool list by default — search_tools(query=\"...\") loads the ones you need, on demand. Repeat uses stay loaded.\n"
+			prompt += "When spawning a worker that should boot hot with a server's full surface: spawn(id=\"ops\", directive=\"Manage inventory\", mcps=\"store\", tools=\"\")\n\n"
+		}
 		for _, info := range mcpCatalog {
 			prompt += fmt.Sprintf("- %s (%d tools)\n", info.Name, info.ToolCount)
 		}
@@ -662,6 +673,21 @@ type Thinker struct {
 	// surfaced — the recency key for evictActiveToolsLRU. Lazily
 	// initialised by touchActiveTool.
 	activeToolAge map[string]int
+	// kickNextTurn, when true, causes the iteration loop to skip its
+	// pace sleep and re-think immediately on the next pass. Set by
+	// runSearchTools when it activates new tools so the agent can
+	// call them on the very next iteration (the search_tools contract
+	// is "schemas appear next turn" — that next turn should fire
+	// straight away, not after a `rate: 2.0m` cadence wait).
+	// Cleared as it's consumed in Run().
+	kickNextTurn bool
+	// lastInboundForPreload carries the text of events drained on
+	// THIS iteration through to applyPreload's BM25 query. Set in
+	// Run() before think(); cleared after think() returns. Lets BM25
+	// preload include the user's just-arrived message (one cache-bust
+	// per fresh event, which already busts anyway) without permanently
+	// destabilising the active-tools set on quiet turns.
+	lastInboundForPreload string
 	// MCP server catalog — lightweight metadata for prompt (name +
 	// tool count). Derived from toolIndex; kept as a Thinker field
 	// for buildSystemPrompt back-compat.
@@ -1117,13 +1143,18 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
 						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Realtime: realtime, Voice: voice})
+						// Notify-back reminder — same reason as kill's:
+						// spawn feels like a complete action, so the model
+						// is tempted to end the turn here, leaving any
+						// requester thread hanging. Cheap to nudge.
+						notifyReminder := fmt.Sprintf(" If this was triggered by a request from another thread (see your inbox / recent events for [from:<id>] messages), send(id=\"<that id>\", text=\"spawned: %s\") BEFORE going idle so the requester can act on the result.", id)
 						switch {
 						case paused:
-							addResult(fmt.Sprintf("thread %s spawned (paused — send a message to wake it)", id))
+							addResult(fmt.Sprintf("thread %s spawned (paused — send a message to wake it).%s", id, notifyReminder))
 						case realtime:
-							addResult(fmt.Sprintf("realtime thread %s spawned", id))
+							addResult(fmt.Sprintf("realtime thread %s spawned.%s", id, notifyReminder))
 						default:
-							addResult(fmt.Sprintf("thread %s spawned", id))
+							addResult(fmt.Sprintf("thread %s spawned.%s", id, notifyReminder))
 						}
 					}
 				}
@@ -1135,7 +1166,16 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				} else {
 					t.threads.Kill(id)
 					t.config.RemoveThread(id)
-					addResult(fmt.Sprintf("thread %s killed", id))
+					// Result intentionally includes a notify-back reminder.
+					// kill (and other "terminal-feeling" tools like done /
+					// pace=sleep) bias the model toward ending the turn
+					// immediately, which leaves callers hanging when this
+					// kill was triggered by a send from another thread.
+					// The reminder costs ~50 tokens and dramatically
+					// improves the chat→main→kill confirmation loop.
+					addResult(fmt.Sprintf(
+						"thread %s killed. If this was triggered by a request from another thread (see your inbox / recent events for [from:<id>] messages), send(id=\"<that id>\", text=\"killed: %s\") BEFORE going idle so the requester can act on the result.",
+						id, id))
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "update":
@@ -1630,6 +1670,13 @@ func (t *Thinker) Run() {
 		// changes when the directive, mode, or static config (MCPs,
 		// providers) does — handled at the call sites of buildSystemPrompt.
 
+		// Hand the just-drained event text to applyPreload so BM25 can
+		// surface tools the user's message references on this same turn
+		// (e.g. "send a pushover" → pushover_* tools preloaded). Cleared
+		// after think() so a subsequent quiet iteration reverts to the
+		// stable directive-only preload that lets the prompt prefix cache.
+		t.lastInboundForPreload = strings.Join(consumed, "\n")
+
 		start := time.Now()
 		chatResp, err := t.think()
 
@@ -1646,6 +1693,7 @@ func (t *Thinker) Run() {
 				}
 			}
 		}
+		t.lastInboundForPreload = ""
 
 		duration := time.Since(start)
 		reply := chatResp.Text
@@ -1870,6 +1918,17 @@ func (t *Thinker) Run() {
 			go t.session.Compact(nil) // nil = simple count-based summary, no LLM call for now
 		}
 
+		// Kick: search_tools (or any future setter) flips this when it
+		// wants the next iteration to fire immediately rather than
+		// honor the pace cadence. Consumed exactly once. Keeps the
+		// "schemas appear next turn" contract feeling instant instead
+		// of waiting a multi-minute pace tick after a tool discovery.
+		if t.kickNextTurn {
+			t.kickNextTurn = false
+			logMsg("RUN", fmt.Sprintf("[%s] kick: skipping pace sleep, re-thinking immediately", t.threadID))
+			continue
+		}
+
 		// Interruptible sleep — wakes on new event, quit, or pause
 		logMsg("RUN", fmt.Sprintf("[%s] sleeping %s", t.threadID, formatSleep(sleepDur)))
 		select {
@@ -1953,7 +2012,7 @@ func (t *Thinker) think() (ChatResponse, error) {
 				active = merged
 			}
 		} else {
-			t.applyPreload(5)
+			t.applyPreload(5, t.lastInboundForPreload)
 			t.evictActiveToolsLRU(activeToolsCap)
 			active = t.activeTools
 		}

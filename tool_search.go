@@ -9,12 +9,29 @@ import (
 	"strings"
 )
 
-// toolSearchAutoThreshold: at or below this many indexed tools,
-// APTEVA_TOOL_SEARCH=auto loads everything eagerly. The A/B runs put
-// the crossover above ~21 tools (discovery lost there) and well below
-// 113 (discovery won big); 30 is a conservative pick that keeps small
-// agents on the cheaper eager path.
-const toolSearchAutoThreshold = 30
+// defaultToolSearchAutoThreshold: at or below this many indexed
+// tools, APTEVA_TOOL_SEARCH=auto loads everything eagerly. The
+// original A/B runs put the crossover above ~21 tools (discovery
+// lost there) and well below 113 (discovery won big); we ship 100
+// as the default so typical apteva agents (channels + a handful of
+// integrations + a handful of apps) stay on the cheaper eager path
+// where the per-turn `tools` array is stable and the prompt prefix
+// caches without the model having to call search_tools first.
+//
+// Override at runtime via APTEVA_EAGER_TOOL_LIMIT=<int>. The two
+// env vars compose: APTEVA_TOOL_SEARCH=off forces eager regardless
+// of count; APTEVA_TOOL_SEARCH=on forces discovery regardless;
+// APTEVA_TOOL_SEARCH=auto (default) consults APTEVA_EAGER_TOOL_LIMIT.
+const defaultToolSearchAutoThreshold = 100
+
+func eagerToolLimit() int {
+	if raw := strings.TrimSpace(os.Getenv("APTEVA_EAGER_TOOL_LIMIT")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultToolSearchAutoThreshold
+}
 
 // activeToolsCap bounds the sticky active-tool set in discovery mode.
 // Sticky preload makes the per-turn tool list grow then STABILISE,
@@ -39,23 +56,32 @@ func toolSearchMode() string {
 	}
 }
 
-// useEagerTools reports whether this thinker should load every
-// attached tool every turn (eager) rather than the discovery model.
-// Resolved per-turn so a runtime connect / app-install that pushes the
-// surface past the auto threshold flips the mode without a restart.
-func (t *Thinker) useEagerTools() bool {
+// isEagerMode is the pure-function form of useEagerTools — takes the
+// raw indexed-tool count and returns whether eager applies, honoring
+// the APTEVA_TOOL_SEARCH / APTEVA_EAGER_TOOL_LIMIT env vars.
+// Pulled out so buildSystemPrompt can decide which [AVAILABLE MCP
+// SERVERS] wording to emit without needing a Thinker pointer.
+func isEagerMode(toolCount int) bool {
 	switch toolSearchMode() {
 	case "off":
 		return true
 	case "on":
 		return false
-	default: // auto
-		n := 0
-		if t.toolIndex != nil {
-			n = t.toolIndex.Count()
-		}
-		return n <= toolSearchAutoThreshold
+	default:
+		return toolCount <= eagerToolLimit()
 	}
+}
+
+// useEagerTools reports whether this thinker should load every
+// attached tool every turn (eager) rather than the discovery model.
+// Resolved per-turn so a runtime connect / app-install that pushes the
+// surface past the auto threshold flips the mode without a restart.
+func (t *Thinker) useEagerTools() bool {
+	n := 0
+	if t.toolIndex != nil {
+		n = t.toolIndex.Count()
+	}
+	return isEagerMode(n)
 }
 
 // search_tools is the meta-tool every thread has in its scaffolding.
@@ -152,11 +178,28 @@ type searchToolHit struct {
 //
 // Sub-threads run with allowNoSpawn=false (their thread-id is not
 // "main"); main runs with allowNoSpawn=true.
-func (t *Thinker) applyPreload(k int) {
+//
+// extraQuery is the text of any events drained THIS iteration (user
+// message, peer send, etc.). Appending it lets BM25 surface tools
+// the user asked for — "send a pushover test" preloads pushover_*
+// the same turn the agent first sees the request, no `search_tools`
+// round-trip. Cache cost: the turn after a fresh event already busts
+// the prompt prefix (new user content in messages), so widening
+// preload that turn is free. On subsequent quiet turns extraQuery
+// is "", we revert to directive-only, and the active set stabilises
+// so the prefix caches again.
+func (t *Thinker) applyPreload(k int, extraQuery string) {
 	if t == nil || t.toolIndex == nil {
 		return
 	}
 	query := strings.TrimSpace(t.directive)
+	if extra := strings.TrimSpace(extraQuery); extra != "" {
+		if query == "" {
+			query = extra
+		} else {
+			query = query + "\n" + extra
+		}
+	}
 	if query == "" {
 		return
 	}
@@ -242,6 +285,13 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 			Name: h.Name, Server: h.Server, Summary: summary,
 		})
 		res.Loaded = append(res.Loaded, h.Name)
+	}
+	// Tell the iteration loop to skip its pace sleep on the next pass —
+	// the agent just discovered tools, and the doc contract says the
+	// schemas appear "next turn". That next turn should fire as soon as
+	// possible, not after the configured pace tick (which can be minutes).
+	if len(hits) > 0 {
+		t.kickNextTurn = true
 	}
 	if len(res.Hits) == 0 {
 		// Tell the LLM what *is* attached so it can refine the query or

@@ -139,7 +139,7 @@ func TestApplyPreload(t *testing.T) {
 	th := indexedThinker("main")
 	th.directive = "Keep the storage folder tidy — upload new files as they arrive and list what's there."
 
-	th.applyPreload(5)
+	th.applyPreload(5, "")
 	if len(th.activeTools) == 0 {
 		t.Fatal("applyPreload activated nothing for a storage-related directive")
 	}
@@ -154,7 +154,7 @@ func TestApplyPreload(t *testing.T) {
 	// neither grows nor shrinks. This is what lets the tools array go
 	// stable and the prompt cache start hitting.
 	before := len(th.activeTools)
-	th.applyPreload(5)
+	th.applyPreload(5, "")
 	if len(th.activeTools) != before {
 		t.Errorf("applyPreload not idempotent: %d → %d on a repeat call with the same directive", before, len(th.activeTools))
 	}
@@ -162,7 +162,7 @@ func TestApplyPreload(t *testing.T) {
 	// Sub-thread preload excludes no_spawn servers.
 	sub := indexedThinker("worker-9")
 	sub.directive = "Create and upload things for the team."
-	sub.applyPreload(5)
+	sub.applyPreload(5, "")
 	if sub.activeTools["apteva-server_create_agent"] {
 		t.Error("sub-thread preload leaked a no_spawn tool into activeTools")
 	}
@@ -170,16 +170,59 @@ func TestApplyPreload(t *testing.T) {
 	// No directive → no-op (the user turn is deliberately NOT consulted).
 	bare := indexedThinker("main")
 	bare.messages = append(bare.messages, Message{Role: "user", Content: "I need to upload a file"})
-	bare.applyPreload(5)
+	bare.applyPreload(5, "")
 	if len(bare.activeTools) != 0 {
 		t.Errorf("applyPreload with no directive activated %v — must ignore the user turn", keysOf(bare.activeTools))
 	}
 
 	// No index → no-op, no panic.
 	noIx := &Thinker{threadID: "main", directive: "upload files"}
-	noIx.applyPreload(5)
+	noIx.applyPreload(5, "")
 	if len(noIx.activeTools) != 0 {
 		t.Error("applyPreload with no index should be a no-op")
+	}
+}
+
+// TestApplyPreloadExtraQuery pins the fresh-event preload widening: when
+// the iteration loop hands applyPreload the just-drained event text,
+// BM25 should surface tools the user's message references — even if the
+// directive itself wouldn't trigger them. Cache discipline is preserved
+// by the caller (only passes extra on event turns); we just check that
+// applyPreload honors the argument when it's set and ignores it when
+// empty.
+func TestApplyPreloadExtraQuery(t *testing.T) {
+	th := indexedThinker("main")
+	th.directive = "Idle." // a placeholder directive — would normally activate nothing
+
+	// No extra: matches nothing (idle directive).
+	th.applyPreload(5, "")
+	if len(th.activeTools) != 0 {
+		t.Errorf("placeholder directive + empty extra activated %v — expected none", keysOf(th.activeTools))
+	}
+
+	// With extra describing the user's request: BM25 should now find
+	// storage tools and stick them onto activeTools.
+	th.applyPreload(5, "upload a file to storage please")
+	if !th.activeTools["storage_files_upload"] {
+		t.Errorf("extra query referencing storage should activate storage_files_upload; got %v", keysOf(th.activeTools))
+	}
+}
+
+// TestSearchToolsSetsKick pins the immediate-rethink contract: after
+// search_tools activates new tools, the thinker should flag itself to
+// skip its next pace sleep so the just-discovered tools can be called
+// without a multi-minute cadence wait.
+func TestSearchToolsSetsKick(t *testing.T) {
+	th := indexedThinker("main")
+	if th.kickNextTurn {
+		t.Fatal("kickNextTurn should start false")
+	}
+	out := runSearchTools(th, map[string]string{"query": "file upload"}, true)
+	if out == "" {
+		t.Fatal("runSearchTools returned empty")
+	}
+	if !th.kickNextTurn {
+		t.Error("kickNextTurn should be true after a successful search_tools call")
 	}
 }
 
