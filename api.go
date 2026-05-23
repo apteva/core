@@ -256,9 +256,57 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"status": "killed", "id": id})
 	case http.MethodPost:
 		a.spawnThread(w, r, id)
+	case http.MethodPut:
+		a.updateThread(w, r, id)
 	default:
-		http.Error(w, "DELETE or POST only", http.StatusMethodNotAllowed)
+		http.Error(w, "DELETE, POST, or PUT only", http.StatusMethodNotAllowed)
 	}
+}
+
+// updateThread handles PUT /threads/{id} — change a live sub-thread's
+// directive (and optionally tools) WITHOUT killing it, so its session
+// (conversation history) survives. The chat-handling thread uses this
+// so an edit to the agent's directive reaches the live chat thread on
+// the next message rather than waiting for a server restart.
+//
+// Directive precedence mirrors spawnThread exactly so PUT and POST
+// produce byte-identical system prompts:
+//  1. body.Directive non-empty            → use verbatim
+//  2. body.DirectiveSuffix non-empty       → main's directive + suffix
+//  3. neither                              → main's directive verbatim
+func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "main" {
+		http.Error(w, "cannot update main via this endpoint", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Directive       string   `json:"directive"`
+		DirectiveSuffix string   `json:"directive_suffix"`
+		Tools           []string `json:"tools,omitempty"`
+	}
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+	}
+	directive := body.Directive
+	if directive == "" {
+		directive = a.thinker.config.GetDirective()
+		if body.DirectiveSuffix != "" {
+			directive = directive + body.DirectiveSuffix
+		}
+	}
+	if err := a.thinker.threads.Update(id, "", directive, body.Tools); err != nil {
+		// Update returns "thread not found" for unknown ids.
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	// Nudge the thread the same way the LLM-driven update tool does
+	// (thread.go) so it notices the change mid-conversation rather than
+	// silently swapping its system prompt on the next turn.
+	a.thinker.threads.Send(id, "[directive updated]")
+	writeJSON(w, map[string]string{"status": "updated", "id": id})
 }
 
 // spawnThread handles POST /threads/{id}. Idempotent: if the thread
@@ -274,13 +322,13 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	var body struct {
-		Directive        string   `json:"directive"`
-		DirectiveSuffix  string   `json:"directive_suffix"`
-		Tools            []string `json:"tools"`
-		MCP              []string `json:"mcp"`
-		Realtime         bool     `json:"realtime,omitempty"`
-		Voice            string   `json:"voice,omitempty"`
-		ProviderName     string   `json:"provider,omitempty"`
+		Directive       string   `json:"directive"`
+		DirectiveSuffix string   `json:"directive_suffix"`
+		Tools           []string `json:"tools"`
+		MCP             []string `json:"mcp"`
+		Realtime        bool     `json:"realtime,omitempty"`
+		Voice           string   `json:"voice,omitempty"`
+		ProviderName    string   `json:"provider,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -504,7 +552,7 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	//     in-memory thread tree is empty after restart.
 	// The "already exists" race is handled the same way as in
 	// spawnThread — treat as success.
-	if threadID != "main" && findThinkerByID(a.thinker, threadID) == nil {
+	if threadID != "main" && findThinkerByID(a.thinker, threadID) == nil && !a.thinker.bus.HasSubscriber(threadID) {
 		directive := a.thinker.config.GetDirective()
 		if err := a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}); err != nil {
 			if !strings.Contains(err.Error(), "already exists") {
@@ -599,8 +647,8 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			Mode       RunMode           `json:"mode,omitempty"`
 			Provider   *ProviderConfig   `json:"provider,omitempty"`
 			Providers  []ProviderConfig  `json:"providers,omitempty"`
-			Computer    *ComputerConfig   `json:"computer,omitempty"`
-			MCPServers  []MCPServerConfig `json:"mcp_servers,omitempty"`
+			Computer   *ComputerConfig   `json:"computer,omitempty"`
+			MCPServers []MCPServerConfig `json:"mcp_servers,omitempty"`
 			Reset      *struct {
 				History bool `json:"history,omitempty"`
 				Memory  bool `json:"memory,omitempty"`
@@ -914,17 +962,19 @@ func writeJSON(w http.ResponseWriter, v any) {
 // continues to work; ID is also exposed for callers that want to
 // address by id directly.
 type memoryListItem struct {
-	Index   int       `json:"index"`
-	ID      string    `json:"id"`
-	Text    string    `json:"text"`           // = MemoryRecord.Content (kept as `text` for backward UI compat)
-	Tags    []string  `json:"tags,omitempty"`
-	Weight  float64   `json:"weight,omitempty"`
-	Time    time.Time `json:"time"`           // = MemoryRecord.TS
+	Index  int       `json:"index"`
+	ID     string    `json:"id"`
+	Text   string    `json:"text"` // = MemoryRecord.Content (kept as `text` for backward UI compat)
+	Tags   []string  `json:"tags,omitempty"`
+	Weight float64   `json:"weight,omitempty"`
+	Time   time.Time `json:"time"` // = MemoryRecord.TS
 }
 
 // memoryRoot dispatches /memory by method:
-//   GET  → list active memories (legacy memoryList behaviour)
-//   POST → insert or upsert by id
+//
+//	GET  → list active memories (legacy memoryList behaviour)
+//	POST → insert or upsert by id
+//
 // The platform uses POST to push skill-as-memory records with
 // deterministic ids, so re-pushing the same skill upserts via
 // Supersede instead of duplicating.

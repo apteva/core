@@ -150,6 +150,41 @@ func TestPromptStability(t *testing.T) {
 	t.Logf("[dynamic context size with 1 worker] %d bytes", len(dyn1))
 }
 
+func TestBuildSystemPrompt_CodexVisibleActivity(t *testing.T) {
+	directive := "Idle."
+	mcpCatalog := []MCPServerInfo{{Name: "channels", ToolCount: 3}}
+	codexPool := &ProviderPool{default_: "openai-codex"}
+	codexPrompt := buildSystemPrompt(directive, ModeAutonomous, nil, "", nil, nil, codexPool, mcpCatalog)
+	if !strings.Contains(codexPrompt, "[CODEX VISIBLE ACTIVITY]") {
+		t.Fatal("Codex prompt missing visible activity guidance")
+	}
+	if !strings.Contains(codexPrompt, `search_tools(query="..."`) {
+		t.Fatal("Codex prompt should describe MCP tool discovery mode")
+	}
+	if strings.Contains(codexPrompt, "ALL their tools are already in your tool list") {
+		t.Fatal("Codex prompt should not describe eager MCP tools")
+	}
+
+	kimiPool := &ProviderPool{default_: "fireworks"}
+	kimiPrompt := buildSystemPrompt(directive, ModeAutonomous, nil, "", nil, nil, kimiPool, mcpCatalog)
+	if strings.Contains(kimiPrompt, "[CODEX VISIBLE ACTIVITY]") {
+		t.Fatal("non-Codex prompt should not include Codex visible activity guidance")
+	}
+	if !strings.Contains(kimiPrompt, "ALL their tools are already in your tool list") {
+		t.Fatal("non-Codex prompt should keep eager MCP wording for small tool surfaces")
+	}
+}
+
+func TestUseEagerTools_CodexForcesDiscovery(t *testing.T) {
+	tk := &Thinker{
+		provider:  &OpenAINativeProvider{name: "openai-codex"},
+		toolIndex: NewToolIndex(),
+	}
+	if tk.useEagerTools() {
+		t.Fatal("Codex should force discovery mode even for small tool surfaces")
+	}
+}
+
 // TestIntegration_CacheHitRatio_Kimi exercises a multi-turn session
 // against Fireworks kimi-k2p6 and reports the steady-state cache hit
 // ratio. Iteration 1 is excluded from the ratio (cold cache).

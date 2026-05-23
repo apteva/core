@@ -43,10 +43,12 @@ func streamIdleTimeout() time.Duration {
 // extractProviderRequestIDs pulls known request-id headers from an
 // HTTP response so we can tag telemetry with values the provider's own
 // support can grep. Different vendors ship different headers:
-//   Fireworks:  x-request-id
-//   Anthropic:  request-id, x-request-id
-//   OpenAI:     openai-request-id, x-request-id
-//   Google:     x-request-id, x-goog-request-id
+//
+//	Fireworks:  x-request-id
+//	Anthropic:  request-id, x-request-id
+//	OpenAI:     openai-request-id, x-request-id
+//	Google:     x-request-id, x-goog-request-id
+//
 // Return as a name=value map preserving order of known headers we
 // checked; keeps the logs readable.
 func extractProviderRequestIDs(h http.Header) map[string]string {
@@ -149,7 +151,7 @@ type NativeTool struct {
 
 // NativeToolCall is a structured tool call returned by the provider.
 type NativeToolCall struct {
-	ID               string            `json:"id"`                          // provider-assigned ID for matching results
+	ID               string            `json:"id"` // provider-assigned ID for matching results
 	Name             string            `json:"name"`
 	Args             map[string]string `json:"args"`
 	ThoughtSignature string            `json:"thought_signature,omitempty"` // Gemini: encrypted reasoning state
@@ -158,8 +160,8 @@ type NativeToolCall struct {
 // ToolResult is sent back to the provider after executing a tool.
 type ToolResult struct {
 	CallID  string `json:"call_id"`
-	Content string `json:"content"`           // text result
-	Image   []byte `json:"image,omitempty"`   // optional image (screenshot etc.)
+	Content string `json:"content"`         // text result
+	Image   []byte `json:"image,omitempty"` // optional image (screenshot etc.)
 	IsError bool   `json:"is_error,omitempty"`
 }
 
@@ -268,6 +270,10 @@ func createProviderByName(name string) LLMProvider {
 		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 			return NewOpenAINativeProvider(key)
 		}
+	case "openai-codex":
+		if token := os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"); token != "" {
+			return NewOpenAICodexProvider(token)
+		}
 	case "anthropic":
 		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
 			return NewAnthropicProvider(key)
@@ -330,6 +336,16 @@ func applyModelOverrides(provider LLMProvider, models map[string]string) {
 			p.models[ModelSmall] = small
 		}
 	case *OpenAICompatProvider:
+		if large != "" {
+			p.models[ModelLarge] = large
+		}
+		if medium != "" {
+			p.models[ModelMedium] = medium
+		}
+		if small != "" {
+			p.models[ModelSmall] = small
+		}
+	case *OpenAINativeProvider:
 		if large != "" {
 			p.models[ModelLarge] = large
 		}

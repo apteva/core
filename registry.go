@@ -499,12 +499,12 @@ func copyAndInjectReason(schema map[string]any) map[string]any {
 		}
 	}
 	// Short schema description — the full rule lives once in the system
-	// prompt's "TOOL CALL LABELS" section (see baseSystemPrompt). Keeping
+	// prompt's "TOOL CALLS" section (see baseSystemPrompt). Keeping
 	// the per-schema description terse saves ~150 chars × N tools on
 	// every Chat call.
 	props["_reason"] = map[string]any{
 		"type":        "string",
-		"description": "Short action label (3-6 words, imperative).",
+		"description": "Capitalized activity phrase, max 6 words, usually ending in -ing.",
 	}
 	out["properties"] = props
 	// Add _reason to required list

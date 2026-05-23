@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/apteva/core/pkg/computer"
@@ -18,14 +19,21 @@ import (
 // web_search, code_interpreter, and other OpenAI-specific features.
 // For OpenAI-compatible endpoints (Fireworks, Ollama, etc.), use OpenAICompatProvider.
 type OpenAINativeProvider struct {
-	apiKey       string
-	models       map[ModelTier]string
-	builtinTools []string
+	name            string
+	apiKey          string
+	responsesURL    string
+	forceStoreFalse bool
+	runtimeTokenURL string
+	serverAPIKey    string
+	models          map[ModelTier]string
+	builtinTools    []string
 }
 
 func NewOpenAINativeProvider(apiKey string) LLMProvider {
 	return &OpenAINativeProvider{
-		apiKey: apiKey,
+		name:         "openai",
+		apiKey:       apiKey,
+		responsesURL: "https://api.openai.com/v1/responses",
 		models: map[ModelTier]string{
 			ModelLarge:  "gpt-5.4-mini",
 			ModelMedium: "gpt-5.4-mini",
@@ -34,15 +42,48 @@ func NewOpenAINativeProvider(apiKey string) LLMProvider {
 	}
 }
 
-func (p *OpenAINativeProvider) Name() string                            { return "openai" }
-func (p *OpenAINativeProvider) Models() map[ModelTier]string            { return p.models }
-func (p *OpenAINativeProvider) SupportsNativeTools() bool               { return true }
+func NewOpenAICodexProvider(accessToken string) LLMProvider {
+	serverURL := strings.TrimRight(os.Getenv("SERVER_URL"), "/")
+	providerID := strings.TrimSpace(os.Getenv("OPENAI_CODEX_PROVIDER_ID"))
+	runtimeTokenURL := ""
+	if serverURL != "" && providerID != "" {
+		runtimeTokenURL = serverURL + "/api/providers/" + providerID + "/auth/runtime-token"
+	}
+	return &OpenAINativeProvider{
+		name:            "openai-codex",
+		apiKey:          accessToken,
+		responsesURL:    "https://chatgpt.com/backend-api/codex/responses",
+		forceStoreFalse: true,
+		runtimeTokenURL: runtimeTokenURL,
+		serverAPIKey:    os.Getenv("APTEVA_API_KEY"),
+		models: map[ModelTier]string{
+			ModelLarge:  "gpt-5.5",
+			ModelMedium: "gpt-5.5",
+			ModelSmall:  "gpt-5.5",
+		},
+	}
+}
+
+func (p *OpenAINativeProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "openai"
+}
+func (p *OpenAINativeProvider) Models() map[ModelTier]string { return p.models }
+func (p *OpenAINativeProvider) SupportsNativeTools() bool    { return true }
 func (p *OpenAINativeProvider) CostPer1M() (float64, float64, float64) {
+	if p.Name() == "openai-codex" {
+		return 0, 0, 0
+	}
 	// Default to gpt-5.4-mini pricing
 	return 0.75, 0.375, 4.50
 }
 
 func (p *OpenAINativeProvider) AvailableBuiltinTools() []BuiltinTool {
+	if p.Name() == "openai-codex" {
+		return nil
+	}
 	return []BuiltinTool{
 		{Type: "code_interpreter", Name: "code_interpreter"},
 		{Type: "web_search_preview", Name: "web_search"},
@@ -62,37 +103,49 @@ func (p *OpenAINativeProvider) WithBuiltins(builtins []string) LLMProvider {
 // --- Responses API types ---
 
 type oaiResponsesRequest struct {
-	Model  string           `json:"model"`
-	Input  []oaiInputItem   `json:"input"`
-	Tools  []any            `json:"tools,omitempty"`
-	Stream bool             `json:"stream"`
+	Model        string         `json:"model"`
+	Instructions string         `json:"instructions,omitempty"`
+	Input        []oaiInputItem `json:"input"`
+	Tools        []any          `json:"tools,omitempty"`
+	Stream       bool           `json:"stream"`
+	Store        *bool          `json:"store,omitempty"`
+	Reasoning    *oaiReasoning  `json:"reasoning,omitempty"`
+}
+
+type oaiReasoning struct {
+	Summary string `json:"summary,omitempty"`
 }
 
 // oaiInputItem is a polymorphic input item for the Responses API.
 type oaiInputItem struct {
 	Type    string `json:"type"`              // "message", "computer_call_output", "function_call", "function_call_output"
+	ID      string `json:"id,omitempty"`      // for replaying Responses output items
+	Status  string `json:"status,omitempty"`  // for replaying Responses output items
 	Role    string `json:"role,omitempty"`    // for type=message
 	Content any    `json:"content,omitempty"` // string or []oaiContentBlock
 	Name    string `json:"name,omitempty"`    // for type=function_call
 
 	// computer_call_output / function_call fields
-	CallID     string `json:"call_id,omitempty"`
-	Output     any    `json:"output,omitempty"` // screenshot etc.
-	Arguments  string `json:"arguments,omitempty"` // for type=function_call (JSON string)
+	CallID    string `json:"call_id,omitempty"`
+	Output    any    `json:"output,omitempty"`    // screenshot etc.
+	Arguments string `json:"arguments,omitempty"` // for type=function_call (JSON string)
+	Actions   any    `json:"actions,omitempty"`   // for type=computer_call (GA computer tool)
+	Action    any    `json:"action,omitempty"`    // for legacy computer-use-preview
 }
 
 type oaiContentBlock struct {
-	Type     string `json:"type"`                  // "input_text", "input_image", "input_file"
+	Type     string `json:"type"` // "input_text", "input_image", "input_file"
 	Text     string `json:"text,omitempty"`
-	ImageURL string `json:"image_url,omitempty"`    // data:image/png;base64,...
-	Detail   string `json:"detail,omitempty"`       // "original", "high", "low"
-	FileURL  string `json:"file_url,omitempty"`     // URL or data URI for audio/files
+	ImageURL string `json:"image_url,omitempty"` // data:image/png;base64,...
+	Detail   string `json:"detail,omitempty"`    // "original", "high", "low"
+	FileURL  string `json:"file_url,omitempty"`  // URL or data URI for audio/files
 }
 
 type oaiComputerTool struct {
-	Type          string `json:"type"`           // "computer"
-	DisplayWidth  int    `json:"display_width"`
-	DisplayHeight int    `json:"display_height"`
+	Type          string `json:"type"` // "computer"
+	DisplayWidth  int    `json:"display_width,omitempty"`
+	DisplayHeight int    `json:"display_height,omitempty"`
+	Environment   string `json:"environment,omitempty"`
 }
 
 type oaiFunctionTool struct {
@@ -124,72 +177,45 @@ type oaiOutputItem struct {
 	// computer_call fields
 	CallID  string          `json:"call_id,omitempty"`
 	Actions json.RawMessage `json:"actions,omitempty"`
+	Action  json.RawMessage `json:"action,omitempty"`
 
 	// function_call fields
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
+
+	// reasoning fields
+	Summary []struct {
+		Type string `json:"type"`
+		Text string `json:"text,omitempty"`
+	} `json:"summary,omitempty"`
 }
 
 type oaiComputerAction struct {
-	Type      string `json:"type"` // "click", "type", "keypress", "scroll", "drag", "move", "screenshot", "wait", "double_click"
-	X         int    `json:"x,omitempty"`
-	Y         int    `json:"y,omitempty"`
-	Button    string `json:"button,omitempty"`    // "left", "right", "middle"
-	Text      string `json:"text,omitempty"`      // for "type"
-	Key       string `json:"key,omitempty"`       // for "keypress"
-	ScrollX   int    `json:"scroll_x,omitempty"`
-	ScrollY   int    `json:"scroll_y,omitempty"`
-	StartX    int    `json:"start_x,omitempty"` // drag
-	StartY    int    `json:"start_y,omitempty"`
-	EndX      int    `json:"end_x,omitempty"`
-	EndY      int    `json:"end_y,omitempty"`
-	Duration  int    `json:"duration,omitempty"` // wait ms
-	Keys      []string `json:"keys,omitempty"`   // modifier keys
+	Type     string   `json:"type"` // "click", "type", "keypress", "scroll", "drag", "move", "screenshot", "wait", "double_click"
+	X        int      `json:"x,omitempty"`
+	Y        int      `json:"y,omitempty"`
+	Button   string   `json:"button,omitempty"` // "left", "right", "middle"
+	Text     string   `json:"text,omitempty"`   // for "type"
+	Key      string   `json:"key,omitempty"`    // for "keypress"
+	ScrollX  int      `json:"scroll_x,omitempty"`
+	ScrollY  int      `json:"scroll_y,omitempty"`
+	StartX   int      `json:"start_x,omitempty"` // drag
+	StartY   int      `json:"start_y,omitempty"`
+	EndX     int      `json:"end_x,omitempty"`
+	EndY     int      `json:"end_y,omitempty"`
+	Duration int      `json:"duration,omitempty"` // wait ms
+	Keys     []string `json:"keys,omitempty"`     // modifier keys
 }
 
 func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+	if p.Name() == "openai-codex" {
+		_ = p.refreshRuntimeToken(ctx, false)
+	}
 	// Convert messages to Responses API input items
 	input := p.buildInput(messages)
 
 	// Convert tools
-	var apiTools []any
-	hasComputerUse := false
-	for _, t := range tools {
-		if t.Name == "computer_use" {
-			// Only gpt-5.4 supports native computer use
-			if !strings.Contains(model, "gpt-5.4") || strings.Contains(model, "mini") || strings.Contains(model, "nano") {
-				logMsg("OPENAI-NATIVE", fmt.Sprintf("skipping computer_use — not supported by %s", model))
-				continue
-			}
-			width, height := 1280, 800
-			if w, ok := t.Parameters["_display_width"].(int); ok {
-				width = w
-			}
-			if h, ok := t.Parameters["_display_height"].(int); ok {
-				height = h
-			}
-			apiTools = append(apiTools, oaiComputerTool{
-				Type:          "computer",
-				DisplayWidth:  width,
-				DisplayHeight: height,
-			})
-			hasComputerUse = true
-			logMsg("OPENAI-NATIVE", "native computer tool enabled")
-		} else if t.Name == "browser_session" {
-			if !hasComputerUse {
-				continue // skip if computer not enabled
-			}
-			continue
-		} else {
-			apiTools = append(apiTools, oaiFunctionTool{
-				Type:        "function",
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.Parameters,
-			})
-		}
-	}
-	_ = hasComputerUse
+	apiTools := p.buildAPITools(model, tools)
 
 	// Add builtin tools (only those supported by Responses API)
 	supportedBuiltins := map[string]bool{
@@ -208,6 +234,14 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		Tools:  apiTools,
 		Stream: true,
 	}
+	if p.Name() == "openai-codex" {
+		reqBody.Reasoning = &oaiReasoning{Summary: "auto"}
+	}
+	if p.forceStoreFalse {
+		store := false
+		reqBody.Store = &store
+		reqBody.Instructions = p.instructionsFromMessages(messages)
+	}
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -222,7 +256,11 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		logMsg("OPENAI-NATIVE", fmt.Sprintf("model=%s input_items=%d tools=0", model, len(input)))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/responses", bytes.NewReader(body))
+	responsesURL := p.responsesURL
+	if responsesURL == "" {
+		responsesURL = "https://api.openai.com/v1/responses"
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -233,6 +271,19 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	if err != nil {
 		return ChatResponse{}, err
 	}
+	if p.Name() == "openai-codex" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
+		_ = resp.Body.Close()
+		req, err = http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(body))
+		if err != nil {
+			return ChatResponse{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		resp, err = llmHTTPClient.Do(req)
+		if err != nil {
+			return ChatResponse{}, err
+		}
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -241,16 +292,138 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		return ChatResponse{}, fmt.Errorf("OpenAI Responses API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	return p.streamResponse(resp.Body, onChunk, onToolChunk)
+	return p.streamResponse(resp.Body, onChunk, onThinking, onToolChunk)
+}
+
+func (p *OpenAINativeProvider) buildAPITools(model string, tools []NativeTool) []any {
+	var apiTools []any
+	computerMode := p.openAIComputerMode()
+	for _, t := range tools {
+		if t.Name == "computer_use" {
+			if computerMode == "off" {
+				continue
+			}
+			if computerMode != "custom" && openAIModelSupportsNativeComputer(model) {
+				tool := oaiComputerTool{Type: "computer"}
+				if strings.HasPrefix(model, "computer-use-preview") {
+					tool.Type = "computer_use_preview"
+					tool.DisplayWidth, tool.DisplayHeight = 1280, 800
+					tool.Environment = "browser"
+					if w, ok := t.Parameters["_display_width"].(int); ok {
+						tool.DisplayWidth = w
+					}
+					if h, ok := t.Parameters["_display_height"].(int); ok {
+						tool.DisplayHeight = h
+					}
+				}
+				apiTools = append(apiTools, tool)
+				logMsg("OPENAI-NATIVE", fmt.Sprintf("native computer tool enabled mode=%s model=%s", computerMode, model))
+				continue
+			}
+			logMsg("OPENAI-NATIVE", fmt.Sprintf("computer_use exposed as function mode=%s model=%s", computerMode, model))
+		}
+		apiTools = append(apiTools, oaiFunctionTool{
+			Type:        "function",
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		})
+	}
+	return apiTools
+}
+
+func (p *OpenAINativeProvider) openAIComputerMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APTEVA_OPENAI_COMPUTER_MODE"))) {
+	case "custom":
+		return "custom"
+	case "off":
+		return "off"
+	case "native":
+		return "native"
+	default:
+		if p.Name() == "openai-codex" {
+			return "custom"
+		}
+		return "native"
+	}
+}
+
+func openAIModelSupportsNativeComputer(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(model, "gpt-5.5") ||
+		strings.HasPrefix(model, "gpt-5.4") ||
+		strings.HasPrefix(model, "computer-use-preview")
+}
+
+func (p *OpenAINativeProvider) refreshRuntimeToken(ctx context.Context, force bool) error {
+	if p.runtimeTokenURL == "" || p.serverAPIKey == "" {
+		return nil
+	}
+	url := p.runtimeTokenURL
+	if force {
+		url += "?force=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.serverAPIKey)
+	resp, err := llmHTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("runtime token refresh failed: HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return err
+	}
+	if strings.TrimSpace(payload.AccessToken) == "" {
+		return fmt.Errorf("runtime token refresh returned empty access_token")
+	}
+	p.apiKey = payload.AccessToken
+	return nil
+}
+
+func (p *OpenAINativeProvider) instructionsFromMessages(messages []Message) string {
+	var parts []string
+	for _, m := range messages {
+		if m.Role == "system" && strings.TrimSpace(m.TextContent()) != "" {
+			parts = append(parts, m.TextContent())
+		}
+	}
+	if len(parts) == 0 {
+		return "You are an Apteva agent. Follow the provided tools and user instructions."
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // buildInput converts our Message slice to Responses API input items.
 func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 	var items []oaiInputItem
+	computerCallIDs := map[string]bool{}
+	useNativeComputerReplay := p.openAIComputerMode() != "custom"
+	for _, m := range messages {
+		for _, tc := range m.ToolCalls {
+			if useNativeComputerReplay && (computer.IsGeminiComputerAction(tc.Name) || isComputerUseTool(tc.Name)) {
+				computerCallIDs[tc.ID] = true
+			}
+		}
+	}
 
 	for _, m := range messages {
 		// System message
 		if m.Role == "system" {
+			if p.forceStoreFalse {
+				// Codex receives system/developer text through the
+				// top-level instructions field. Repeating it in input[]
+				// bloats the uncached prefix and weakens cache locality.
+				continue
+			}
 			items = append(items, oaiInputItem{
 				Type:    "message",
 				Role:    "developer",
@@ -263,20 +436,36 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
 				if tr.Image != nil {
-					// Computer call output with screenshot
-					items = append(items, oaiInputItem{
-						Type:   "computer_call_output",
-						CallID: tr.CallID,
-						Output: []oaiContentBlock{
-							{Type: "input_image", ImageURL: "data:image/png;base64," + base64.StdEncoding.EncodeToString(tr.Image), Detail: "original"},
-						},
-					})
+					imageURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tr.Image)
+					if computerCallIDs[tr.CallID] && p.openAIComputerMode() != "custom" {
+						// Native OpenAI computer result.
+						items = append(items, oaiInputItem{
+							Type:   "computer_call_output",
+							CallID: tr.CallID,
+							Output: map[string]any{
+								"type":      "computer_screenshot",
+								"image_url": imageURL,
+							},
+						})
+					} else {
+						// Custom function-tool fallback: keep the screenshot in
+						// the tool result so vision-capable OpenAI models can
+						// inspect the page without the native computer tool.
+						items = append(items, oaiInputItem{
+							Type:   "function_call_output",
+							CallID: tr.CallID,
+							Output: []oaiContentBlock{
+								{Type: "input_text", Text: tr.Content},
+								{Type: "input_image", ImageURL: imageURL, Detail: "original"},
+							},
+						})
+					}
 				} else {
 					// Function call output
 					items = append(items, oaiInputItem{
-						Type:    "function_call_output",
-						CallID:  tr.CallID,
-						Output:  tr.Content,
+						Type:   "function_call_output",
+						CallID: tr.CallID,
+						Output: tr.Content,
 					})
 				}
 			}
@@ -295,17 +484,17 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			}
 			// Then add each tool call as its original output item
 			for _, tc := range m.ToolCalls {
-				if computer.IsGeminiComputerAction(tc.Name) || isComputerUseTool(tc.Name) {
+				if useNativeComputerReplay && (computer.IsGeminiComputerAction(tc.Name) || isComputerUseTool(tc.Name)) {
 					// Computer call — reconstruct as computer_call item
 					argsAny := make(map[string]any, len(tc.Args))
 					for k, v := range tc.Args {
 						argsAny[k] = v
 					}
-					actionsJSON, _ := json.Marshal([]map[string]any{argsAny})
 					items = append(items, oaiInputItem{
-						Type:   "computer_call",
-						CallID: tc.ID,
-						Output: json.RawMessage(actionsJSON),
+						Type:    "computer_call",
+						CallID:  tc.ID,
+						Status:  "completed",
+						Actions: []map[string]any{argsAny},
 					})
 				} else {
 					argsJSON, _ := json.Marshal(tc.Args)
@@ -352,16 +541,18 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 }
 
 // streamResponse parses the Responses API SSE stream.
-func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	var full strings.Builder
+	var fullReasoning strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
 
 	// Track pending items
 	type pendingFunc struct {
-		id   string
-		name string
-		args strings.Builder
+		id         string
+		name       string
+		args       strings.Builder
+		pendingBuf strings.Builder
 	}
 	pendingFuncs := map[string]*pendingFunc{} // by item ID
 
@@ -389,6 +580,10 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
 		}
+		if os.Getenv("APTEVA_DUMP_STREAM_EVENTS") == "1" {
+			logMsg("OPENAI-NATIVE-STREAM", event.Type)
+			logOpenAINativeStreamItemMeta(event.Type, event.Item)
+		}
 
 		switch event.Type {
 		// Text content delta
@@ -404,6 +599,44 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 				}
 			}
 
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			var delta struct {
+				Delta string `json:"delta"`
+			}
+			json.Unmarshal([]byte(data), &delta)
+			if delta.Delta != "" {
+				fullReasoning.WriteString(delta.Delta)
+				if onThinking != nil {
+					onThinking(delta.Delta)
+				}
+			}
+
+		case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+			var done struct {
+				Text string `json:"text"`
+			}
+			json.Unmarshal([]byte(data), &done)
+			if done.Text != "" && fullReasoning.Len() == 0 {
+				fullReasoning.WriteString(done.Text)
+				if onThinking != nil {
+					onThinking(done.Text)
+				}
+			}
+
+		case "response.reasoning_summary_part.done":
+			var done struct {
+				Part struct {
+					Text string `json:"text"`
+				} `json:"part"`
+			}
+			json.Unmarshal([]byte(data), &done)
+			if done.Part.Text != "" && fullReasoning.Len() == 0 {
+				fullReasoning.WriteString(done.Part.Text)
+				if onThinking != nil {
+					onThinking(done.Part.Text)
+				}
+			}
+
 		// Function call started
 		case "response.function_call_arguments.delta":
 			var delta struct {
@@ -414,8 +647,14 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			pf, ok := pendingFuncs[delta.ItemID]
 			if ok {
 				pf.args.WriteString(delta.Delta)
-				if onToolChunk != nil && pf.name != "" {
-					onToolChunk(pf.name, delta.ItemID, delta.Delta)
+				if pf.id == "" {
+					pf.pendingBuf.WriteString(delta.Delta)
+				} else if onToolChunk != nil && pf.name != "" {
+					if pf.pendingBuf.Len() > 0 {
+						onToolChunk(pf.name, pf.id, pf.pendingBuf.String())
+						pf.pendingBuf.Reset()
+					}
+					onToolChunk(pf.name, pf.id, delta.Delta)
 				}
 			}
 
@@ -440,9 +679,23 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			case "function_call":
 				pf, ok := pendingFuncs[item.ID]
 				if ok {
+					if item.CallID != "" {
+						pf.id = item.CallID
+					}
+					if pf.id == "" {
+						pf.id = item.ID
+					}
+					if onToolChunk != nil && pf.name != "" && pf.pendingBuf.Len() > 0 {
+						onToolChunk(pf.name, pf.id, pf.pendingBuf.String())
+						pf.pendingBuf.Reset()
+					}
 					args := make(map[string]string)
 					var rawArgs map[string]any
-					if json.Unmarshal([]byte(pf.args.String()), &rawArgs) == nil {
+					argsJSON := pf.args.String()
+					if argsJSON == "" {
+						argsJSON = item.Arguments
+					}
+					if json.Unmarshal([]byte(argsJSON), &rawArgs) == nil {
 						for k, v := range rawArgs {
 							switch val := v.(type) {
 							case string:
@@ -461,11 +714,32 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 					delete(pendingFuncs, item.ID)
 				}
 
+			case "reasoning":
+				if fullReasoning.Len() == 0 {
+					for _, summary := range item.Summary {
+						if summary.Text == "" {
+							continue
+						}
+						fullReasoning.WriteString(summary.Text)
+						if onThinking != nil {
+							onThinking(summary.Text)
+						}
+					}
+				}
+
 			case "computer_call":
 				if currentComputer != nil {
 					// Parse actions from the completed item
 					var actions []oaiComputerAction
-					json.Unmarshal(item.Actions, &actions)
+					if len(item.Actions) > 0 {
+						json.Unmarshal(item.Actions, &actions)
+					}
+					if len(actions) == 0 && len(item.Action) > 0 {
+						var action oaiComputerAction
+						if json.Unmarshal(item.Action, &action) == nil && action.Type != "" {
+							actions = append(actions, action)
+						}
+					}
 
 					// Convert each action to a NativeToolCall
 					for i, action := range actions {
@@ -515,7 +789,47 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 
 	response := full.String()
 	logMsg("OPENAI-NATIVE", fmt.Sprintf("done tokens_in=%d tokens_out=%d tools=%d len=%d", usage.PromptTokens, usage.CompletionTokens, len(toolCalls), len(response)))
-	return ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage}, nil
+	return ChatResponse{Text: response, ToolCalls: toolCalls, Reasoning: fullReasoning.String(), Usage: usage}, nil
+}
+
+func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var item oaiOutputItem
+	if err := json.Unmarshal(raw, &item); err != nil {
+		logMsg("OPENAI-NATIVE-STREAM", fmt.Sprintf("%s item_meta_unparseable bytes=%d", eventType, len(raw)))
+		return
+	}
+	contentTypes := make(map[string]int)
+	contentTextChars := 0
+	for _, c := range item.Content {
+		contentTypes[c.Type]++
+		contentTextChars += len(c.Text)
+	}
+	summaryTypes := make(map[string]int)
+	summaryTextChars := 0
+	for _, s := range item.Summary {
+		summaryTypes[s.Type]++
+		summaryTextChars += len(s.Text)
+	}
+	logMsg("OPENAI-NATIVE-STREAM", fmt.Sprintf(
+		"%s item_meta type=%q status=%q id_present=%t call_id_present=%t name=%q content_count=%d content_types=%v content_text_chars=%d summary_count=%d summary_types=%v summary_text_chars=%d arguments_chars=%d actions_bytes=%d",
+		eventType,
+		item.Type,
+		item.Status,
+		item.ID != "",
+		item.CallID != "",
+		item.Name,
+		len(item.Content),
+		contentTypes,
+		contentTextChars,
+		len(item.Summary),
+		summaryTypes,
+		summaryTextChars,
+		len(item.Arguments),
+		len(item.Actions),
+	))
 }
 
 // oaiActionToArgs converts an OpenAI computer action to our standard args map.

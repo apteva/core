@@ -17,7 +17,7 @@ import (
 const (
 	maxHistoryMain   = 100 // main coordinator
 	maxHistoryLead   = 100 // team leads (depth 0)
-	maxHistoryWorker = 20 // workers (depth 1+)
+	maxHistoryWorker = 20  // workers (depth 1+)
 )
 
 // MCPServerInfo is a lightweight catalog entry for an MCP server.
@@ -26,8 +26,6 @@ type MCPServerInfo struct {
 	Name      string
 	ToolCount int
 }
-
-
 
 type ModelTier int
 
@@ -246,7 +244,7 @@ PACING:
 - Pace persists — don't re-set it every thought. When an event wakes you, you auto-switch to large model for that turn.
 
 TOOL CALLS:
-- Every tool takes a "_reason" string: 3-6 words, imperative, describing THIS call (e.g. "find ventes sheet id", "update Score cell"). No "to …" clauses — the thought above already holds the why.`
+- Every tool takes a "_reason" string for the operator UI. Write a clear capitalized activity phrase, maximum 6 words, usually ending in "-ing", naming the action and object so it is understandable without the tool name (e.g. "Searching for customer row", "Sending Pushover notification"). Do not use a generic tool name as the reason.`
 
 // buildSystemPrompt assembles messages[0] — the truly static portion of
 // every request. Per-turn volatile content (active threads, recalled
@@ -306,7 +304,7 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 			totalTools += info.ToolCount
 		}
 		prompt += "\n\n[AVAILABLE MCP SERVERS]\n"
-		if isEagerMode(totalTools) {
+		if poolUsesEagerTools(pool, totalTools) {
 			// Eager: every tool's schema is in `tools` already — telling
 			// the model to search_tools first would cost a wasted round-
 			// trip per request.
@@ -370,6 +368,16 @@ When the user pushes back ("no", "don't", "stop", "I didn't want that"), stop an
 - When the user corrects or pushes back, stop and adjust immediately — don't argue.
 
 ACT, DON'T NARRATE. You have no live audience between thoughts — every tool result comes back as structured input, not as something a human is watching scroll by. Skip the "let me think about this, I'll take a screenshot to see what's there, then I'll consider the options before..." prose. Take the next tool call. The tool's output is your feedback; react to it on the next iteration. Reserve natural-language output for channels_respond (actually talking to the user). Thoughts that produce only prose and no tool call waste a round-trip.`
+	}
+
+	if pool != nil && pool.DefaultName() == "openai-codex" {
+		prompt += `
+
+[CODEX VISIBLE ACTIVITY]
+Codex may not expose provider reasoning summaries. When you call tools, include one short visible status sentence before the tool call so the operator can see what you are doing.
+- Keep it factual and action-oriented, not private chain-of-thought.
+- Good: "I’ll wait quietly and check again later." "I’ll hand this off to the chat worker." "I’ll report the result to the user."
+- Do not output only tool calls unless the provider refuses to include text.`
 	}
 
 	// Inject learned skills if any exist
@@ -585,7 +593,7 @@ func (r ThinkRate) Delay() time.Duration {
 
 type APIEvent struct {
 	Time      time.Time `json:"time"`
-	Type      string    `json:"type"`                 // "thought", "chunk", "reply", "thread_started", "thread_done", "error"
+	Type      string    `json:"type"` // "thought", "chunk", "reply", "thread_started", "thread_done", "error"
 	ThreadID  string    `json:"thread_id"`
 	Message   string    `json:"message,omitempty"`
 	Iteration int       `json:"iteration,omitempty"`
@@ -596,18 +604,17 @@ type APIEvent struct {
 // consumed contains the events that were consumed this iteration (for context).
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
-
 type Thinker struct {
-	apiKey    string
-	pool      *ProviderPool // all available providers (shared across threads)
-	provider  LLMProvider   // current active provider for this thinker
-	messages  []Message
-	bus       *EventBus
-	sub       *Subscription
-	pause     chan bool
-	quit      chan struct{}
-	iteration int
-	paused    bool
+	apiKey     string
+	pool       *ProviderPool // all available providers (shared across threads)
+	provider   LLMProvider   // current active provider for this thinker
+	messages   []Message
+	bus        *EventBus
+	sub        *Subscription
+	pause      chan bool
+	quit       chan struct{}
+	iteration  int
+	paused     bool
 	rate       ThinkRate
 	agentRate  ThinkRate
 	agentSleep time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
@@ -619,7 +626,7 @@ type Thinker struct {
 	config     *Config
 	registry   *ToolRegistry
 
-	maxHistory     int // max messages in context window (varies by role)
+	maxHistory int // max messages in context window (varies by role)
 
 	// directive is this thread's mission text — main's directive for
 	// the main thinker, the spawn directive for a sub-thread. Fed into
@@ -633,10 +640,10 @@ type Thinker struct {
 	directive string
 
 	// Hooks — set these to customize behavior. nil = defaults.
-	handleTools    ToolHandler
-	rebuildPrompt  func(toolDocs string) string // rebuild system prompt with current tool docs
-	onStop         func()
-	toolAllowlist  map[string]bool // nil = all tools allowed (main thread)
+	handleTools   ToolHandler
+	rebuildPrompt func(toolDocs string) string // rebuild system prompt with current tool docs
+	onStop        func()
+	toolAllowlist map[string]bool // nil = all tools allowed (main thread)
 
 	// API event log — shared across all threads, owned by main thinker
 	apiLog    *[]APIEvent
@@ -691,9 +698,9 @@ type Thinker struct {
 	// MCP server catalog — lightweight metadata for prompt (name +
 	// tool count). Derived from toolIndex; kept as a Thinker field
 	// for buildSystemPrompt back-compat.
-	mcpCatalog []MCPServerInfo
+	mcpCatalog   []MCPServerInfo
 	computer     computer.Computer // screen-based environment (nil = no computer use)
-	pendingTools sync.Map         // tool call IDs with pending async results
+	pendingTools sync.Map          // tool call IDs with pending async results
 
 	// Placeholders injected for tool calls that didn't finish within the
 	// iter-boundary wait barrier. Keyed by call id → placeholderInfo.
@@ -763,19 +770,19 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		messages: []Message{
 			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil, nil)},
 		},
-		config:    config,
-		bus:       bus,
-		sub:       bus.Subscribe("main", 100),
-		pause:     make(chan bool, 1),
-		quit:      make(chan struct{}),
+		config:     config,
+		bus:        bus,
+		sub:        bus.Subscribe("main", 100),
+		pause:      make(chan bool, 1),
+		quit:       make(chan struct{}),
 		rate:       RateSlow,
 		agentRate:  RateSlow,
 		agentSleep: 30 * time.Second,
-		memory:    NewMemoryStore(apiKey),
-		session:   NewSession(".", "main"),
-		apiLog:    &[]APIEvent{},
-		apiMu:     &sync.RWMutex{},
-		apiNotify: make(chan struct{}, 1),
+		memory:     NewMemoryStore(apiKey),
+		session:    NewSession(".", "main"),
+		apiLog:     &[]APIEvent{},
+		apiMu:      &sync.RWMutex{},
+		apiNotify:  make(chan struct{}, 1),
 		threadID:   "main",
 		maxHistory: maxHistoryMain,
 		telemetry:  NewTelemetry(),
@@ -1894,11 +1901,11 @@ func (t *Thinker) Run() {
 		if t.telemetry != nil {
 			model := t.modelID()
 			t.telemetry.Emit("llm.done", t.threadID, LLMDoneData{
-				Model:            model,
-				TokensIn:         usage.PromptTokens,
-				TokensCached:     usage.CachedTokens,
-				TokensOut:        usage.CompletionTokens,
-				DurationMs:       duration.Milliseconds(),
+				Model:        model,
+				TokensIn:     usage.PromptTokens,
+				TokensCached: usage.CachedTokens,
+				TokensOut:    usage.CompletionTokens,
+				DurationMs:   duration.Milliseconds(),
 				// cost_usd intentionally omitted — server enriches with
 				// canonical pricing at ingest so we're not double-booking
 				// the model→cost knowledge in core.
@@ -1990,7 +1997,7 @@ func (t *Thinker) think() (ChatResponse, error) {
 	//     turn-to-turn, so the `tools` prompt prefix caches well — the
 	//     right call for a small surface where the search round-trip
 	//     would cost more than it saves.
-	//   - discovery: applyPreload STICKILY activates the BM25 top-5 for
+	//   - discovery: applyPreload STICKILY activates the BM25 top matches for
 	//     this turn's directive+context; search_tools adds more on
 	//     demand. The active set grows then stabilises (then caches),
 	//     bounded by evictActiveToolsLRU.
@@ -2012,7 +2019,11 @@ func (t *Thinker) think() (ChatResponse, error) {
 				active = merged
 			}
 		} else {
-			t.applyPreload(5, t.lastInboundForPreload)
+			preloadK := 5
+			if t.provider.Name() == "openai-codex" {
+				preloadK = 3
+			}
+			t.applyPreload(preloadK, t.lastInboundForPreload)
 			t.evictActiveToolsLRU(activeToolsCap)
 			active = t.activeTools
 		}
@@ -2577,7 +2588,7 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 	})
 
 	t.bus.Publish(Event{Type: EventChunk, From: t.threadID,
-		Text: fmt.Sprintf("\n← computer_use: screenshot (%d bytes, %dms)\n", len(screenshot), duration.Milliseconds()),
+		Text:      fmt.Sprintf("\n← computer_use: screenshot (%d bytes, %dms)\n", len(screenshot), duration.Milliseconds()),
 		Iteration: t.iteration})
 }
 

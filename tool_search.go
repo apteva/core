@@ -77,11 +77,21 @@ func isEagerMode(toolCount int) bool {
 // Resolved per-turn so a runtime connect / app-install that pushes the
 // surface past the auto threshold flips the mode without a restart.
 func (t *Thinker) useEagerTools() bool {
+	if t != nil && t.provider != nil && t.provider.Name() == "openai-codex" {
+		return false
+	}
 	n := 0
 	if t.toolIndex != nil {
 		n = t.toolIndex.Count()
 	}
 	return isEagerMode(n)
+}
+
+func poolUsesEagerTools(pool *ProviderPool, toolCount int) bool {
+	if pool != nil && pool.DefaultName() == "openai-codex" {
+		return false
+	}
+	return isEagerMode(toolCount)
 }
 
 // search_tools is the meta-tool every thread has in its scaffolding.
@@ -110,7 +120,7 @@ func registerSearchTool(r *ToolRegistry) {
 			"with name + summary; their full schemas become available for you to call on the " +
 			"next turn. Call multiple search_tools in parallel if you need several capabilities.",
 		Syntax: `[[search_tools query="upload file" k="5"]]`,
-		Rules: `query is required; k defaults to 5 and caps at 20. Loaded tools persist for the rest of this thread's conversation (subject to compaction). Schemas appear on the next thinking turn — you cannot call a discovered tool in the same turn you searched for it.`,
+		Rules:  `query is required; k defaults to 5 and caps at 20. Loaded tools persist for the rest of this thread's conversation (subject to compaction). Schemas appear on the next thinking turn — you cannot call a discovered tool in the same turn you searched for it.`,
 		Core:   true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -138,10 +148,10 @@ func registerSearchTool(r *ToolRegistry) {
 // turn, so the LLM doesn't need a paragraph of description here —
 // just enough to confirm it found what it was looking for.
 type searchToolsResult struct {
-	Query  string                `json:"query"`
-	Hits   []searchToolHit       `json:"hits"`
-	Loaded []string              `json:"loaded"` // names whose schemas are now in context
-	Note   string                `json:"note,omitempty"`
+	Query  string          `json:"query"`
+	Hits   []searchToolHit `json:"hits"`
+	Loaded []string        `json:"loaded"` // names whose schemas are now in context
+	Note   string          `json:"note,omitempty"`
 }
 
 type searchToolHit struct {

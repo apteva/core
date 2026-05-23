@@ -108,6 +108,13 @@ func (b *EventBus) SubscribeAll(id string, buffer int) *Subscription {
 	return sub
 }
 
+func (b *EventBus) HasSubscriber(id string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	_, ok := b.subs[id]
+	return ok
+}
+
 // Unsubscribe removes a subscription.
 func (b *EventBus) Unsubscribe(id string) {
 	b.mu.Lock()
