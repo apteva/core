@@ -14,21 +14,21 @@ import (
 func newTestAPI() (*APIServer, *Thinker) {
 	bus := NewEventBus()
 	t := &Thinker{
-		apiKey:     "test",
-		messages:   []Message{{Role: "system", Content: "test"}},
-		bus:        bus,
-		sub:        bus.Subscribe("main", 100),
-		pause:      make(chan bool),
-		quit:       make(chan struct{}),
-		rate:       RateSlow,
-		agentRate:  RateSlow,
-		memory:     &MemoryStore{path: "/dev/null"},
-		config:     &Config{Directive: "test directive"},
-		apiLog:     &[]APIEvent{},
-		apiMu:      &sync.RWMutex{},
-		apiNotify:  make(chan struct{}, 1),
-		threadID:   "main",
-		telemetry:  NewTelemetry(),
+		apiKey:    "test",
+		messages:  []Message{{Role: "system", Content: "test"}},
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		pause:     make(chan bool),
+		quit:      make(chan struct{}),
+		rate:      RateSlow,
+		agentRate: RateSlow,
+		memory:    &MemoryStore{path: "/dev/null"},
+		config:    &Config{Directive: "test directive"},
+		apiLog:    &[]APIEvent{},
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		threadID:  "main",
+		telemetry: NewTelemetry(),
 	}
 	t.threads = NewThreadManager(t)
 	api := &APIServer{thinker: t, startTime: time.Now()}
@@ -76,6 +76,86 @@ func TestAPI_Status(t *testing.T) {
 	if body["model"] != "large" {
 		t.Errorf("expected model large, got %v", body["model"])
 	}
+	if body["execution_control"] == nil {
+		t.Errorf("expected execution_control in status")
+	}
+}
+
+func TestAPI_ControlStep(t *testing.T) {
+	api, _ := newTestAPI()
+	payload, _ := json.Marshal(map[string]string{"action": "step"})
+	req := httptest.NewRequest("POST", "/control", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.control(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	json.Unmarshal(w.Body.Bytes(), &body)
+	ec, _ := body["execution_control"].(map[string]any)
+	if ec["mode"] != "step" {
+		t.Fatalf("execution mode = %v, want step", ec["mode"])
+	}
+}
+
+func TestAPI_RestoreCheckpointDoesNotCloseQuit(t *testing.T) {
+	api, thinker := newTestAPI()
+	thinker.execution = NewExecutionController(ExecutionControlConfig{
+		Mode:        ExecutionStep,
+		Breakpoints: []string{string(ExecutionPhaseToolBefore)},
+	})
+	thinker.checkpoints = NewExecutionCheckpointStore()
+	thinker.iteration = 1
+
+	waitDone := make(chan bool, 1)
+	go func() {
+		waitDone <- thinker.executionGate(ExecutionPhaseToolBefore, ExecutionGate{
+			Tool:    "smoke_tool",
+			Summary: "smoke_tool ready",
+			Args:    map[string]string{"message": "before"},
+		})
+	}()
+
+	var checkpointID string
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		st := thinker.executionStatus()
+		if st.Waiting && st.RestoreCheckpointID != "" {
+			checkpointID = st.RestoreCheckpointID
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if checkpointID == "" {
+		t.Fatal("checkpoint was not captured while waiting")
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"action":        "restore_checkpoint",
+		"checkpoint_id": checkpointID,
+	})
+	req := httptest.NewRequest("POST", "/control", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.control(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-thinker.quit:
+		t.Fatal("restore closed thinker.quit; headless core would exit")
+	default:
+	}
+	select {
+	case proceed := <-waitDone:
+		if proceed {
+			t.Fatal("restore released the old gate instead of cancelling it")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old execution gate was not cancelled")
+	}
+	close(thinker.quit)
 }
 
 func TestAPI_Threads_MainOnly(t *testing.T) {
@@ -292,6 +372,14 @@ func TestAPI_Config_Put(t *testing.T) {
 	}
 	if thinker.config.GetDirective() != "new directive" {
 		t.Errorf("directive not updated, got %q", thinker.config.GetDirective())
+	}
+	if thinker.directive != "new directive" {
+		t.Errorf("live directive not reloaded, got %q", thinker.directive)
+	}
+	select {
+	case ev := <-thinker.sub.C:
+		t.Fatalf("directive config update should not inject a wake event, got %s %q", ev.Type, ev.Text)
+	default:
 	}
 }
 
@@ -687,4 +775,3 @@ func TestAPI_MemoryRoot_RejectsBadMethod(t *testing.T) {
 		t.Errorf("expected 405, got %d", w.Code)
 	}
 }
-

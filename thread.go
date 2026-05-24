@@ -106,13 +106,13 @@ type ThreadInfo struct {
 }
 
 type Thread struct {
-	ID           string
-	Name         string // human-readable label, separate from ID. ID is immutable;
-	                    // Name can be edited via update without touching parent_id
-	                    // references or session storage. Empty means "use ID for display".
-	ParentID     string // "main" or parent thread ID
-	Depth        int    // 0 = child of main, 1 = grandchild, etc.
-	Directive    string // original directive before tool docs
+	ID   string
+	Name string // human-readable label, separate from ID. ID is immutable;
+	// Name can be edited via update without touching parent_id
+	// references or session storage. Empty means "use ID for display".
+	ParentID     string   // "main" or parent thread ID
+	Depth        int      // 0 = child of main, 1 = grandchild, etc.
+	Directive    string   // original directive before tool docs
 	MCPNames     []string // MCP server names this thread connected to
 	Thinker      *Thinker
 	Realtime     *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
@@ -140,7 +140,7 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 // SpawnOpts holds optional parameters for spawning a thread.
 type SpawnOpts struct {
 	MediaParts      []ContentPart
-	ProviderName    string   // override provider from pool (empty = inherit parent)
+	ProviderName    string // override provider from pool (empty = inherit parent)
 	InitialMessages []string
 	ParentID        string   // "main" or parent thread ID (empty = "main")
 	Depth           int      // depth in the spawn tree (0 = child of main)
@@ -152,9 +152,9 @@ type SpawnOpts struct {
 	// privileged HTTP spawn endpoint (POST /threads/{id}) for system
 	// callers that know which tools they need; the LLM-driven spawn
 	// tool path leaves this nil and uses mcps=[…] instead.
-	Tools           []string
-	BuiltinTools    []string // provider builtin overrides (nil = inherit, empty = none)
-	DeferRun        bool     // if true, don't start Run() — call StartAll() later
+	Tools        []string
+	BuiltinTools []string // provider builtin overrides (nil = inherit, empty = none)
+	DeferRun     bool     // if true, don't start Run() — call StartAll() later
 	// Paused: if true, the thread spawns in paused state. Run() loop
 	// blocks at the top of its first iteration until either an inbox
 	// event arrives (an explicit `send` from the leader) OR the
@@ -471,18 +471,18 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		messages: []Message{
 			{Role: "system", Content: threadSystemPrompt},
 		},
-		bus:       tm.parent.bus,
-		sub:       tm.parent.bus.Subscribe(id, 100),
-		pause:     make(chan bool),
-		quit:      make(chan struct{}),
-		rate:       RateReactive,
-		agentRate:  RateNormal,
-		agentSleep: 10 * time.Second,
-		maxHistory: historyLimit,
-		memory:    tm.parent.memory,
-		session:   NewSession(".", id),
-		onStop:    func() { tm.cleanupThread(id) },
-		threadID:  id,
+		bus:           tm.parent.bus,
+		sub:           tm.parent.bus.Subscribe(id, 100),
+		pause:         make(chan bool),
+		quit:          make(chan struct{}),
+		rate:          RateReactive,
+		agentRate:     RateNormal,
+		agentSleep:    10 * time.Second,
+		maxHistory:    historyLimit,
+		memory:        tm.parent.memory,
+		session:       NewSession(".", id),
+		onStop:        func() { tm.cleanupThread(id) },
+		threadID:      id,
 		apiLog:        tm.parent.apiLog,
 		apiMu:         tm.parent.apiMu,
 		apiNotify:     tm.parent.apiNotify,
@@ -537,7 +537,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		},
 	}
 	thread.Thinker = thinker
-	thinker.telemetry = tm.parent.telemetry // share telemetry
+	thinker.telemetry = tm.parent.telemetry     // share telemetry
+	thinker.execution = tm.parent.execution     // share instance-level execution control
+	thinker.checkpoints = tm.parent.checkpoints // share instance-level restore checkpoints
 
 	// Set up Children ThreadManager for leaders (depth < MaxSpawnDepth)
 	if canSpawn {
@@ -1026,22 +1028,28 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			subCount = t.Children.Count()
 		}
 		infos = append(infos, ThreadInfo{
-			ID:        t.ID,
-			Name:      t.Name,
-			ParentID:  t.ParentID,
-			Depth:     t.Depth,
-			Directive: t.Directive,
-			Tools:     toolSetToSlice(t.Tools),
-			Running:   true,
-			Iteration: t.Thinker.iteration,
-			Rate:         t.Thinker.rate,
-			Model:        t.Thinker.model,
-			Provider:     providerName,
-			Started:      t.Started,
-			ContextMsgs:  len(t.Thinker.messages),
-			ContextChars: func() int { n := 0; for _, m := range t.Thinker.messages { n += len(m.Content) }; return n }(),
-			MCPNames:     t.MCPNames,
-			SubThreads:   subCount,
+			ID:          t.ID,
+			Name:        t.Name,
+			ParentID:    t.ParentID,
+			Depth:       t.Depth,
+			Directive:   t.Directive,
+			Tools:       toolSetToSlice(t.Tools),
+			Running:     true,
+			Iteration:   t.Thinker.iteration,
+			Rate:        t.Thinker.rate,
+			Model:       t.Thinker.model,
+			Provider:    providerName,
+			Started:     t.Started,
+			ContextMsgs: len(t.Thinker.messages),
+			ContextChars: func() int {
+				n := 0
+				for _, m := range t.Thinker.messages {
+					n += len(m.Content)
+				}
+				return n
+			}(),
+			MCPNames:   t.MCPNames,
+			SubThreads: subCount,
 		})
 	}
 	// Sort by ID for deterministic order

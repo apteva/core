@@ -652,7 +652,10 @@ type Thinker struct {
 	threadID  string // "main" for main thinker, thread ID for sub-threads
 
 	// Telemetry — shared across all threads, owned by main thinker
-	telemetry *Telemetry
+	telemetry   *Telemetry
+	execution   *ExecutionController
+	checkpoints *ExecutionCheckpointStore
+	restarting  bool
 
 	// Live MCP connections — servers connected at runtime
 	mcpServers []MCPConn
@@ -770,23 +773,25 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		messages: []Message{
 			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil, nil)},
 		},
-		config:     config,
-		bus:        bus,
-		sub:        bus.Subscribe("main", 100),
-		pause:      make(chan bool, 1),
-		quit:       make(chan struct{}),
-		rate:       RateSlow,
-		agentRate:  RateSlow,
-		agentSleep: 30 * time.Second,
-		memory:     NewMemoryStore(apiKey),
-		session:    NewSession(".", "main"),
-		apiLog:     &[]APIEvent{},
-		apiMu:      &sync.RWMutex{},
-		apiNotify:  make(chan struct{}, 1),
-		threadID:   "main",
-		maxHistory: maxHistoryMain,
-		telemetry:  NewTelemetry(),
-		blobs:      NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
+		config:      config,
+		bus:         bus,
+		sub:         bus.Subscribe("main", 100),
+		pause:       make(chan bool, 1),
+		quit:        make(chan struct{}),
+		rate:        RateSlow,
+		agentRate:   RateSlow,
+		agentSleep:  30 * time.Second,
+		memory:      NewMemoryStore(apiKey),
+		session:     NewSession(".", "main"),
+		apiLog:      &[]APIEvent{},
+		apiMu:       &sync.RWMutex{},
+		apiNotify:   make(chan struct{}, 1),
+		threadID:    "main",
+		maxHistory:  maxHistoryMain,
+		telemetry:   NewTelemetry(),
+		execution:   NewExecutionController(config.GetExecutionControl()),
+		checkpoints: NewExecutionCheckpointStore(),
+		blobs:       NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
 	}
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
@@ -930,6 +935,130 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	}
 
 	return t
+}
+
+func (t *Thinker) executionStatus() ExecutionControlStatus {
+	if t == nil || t.execution == nil {
+		return NewExecutionController(ExecutionControlConfig{}).Status()
+	}
+	st := t.execution.Status()
+	threadID := st.ActiveThreadID
+	if threadID == "" {
+		threadID = t.threadID
+	}
+	if st.Waiting && t.checkpoints != nil {
+		if meta := t.checkpoints.RestoreTargetBeforeGate(ExecutionGate{
+			ThreadID:  threadID,
+			Phase:     ExecutionPhase(st.Phase),
+			Iteration: st.Iteration,
+			Tool:      st.Tool,
+			CallID:    st.CallID,
+		}); meta != nil {
+			st.CanRestore = true
+			st.RestoreCheckpointID = meta.ID
+			st.RestoreSummary = meta.Summary
+			st.RestorePhase = meta.Phase
+		}
+	}
+	return st
+}
+
+func (t *Thinker) executionGate(phase ExecutionPhase, meta ExecutionGate) bool {
+	if t == nil || t.execution == nil {
+		return true
+	}
+	meta.ThreadID = t.threadID
+	meta.Phase = phase
+	if meta.Iteration == 0 {
+		meta.Iteration = t.iteration
+	}
+	if t.checkpoints != nil {
+		t.checkpoints.Capture(t, meta)
+	}
+	return t.execution.Wait(meta, t.quit, func(eventType string, data ExecutionPhaseData) {
+		if t.telemetry != nil {
+			t.telemetry.Emit(eventType, data.ThreadID, data)
+		}
+	})
+}
+
+func (t *Thinker) executionCheckpointMeta() []ExecutionCheckpointMeta {
+	if t == nil || t.checkpoints == nil {
+		return nil
+	}
+	return t.checkpoints.ListMeta()
+}
+
+func (t *Thinker) restoreExecutionCheckpoint(checkpointID string) (*ExecutionCheckpointMeta, error) {
+	if t == nil || t.checkpoints == nil {
+		return nil, fmt.Errorf("no checkpoints available")
+	}
+	cp, ok := t.checkpoints.Get(checkpointID)
+	if !ok {
+		return nil, fmt.Errorf("checkpoint not found")
+	}
+	target := findThinkerByID(t, cp.ThreadID)
+	if target == nil {
+		return nil, fmt.Errorf("thread %q not found", cp.ThreadID)
+	}
+	if err := target.restoreFromExecutionCheckpoint(cp); err != nil {
+		return nil, err
+	}
+	meta := cp.ExecutionCheckpointMeta
+	meta.Args = copyStringMap(cp.Args)
+	if t.telemetry != nil {
+		t.telemetry.Emit("execution.restored", meta.ThreadID, map[string]any{
+			"checkpoint_id":   meta.ID,
+			"checkpoint_time": meta.CreatedAt,
+			"phase":           meta.Phase,
+			"iteration":       meta.Iteration,
+			"tool":            meta.Tool,
+			"summary":         meta.Summary,
+		})
+	}
+	return &meta, nil
+}
+
+func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error {
+	t.restarting = true
+	if t.execution == nil || !t.execution.CancelThread(t.threadID) {
+		t.restarting = false
+		return fmt.Errorf("thread %q is not waiting at an execution gate", t.threadID)
+	}
+
+	t.messages = cloneMessages(cp.messages)
+	if len(t.messages) == 0 {
+		t.messages = []Message{{Role: "system", Content: ""}}
+	}
+	if t.rebuildPrompt != nil {
+		t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
+	}
+	t.activeTools = copyBoolMap(cp.activeTools)
+	t.activeToolAge = copyIntMap(cp.activeToolAge)
+	t.rate = cp.rate
+	t.agentRate = cp.agentRate
+	t.agentSleep = cp.agentSleep
+	t.model = cp.model
+	t.agentModel = cp.agentModel
+	t.directive = cp.directive
+	t.iteration = cp.Iteration
+	t.pendingTools = sync.Map{}
+	t.placeholdersSent = sync.Map{}
+	t.lastInboundForPreload = ""
+	restoreToInput := cp.Phase == string(ExecutionPhaseInputReady)
+	t.kickNextTurn = !restoreToInput
+	t.paused = restoreToInput
+
+	if t.session != nil {
+		t.session.Delete()
+		t.session = NewSession(".", t.threadID)
+		for _, msg := range t.messages[1:] {
+			t.session.AppendMessage(msg, t.iteration, TokenUsage{})
+		}
+	}
+
+	go t.Run()
+	return nil
 }
 
 const (
@@ -1441,6 +1570,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 
 func (t *Thinker) Run() {
 	defer func() {
+		if t.restarting {
+			t.restarting = false
+			return
+		}
 		if t.onStop != nil {
 			t.onStop()
 		}
@@ -1494,6 +1627,9 @@ func (t *Thinker) Run() {
 
 		t.iteration++
 		logMsg("RUN", fmt.Sprintf("[%s] iteration #%d start, rate=%s", t.threadID, t.iteration, t.rate.String()))
+		if !t.executionGate(ExecutionPhaseIterationStart, ExecutionGate{Summary: "Iteration starting"}) {
+			return
+		}
 
 		// Drain events from bus, optionally filter/route
 		drained := t.drainEvents()
@@ -1529,6 +1665,10 @@ func (t *Thinker) Run() {
 			}
 		}
 		t.sweepStalePlaceholders()
+
+		if !t.executionGate(ExecutionPhaseInputReady, ExecutionGate{Summary: fmt.Sprintf("Input ready: %d events, %d tool results", len(consumed), len(toolResults))}) {
+			return
+		}
 
 		if len(consumed) > 0 {
 			logMsg("RUN", fmt.Sprintf("[%s] drained %d events (media_parts=%d)", t.threadID, len(consumed), len(mediaParts)))
@@ -1685,6 +1825,9 @@ func (t *Thinker) Run() {
 		t.lastInboundForPreload = strings.Join(consumed, "\n")
 
 		start := time.Now()
+		if !t.executionGate(ExecutionPhaseLLMStart, ExecutionGate{Summary: fmt.Sprintf("Calling %s", t.modelID())}) {
+			return
+		}
 		chatResp, err := t.think()
 
 		// Fallback: if the provider errored and we have alternatives, try next in pool
@@ -1719,6 +1862,22 @@ func (t *Thinker) Run() {
 				return
 			}
 			continue
+		}
+		var llmSummary string
+		if len(chatResp.ToolCalls) > 0 {
+			var names []string
+			for _, ntc := range chatResp.ToolCalls {
+				names = append(names, ntc.Name)
+			}
+			llmSummary = fmt.Sprintf("Returned %d tool calls: %s", len(chatResp.ToolCalls), strings.Join(names, ", "))
+		} else {
+			llmSummary = truncateStr(strings.TrimSpace(reply), 240)
+		}
+		if llmSummary == "" {
+			llmSummary = "LLM response completed"
+		}
+		if !t.executionGate(ExecutionPhaseLLMDone, ExecutionGate{Summary: llmSummary}) {
+			return
 		}
 
 		// Build assistant message — may include native tool calls.
@@ -1787,6 +1946,14 @@ func (t *Thinker) Run() {
 			for _, ntc := range chatResp.ToolCalls {
 				// Intercept computer_use calls — execute via Computer interface with image ToolResults
 				if isComputerUseTool(ntc.Name) && t.computer != nil {
+					if !t.executionGate(ExecutionPhaseToolBefore, ExecutionGate{
+						Tool:    ntc.Name,
+						CallID:  ntc.ID,
+						Summary: toolSummary(ntc.Name, ntc.Args),
+						Args:    ntc.Args,
+					}) {
+						return
+					}
 					go t.executeComputerAction(ntc)
 					continue
 				}
@@ -1798,7 +1965,44 @@ func (t *Thinker) Run() {
 		var toolNames []string
 		var inlineResults []ToolResult
 		if t.handleTools != nil {
+			for _, call := range calls {
+				if !t.executionGate(ExecutionPhaseToolBefore, ExecutionGate{
+					Tool:    call.Name,
+					CallID:  call.NativeID,
+					Summary: toolSummary(call.Name, call.Args),
+					Args:    call.Args,
+				}) {
+					return
+				}
+			}
 			replies, toolNames, inlineResults = t.handleTools(t, calls, consumed)
+			toolNameByCallID := map[string]string{}
+			for _, call := range calls {
+				if call.NativeID != "" {
+					toolNameByCallID[call.NativeID] = call.Name
+				}
+			}
+			for i, result := range inlineResults {
+				toolName := ""
+				if result.CallID != "" {
+					toolName = toolNameByCallID[result.CallID]
+				}
+				if toolName == "" && i < len(calls) {
+					toolName = calls[i].Name
+				}
+				summary := "Tool result ready"
+				if toolName != "" {
+					summary = toolName + " result ready"
+				}
+				if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
+					Tool:    toolName,
+					CallID:  result.CallID,
+					Summary: summary,
+					Result:  result.Content,
+				}) {
+					return
+				}
+			}
 		}
 
 		// Inject results for inline-handled tools (pace, spawn, kill, etc.)
@@ -1919,6 +2123,9 @@ func (t *Thinker) Run() {
 				Message:          thoughtLog,
 			})
 		}
+		if !t.executionGate(ExecutionPhaseIterationDone, ExecutionGate{Summary: fmt.Sprintf("Iteration done; sleeping %s", sleepSummary(sleepDur))}) {
+			return
+		}
 
 		// Check if session needs compaction (background, non-blocking)
 		if t.session != nil && t.session.NeedsCompaction() {
@@ -1938,6 +2145,9 @@ func (t *Thinker) Run() {
 
 		// Interruptible sleep — wakes on new event, quit, or pause
 		logMsg("RUN", fmt.Sprintf("[%s] sleeping %s", t.threadID, formatSleep(sleepDur)))
+		if !t.executionGate(ExecutionPhaseSleepBefore, ExecutionGate{Summary: fmt.Sprintf("Sleeping %s", sleepSummary(sleepDur))}) {
+			return
+		}
 		select {
 		case <-time.After(sleepDur):
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
@@ -2300,10 +2510,14 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 }
 
 func (t *Thinker) ReloadDirective() {
+	t.ReloadDirectiveQuiet()
+	t.InjectConsole("Directive updated to: " + t.directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
+}
+
+func (t *Thinker) ReloadDirectiveQuiet() {
 	directive := t.config.GetDirective()
 	t.directive = directive
 	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
-	t.InjectConsole("Directive updated to: " + directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
 }
 
 // Inject sends a message event to this thinker's bus subscription.
@@ -2535,13 +2749,22 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 				ID: ntc.ID, Name: ntc.Name, DurationMs: duration.Milliseconds(), Success: false, Result: err.Error(),
 			})
 		}
+		errContent := fmt.Sprintf("Error: %v", err)
+		if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
+			Tool:    ntc.Name,
+			CallID:  ntc.ID,
+			Summary: "Computer error ready",
+			Result:  errContent,
+		}) {
+			return
+		}
 		// Inject as tool result with error
 		t.bus.Publish(Event{
 			Type: EventInbox, To: t.threadID,
 			Text: fmt.Sprintf("[tool:computer_use] error: %v", err),
 			ToolResult: &ToolResult{
 				CallID:  ntc.ID,
-				Content: fmt.Sprintf("Error: %v", err),
+				Content: errContent,
 				IsError: true,
 			},
 		})
@@ -2574,6 +2797,15 @@ func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
 		}
 		ref := t.blobs.Put(mime, screenshot)
 		content += fmt.Sprintf(" To forward these exact bytes to another tool, pass the file handle %s as that tool's bytes argument.", ref)
+	}
+
+	if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
+		Tool:    ntc.Name,
+		CallID:  ntc.ID,
+		Summary: "Computer screenshot ready",
+		Result:  content,
+	}) {
+		return
 	}
 
 	// Inject as tool result with screenshot image

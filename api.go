@@ -53,6 +53,7 @@ func startAPI(thinker *Thinker, addr string) error {
 	mux.HandleFunc("/realtime/audio", api.apiAuth(api.realtimeAudioHandler))
 	mux.HandleFunc("/events", api.apiAuth(api.events))
 	mux.HandleFunc("/pause", api.apiAuth(api.pause))
+	mux.HandleFunc("/control", api.apiAuth(api.control))
 	mux.HandleFunc("/event", api.apiAuth(api.postEvent))
 	mux.HandleFunc("/config", api.apiAuth(api.config))
 	// Memory inspection/editing.
@@ -80,14 +81,16 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(a.startTime)
 
 	writeJSON(w, map[string]any{
-		"uptime_seconds": int(elapsed.Seconds()),
-		"iteration":      a.thinker.iteration,
-		"rate":           formatSleep(a.thinker.agentSleep),
-		"model":          a.thinker.model.String(),
-		"threads":        a.thinker.threads.Count() + 1, // +1 for main
-		"memories":       a.thinker.memory.Count(),
-		"paused":         a.thinker.paused,
-		"mode":           a.thinker.config.GetMode(),
+		"uptime_seconds":        int(elapsed.Seconds()),
+		"iteration":             a.thinker.iteration,
+		"rate":                  formatSleep(a.thinker.agentSleep),
+		"model":                 a.thinker.model.String(),
+		"threads":               a.thinker.threads.Count() + 1, // +1 for main
+		"memories":              a.thinker.memory.Count(),
+		"paused":                a.thinker.paused,
+		"mode":                  a.thinker.config.GetMode(),
+		"execution_control":     a.thinker.executionStatus(),
+		"execution_checkpoints": a.thinker.executionCheckpointMeta(),
 	})
 }
 
@@ -496,6 +499,57 @@ func (a *APIServer) pause(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"paused": paused})
 }
 
+func (a *APIServer) control(w http.ResponseWriter, r *http.Request) {
+	logMsg("API", "POST /control")
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body ExecutionControlAction
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if a.thinker.execution == nil {
+		a.thinker.execution = NewExecutionController(a.thinker.config.GetExecutionControl())
+	}
+	if strings.ToLower(strings.TrimSpace(body.Action)) == "restore_checkpoint" {
+		meta, err := a.thinker.restoreExecutionCheckpoint(body.CheckpointID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cfg := a.thinker.execution.Config()
+		cfg.Mode = ExecutionStep
+		if body.Mode == ExecutionPaused || body.Mode == ExecutionAuto {
+			cfg.Mode = body.Mode
+		}
+		a.thinker.execution.ApplyConfig(cfg)
+		a.thinker.config.SetExecutionControl(cfg)
+		status := a.thinker.executionStatus()
+		if a.thinker.telemetry != nil {
+			a.thinker.telemetry.Emit("execution.mode_changed", "main", status)
+		}
+		writeJSON(w, map[string]any{
+			"status":            "restored",
+			"checkpoint":        meta,
+			"execution_control": status,
+		})
+		return
+	}
+	status, err := a.thinker.execution.Control(body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	cfg := a.thinker.execution.Config()
+	a.thinker.config.SetExecutionControl(cfg)
+	if a.thinker.telemetry != nil {
+		a.thinker.telemetry.Emit("execution.mode_changed", "main", status)
+	}
+	writeJSON(w, map[string]any{"status": "accepted", "execution_control": status})
+}
+
 func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	logMsg("API", "POST /event")
 	if r.Method != http.MethodPost {
@@ -634,21 +688,24 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSON(w, map[string]any{
-			"directive":   a.thinker.config.GetDirective(),
-			"mode":        a.thinker.config.GetMode(),
-			"provider":    providerInfo,
-			"providers":   a.thinker.config.GetProviders(),
-			"computer":    computerInfo,
-			"mcp_servers": mcpInfo,
+			"directive":             a.thinker.config.GetDirective(),
+			"mode":                  a.thinker.config.GetMode(),
+			"provider":              providerInfo,
+			"providers":             a.thinker.config.GetProviders(),
+			"computer":              computerInfo,
+			"mcp_servers":           mcpInfo,
+			"execution_control":     a.thinker.executionStatus(),
+			"execution_checkpoints": a.thinker.executionCheckpointMeta(),
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive  string            `json:"directive,omitempty"`
-			Mode       RunMode           `json:"mode,omitempty"`
-			Provider   *ProviderConfig   `json:"provider,omitempty"`
-			Providers  []ProviderConfig  `json:"providers,omitempty"`
-			Computer   *ComputerConfig   `json:"computer,omitempty"`
-			MCPServers []MCPServerConfig `json:"mcp_servers,omitempty"`
+			Directive  string                  `json:"directive,omitempty"`
+			Mode       RunMode                 `json:"mode,omitempty"`
+			Provider   *ProviderConfig         `json:"provider,omitempty"`
+			Providers  []ProviderConfig        `json:"providers,omitempty"`
+			Computer   *ComputerConfig         `json:"computer,omitempty"`
+			MCPServers []MCPServerConfig       `json:"mcp_servers,omitempty"`
+			Execution  *ExecutionControlConfig `json:"execution_control,omitempty"`
 			Reset      *struct {
 				History bool `json:"history,omitempty"`
 				Memory  bool `json:"memory,omitempty"`
@@ -661,12 +718,21 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Directive != "" {
 			a.thinker.config.SetDirective(body.Directive)
-			a.thinker.ReloadDirective()
+			a.thinker.ReloadDirectiveQuiet()
 		}
 		if body.Mode == ModeAutonomous || body.Mode == ModeCautious || body.Mode == ModeLearn {
 			a.thinker.config.SetMode(body.Mode)
 			if a.thinker.telemetry != nil {
 				a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
+			}
+		}
+		if body.Execution != nil {
+			a.thinker.config.SetExecutionControl(*body.Execution)
+			if a.thinker.execution != nil {
+				a.thinker.execution.ApplyConfig(*body.Execution)
+			}
+			if a.thinker.telemetry != nil {
+				a.thinker.telemetry.Emit("execution.mode_changed", "main", a.thinker.executionStatus())
 			}
 		}
 		logMsg("API", fmt.Sprintf("PUT /config: providers=%d provider=%v", len(body.Providers), body.Provider != nil))

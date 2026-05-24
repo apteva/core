@@ -124,7 +124,7 @@ func executeTool(t *Thinker, call toolCall) {
 			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
 				ID: call.NativeID, Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
 				Success: !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown"),
-				Result: resultSummary,
+				Result:  resultSummary,
 			})
 		}
 
@@ -158,6 +158,15 @@ func executeTool(t *Thinker, call toolCall) {
 				Type: EventInbox, To: t.threadID,
 				Text: lateText,
 			})
+			return
+		}
+
+		if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
+			Tool:    call.Name,
+			CallID:  call.NativeID,
+			Summary: "Tool result ready",
+			Result:  resultText,
+		}) {
 			return
 		}
 

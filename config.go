@@ -10,15 +10,15 @@ const configFile = "config.json"
 
 type PersistentThread struct {
 	ID        string   `json:"id"`
-	Name      string   `json:"name,omitempty"`       // human-readable label; empty = display as ID
-	ParentID  string   `json:"parent_id,omitempty"`  // empty = child of main
-	Depth     int      `json:"depth,omitempty"`      // 0 = main's direct child
-	System    bool     `json:"system,omitempty"`     // system thread (can't be killed by LLM)
+	Name      string   `json:"name,omitempty"`      // human-readable label; empty = display as ID
+	ParentID  string   `json:"parent_id,omitempty"` // empty = child of main
+	Depth     int      `json:"depth,omitempty"`     // 0 = main's direct child
+	System    bool     `json:"system,omitempty"`    // system thread (can't be killed by LLM)
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
-	MCPNames  []string `json:"mcp_names,omitempty"`  // MCP servers to connect on respawn
-	Realtime  bool     `json:"realtime,omitempty"`   // spawn as a realtime (voice/audio) thread
-	Voice     string   `json:"voice,omitempty"`      // realtime voice id (e.g. "alloy"); empty = provider default
+	MCPNames  []string `json:"mcp_names,omitempty"` // MCP servers to connect on respawn
+	Realtime  bool     `json:"realtime,omitempty"`  // spawn as a realtime (voice/audio) thread
+	Voice     string   `json:"voice,omitempty"`     // realtime voice id (e.g. "alloy"); empty = provider default
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
@@ -32,11 +32,11 @@ const (
 
 // ProviderConfig persists a provider and its model selections.
 type ProviderConfig struct {
-	Name           string            `json:"name"`                      // "google", "openai", "anthropic", "fireworks", "ollama", "openai-realtime"
-	Default        bool              `json:"default,omitempty"`         // true = default provider (first match wins)
-	Models         map[string]string `json:"models,omitempty"`          // "large" → model ID, "medium" → ..., "small" → ...
-	BuiltinTools   []string          `json:"builtin_tools,omitempty"`   // e.g. ["code_execution"]
-	RealtimeVoice  string            `json:"realtime_voice,omitempty"`  // default voice for realtime providers (e.g. "alloy")
+	Name          string            `json:"name"`                     // "google", "openai", "anthropic", "fireworks", "ollama", "openai-realtime"
+	Default       bool              `json:"default,omitempty"`        // true = default provider (first match wins)
+	Models        map[string]string `json:"models,omitempty"`         // "large" → model ID, "medium" → ..., "small" → ...
+	BuiltinTools  []string          `json:"builtin_tools,omitempty"`  // e.g. ["code_execution"]
+	RealtimeVoice string            `json:"realtime_voice,omitempty"` // default voice for realtime providers (e.g. "alloy")
 }
 
 // ComputerConfig holds the configuration for a computer use environment.
@@ -52,15 +52,16 @@ type ComputerConfig struct {
 type Config struct {
 	mu              sync.RWMutex
 	path            string
-	Directive       string             `json:"directive"`
-	Mode            RunMode            `json:"mode,omitempty"`
-	Unconscious     bool               `json:"unconscious,omitempty"`      // enable background memory consolidation thread
-	RealtimeEnabled bool               `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
-	Providers       []ProviderConfig   `json:"providers,omitempty"`        // multi-provider pool
-	Provider        *ProviderConfig    `json:"provider,omitempty"`         // legacy single-provider (auto-migrated to Providers on load)
-	Computer        *ComputerConfig    `json:"computer,omitempty"`
-	Threads         []PersistentThread `json:"threads,omitempty"`
-	MCPServers      []MCPServerConfig  `json:"mcp_servers,omitempty"`
+	Directive       string                 `json:"directive"`
+	Mode            RunMode                `json:"mode,omitempty"`
+	Unconscious     bool                   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
+	RealtimeEnabled bool                   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
+	Providers       []ProviderConfig       `json:"providers,omitempty"`        // multi-provider pool
+	Provider        *ProviderConfig        `json:"provider,omitempty"`         // legacy single-provider (auto-migrated to Providers on load)
+	Computer        *ComputerConfig        `json:"computer,omitempty"`
+	Threads         []PersistentThread     `json:"threads,omitempty"`
+	MCPServers      []MCPServerConfig      `json:"mcp_servers,omitempty"`
+	Execution       ExecutionControlConfig `json:"execution_control,omitempty"`
 }
 
 func NewConfig() *Config {
@@ -223,6 +224,26 @@ func (c *Config) SetMode(m RunMode) {
 	c.Save()
 }
 
+func (c *Config) GetExecutionControl() ExecutionControlConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := c.Execution
+	if len(c.Execution.Breakpoints) > 0 {
+		out.Breakpoints = append([]string(nil), c.Execution.Breakpoints...)
+	}
+	return out
+}
+
+func (c *Config) SetExecutionControl(ec ExecutionControlConfig) {
+	c.mu.Lock()
+	if len(ec.Breakpoints) > 0 {
+		ec.Breakpoints = append([]string(nil), ec.Breakpoints...)
+	}
+	c.Execution = ec
+	c.mu.Unlock()
+	c.Save()
+}
+
 // GetProviders returns a copy of the providers list.
 func (c *Config) GetProviders() []ProviderConfig {
 	c.mu.RLock()
@@ -366,4 +387,3 @@ func (c *Config) RemoveProvider(name string) {
 	c.mu.Unlock()
 	c.Save()
 }
-
