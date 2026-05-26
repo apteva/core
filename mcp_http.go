@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,6 +122,9 @@ func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []
 			// with SSE even for POSTs.
 			httpReq.Header.Set("Accept", "application/json, text/event-stream")
 		}
+		if agentID := os.Getenv("AGENT_ID"); agentID != "" && isAptevaAppMCPURL(currentURL) {
+			httpReq.Header.Set("X-Apteva-Caller-Agent", agentID)
+		}
 		if s.sessionID != "" {
 			httpReq.Header.Set("Mcp-Session-Id", s.sessionID)
 		}
@@ -164,6 +168,18 @@ func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []
 		return resp.Header, respBody, resp.StatusCode, nil
 	}
 	return nil, nil, 0, fmt.Errorf("too many redirects")
+}
+
+func isAptevaAppMCPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return false
+	}
+	return strings.HasPrefix(u.Path, "/api/apps/") && strings.HasSuffix(u.Path, "/mcp")
 }
 
 func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMessage, http.Header, error) {
