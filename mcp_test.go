@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"strings"
@@ -162,4 +163,31 @@ func TestCallToolParsesJSONArgs(t *testing.T) {
 
 	_ = strings.NewReader // keep import
 	_ = atomic.Int64{}    // keep import
+}
+
+func TestExtractMCPResultImageFromComputerScreenshot(t *testing.T) {
+	rawImage := []byte{0x89, 0x50, 0x4e, 0x47}
+	result := map[string]any{
+		"text": "Success: screenshot action completed. Screenshot attached.",
+		"screenshot": map[string]any{
+			"_binary":  true,
+			"base64":   base64.StdEncoding.EncodeToString(rawImage),
+			"mimeType": "image/png",
+			"size":     len(rawImage),
+		},
+		"screenshot_b64": base64.StdEncoding.EncodeToString(rawImage),
+		"current_url":    "https://example.com",
+	}
+	raw, _ := json.Marshal(result)
+
+	text, image := extractMCPResultImage(string(raw))
+	if string(image) != string(rawImage) {
+		t.Fatalf("image extraction mismatch: got %v want %v", image, rawImage)
+	}
+	if strings.Contains(text, "screenshot_b64") {
+		t.Fatalf("compacted text should not retain screenshot_b64: %s", text)
+	}
+	if !strings.Contains(text, "attached as image") || !strings.Contains(text, "https://example.com") {
+		t.Fatalf("compacted text missing useful fields: %s", text)
+	}
 }

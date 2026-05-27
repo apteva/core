@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -309,11 +310,57 @@ func mcpProxyHandler(server MCPConn, toolName string, blobs *BlobStore) func(arg
 		if err != nil {
 			return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
 		}
+		var image []byte
+		result, image = extractMCPResultImage(result)
 		if blobs != nil {
 			result = blobs.RewriteBinaryToHandle(result)
 		}
-		return ToolResponse{Text: result}
+		return ToolResponse{Text: result, Image: image}
 	}
+}
+
+func extractMCPResultImage(text string) (string, []byte) {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &obj); err != nil {
+		return text, nil
+	}
+	raw, ok := obj["screenshot"]
+	if !ok {
+		return text, nil
+	}
+	image, ok := decodeNestedBinaryImage(raw)
+	if !ok {
+		return text, nil
+	}
+	obj["screenshot"] = "attached as image"
+	delete(obj, "screenshot_b64")
+	if out, err := json.Marshal(obj); err == nil {
+		return string(out), image
+	}
+	return text, image
+}
+
+func decodeNestedBinaryImage(v any) ([]byte, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if binary, _ := m["_binary"].(bool); !binary {
+		return nil, false
+	}
+	mime, _ := m["mimeType"].(string)
+	if !strings.HasPrefix(mime, "image/") {
+		return nil, false
+	}
+	b64, _ := m["base64"].(string)
+	if b64 == "" {
+		return nil, false
+	}
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
 }
 
 // buildMCPSyntax generates [[tool arg1="..." arg2="..."]] syntax from MCP schema
