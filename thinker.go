@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/apteva/core/pkg/computer"
 )
 
 // Default context window sizes by role
@@ -74,7 +72,7 @@ func (t *Thinker) modelID() string {
 //     model is about to see a "blobref://" token and needs the rule
 //     to understand it. This is the strongest signal.
 //  2. A blob-producing local tool is registered (read_file, exec,
-//     computer_use, etc.) — these emit handles on the next call, so
+//     exec, etc.) — these emit handles on the next call, so
 //     the hint needs to ride even before the first blob appears.
 //  3. An MCP whose name hints at binary content (media, audio,
 //     image, file, video, deepgram, pdf) is attached to this thread
@@ -102,7 +100,7 @@ func shouldEmitBlobHint(registry *ToolRegistry, messages []Message, activeThread
 	for _, t := range registry.tools {
 		switch t.Name {
 		case "read_file", "list_files", "write_file",
-			"exec", "computer_use", "browser_session":
+			"exec":
 			return true
 		}
 	}
@@ -111,7 +109,7 @@ func shouldEmitBlobHint(registry *ToolRegistry, messages []Message, activeThread
 		"media": true, "audio": true, "image": true,
 		"file": true, "files": true, "video": true,
 		"deepgram": true, "pdf": true, "storage": true,
-		"gdrive": true,
+		"gdrive": true, "computer": true,
 	}
 	for _, t := range registry.tools {
 		if t.MCPServer != "" && binaryMCPs[t.MCPServer] {
@@ -324,7 +322,7 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		for _, name := range pool.Names() {
 			prompt += "- " + pool.ProviderSummary(name) + "\n"
 		}
-		prompt += "\nUse provider=\"name\" in spawn or pace to select a specific provider. Default: " + pool.DefaultName() + ".\n"
+		prompt += "\nUse provider=\"name\" in spawn or pace to select a specific provider. Use model=\"large|medium|small\" and reasoning=\"auto|none|minimal|low|medium|high|xhigh\" when a task needs a different model profile. Default provider: " + pool.DefaultName() + ".\n"
 	}
 
 	// activeThreads is intentionally NOT rendered here anymore — see
@@ -605,26 +603,27 @@ type APIEvent struct {
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 type Thinker struct {
-	apiKey     string
-	pool       *ProviderPool // all available providers (shared across threads)
-	provider   LLMProvider   // current active provider for this thinker
-	messages   []Message
-	bus        *EventBus
-	sub        *Subscription
-	pause      chan bool
-	quit       chan struct{}
-	iteration  int
-	paused     bool
-	rate       ThinkRate
-	agentRate  ThinkRate
-	agentSleep time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
-	model      ModelTier
-	agentModel ModelTier
-	memory     *MemoryStore
-	session    *Session
-	threads    *ThreadManager
-	config     *Config
-	registry   *ToolRegistry
+	apiKey         string
+	pool           *ProviderPool // all available providers (shared across threads)
+	provider       LLMProvider   // current active provider for this thinker
+	messages       []Message
+	bus            *EventBus
+	sub            *Subscription
+	pause          chan bool
+	quit           chan struct{}
+	iteration      int
+	paused         bool
+	rate           ThinkRate
+	agentRate      ThinkRate
+	agentSleep     time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
+	model          ModelTier
+	agentModel     ModelTier
+	agentReasoning ReasoningLevel
+	memory         *MemoryStore
+	session        *Session
+	threads        *ThreadManager
+	config         *Config
+	registry       *ToolRegistry
 
 	maxHistory int // max messages in context window (varies by role)
 
@@ -702,8 +701,10 @@ type Thinker struct {
 	// tool count). Derived from toolIndex; kept as a Thinker field
 	// for buildSystemPrompt back-compat.
 	mcpCatalog   []MCPServerInfo
-	computer     computer.Computer // screen-based environment (nil = no computer use)
-	pendingTools sync.Map          // tool call IDs with pending async results
+	pendingTools sync.Map // tool call IDs with pending async results
+
+	silentToolMu      sync.Mutex
+	silentToolResults []ToolResult
 
 	// Placeholders injected for tool calls that didn't finish within the
 	// iter-boundary wait barrier. Keyed by call id → placeholderInfo.
@@ -773,25 +774,26 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		messages: []Message{
 			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil, nil)},
 		},
-		config:      config,
-		bus:         bus,
-		sub:         bus.Subscribe("main", 100),
-		pause:       make(chan bool, 1),
-		quit:        make(chan struct{}),
-		rate:        RateSlow,
-		agentRate:   RateSlow,
-		agentSleep:  30 * time.Second,
-		memory:      NewMemoryStore(apiKey),
-		session:     NewSession(".", "main"),
-		apiLog:      &[]APIEvent{},
-		apiMu:       &sync.RWMutex{},
-		apiNotify:   make(chan struct{}, 1),
-		threadID:    "main",
-		maxHistory:  maxHistoryMain,
-		telemetry:   NewTelemetry(),
-		execution:   NewExecutionController(config.GetExecutionControl()),
-		checkpoints: NewExecutionCheckpointStore(),
-		blobs:       NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
+		config:         config,
+		bus:            bus,
+		sub:            bus.Subscribe("main", 100),
+		pause:          make(chan bool, 1),
+		quit:           make(chan struct{}),
+		rate:           RateSlow,
+		agentRate:      RateSlow,
+		agentSleep:     30 * time.Second,
+		agentReasoning: ReasoningAuto,
+		memory:         NewMemoryStore(apiKey),
+		session:        NewSession(".", "main"),
+		apiLog:         &[]APIEvent{},
+		apiMu:          &sync.RWMutex{},
+		apiNotify:      make(chan struct{}, 1),
+		threadID:       "main",
+		maxHistory:     maxHistoryMain,
+		telemetry:      NewTelemetry(),
+		execution:      NewExecutionController(config.GetExecutionControl()),
+		checkpoints:    NewExecutionCheckpointStore(),
+		blobs:          NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
 	}
 	t.threads = NewThreadManager(t)
 	t.registry = NewToolRegistry(apiKey)
@@ -844,9 +846,6 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		t.messages = append(t.messages, saved...)
 		logMsg("SESSION", fmt.Sprintf("loaded %d messages from history (%d compacted summaries)", len(saved), len(summaries)))
 	}
-
-	// Computer use environment is injected externally via SetComputer()
-
 	// Respawn persistent threads from config, sorted by depth (parents before children).
 	// DeferRun=true so all threads are created before any starts thinking.
 	// This ensures parents see their children in [ACTIVE SUB-THREADS] on first iteration.
@@ -856,6 +855,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	})
 	for _, pt := range persistedThreads {
 		parentID := pt.ParentID
+		ptReasoning, _ := parseReasoningLevel(pt.Reasoning)
 		// Skip persistent realtime threads on respawn when the feature
 		// is off. Without this, an instance that previously had
 		// realtime enabled would try to bring those threads back even
@@ -866,23 +866,27 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		}
 		if parentID == "" || parentID == "main" {
 			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-				ParentID: "main",
-				Depth:    pt.Depth,
-				DeferRun: true,
-				MCPNames: pt.MCPNames,
-				Realtime: pt.Realtime,
-				Voice:    pt.Voice,
+				ParentID:  "main",
+				Depth:     pt.Depth,
+				DeferRun:  true,
+				MCPNames:  pt.MCPNames,
+				Model:     pt.Model,
+				Reasoning: ptReasoning,
+				Realtime:  pt.Realtime,
+				Voice:     pt.Voice,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
 			if mgr != nil {
 				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-					ParentID: parentID,
-					Depth:    pt.Depth,
-					DeferRun: true,
-					MCPNames: pt.MCPNames,
-					Realtime: pt.Realtime,
-					Voice:    pt.Voice,
+					ParentID:  parentID,
+					Depth:     pt.Depth,
+					DeferRun:  true,
+					MCPNames:  pt.MCPNames,
+					Model:     pt.Model,
+					Reasoning: ptReasoning,
+					Realtime:  pt.Realtime,
+					Voice:     pt.Voice,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -1040,10 +1044,14 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 	t.agentSleep = cp.agentSleep
 	t.model = cp.model
 	t.agentModel = cp.agentModel
+	t.agentReasoning = cp.agentReasoning
 	t.directive = cp.directive
 	t.iteration = cp.Iteration
 	t.pendingTools = sync.Map{}
 	t.placeholdersSent = sync.Map{}
+	t.silentToolMu.Lock()
+	t.silentToolResults = nil
+	t.silentToolMu.Unlock()
 	t.lastInboundForPreload = ""
 	restoreToInput := cp.Phase == string(ExecutionPhaseInputReady)
 	t.kickNextTurn = !restoreToInput
@@ -1207,6 +1215,24 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				mediaStr := call.Args["media"]
 				mediaParts := parseMediaURLs(mediaStr)
 				providerName := call.Args["provider"]
+				modelName := strings.ToLower(strings.TrimSpace(call.Args["model"]))
+				if modelName != "" {
+					if _, ok := modelNames[modelName]; !ok {
+						addResult(fmt.Sprintf("error: invalid model %q (use large, medium, or small)", modelName))
+						toolNames = append(toolNames, call.Raw)
+						continue
+					}
+				}
+				reasoning := ReasoningAuto
+				if rawReasoning := reasoningArgValue(call.Args); rawReasoning != "" {
+					parsed, ok := parseReasoningLevel(rawReasoning)
+					if !ok {
+						addResult(fmt.Sprintf("error: invalid reasoning %q (use auto, none, minimal, low, medium, high, or xhigh)", rawReasoning))
+						toolNames = append(toolNames, call.Raw)
+						continue
+					}
+					reasoning = parsed
+				}
 				// MCP scoping: child thread preloads tools from these
 				// servers into its activeTools at boot. Accept both
 				// `mcps` (new, plural, preferred) and `mcp` (legacy
@@ -1265,6 +1291,8 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
 						MediaParts:   mediaParts,
 						ProviderName: providerName,
+						Model:        modelName,
+						Reasoning:    reasoning,
 						ParentID:     "main",
 						Depth:        0,
 						MCPNames:     mcpNames,
@@ -1278,7 +1306,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						addResult(fmt.Sprintf("error: %v", err))
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
-						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Realtime: realtime, Voice: voice})
+						t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Model: modelName, Reasoning: reasoning.String(), Realtime: realtime, Voice: voice})
 						// Notify-back reminder — same reason as kill's:
 						// spawn feels like a complete action, so the model
 						// is tempted to end the turn here, leaving any
@@ -1424,6 +1452,15 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if m, ok := modelNames[call.Args["model"]]; ok {
 					t.agentModel = m
 					parts = append(parts, "model="+call.Args["model"])
+				}
+				if rawReasoning := reasoningArgValue(call.Args); rawReasoning != "" {
+					if r, ok := parseReasoningLevel(rawReasoning); ok {
+						t.agentReasoning = r
+						parts = append(parts, "reasoning="+r.String())
+					} else {
+						addResult(fmt.Sprintf("error: invalid reasoning %q (use auto, none, minimal, low, medium, high, or xhigh)", rawReasoning))
+						continue
+					}
 				}
 				if pn := call.Args["provider"]; pn != "" && t.pool != nil {
 					if p := t.pool.Get(pn); p != nil {
@@ -1645,6 +1682,10 @@ func (t *Thinker) Run() {
 				toolResults = append(toolResults, *de.ToolResult)
 			}
 		}
+		if silentResults := t.drainSilentToolResults(); len(silentResults) > 0 {
+			toolResults = append(toolResults, silentResults...)
+			logMsg("RUN", fmt.Sprintf("[%s] drained %d silent tool results", t.threadID, len(silentResults)))
+		}
 
 		// --- Iter-boundary wait barrier for parallel async tool calls ---
 		// Without this, when the previous iteration dispatched N parallel
@@ -1775,7 +1816,7 @@ func (t *Thinker) Run() {
 			// Filter out tool result text from the events text (they're already in ToolResults)
 			var textEvents []string
 			for _, ev := range consumed {
-				if len(toolResults) > 0 && strings.HasPrefix(ev, "[tool:computer_use]") {
+				if len(toolResults) > 0 && strings.HasPrefix(ev, "[tool:") {
 					continue // skip, already handled as ToolResult
 				}
 				textEvents = append(textEvents, ev)
@@ -1944,19 +1985,6 @@ func (t *Thinker) Run() {
 		var calls []toolCall
 		if len(chatResp.ToolCalls) > 0 {
 			for _, ntc := range chatResp.ToolCalls {
-				// Intercept computer_use calls — execute via Computer interface with image ToolResults
-				if isComputerUseTool(ntc.Name) && t.computer != nil {
-					if !t.executionGate(ExecutionPhaseToolBefore, ExecutionGate{
-						Tool:    ntc.Name,
-						CallID:  ntc.ID,
-						Summary: toolSummary(ntc.Name, ntc.Args),
-						Args:    ntc.Args,
-					}) {
-						return
-					}
-					go t.executeComputerAction(ntc)
-					continue
-				}
 				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: ntc.Name, NativeID: ntc.ID})
 			}
 		}
@@ -2086,7 +2114,7 @@ func (t *Thinker) Run() {
 			Iteration: t.iteration, Duration: duration,
 			ConsumedEvents: consumed, Usage: usage,
 			ToolCalls: toolNames, Replies: replies,
-			Rate: t.rate, SleepDuration: sleepDur, Model: t.model,
+			Rate: t.rate, SleepDuration: sleepDur, Model: t.model, Reasoning: t.agentReasoning,
 			MemoryCount: t.memory.Count(), ThreadCount: threadCount,
 			ContextMsgs: len(t.messages), ContextChars: ctxChars,
 		})
@@ -2106,6 +2134,7 @@ func (t *Thinker) Run() {
 			model := t.modelID()
 			t.telemetry.Emit("llm.done", t.threadID, LLMDoneData{
 				Model:        model,
+				Reasoning:    t.agentReasoning.String(),
 				TokensIn:     usage.PromptTokens,
 				TokensCached: usage.CachedTokens,
 				TokensOut:    usage.CompletionTokens,
@@ -2240,23 +2269,6 @@ func (t *Thinker) think() (ChatResponse, error) {
 		nativeTools = t.registry.NativeTools(t.toolAllowlist, active)
 	}
 
-	// For Anthropic: add _display dimensions to computer_use tool params
-	// so the provider can extract them for the native spec
-	if t.computer != nil && t.provider != nil && t.provider.Name() == "anthropic" {
-		display := t.computer.DisplaySize()
-		logMsg("COMPUTER", fmt.Sprintf("injecting display dims for anthropic: %dx%d", display.Width, display.Height))
-		for i, nt := range nativeTools {
-			if nt.Name == "computer_use" {
-				if nativeTools[i].Parameters == nil {
-					nativeTools[i].Parameters = make(map[string]any)
-				}
-				nativeTools[i].Parameters["_display_width"] = display.Width
-				nativeTools[i].Parameters["_display_height"] = display.Height
-				break
-			}
-		}
-	}
-
 	onThinking := func(chunk string) {
 		if t.telemetry != nil && chunk != "" {
 			t.telemetry.EmitLive("llm.thinking", t.threadID, map[string]any{
@@ -2293,7 +2305,8 @@ func (t *Thinker) think() (ChatResponse, error) {
 	// a user-abort channel) so a slow stream can be unblocked from outside.
 	// For now context.Background() preserves prior behaviour — the request
 	// is now cancellable in principle, just nothing is wired to cancel it.
-	resp, err := t.provider.Chat(context.Background(), t.messages, t.modelID(), nativeTools, onChunk, onThinking, onToolChunk)
+	chatProvider := providerWithReasoning(t.provider, t.agentReasoning)
+	resp, err := chatProvider.Chat(context.Background(), t.messages, t.modelID(), nativeTools, onChunk, onThinking, onToolChunk)
 	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat exit model=%s dur=%s tool_calls=%d err=%v",
 		t.threadID, t.modelID(), time.Since(callStart).Round(time.Millisecond), len(resp.ToolCalls), err))
 	return resp, err
@@ -2341,6 +2354,29 @@ func (t *Thinker) pendingToolCount() int {
 		return true
 	})
 	return n
+}
+
+func (t *Thinker) queueSilentToolResult(result ToolResult) {
+	if t == nil {
+		return
+	}
+	t.silentToolMu.Lock()
+	t.silentToolResults = append(t.silentToolResults, result)
+	t.silentToolMu.Unlock()
+}
+
+func (t *Thinker) drainSilentToolResults() []ToolResult {
+	if t == nil {
+		return nil
+	}
+	t.silentToolMu.Lock()
+	defer t.silentToolMu.Unlock()
+	if len(t.silentToolResults) == 0 {
+		return nil
+	}
+	out := append([]ToolResult(nil), t.silentToolResults...)
+	t.silentToolResults = nil
+	return out
 }
 
 // waitForPendingTools implements the iteration-boundary barrier that
@@ -2399,6 +2435,10 @@ func (t *Thinker) waitForPendingTools(
 			default:
 			}
 			break
+		}
+		if silentResults := t.drainSilentToolResults(); len(silentResults) > 0 {
+			*toolResults = append(*toolResults, silentResults...)
+			logMsg("RUN", fmt.Sprintf("[%s] drained %d silent tool results while waiting for pending tools", t.threadID, len(silentResults)))
 		}
 		if t.pendingToolCount() == 0 {
 			logMsg("RUN", fmt.Sprintf("[%s] pending tools drained in %s", t.threadID, time.Since(start)))
@@ -2586,242 +2626,12 @@ func (t *Thinker) TogglePause() {
 	}
 }
 
-// Shutdown releases external resources held by the thinker: currently
-// only the computer-use browser session. Safe to call multiple times.
-// Used by the main signal handler so SIGTERM/SIGINT closes Chrome
-// (local) or REQUEST_RELEASEs the session (Browserbase) instead of
-// orphaning it when the server SIGKILLs core during instance stop.
-func (t *Thinker) Shutdown() {
-	if t == nil {
-		return
-	}
-	if c := t.computer; c != nil {
-		t.computer = nil
-		_ = c.Close()
-	}
-}
-
-// SetComputer attaches a computer use environment to this thinker.
-// Registers computer_use as a tool in the registry for non-Anthropic providers.
-func (t *Thinker) SetComputer(c computer.Computer) {
-	t.computer = c
-	if c != nil && t.registry != nil {
-		def := computer.GetComputerToolDef(c.DisplaySize())
-		// Register computer_use — screen interaction (no navigate)
-		comp := c
-		t.registry.Register(&ToolDef{
-			Name:        def.Name,
-			Description: def.Description,
-			Syntax:      def.Syntax,
-			Rules:       def.Rules,
-			InputSchema: def.Parameters,
-			Handler: func(args map[string]string) ToolResponse {
-				text, screenshot, err := computer.HandleComputerAction(comp, args)
-				if err != nil {
-					return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
-				}
-				return ToolResponse{Text: text, Image: screenshot}
-			},
-		})
-
-		// Register browser_session — session lifecycle (open/close/resume/status)
-		sessionDef := computer.GetSessionToolDef()
-		t.registry.Register(&ToolDef{
-			Name:        sessionDef.Name,
-			Description: sessionDef.Description,
-			Syntax:      sessionDef.Syntax,
-			Rules:       sessionDef.Rules,
-			InputSchema: sessionDef.Parameters,
-			Handler: func(args map[string]string) ToolResponse {
-				text, screenshot, err := computer.HandleSessionAction(comp, args)
-				if err != nil {
-					return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
-				}
-				return ToolResponse{Text: text, Image: screenshot}
-			},
-		})
-	}
-}
-
 func (t *Thinker) Stop() {
 	select {
 	case <-t.quit:
 	default:
 		close(t.quit)
 	}
-	// Clean up computer session
-	if t.computer != nil {
-		t.computer.Close()
-	}
-}
-
-// isComputerUseTool returns true if the tool name is a computer use tool from any provider.
-func isComputerUseTool(name string) bool {
-	switch name {
-	case "computer_use", "computer", "computer_use_2025", "computer_20250124":
-		return true
-	}
-	// Gemini native Computer Use actions
-	return computer.IsGeminiComputerAction(name)
-}
-
-// normalizeComputerAction converts provider-specific args to a computer.Action.
-func normalizeComputerAction(args map[string]string) computer.Action {
-	action := computer.Action{Type: computer.NormalizeActionType(args["action"])}
-
-	// Parse coordinate — providers use different formats
-	// Anthropic: coordinate=[x, y] as string; OpenAI: x=400, y=300
-	if coord := args["coordinate"]; coord != "" {
-		// Parse "[400, 300]" format
-		coord = strings.Trim(coord, "[] ")
-		parts := strings.Split(coord, ",")
-		if len(parts) == 2 {
-			fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &action.X)
-			fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &action.Y)
-		}
-	}
-	if x := args["x"]; x != "" {
-		fmt.Sscanf(x, "%d", &action.X)
-	}
-	if y := args["y"]; y != "" {
-		fmt.Sscanf(y, "%d", &action.Y)
-	}
-
-	action.Text = args["text"]
-	action.Key = args["key"]
-	action.Direction = args["direction"]
-	action.URL = args["url"]
-
-	if d := args["duration"]; d != "" {
-		fmt.Sscanf(d, "%d", &action.Duration)
-	}
-
-	// Set-of-Mark label. Providers may stringify a JSON integer as
-	// unquoted "1" or quoted "\"1\""; strip quotes and parse.
-	if lbl := strings.Trim(strings.TrimSpace(args["label"]), `"`); lbl != "" {
-		fmt.Sscanf(lbl, "%d", &action.Label)
-	}
-
-	return action
-}
-
-// executeComputerAction runs a computer_use action and injects the result as a proper ToolResult.
-func (t *Thinker) executeComputerAction(ntc NativeToolCall) {
-	if ntc.ID != "" {
-		t.pendingTools.Store(ntc.ID, ntc.Name)
-		defer t.pendingTools.Delete(ntc.ID)
-	}
-	logMsg("COMPUTER", fmt.Sprintf("action=%s args=%v", ntc.Name, ntc.Args))
-	reason := ntc.Args["_reason"]
-	delete(ntc.Args, "_reason")
-
-	// Emit tool.call telemetry
-	if t.telemetry != nil {
-		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
-			ID: ntc.ID, Name: ntc.Name, Args: ntc.Args, Reason: reason,
-		})
-	}
-	start := time.Now()
-
-	var screenshot []byte
-	var err error
-	var actionLabel string
-
-	// Gemini native Computer Use actions (click_at, type_text_at, etc.)
-	if computer.IsGeminiComputerAction(ntc.Name) {
-		var text string
-		text, screenshot, err = computer.HandleGeminiComputerAction(t.computer, ntc.Name, ntc.Args)
-		_ = text
-		actionLabel = ntc.Name
-	} else {
-		// Anthropic/generic computer_use (single tool with "action" arg)
-		action := normalizeComputerAction(ntc.Args)
-		actionLabel = action.Type
-		screenshot, err = t.computer.Execute(action)
-	}
-
-	duration := time.Since(start)
-
-	if err != nil {
-		logMsg("COMPUTER", fmt.Sprintf("error (%dms): %v", duration.Milliseconds(), err))
-		if t.telemetry != nil {
-			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-				ID: ntc.ID, Name: ntc.Name, DurationMs: duration.Milliseconds(), Success: false, Result: err.Error(),
-			})
-		}
-		errContent := fmt.Sprintf("Error: %v", err)
-		if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
-			Tool:    ntc.Name,
-			CallID:  ntc.ID,
-			Summary: "Computer error ready",
-			Result:  errContent,
-		}) {
-			return
-		}
-		// Inject as tool result with error
-		t.bus.Publish(Event{
-			Type: EventInbox, To: t.threadID,
-			Text: fmt.Sprintf("[tool:computer_use] error: %v", err),
-			ToolResult: &ToolResult{
-				CallID:  ntc.ID,
-				Content: errContent,
-				IsError: true,
-			},
-		})
-		t.bus.Publish(Event{Type: EventChunk, From: t.threadID,
-			Text: "\n← computer_use: error: " + err.Error() + "\n", Iteration: t.iteration})
-		return
-	}
-
-	logMsg("COMPUTER", fmt.Sprintf("done (%dms) screenshot=%d bytes", duration.Milliseconds(), len(screenshot)))
-	if t.telemetry != nil {
-		t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-			ID: ntc.ID, Name: ntc.Name, DurationMs: duration.Milliseconds(), Success: true,
-			Result: fmt.Sprintf("screenshot %d bytes", len(screenshot)),
-		})
-	}
-
-	// Also stash the screenshot bytes in the BlobStore and surface
-	// the handle in the result text. The Image field stays attached
-	// so vision input is unchanged — this is purely additive: gives
-	// the agent a way to forward these exact bytes to another tool
-	// (e.g. files_upload via storage MCP) without re-encoding from
-	// the vision channel (which it can't do anyway).
-	content := fmt.Sprintf("Success: %s action completed. A screenshot of the current screen is attached as an image. Examine it to see the result.", actionLabel)
-	if t.blobs != nil && len(screenshot) > 0 {
-		mime := "image/jpeg"
-		if len(screenshot) >= 8 &&
-			screenshot[0] == 0x89 && screenshot[1] == 0x50 &&
-			screenshot[2] == 0x4E && screenshot[3] == 0x47 {
-			mime = "image/png"
-		}
-		ref := t.blobs.Put(mime, screenshot)
-		content += fmt.Sprintf(" To forward these exact bytes to another tool, pass the file handle %s as that tool's bytes argument.", ref)
-	}
-
-	if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
-		Tool:    ntc.Name,
-		CallID:  ntc.ID,
-		Summary: "Computer screenshot ready",
-		Result:  content,
-	}) {
-		return
-	}
-
-	// Inject as tool result with screenshot image
-	t.bus.Publish(Event{
-		Type: EventInbox, To: t.threadID,
-		Text: fmt.Sprintf("[tool:computer_use] success: %s completed, screenshot attached (%d bytes, %dms)", actionLabel, len(screenshot), duration.Milliseconds()),
-		ToolResult: &ToolResult{
-			CallID:  ntc.ID,
-			Content: content,
-			Image:   screenshot,
-		},
-	})
-
-	t.bus.Publish(Event{Type: EventChunk, From: t.threadID,
-		Text:      fmt.Sprintf("\n← computer_use: screenshot (%d bytes, %dms)\n", len(screenshot), duration.Milliseconds()),
-		Iteration: t.iteration})
 }
 
 func encodeBase64(data []byte) string {

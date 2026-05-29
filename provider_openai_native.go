@@ -11,12 +11,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
-
-	"github.com/apteva/core/pkg/computer"
 )
 
-// OpenAINativeProvider uses the OpenAI Responses API for native computer use,
-// web_search, code_interpreter, and other OpenAI-specific features.
+// OpenAINativeProvider uses the OpenAI Responses API for web_search,
+// code_interpreter, and other OpenAI-specific features.
 // For OpenAI-compatible endpoints (Fireworks, Ollama, etc.), use OpenAICompatProvider.
 type OpenAINativeProvider struct {
 	name            string
@@ -27,6 +25,7 @@ type OpenAINativeProvider struct {
 	serverAPIKey    string
 	models          map[ModelTier]string
 	builtinTools    []string
+	reasoning       ReasoningSettings
 }
 
 func NewOpenAINativeProvider(apiKey string) LLMProvider {
@@ -100,6 +99,56 @@ func (p *OpenAINativeProvider) WithBuiltins(builtins []string) LLMProvider {
 	return &clone
 }
 
+func (p *OpenAINativeProvider) WithReasoning(settings ReasoningSettings) LLMProvider {
+	clone := *p
+	clone.reasoning = settings
+	return &clone
+}
+
+func (p *OpenAINativeProvider) requestReasoning(model string) *oaiReasoning {
+	level := normalizeReasoningLevel(p.reasoning.Level)
+	if p.Name() == "openai-codex" && level == ReasoningAuto {
+		return &oaiReasoning{Summary: "auto"}
+	}
+	if level == ReasoningAuto {
+		return nil
+	}
+	out := &oaiReasoning{Effort: openAIReasoningEffort(level, p.Name(), model)}
+	if level != ReasoningNone {
+		out.Summary = "auto"
+	}
+	return out
+}
+
+func openAIReasoningEffort(level ReasoningLevel, providerName, model string) string {
+	switch normalizeReasoningLevel(level) {
+	case ReasoningNone:
+		return "none"
+	case ReasoningMinimal:
+		if openAIModelSupportsXHigh(model) || providerName == "openai-codex" {
+			return "low"
+		}
+		return "minimal"
+	case ReasoningLow:
+		return "low"
+	case ReasoningMedium:
+		return "medium"
+	case ReasoningHigh:
+		return "high"
+	case ReasoningXHigh:
+		if openAIModelSupportsXHigh(model) || providerName == "openai-codex" {
+			return "xhigh"
+		}
+		return "high"
+	default:
+		return ""
+	}
+}
+
+func openAIModelSupportsXHigh(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "gpt-5.5")
+}
+
 // --- Responses API types ---
 
 type oaiResponsesRequest struct {
@@ -114,23 +163,22 @@ type oaiResponsesRequest struct {
 
 type oaiReasoning struct {
 	Summary string `json:"summary,omitempty"`
+	Effort  string `json:"effort,omitempty"`
 }
 
 // oaiInputItem is a polymorphic input item for the Responses API.
 type oaiInputItem struct {
-	Type    string `json:"type"`              // "message", "computer_call_output", "function_call", "function_call_output"
+	Type    string `json:"type"`              // "message", "function_call", "function_call_output"
 	ID      string `json:"id,omitempty"`      // for replaying Responses output items
 	Status  string `json:"status,omitempty"`  // for replaying Responses output items
 	Role    string `json:"role,omitempty"`    // for type=message
 	Content any    `json:"content,omitempty"` // string or []oaiContentBlock
 	Name    string `json:"name,omitempty"`    // for type=function_call
 
-	// computer_call_output / function_call fields
+	// function_call fields
 	CallID    string `json:"call_id,omitempty"`
-	Output    any    `json:"output,omitempty"`    // screenshot etc.
+	Output    any    `json:"output,omitempty"`
 	Arguments string `json:"arguments,omitempty"` // for type=function_call (JSON string)
-	Actions   any    `json:"actions,omitempty"`   // for type=computer_call (GA computer tool)
-	Action    any    `json:"action,omitempty"`    // for legacy computer-use-preview
 }
 
 type oaiContentBlock struct {
@@ -139,13 +187,6 @@ type oaiContentBlock struct {
 	ImageURL string `json:"image_url,omitempty"` // data:image/png;base64,...
 	Detail   string `json:"detail,omitempty"`    // "original", "high", "low"
 	FileURL  string `json:"file_url,omitempty"`  // URL or data URI for audio/files
-}
-
-type oaiComputerTool struct {
-	Type          string `json:"type"` // "computer"
-	DisplayWidth  int    `json:"display_width,omitempty"`
-	DisplayHeight int    `json:"display_height,omitempty"`
-	Environment   string `json:"environment,omitempty"`
 }
 
 type oaiFunctionTool struct {
@@ -165,7 +206,7 @@ type oaiStreamEvent struct {
 }
 
 type oaiOutputItem struct {
-	Type    string `json:"type"` // "message", "computer_call", "function_call"
+	Type    string `json:"type"` // "message", "function_call"
 	ID      string `json:"id,omitempty"`
 	Status  string `json:"status,omitempty"`
 	Role    string `json:"role,omitempty"`
@@ -174,12 +215,8 @@ type oaiOutputItem struct {
 		Text string `json:"text,omitempty"`
 	} `json:"content,omitempty"`
 
-	// computer_call fields
-	CallID  string          `json:"call_id,omitempty"`
-	Actions json.RawMessage `json:"actions,omitempty"`
-	Action  json.RawMessage `json:"action,omitempty"`
-
 	// function_call fields
+	CallID    string `json:"call_id,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 
@@ -188,23 +225,6 @@ type oaiOutputItem struct {
 		Type string `json:"type"`
 		Text string `json:"text,omitempty"`
 	} `json:"summary,omitempty"`
-}
-
-type oaiComputerAction struct {
-	Type     string   `json:"type"` // "click", "type", "keypress", "scroll", "drag", "move", "screenshot", "wait", "double_click"
-	X        int      `json:"x,omitempty"`
-	Y        int      `json:"y,omitempty"`
-	Button   string   `json:"button,omitempty"` // "left", "right", "middle"
-	Text     string   `json:"text,omitempty"`   // for "type"
-	Key      string   `json:"key,omitempty"`    // for "keypress"
-	ScrollX  int      `json:"scroll_x,omitempty"`
-	ScrollY  int      `json:"scroll_y,omitempty"`
-	StartX   int      `json:"start_x,omitempty"` // drag
-	StartY   int      `json:"start_y,omitempty"`
-	EndX     int      `json:"end_x,omitempty"`
-	EndY     int      `json:"end_y,omitempty"`
-	Duration int      `json:"duration,omitempty"` // wait ms
-	Keys     []string `json:"keys,omitempty"`     // modifier keys
 }
 
 func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
@@ -234,9 +254,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		Tools:  apiTools,
 		Stream: true,
 	}
-	if p.Name() == "openai-codex" {
-		reqBody.Reasoning = &oaiReasoning{Summary: "auto"}
-	}
+	reqBody.Reasoning = p.requestReasoning(model)
 	if p.forceStoreFalse {
 		store := false
 		reqBody.Store = &store
@@ -295,33 +313,9 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	return p.streamResponse(resp.Body, onChunk, onThinking, onToolChunk)
 }
 
-func (p *OpenAINativeProvider) buildAPITools(model string, tools []NativeTool) []any {
+func (p *OpenAINativeProvider) buildAPITools(_ string, tools []NativeTool) []any {
 	var apiTools []any
-	computerMode := p.openAIComputerMode()
 	for _, t := range tools {
-		if t.Name == "computer_use" {
-			if computerMode == "off" {
-				continue
-			}
-			if computerMode != "custom" && openAIModelSupportsNativeComputer(model) {
-				tool := oaiComputerTool{Type: "computer"}
-				if strings.HasPrefix(model, "computer-use-preview") {
-					tool.Type = "computer_use_preview"
-					tool.DisplayWidth, tool.DisplayHeight = 1280, 800
-					tool.Environment = "browser"
-					if w, ok := t.Parameters["_display_width"].(int); ok {
-						tool.DisplayWidth = w
-					}
-					if h, ok := t.Parameters["_display_height"].(int); ok {
-						tool.DisplayHeight = h
-					}
-				}
-				apiTools = append(apiTools, tool)
-				logMsg("OPENAI-NATIVE", fmt.Sprintf("native computer tool enabled mode=%s model=%s", computerMode, model))
-				continue
-			}
-			logMsg("OPENAI-NATIVE", fmt.Sprintf("computer_use exposed as function mode=%s model=%s", computerMode, model))
-		}
 		apiTools = append(apiTools, oaiFunctionTool{
 			Type:        "function",
 			Name:        t.Name,
@@ -330,29 +324,6 @@ func (p *OpenAINativeProvider) buildAPITools(model string, tools []NativeTool) [
 		})
 	}
 	return apiTools
-}
-
-func (p *OpenAINativeProvider) openAIComputerMode() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("APTEVA_OPENAI_COMPUTER_MODE"))) {
-	case "custom":
-		return "custom"
-	case "off":
-		return "off"
-	case "native":
-		return "native"
-	default:
-		if p.Name() == "openai-codex" {
-			return "custom"
-		}
-		return "native"
-	}
-}
-
-func openAIModelSupportsNativeComputer(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(model, "gpt-5.5") ||
-		strings.HasPrefix(model, "gpt-5.4") ||
-		strings.HasPrefix(model, "computer-use-preview")
 }
 
 func (p *OpenAINativeProvider) refreshRuntimeToken(ctx context.Context, force bool) error {
@@ -405,15 +376,6 @@ func (p *OpenAINativeProvider) instructionsFromMessages(messages []Message) stri
 // buildInput converts our Message slice to Responses API input items.
 func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 	var items []oaiInputItem
-	computerCallIDs := map[string]bool{}
-	useNativeComputerReplay := p.openAIComputerMode() != "custom"
-	for _, m := range messages {
-		for _, tc := range m.ToolCalls {
-			if useNativeComputerReplay && (computer.IsGeminiComputerAction(tc.Name) || isComputerUseTool(tc.Name)) {
-				computerCallIDs[tc.ID] = true
-			}
-		}
-	}
 
 	for _, m := range messages {
 		// System message
@@ -437,29 +399,14 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			for _, tr := range m.ToolResults {
 				if tr.Image != nil {
 					imageURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tr.Image)
-					if computerCallIDs[tr.CallID] && p.openAIComputerMode() != "custom" {
-						// Native OpenAI computer result.
-						items = append(items, oaiInputItem{
-							Type:   "computer_call_output",
-							CallID: tr.CallID,
-							Output: map[string]any{
-								"type":      "computer_screenshot",
-								"image_url": imageURL,
-							},
-						})
-					} else {
-						// Custom function-tool fallback: keep the screenshot in
-						// the tool result so vision-capable OpenAI models can
-						// inspect the page without the native computer tool.
-						items = append(items, oaiInputItem{
-							Type:   "function_call_output",
-							CallID: tr.CallID,
-							Output: []oaiContentBlock{
-								{Type: "input_text", Text: tr.Content},
-								{Type: "input_image", ImageURL: imageURL, Detail: "original"},
-							},
-						})
-					}
+					items = append(items, oaiInputItem{
+						Type:   "function_call_output",
+						CallID: tr.CallID,
+						Output: []oaiContentBlock{
+							{Type: "input_text", Text: tr.Content},
+							{Type: "input_image", ImageURL: imageURL, Detail: "original"},
+						},
+					})
 				} else {
 					// Function call output
 					items = append(items, oaiInputItem{
@@ -484,27 +431,13 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			}
 			// Then add each tool call as its original output item
 			for _, tc := range m.ToolCalls {
-				if useNativeComputerReplay && (computer.IsGeminiComputerAction(tc.Name) || isComputerUseTool(tc.Name)) {
-					// Computer call — reconstruct as computer_call item
-					argsAny := make(map[string]any, len(tc.Args))
-					for k, v := range tc.Args {
-						argsAny[k] = v
-					}
-					items = append(items, oaiInputItem{
-						Type:    "computer_call",
-						CallID:  tc.ID,
-						Status:  "completed",
-						Actions: []map[string]any{argsAny},
-					})
-				} else {
-					argsJSON, _ := json.Marshal(tc.Args)
-					items = append(items, oaiInputItem{
-						Type:      "function_call",
-						CallID:    tc.ID,
-						Name:      tc.Name,
-						Arguments: string(argsJSON),
-					})
-				}
+				argsJSON, _ := json.Marshal(tc.Args)
+				items = append(items, oaiInputItem{
+					Type:      "function_call",
+					CallID:    tc.ID,
+					Name:      tc.Name,
+					Arguments: string(argsJSON),
+				})
 			}
 			continue
 		}
@@ -555,13 +488,6 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 		pendingBuf strings.Builder
 	}
 	pendingFuncs := map[string]*pendingFunc{} // by item ID
-
-	// Track computer calls
-	type pendingComputer struct {
-		callID  string
-		actions []oaiComputerAction
-	}
-	var currentComputer *pendingComputer
 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -645,6 +571,11 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			}
 			json.Unmarshal([]byte(data), &delta)
 			pf, ok := pendingFuncs[delta.ItemID]
+			if !ok && delta.ItemID != "" {
+				pf = &pendingFunc{}
+				pendingFuncs[delta.ItemID] = pf
+				ok = true
+			}
 			if ok {
 				pf.args.WriteString(delta.Delta)
 				if pf.id == "" {
@@ -658,7 +589,7 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 				}
 			}
 
-		// Output item added (function_call, computer_call, message)
+		// Output item added (function_call, message)
 		case "response.output_item.added":
 			var item oaiOutputItem
 			json.Unmarshal(event.Item, &item)
@@ -666,8 +597,6 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			switch item.Type {
 			case "function_call":
 				pendingFuncs[item.ID] = &pendingFunc{id: item.CallID, name: item.Name}
-			case "computer_call":
-				currentComputer = &pendingComputer{callID: item.CallID}
 			}
 
 		// Output item done — finalize
@@ -679,6 +608,9 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			case "function_call":
 				pf, ok := pendingFuncs[item.ID]
 				if ok {
+					if item.Name != "" {
+						pf.name = item.Name
+					}
 					if item.CallID != "" {
 						pf.id = item.CallID
 					}
@@ -694,6 +626,9 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 					argsJSON := pf.args.String()
 					if argsJSON == "" {
 						argsJSON = item.Arguments
+						if argsJSON != "" && onToolChunk != nil && pf.name != "" {
+							onToolChunk(pf.name, pf.id, argsJSON)
+						}
 					}
 					if json.Unmarshal([]byte(argsJSON), &rawArgs) == nil {
 						for k, v := range rawArgs {
@@ -727,35 +662,6 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 					}
 				}
 
-			case "computer_call":
-				if currentComputer != nil {
-					// Parse actions from the completed item
-					var actions []oaiComputerAction
-					if len(item.Actions) > 0 {
-						json.Unmarshal(item.Actions, &actions)
-					}
-					if len(actions) == 0 && len(item.Action) > 0 {
-						var action oaiComputerAction
-						if json.Unmarshal(item.Action, &action) == nil && action.Type != "" {
-							actions = append(actions, action)
-						}
-					}
-
-					// Convert each action to a NativeToolCall
-					for i, action := range actions {
-						args := oaiActionToArgs(action)
-						callID := currentComputer.callID
-						if i > 0 {
-							callID = fmt.Sprintf("%s_%d", callID, i)
-						}
-						toolCalls = append(toolCalls, NativeToolCall{
-							ID:   callID,
-							Name: "computer_use",
-							Args: args,
-						})
-					}
-					currentComputer = nil
-				}
 			}
 
 		// Usage
@@ -814,7 +720,7 @@ func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {
 		summaryTextChars += len(s.Text)
 	}
 	logMsg("OPENAI-NATIVE-STREAM", fmt.Sprintf(
-		"%s item_meta type=%q status=%q id_present=%t call_id_present=%t name=%q content_count=%d content_types=%v content_text_chars=%d summary_count=%d summary_types=%v summary_text_chars=%d arguments_chars=%d actions_bytes=%d",
+		"%s item_meta type=%q status=%q id_present=%t call_id_present=%t name=%q content_count=%d content_types=%v content_text_chars=%d summary_count=%d summary_types=%v summary_text_chars=%d arguments_chars=%d",
 		eventType,
 		item.Type,
 		item.Status,
@@ -828,48 +734,5 @@ func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {
 		summaryTypes,
 		summaryTextChars,
 		len(item.Arguments),
-		len(item.Actions),
 	))
-}
-
-// oaiActionToArgs converts an OpenAI computer action to our standard args map.
-func oaiActionToArgs(a oaiComputerAction) map[string]string {
-	args := map[string]string{"action": a.Type}
-	switch a.Type {
-	case "click", "double_click", "move":
-		args["coordinate"] = fmt.Sprintf("[%d, %d]", a.X, a.Y)
-		if a.Button != "" {
-			args["button"] = a.Button
-		}
-	case "type":
-		args["text"] = a.Text
-	case "keypress":
-		args["key"] = a.Key
-	case "scroll":
-		args["coordinate"] = fmt.Sprintf("[%d, %d]", a.X, a.Y)
-		args["direction"] = "down"
-		if a.ScrollY < 0 {
-			args["direction"] = "up"
-		}
-		amount := a.ScrollY
-		if amount < 0 {
-			amount = -amount
-		}
-		if amount == 0 {
-			amount = 3
-		}
-		args["amount"] = fmt.Sprintf("%d", amount)
-	case "drag":
-		args["coordinate"] = fmt.Sprintf("[%d, %d]", a.StartX, a.StartY)
-		args["end_coordinate"] = fmt.Sprintf("[%d, %d]", a.EndX, a.EndY)
-	case "wait":
-		dur := a.Duration
-		if dur == 0 {
-			dur = 1000
-		}
-		args["duration"] = fmt.Sprintf("%d", dur)
-	case "screenshot":
-		// No extra args needed
-	}
-	return args
 }

@@ -25,18 +25,18 @@ type TelemetryEvent struct {
 
 // Telemetry collects events and forwards them to the server.
 type Telemetry struct {
-	mu             sync.Mutex
-	log            []TelemetryEvent // stored events (forwarded to server)
-	liveLog        []TelemetryEvent // all events including live-only (for SSE)
-	notify         chan struct{}
-	forwardCh      chan TelemetryEvent // serialized queue for live event forwarding
-	serverURL        string // server URL (e.g. "http://localhost:5280")
-	telemetryURL     string // full URL for batched stored events
-	telemetryLiveURL string // full URL for live event forwarding
-	instanceSecret   string // shared secret for telemetry auth
-	instanceID     int64
-	seq            int64
-	quit           chan struct{}
+	mu               sync.Mutex
+	log              []TelemetryEvent // stored events (forwarded to server)
+	liveLog          []TelemetryEvent // all events including live-only (for SSE)
+	notify           chan struct{}
+	forwardCh        chan TelemetryEvent // serialized queue for live event forwarding
+	serverURL        string              // server URL (e.g. "http://localhost:5280")
+	telemetryURL     string              // full URL for batched stored events
+	telemetryLiveURL string              // full URL for live event forwarding
+	instanceSecret   string              // shared secret for telemetry auth
+	instanceID       int64
+	seq              int64
+	quit             chan struct{}
 
 	// dropCount tracks live-forward events dropped because forwardCh was
 	// full. We still drop (blocking Emit from the thinker hot path would
@@ -47,7 +47,7 @@ type Telemetry struct {
 
 func NewTelemetry() *Telemetry {
 	t := &Telemetry{
-		notify:    make(chan struct{}, 1),
+		notify: make(chan struct{}, 1),
 		// 5000-slot buffer (was 500) to absorb bursts during heavy tool
 		// activity like transcription runs without dropping events.
 		forwardCh: make(chan TelemetryEvent, 5000),
@@ -367,28 +367,29 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 // --- Convenience emitters with typed data ---
 
 type LLMDoneData struct {
-	Model        string  `json:"model"`
-	TokensIn     int     `json:"tokens_in"`
-	TokensCached int     `json:"tokens_cached"`
-	TokensOut    int     `json:"tokens_out"`
-	DurationMs   int64   `json:"duration_ms"`
+	Model        string `json:"model"`
+	Reasoning    string `json:"reasoning,omitempty"`
+	TokensIn     int    `json:"tokens_in"`
+	TokensCached int    `json:"tokens_cached"`
+	TokensOut    int    `json:"tokens_out"`
+	DurationMs   int64  `json:"duration_ms"`
 	// cost_usd is no longer populated by core — pricing lives in the
 	// server, which enriches llm.done events with a canonical
 	// cost_usd on ingest. Removing the field from the Go type keeps
 	// core free of pricing data, but the wire format is still the
 	// same map-of-strings consumed by dashboards and persisted by
 	// the server.
-	Iteration    int     `json:"iteration"`
-	Rate         string  `json:"rate"`
-	ContextMsgs  int     `json:"context_msgs"`
-	ContextChars int     `json:"context_chars"`
+	Iteration    int    `json:"iteration"`
+	Rate         string `json:"rate"`
+	ContextMsgs  int    `json:"context_msgs"`
+	ContextChars int    `json:"context_chars"`
 	// MaxContextTokens is the model's advertised input-context window
 	// (in tokens). Comes from a static lookup keyed on the model id —
 	// see ModelContextWindow. 0 when the model isn't in the table; UI
 	// should treat 0 as "unknown" and skip percentage rendering.
-	MaxContextTokens int `json:"max_context_tokens,omitempty"`
-	MemoryCount      int `json:"memory_count"`
-	ThreadCount      int `json:"thread_count"`
+	MaxContextTokens int    `json:"max_context_tokens,omitempty"`
+	MemoryCount      int    `json:"memory_count"`
+	ThreadCount      int    `json:"thread_count"`
 	Message          string `json:"message,omitempty"`
 }
 
@@ -587,4 +588,3 @@ func ModelContextWindow(modelID string) int {
 	}
 	return 0
 }
-

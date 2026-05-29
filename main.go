@@ -3,12 +3,9 @@ package core
 import (
 	"fmt"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
-	aptcomputer "github.com/apteva/computer"
 	"github.com/joho/godotenv"
 )
 
@@ -56,7 +53,7 @@ type InputAudio struct {
 }
 
 type AudioURL struct {
-	URL      string `json:"url"`                // https:// or data:audio/...;base64,...
+	URL      string `json:"url"`                 // https:// or data:audio/...;base64,...
 	MimeType string `json:"mime_type,omitempty"` // "audio/mp3", "audio/wav", etc. (auto-detected if empty)
 }
 
@@ -173,44 +170,6 @@ func Run() {
 	// access should reach it through the server's /instances/<id>/*
 	// proxy, which has its own auth layer.
 	go startAPI(thinker, "127.0.0.1:"+apiPort)
-
-	// Initialize computer use environment in background
-	if cfg.Computer != nil && cfg.Computer.Type != "" {
-		go func() {
-			comp, err := aptcomputer.New(aptcomputer.Config{
-				Type:      cfg.Computer.Type,
-				URL:       cfg.Computer.URL,
-				APIKey:    cfg.Computer.APIKey,
-				ProjectID: cfg.Computer.ProjectID,
-				Width:     cfg.Computer.Width,
-				Height:    cfg.Computer.Height,
-			})
-			if err != nil {
-				logMsg("BOOT", fmt.Sprintf("computer error: %v", err))
-			} else if comp != nil {
-				thinker.SetComputer(comp)
-				d := comp.DisplaySize()
-				logMsg("BOOT", fmt.Sprintf("computer ready: %s (%dx%d)", cfg.Computer.Type, d.Width, d.Height))
-			}
-		}()
-	}
-
-	// Trap SIGTERM/SIGINT so a server-initiated instance stop (or a
-	// manual Ctrl+C in headless mode) can release the local Chrome
-	// process or Browserbase session before the process exits. Without
-	// this, SIGKILL from the server's Stop() leaks Chrome (reparented
-	// to PID 1) and leaks paid Browserbase minutes. First signal runs
-	// Shutdown() and exits cleanly; a second signal after the deadline
-	// exits immediately in case Chrome's own SIGTERM hangs.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		<-sigCh
-		logMsg("SHUTDOWN", "signal received, releasing computer session")
-		thinker.Shutdown()
-		logMsg("SHUTDOWN", "done")
-		os.Exit(0)
-	}()
 
 	// Check for --headless flag or NO_TUI env var
 	headless := os.Getenv("NO_TUI") != ""

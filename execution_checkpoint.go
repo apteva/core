@@ -22,15 +22,16 @@ type ExecutionCheckpointMeta struct {
 
 type executionCheckpoint struct {
 	ExecutionCheckpointMeta
-	messages      []Message
-	activeTools   map[string]bool
-	activeToolAge map[string]int
-	rate          ThinkRate
-	agentRate     ThinkRate
-	agentSleep    time.Duration
-	model         ModelTier
-	agentModel    ModelTier
-	directive     string
+	messages       []Message
+	activeTools    map[string]bool
+	activeToolAge  map[string]int
+	rate           ThinkRate
+	agentRate      ThinkRate
+	agentSleep     time.Duration
+	model          ModelTier
+	agentModel     ModelTier
+	agentReasoning ReasoningLevel
+	directive      string
 }
 
 type ExecutionCheckpointStore struct {
@@ -63,15 +64,16 @@ func (s *ExecutionCheckpointStore) Capture(t *Thinker, gate ExecutionGate) *Exec
 			Args:      sanitizeExecutionArgs(gate.Args),
 			CreatedAt: time.Now(),
 		},
-		messages:      cloneMessages(t.messages),
-		activeTools:   copyBoolMap(t.activeTools),
-		activeToolAge: copyIntMap(t.activeToolAge),
-		rate:          t.rate,
-		agentRate:     t.agentRate,
-		agentSleep:    t.agentSleep,
-		model:         t.model,
-		agentModel:    t.agentModel,
-		directive:     t.directive,
+		messages:       cloneMessages(t.messages),
+		activeTools:    copyBoolMap(t.activeTools),
+		activeToolAge:  copyIntMap(t.activeToolAge),
+		rate:           t.rate,
+		agentRate:      t.agentRate,
+		agentSleep:     t.agentSleep,
+		model:          t.model,
+		agentModel:     t.agentModel,
+		agentReasoning: t.agentReasoning,
+		directive:      t.directive,
 	}
 	s.items = append(s.items, cp)
 	if len(s.items) > maxExecutionCheckpoints {

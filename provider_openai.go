@@ -26,9 +26,11 @@ type OpenAICompatProvider struct {
 	authHeader string // "Bearer" or empty for no auth (Ollama)
 }
 
-func (p *OpenAICompatProvider) Name() string                            { return p.name }
-func (p *OpenAICompatProvider) Models() map[ModelTier]string            { return p.models }
-func (p *OpenAICompatProvider) CostPer1M() (float64, float64, float64) { return p.inputCost, p.cachedCost, p.outputCost }
+func (p *OpenAICompatProvider) Name() string                 { return p.name }
+func (p *OpenAICompatProvider) Models() map[ModelTier]string { return p.models }
+func (p *OpenAICompatProvider) CostPer1M() (float64, float64, float64) {
+	return p.inputCost, p.cachedCost, p.outputCost
+}
 func (p *OpenAICompatProvider) SupportsNativeTools() bool {
 	// All OpenAI-compatible Chat Completions endpoints accept the
 	// `tools` field. Ollama is the lone exception in practice — tool
@@ -234,14 +236,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	if p.name == "openai" {
 		reqMap["stream_options"] = map[string]any{"include_usage": true}
 	}
-
-	// Add tools if provider supports them
-	// OpenAI native Computer Use uses the Responses API (computer_call/computer_call_output),
-	// which is a different API shape from Chat Completions. For Chat Completions (what we use),
-	// computer_use is handled as a regular function tool via SetComputer() — gpt-5.4 works
-	// well with custom tool harnesses (Option 2 in their docs).
-	// We skip computer_use/browser_session from the tools list for native OpenAI since
-	// they're handled by the thinker's computer interceptor.
+	// Add tools if provider supports them.
 	if len(tools) > 0 && p.SupportsNativeTools() {
 		var defs []openaiToolDef
 		for _, t := range tools {

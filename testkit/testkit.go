@@ -62,10 +62,10 @@ type Session struct {
 // Most tests should use zero-value New(t) and drive through env vars
 // (APTEVA_SERVER_URL, APTEVA_API_KEY, APTEVA_TEST_INSTANCE_ID).
 type Config struct {
-	ServerURL    string        // default: env APTEVA_SERVER_URL, else http://localhost:5280
-	APIKey       string        // default: env APTEVA_API_KEY
-	InstanceID   int64         // default: env APTEVA_TEST_INSTANCE_ID (if 0 and autostart, one is created)
-	ProjectID    string        // default: env APTEVA_TEST_PROJECT_ID
+	ServerURL  string // default: env APTEVA_SERVER_URL, else http://localhost:5280
+	APIKey     string // default: env APTEVA_API_KEY
+	InstanceID int64  // default: env APTEVA_TEST_INSTANCE_ID (if 0 and autostart, one is created)
+	ProjectID  string // default: env APTEVA_TEST_PROJECT_ID
 	// DisableAutoStart, when true, forbids spawning a server — tests
 	// then fail fast if APTEVA_SERVER_URL isn't already live. Useful
 	// for CI where you want the infrastructure pre-set and failures
@@ -122,35 +122,6 @@ type Config struct {
 	// cluttering their tool list.
 	IncludeAptevaServer bool
 	IncludeChannels     bool
-
-	// Computer enables the browser/computer-use tool surface
-	// (browser_session + computer_use) on the instance. When non-nil
-	// testkit forwards this block to PUT /api/instances/:id/config in
-	// the same call that lands the real directive + MCPs, so core
-	// spins up its computer backend before the agent's first real
-	// iteration. nil = no computer mode (default).
-	//
-	// Type=="browserbase"/"steel" relies on a saved provider in the
-	// project for credentials — the server enriches the block before
-	// forwarding to core. Type=="local" runs against a local Chrome
-	// (or an existing CDP endpoint if the matching `browser` provider
-	// has CDP_URL set). Type=="service" points at a custom HTTP
-	// browser service (URL required).
-	Computer *ComputerConfig
-}
-
-// ComputerConfig mirrors core.ComputerConfig (we restate the shape
-// here so testkit users don't have to import core just to flip on
-// browser tools). Only Type is required; Width/Height/URL/APIKey/
-// ProjectID are optional and the server fills in credentials from
-// saved providers when Type is "browserbase" or "steel".
-type ComputerConfig struct {
-	Type      string `json:"type"`                 // "local" | "browserbase" | "steel" | "browser-engine" | "service"
-	URL       string `json:"url,omitempty"`        // for "service", or local CDP endpoint
-	APIKey    string `json:"api_key,omitempty"`    // override saved provider API key (rare)
-	ProjectID string `json:"project_id,omitempty"` // for "browserbase"
-	Width     int    `json:"width,omitempty"`      // 0 = core default per LLM
-	Height    int    `json:"height,omitempty"`
 }
 
 // New wires up a Session against the URL in APTEVA_SERVER_URL (or
@@ -775,20 +746,20 @@ func (s *Session) HasToolCall(toolName string) bool {
 // Returns when ANY of these three conditions is met (whichever comes
 // first), bounded by `timeout`:
 //
-//   1. `quiet` consecutive time with no new telemetry events. Simple
-//      plain-silence rule for tests where the agent just stops emitting.
+//  1. `quiet` consecutive time with no new telemetry events. Simple
+//     plain-silence rule for tests where the agent just stops emitting.
 //
-//   2. main has paced to a long sleep (≥1m) and a short grace period
-//      (`min(quiet, 5s)`) has passed since it did so. Main is the
-//      orchestrator — if it's asleep for an hour, nothing meaningful
-//      is going to happen regardless of what workers do. This
-//      specifically avoids the trap where a worker's 5m pace fires a
-//      heartbeat event that resets the quiet timer long after the
-//      real work is done.
+//  2. main has paced to a long sleep (≥1m) and a short grace period
+//     (`min(quiet, 5s)`) has passed since it did so. Main is the
+//     orchestrator — if it's asleep for an hour, nothing meaningful
+//     is going to happen regardless of what workers do. This
+//     specifically avoids the trap where a worker's 5m pace fires a
+//     heartbeat event that resets the quiet timer long after the
+//     real work is done.
 //
-//   3. All live threads have paced with a long sleep. Same spirit as
-//      (2) but for tests that finish before main emits a long pace
-//      (e.g. when the scenario uses a different top-level strategy).
+//  3. All live threads have paced with a long sleep. Same spirit as
+//     (2) but for tests that finish before main emits a long pace
+//     (e.g. when the scenario uses a different top-level strategy).
 func (s *Session) WaitIdle(timeout, quiet time.Duration) {
 	s.t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -908,13 +879,13 @@ func isLongSleep(sleep string) bool {
 // ThreadContextUsage summarises context-window usage for one thread
 // across a telemetry slice. Peaks come from llm.done events.
 type ThreadContextUsage struct {
-	ThreadID     string
-	PeakIn       int // max tokens_in seen
-	LastIn       int // most recent tokens_in
-	ContextMax   int // model's max_context_tokens (0 if unknown)
-	PeakMsgs     int // max context_msgs
-	PeakChars    int // max context_chars
-	Iters        int // # llm.done events
+	ThreadID   string
+	PeakIn     int // max tokens_in seen
+	LastIn     int // most recent tokens_in
+	ContextMax int // model's max_context_tokens (0 if unknown)
+	PeakMsgs   int // max context_msgs
+	PeakChars  int // max context_chars
+	Iters      int // # llm.done events
 }
 
 // ContextUsage walks llm.done events since `since` and returns a
@@ -1064,15 +1035,15 @@ func (s *Session) ToolCallsByThread() map[string][]string {
 // starting, the config update hits the DB but never reaches core, so
 // the MCP tools never get registered on the agent. We therefore:
 //
-//   1. POST /api/instances with a placeholder directive, start=true.
-//      We deliberately boot with a no-op directive so the agent
-//      doesn't fire any actions before its tools are wired.
-//   2. Wait for /status to respond (core is live).
-//   3. For each AttachMCPs name: look up the project's registered
-//      MCP server rows, build an MCPServerConfig, PUT /config with
-//      mcp_servers + the real directive in one call. Core runs
-//      reconcileMCP synchronously; the agent's next iteration has
-//      the tools + the real directive together.
+//  1. POST /api/instances with a placeholder directive, start=true.
+//     We deliberately boot with a no-op directive so the agent
+//     doesn't fire any actions before its tools are wired.
+//  2. Wait for /status to respond (core is live).
+//  3. For each AttachMCPs name: look up the project's registered
+//     MCP server rows, build an MCPServerConfig, PUT /config with
+//     mcp_servers + the real directive in one call. Core runs
+//     reconcileMCP synchronously; the agent's next iteration has
+//     the tools + the real directive together.
 func (s *Session) createFreshInstance(c Config) (int64, error) {
 	name := c.InstanceName
 	if name == "" {
@@ -1113,16 +1084,11 @@ func (s *Session) createFreshInstance(c Config) (int64, error) {
 		time.Sleep(300 * time.Millisecond)
 	}
 
-	// Build the update payload: real directive + MCP list (if any) +
-	// computer config (if any). The server's PUT /config handler
-	// forwards mcp_servers / computer / providers / threads /
-	// unconscious to core; everything else stays at the server layer.
+	// Build the update payload: real directive + MCP list (if any).
+	// The server's PUT /config handler forwards mcp_servers /
+	// providers / threads / unconscious to core; everything else stays
+	// at the server layer.
 	update := map[string]any{"directive": realDirective}
-
-	if c.Computer != nil {
-		update["computer"] = c.Computer
-		s.t.Logf("testkit: enabling computer mode (type=%q)", c.Computer.Type)
-	}
 
 	if len(c.AttachMCPs) > 0 || len(c.AttachMCPsMainAccess) > 0 {
 		mcps, err := s.fetchMCPServers()
@@ -1207,9 +1173,9 @@ func (s *Session) deleteInstance() {
 // attach. The real endpoint returns more fields (status, tool_count,
 // etc.) — we ignore them here.
 type mcpServerRow struct {
-	ID          int64             `json:"id"`
-	Name        string            `json:"name"`
-	ProxyConfig *mcpProxyConfig   `json:"proxy_config,omitempty"`
+	ID          int64           `json:"id"`
+	Name        string          `json:"name"`
+	ProxyConfig *mcpProxyConfig `json:"proxy_config,omitempty"`
 }
 
 type mcpProxyConfig struct {

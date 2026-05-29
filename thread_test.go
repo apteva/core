@@ -9,18 +9,18 @@ import (
 func newTestThinker() *Thinker {
 	bus := NewEventBus()
 	t := &Thinker{
-		apiKey:    "test-key",
-		provider:  NewFireworksProvider("test-key"),
-		messages:  []Message{{Role: "system", Content: "test"}},
-		bus:       bus,
-		sub:       bus.Subscribe("main", 100),
-		pause:     make(chan bool),
-		quit:      make(chan struct{}),
-		rate:      RateSlow,
-		agentRate: RateSlow,
-		memory:    &MemoryStore{path: "/dev/null"},
-		config:    &Config{Directive: "test"},
-		threadID:  "main",
+		apiKey:      "test-key",
+		provider:    NewFireworksProvider("test-key"),
+		messages:    []Message{{Role: "system", Content: "test"}},
+		bus:         bus,
+		sub:         bus.Subscribe("main", 100),
+		pause:       make(chan bool),
+		quit:        make(chan struct{}),
+		rate:        RateSlow,
+		agentRate:   RateSlow,
+		memory:      &MemoryStore{path: "/dev/null"},
+		config:      &Config{Directive: "test"},
+		threadID:    "main",
 		telemetry:   &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
 		toolIndex:   NewToolIndex(),
 		activeTools: map[string]bool{},
@@ -62,6 +62,31 @@ func TestThreadManager_SpawnDuplicate(t *testing.T) {
 	err := thinker.threads.Spawn("dup", "test2", nil)
 	if err == nil {
 		t.Error("expected error on duplicate spawn")
+	}
+}
+
+func TestThreadManager_SpawnWithModelAndReasoning(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+
+	err := thinker.threads.SpawnWithOpts("profiled", "test", nil, SpawnOpts{
+		Model:     "small",
+		Reasoning: ReasoningHigh,
+		DeferRun:  true,
+	})
+	if err != nil {
+		t.Fatalf("SpawnWithOpts error: %v", err)
+	}
+
+	threads := thinker.threads.List()
+	if len(threads) != 1 {
+		t.Fatalf("expected 1 thread, got %d", len(threads))
+	}
+	if threads[0].Model != ModelSmall {
+		t.Fatalf("model = %s, want small", threads[0].Model)
+	}
+	if threads[0].Reasoning != ReasoningHigh {
+		t.Fatalf("reasoning = %s, want high", threads[0].Reasoning)
 	}
 }
 

@@ -14,12 +14,12 @@ import (
 //
 // If anyone reintroduces the `tr.Image != nil` exception in
 // sanitizeToolPairs, these tests fail and the Patreon login flow
-// (and any other long-running multi-turn computer-use flow) starts
+// (and any other long-running multi-turn image-tool flow) starts
 // 400ing on opencode-go again.
 
 func TestSanitize_OrphanToolResult_NoImage_Dropped(t *testing.T) {
 	in := []Message{
-		{Role: "user", ToolResults: []ToolResult{{CallID: "computer_use:1", Content: "stale"}}},
+		{Role: "user", ToolResults: []ToolResult{{CallID: "screenshot_tool:1", Content: "stale"}}},
 	}
 	out := sanitizeToolPairs(in)
 	if len(out) != 0 {
@@ -33,7 +33,7 @@ func TestSanitize_OrphanToolResult_NoImage_Dropped(t *testing.T) {
 func TestSanitize_OrphanToolResult_WithImage_Dropped(t *testing.T) {
 	in := []Message{
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "computer_use:8", Content: "stale screenshot", Image: []byte("fake-png")},
+			{CallID: "screenshot_tool:8", Content: "stale screenshot", Image: []byte("fake-png")},
 		}},
 	}
 	out := sanitizeToolPairs(in)
@@ -44,7 +44,7 @@ func TestSanitize_OrphanToolResult_WithImage_Dropped(t *testing.T) {
 
 func TestSanitize_OrphanToolUse_NoResult_Dropped(t *testing.T) {
 	in := []Message{
-		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "computer_use:1", Name: "computer_use"}}},
+		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:1", Name: "screenshot_tool"}}},
 	}
 	out := sanitizeToolPairs(in)
 	if len(out) != 1 {
@@ -62,14 +62,14 @@ func TestSanitize_OrphanToolUse_NoResult_Dropped(t *testing.T) {
 func TestSanitize_OrphanToolUse_KeptByImageException_Dropped(t *testing.T) {
 	in := []Message{
 		// Assistant emits a tool_call.
-		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "computer_use:8", Name: "computer_use"}}},
+		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:8", Name: "screenshot_tool"}}},
 		// Its result is an orphan-with-image (the matching tool_use is
 		// elsewhere in the original conversation but rolled off the
 		// LoadTail window). The previous code path: image-exception
 		// kept the result → toolResultIDs included :8 → assistant
 		// tool_call also kept → both wrong-shape on wire.
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "computer_use:99", Image: []byte("fake-png")}, // ← orphan
+			{CallID: "screenshot_tool:99", Image: []byte("fake-png")}, // orphan
 		}},
 	}
 	out := sanitizeToolPairs(in)
@@ -77,17 +77,17 @@ func TestSanitize_OrphanToolUse_KeptByImageException_Dropped(t *testing.T) {
 	// user turn loses its only tool_result and is therefore omitted.
 	for _, m := range out {
 		for _, tr := range m.ToolResults {
-			if tr.CallID == "computer_use:99" {
+			if tr.CallID == "screenshot_tool:99" {
 				t.Fatalf("orphan image tool_result :99 leaked through")
 			}
 		}
 		for _, tc := range m.ToolCalls {
-			if tc.ID == "computer_use:8" && len(out) > 1 {
+			if tc.ID == "screenshot_tool:8" && len(out) > 1 {
 				// It's only valid to keep :8 if its result is also kept.
 				found := false
 				for _, m2 := range out {
 					for _, tr := range m2.ToolResults {
-						if tr.CallID == "computer_use:8" {
+						if tr.CallID == "screenshot_tool:8" {
 							found = true
 						}
 					}
@@ -102,19 +102,19 @@ func TestSanitize_OrphanToolUse_KeptByImageException_Dropped(t *testing.T) {
 
 func TestSanitize_PairedToolsWithImage_Kept(t *testing.T) {
 	in := []Message{
-		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "computer_use:1", Name: "computer_use"}}},
+		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:1", Name: "screenshot_tool"}}},
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "computer_use:1", Content: "ok", Image: []byte("png")},
+			{CallID: "screenshot_tool:1", Content: "ok", Image: []byte("png")},
 		}},
 	}
 	out := sanitizeToolPairs(in)
 	if len(out) != 2 {
 		t.Fatalf("expected both paired messages kept, got %d", len(out))
 	}
-	if len(out[0].ToolCalls) != 1 || out[0].ToolCalls[0].ID != "computer_use:1" {
+	if len(out[0].ToolCalls) != 1 || out[0].ToolCalls[0].ID != "screenshot_tool:1" {
 		t.Fatalf("assistant tool_call dropped from a valid pair")
 	}
-	if len(out[1].ToolResults) != 1 || out[1].ToolResults[0].CallID != "computer_use:1" {
+	if len(out[1].ToolResults) != 1 || out[1].ToolResults[0].CallID != "screenshot_tool:1" {
 		t.Fatalf("user tool_result dropped from a valid pair")
 	}
 	if out[1].ToolResults[0].Image == nil {
@@ -122,16 +122,16 @@ func TestSanitize_PairedToolsWithImage_Kept(t *testing.T) {
 	}
 }
 
-// In-flight async tool_calls (computer_use dispatched as goroutine)
+// In-flight async tool_calls dispatched as goroutines
 // are tracked in pendingTools. The sanitizer must keep their
 // assistant turn so the iteration-barrier placeholder can pair with
 // them later — without this guard, sanitize would strip the call
 // before its result lands.
 func TestSanitize_InFlightToolUse_KeptViaPending(t *testing.T) {
 	in := []Message{
-		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "computer_use:7", Name: "computer_use"}}},
+		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:7", Name: "screenshot_tool"}}},
 	}
-	pending := map[string]bool{"computer_use:7": true}
+	pending := map[string]bool{"screenshot_tool:7": true}
 	out := sanitizeToolPairs(in, pending)
 	if len(out) != 1 || len(out[0].ToolCalls) != 1 {
 		t.Fatalf("in-flight tool_use stripped despite pending: out=%+v", out)
@@ -157,7 +157,7 @@ func TestSanitize_MixedToolResults_OnlyOrphanDropped(t *testing.T) {
 	in := []Message{
 		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "a:1", Name: "x"}}},
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "a:1", Content: "ok"},                        // paired → keep
+			{CallID: "a:1", Content: "ok"},                               // paired → keep
 			{CallID: "ghost:99", Content: "stale", Image: []byte("png")}, // orphan → drop
 		}},
 	}
@@ -177,20 +177,20 @@ func TestSanitize_MixedToolResults_OnlyOrphanDropped(t *testing.T) {
 // reason the orphan-with-image rule had to die.
 func TestSanitize_PostconditionReferentialIntegrity(t *testing.T) {
 	// Simulates a LoadTail window where a screenshot tool_result for
-	// computer_use:8 made the cut but its assistant tool_call did not.
+	// screenshot_tool:8 made the cut but its assistant tool_call did not.
 	in := []Message{
 		// Window starts mid-conversation; the assistant turn for :8 is
 		// outside the slice (rolled off by LoadTail). This is exactly
 		// the shape that triggered the Patreon-login 400.
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "computer_use:8", Content: "stale", Image: []byte("png")},
+			{CallID: "screenshot_tool:8", Content: "stale", Image: []byte("png")},
 		}},
 		// Healthy pair inside the window.
-		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "computer_use:9", Name: "computer_use"}}},
-		{Role: "user", ToolResults: []ToolResult{{CallID: "computer_use:9", Content: "ok"}}},
-		// Orphan tool_call with no result (e.g. a computer_use that's
+		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:9", Name: "screenshot_tool"}}},
+		{Role: "user", ToolResults: []ToolResult{{CallID: "screenshot_tool:9", Content: "ok"}}},
+		// Orphan tool_call with no result.
 		// not in pendingTools because the run died).
-		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "computer_use:10", Name: "computer_use"}}},
+		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:10", Name: "screenshot_tool"}}},
 	}
 	out := sanitizeToolPairs(in)
 

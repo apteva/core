@@ -39,6 +39,7 @@ type mcpToolDef struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	Meta        map[string]any `json:"_meta,omitempty"`
 }
 
 type mcpToolsListResult struct {
@@ -88,7 +89,7 @@ type MCPServerConfig struct {
 type MCPConn interface {
 	GetName() string
 	ListTools() ([]mcpToolDef, error)
-	CallTool(name string, args map[string]string) (string, error)
+	CallTool(name string, args map[string]string) (ToolResponse, error)
 	Close()
 }
 
@@ -249,7 +250,7 @@ func (s *MCPServer) ListTools() ([]mcpToolDef, error) {
 }
 
 // CallTool invokes a tool on the MCP server
-func (s *MCPServer) CallTool(name string, args map[string]string) (string, error) {
+func (s *MCPServer) CallTool(name string, args map[string]string) (ToolResponse, error) {
 	// Convert string args to any for JSON
 	// Parse string values that look like JSON arrays/objects/numbers/booleans
 	// so they're sent as proper JSON types to the MCP server
@@ -270,12 +271,12 @@ func (s *MCPServer) CallTool(name string, args map[string]string) (string, error
 		"arguments": arguments,
 	})
 	if err != nil {
-		return "", err
+		return ToolResponse{}, err
 	}
 
 	var callResult mcpCallResult
 	if err := json.Unmarshal(result, &callResult); err != nil {
-		return "", fmt.Errorf("parse result: %w", err)
+		return ToolResponse{}, fmt.Errorf("parse result: %w", err)
 	}
 
 	var texts []string
@@ -284,7 +285,7 @@ func (s *MCPServer) CallTool(name string, args map[string]string) (string, error
 			texts = append(texts, c.Text)
 		}
 	}
-	return strings.Join(texts, "\n"), nil
+	return ToolResponse{Text: strings.Join(texts, "\n"), IsError: callResult.IsError}, nil
 }
 
 func (s *MCPServer) GetName() string { return s.Name }
@@ -306,16 +307,16 @@ func mcpProxyHandler(server MCPConn, toolName string, blobs *BlobStore) func(arg
 		if blobs != nil {
 			args = blobs.RehydrateFileRefs(args)
 		}
-		result, err := server.CallTool(toolName, args)
+		resp, err := server.CallTool(toolName, args)
 		if err != nil {
-			return ToolResponse{Text: fmt.Sprintf("error: %v", err)}
+			return ToolResponse{Text: fmt.Sprintf("error: %v", err), IsError: true}
 		}
 		var image []byte
-		result, image = extractMCPResultImage(result)
+		result, image := extractMCPResultImage(resp.Text)
 		if blobs != nil {
 			result = blobs.RewriteBinaryToHandle(result)
 		}
-		return ToolResponse{Text: result, Image: image}
+		return ToolResponse{Text: result, Image: image, IsError: resp.IsError}
 	}
 }
 
@@ -462,6 +463,14 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 				InputSchema: tool.InputSchema,
 				MCP:         true, // hidden until activated; old MainAccess flag is gone
 				MCPServer:   cfg.Name,
+				WakeOnResult: normalizeWakeOnResultPolicy(
+					func() any {
+						if tool.Meta == nil {
+							return nil
+						}
+						return tool.Meta[wakeOnResultMetaKey]
+					}(),
+				),
 			})
 		}
 

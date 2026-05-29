@@ -200,7 +200,7 @@ func (m *pipelineMCP) GetName() string                  { return "pipeline-fake"
 func (m *pipelineMCP) ListTools() ([]mcpToolDef, error) { return nil, nil }
 func (m *pipelineMCP) Close()                           {}
 
-func (m *pipelineMCP) CallTool(name string, args map[string]string) (string, error) {
+func (m *pipelineMCP) CallTool(name string, args map[string]string) (ToolResponse, error) {
 	switch name {
 	case "download_file":
 		// Always returns a _binary envelope regardless of id.
@@ -211,7 +211,7 @@ func (m *pipelineMCP) CallTool(name string, args map[string]string) (string, err
 			"size":     len(m.audioPayload),
 		}
 		b, _ := json.Marshal(env)
-		return string(b), nil
+		return ToolResponse{Text: string(b)}, nil
 
 	case "transcribe":
 		m.mu.Lock()
@@ -228,21 +228,21 @@ func (m *pipelineMCP) CallTool(name string, args map[string]string) (string, err
 		audio := args["audio"]
 		var env map[string]any
 		if err := json.Unmarshal([]byte(audio), &env); err != nil {
-			return "", fmt.Errorf("transcribe received non-envelope audio arg: %q", audio)
+			return ToolResponse{}, fmt.Errorf("transcribe received non-envelope audio arg: %q", audio)
 		}
 		if env["_binary"] != true {
-			return "", fmt.Errorf("transcribe audio arg missing _binary: %v", env)
+			return ToolResponse{}, fmt.Errorf("transcribe audio arg missing _binary: %v", env)
 		}
 		decoded, err := base64.StdEncoding.DecodeString(toString(env["base64"]))
 		if err != nil {
-			return "", fmt.Errorf("transcribe base64 decode: %w", err)
+			return ToolResponse{}, fmt.Errorf("transcribe base64 decode: %w", err)
 		}
 		if string(decoded) != m.audioPayload {
-			return "", fmt.Errorf("transcribe received wrong bytes: got %q", string(decoded))
+			return ToolResponse{}, fmt.Errorf("transcribe received wrong bytes: got %q", string(decoded))
 		}
-		return m.transcript, nil
+		return ToolResponse{Text: m.transcript}, nil
 	}
-	return "", fmt.Errorf("unknown tool %q", name)
+	return ToolResponse{}, fmt.Errorf("unknown tool %q", name)
 }
 
 func (m *pipelineMCP) capturedTranscribeArgs() map[string]string {

@@ -283,6 +283,122 @@ func TestExecuteTool_NoBlock(t *testing.T) {
 	}
 }
 
+func TestExecuteTool_WakeOnResultOnErrorSuccessQueuesSilently(t *testing.T) {
+	bus := NewEventBus()
+	registry := NewToolRegistry("")
+	done := make(chan struct{})
+	registry.Register(&ToolDef{
+		Name:         "notify_send",
+		WakeOnResult: WakeOnResultOnError,
+		Handler: func(args map[string]string) ToolResponse {
+			close(done)
+			return ToolResponse{Text: "delivered"}
+		},
+	})
+	thinker := &Thinker{
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		registry:  registry,
+		quit:      make(chan struct{}),
+		telemetry: NewTelemetry(),
+		threadID:  "main",
+	}
+
+	executeTool(thinker, toolCall{Name: "notify_send", NativeID: "call-1", Args: map[string]string{}})
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("tool did not run")
+	}
+	time.Sleep(25 * time.Millisecond)
+	select {
+	case <-thinker.sub.Wake:
+		t.Fatal("successful on_error tool result woke thinker")
+	default:
+	}
+	results := thinker.drainSilentToolResults()
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "delivered" {
+		t.Fatalf("silent results = %+v, want call-1 delivered", results)
+	}
+}
+
+func TestExecuteTool_WakeOnResultOnErrorFailureWakes(t *testing.T) {
+	bus := NewEventBus()
+	registry := NewToolRegistry("")
+	done := make(chan struct{})
+	registry.Register(&ToolDef{
+		Name:         "notify_send",
+		WakeOnResult: WakeOnResultOnError,
+		Handler: func(args map[string]string) ToolResponse {
+			close(done)
+			return ToolResponse{Text: "delivery failed", IsError: true}
+		},
+	})
+	thinker := &Thinker{
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		registry:  registry,
+		quit:      make(chan struct{}),
+		telemetry: NewTelemetry(),
+		threadID:  "main",
+	}
+
+	executeTool(thinker, toolCall{Name: "notify_send", NativeID: "call-2", Args: map[string]string{}})
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("tool did not run")
+	}
+	select {
+	case <-thinker.sub.Wake:
+	case <-time.After(time.Second):
+		t.Fatal("failed on_error tool result did not wake thinker")
+	}
+	var ev Event
+	select {
+	case ev = <-thinker.sub.C:
+	case <-time.After(time.Second):
+		t.Fatal("no inbox event for failed tool result")
+	}
+	if ev.ToolResult == nil || ev.ToolResult.CallID != "call-2" || ev.ToolResult.Content != "delivery failed" {
+		t.Fatalf("event tool result = %+v", ev.ToolResult)
+	}
+	if !ev.ToolResult.IsError {
+		t.Fatal("failed tool result did not preserve IsError")
+	}
+	if got := thinker.drainSilentToolResults(); len(got) != 0 {
+		t.Fatalf("failure queued silent results: %+v", got)
+	}
+}
+
+func TestWaitForPendingToolsDrainsSilentResults(t *testing.T) {
+	thinker := &Thinker{
+		bus:      NewEventBus(),
+		threadID: "main",
+	}
+	thinker.sub = thinker.bus.Subscribe("main", 100)
+	thinker.pendingTools.Store("call-1", "notify_send")
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		thinker.queueSilentToolResult(ToolResult{CallID: "call-1", Content: "delivered"})
+		thinker.pendingTools.Delete("call-1")
+	}()
+
+	var results []ToolResult
+	var consumed []string
+	var parts []ContentPart
+	thinker.waitForPendingTools(&results, &consumed, &parts, time.Second)
+
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "delivered" {
+		t.Fatalf("results = %+v, want silent call-1 result", results)
+	}
+	if len(consumed) != 0 || len(parts) != 0 {
+		t.Fatalf("unexpected consumed=%v parts=%v", consumed, parts)
+	}
+}
+
 func containsStr(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
 		(len(s) > 0 && len(substr) > 0 && searchStr(s, substr)))

@@ -30,106 +30,84 @@ func TestOpenAINativeBuildInput_SystemPromptHandling(t *testing.T) {
 	}
 }
 
-func TestOpenAINativeChat_ComputerToolModes(t *testing.T) {
-	tests := []struct {
-		name             string
-		mode             string
-		providerName     string
-		model            string
-		wantComputerTool bool
-	}{
-		{name: "native gpt 5.5", model: "gpt-5.5", wantComputerTool: true},
-		{name: "native gpt 5.4 mini", model: "gpt-5.4-mini", wantComputerTool: true},
-		{name: "codex defaults custom", providerName: "openai-codex", model: "gpt-5.5", wantComputerTool: false},
-		{name: "codex native override", providerName: "openai-codex", mode: "native", model: "gpt-5.5", wantComputerTool: true},
-		{name: "custom fallback", mode: "custom", model: "gpt-5.5", wantComputerTool: false},
+func TestOpenAINativeChat_BuildsFunctionToolsOnly(t *testing.T) {
+	p := &OpenAINativeProvider{apiKey: "test", name: "openai-codex"}
+	tools := p.buildAPITools("gpt-5.5", []NativeTool{
+		{Name: "app_tool", Description: "tool", Parameters: map[string]any{"type": "object"}},
+	})
+	if len(tools) != 1 {
+		t.Fatalf("tools len = %d, want 1", len(tools))
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("APTEVA_OPENAI_COMPUTER_MODE", tt.mode)
-			p := &OpenAINativeProvider{apiKey: "test", name: tt.providerName}
-			tools := p.buildAPITools(tt.model, []NativeTool{
-				{Name: "computer_use", Description: "screen", Parameters: map[string]any{"type": "object"}},
-				{Name: "browser_session", Description: "session", Parameters: map[string]any{"type": "object"}},
-			})
-
-			var sawComputer, sawComputerFunction, sawBrowserSession bool
-			for _, tool := range tools {
-				b, _ := json.Marshal(tool)
-				var decoded map[string]any
-				if err := json.Unmarshal(b, &decoded); err != nil {
-					t.Fatalf("tool JSON: %v", err)
-				}
-				if decoded["type"] == "computer" {
-					sawComputer = true
-				}
-				if decoded["type"] == "function" {
-					fn, _ := decoded["name"].(string)
-					if fn == "computer_use" {
-						sawComputerFunction = true
-					}
-					if fn == "browser_session" {
-						sawBrowserSession = true
-					}
-				}
-			}
-			if sawComputer != tt.wantComputerTool {
-				t.Fatalf("saw native computer tool = %v, want %v; tools=%#v", sawComputer, tt.wantComputerTool, tools)
-			}
-			if tt.wantComputerTool && sawComputerFunction {
-				t.Fatalf("native mode should not also expose computer_use as a function: %#v", tools)
-			}
-			if !tt.wantComputerTool && !sawComputerFunction {
-				t.Fatalf("custom mode should expose computer_use as a function: %#v", tools)
-			}
-			if !sawBrowserSession {
-				t.Fatalf("browser_session should remain available so sessions can be opened: %#v", tools)
-			}
-		})
+	b, _ := json.Marshal(tools[0])
+	var decoded map[string]any
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("tool JSON: %v", err)
+	}
+	if decoded["type"] != "function" || decoded["name"] != "app_tool" {
+		t.Fatalf("tool = %#v", decoded)
 	}
 }
 
-func TestOpenAINativeBuildInput_ComputerImageOutputs(t *testing.T) {
+func TestOpenAINativeRequestReasoning(t *testing.T) {
+	codex := NewOpenAICodexProvider("token").(*OpenAINativeProvider)
+	if got := codex.requestReasoning("gpt-5.5"); got == nil || got.Summary != "auto" || got.Effort != "" {
+		t.Fatalf("codex auto reasoning = %#v, want summary auto only", got)
+	}
+
+	high := codex.WithReasoning(ReasoningSettings{Level: ReasoningHigh}).(*OpenAINativeProvider)
+	if got := high.requestReasoning("gpt-5.5"); got == nil || got.Summary != "auto" || got.Effort != "high" {
+		t.Fatalf("codex high reasoning = %#v, want summary auto effort high", got)
+	}
+	minimal := codex.WithReasoning(ReasoningSettings{Level: ReasoningMinimal}).(*OpenAINativeProvider)
+	if got := minimal.requestReasoning("gpt-5.5"); got == nil || got.Summary != "auto" || got.Effort != "low" {
+		t.Fatalf("codex minimal reasoning = %#v, want summary auto effort low", got)
+	}
+	xhigh := codex.WithReasoning(ReasoningSettings{Level: ReasoningXHigh}).(*OpenAINativeProvider)
+	if got := xhigh.requestReasoning("gpt-5.5"); got == nil || got.Summary != "auto" || got.Effort != "xhigh" {
+		t.Fatalf("codex xhigh reasoning = %#v, want summary auto effort xhigh", got)
+	}
+
+	openai := NewOpenAINativeProvider("key").(*OpenAINativeProvider)
+	if got := openai.requestReasoning("gpt-5.4-mini"); got != nil {
+		t.Fatalf("openai auto reasoning = %#v, want nil", got)
+	}
+	low := openai.WithReasoning(ReasoningSettings{Level: ReasoningLow}).(*OpenAINativeProvider)
+	if got := low.requestReasoning("gpt-5.4-mini"); got == nil || got.Summary != "auto" || got.Effort != "low" {
+		t.Fatalf("openai low reasoning = %#v, want summary auto effort low", got)
+	}
+	none := openai.WithReasoning(ReasoningSettings{Level: ReasoningNone}).(*OpenAINativeProvider)
+	if got := none.requestReasoning("gpt-5.4-mini"); got == nil || got.Summary != "" || got.Effort != "none" {
+		t.Fatalf("openai none reasoning = %#v, want effort none without summary", got)
+	}
+}
+
+func TestOpenAINativeBuildInput_FunctionImageOutputs(t *testing.T) {
 	messages := []Message{
 		{Role: "assistant", ToolCalls: []NativeToolCall{{
-			ID:   "call_computer",
-			Name: "computer_use",
-			Args: map[string]string{"action": "screenshot"},
+			ID:   "call_image",
+			Name: "app_tool",
+			Args: map[string]string{"action": "capture"},
 		}}},
 		{Role: "user", ToolResults: []ToolResult{{
-			CallID:  "call_computer",
+			CallID:  "call_image",
 			Content: "screenshot attached",
 			Image:   []byte{0x89, 0x50, 0x4e, 0x47},
 		}}},
 	}
 
-	nativeItems := (&OpenAINativeProvider{}).buildInput(messages)
-	if len(nativeItems) != 2 {
-		t.Fatalf("native items len = %d, want 2: %#v", len(nativeItems), nativeItems)
+	items := (&OpenAINativeProvider{}).buildInput(messages)
+	if len(items) != 2 {
+		t.Fatalf("items len = %d, want 2: %#v", len(items), items)
 	}
-	if nativeItems[0].Type != "computer_call" || nativeItems[0].Status != "completed" || nativeItems[0].Actions == nil {
-		t.Fatalf("native replay item = %#v", nativeItems[0])
+	if items[0].Type != "function_call" || items[0].Name != "app_tool" {
+		t.Fatalf("replay item = %#v", items[0])
 	}
-	if nativeItems[1].Type != "computer_call_output" {
-		t.Fatalf("native image result type = %q, want computer_call_output", nativeItems[1].Type)
+	if items[1].Type != "function_call_output" {
+		t.Fatalf("image result type = %q, want function_call_output", items[1].Type)
 	}
-	out, ok := nativeItems[1].Output.(map[string]any)
-	if !ok || out["type"] != "computer_screenshot" {
-		t.Fatalf("native image output = %#v", nativeItems[1].Output)
-	}
-
-	t.Setenv("APTEVA_OPENAI_COMPUTER_MODE", "custom")
-	customItems := (&OpenAINativeProvider{}).buildInput(messages)
-	if customItems[0].Type != "function_call" || customItems[0].Name != "computer_use" {
-		t.Fatalf("custom replay item = %#v", customItems[0])
-	}
-	if customItems[1].Type != "function_call_output" {
-		t.Fatalf("custom image result type = %q, want function_call_output", customItems[1].Type)
-	}
-	blocks, ok := customItems[1].Output.([]oaiContentBlock)
+	blocks, ok := items[1].Output.([]oaiContentBlock)
 	if !ok || len(blocks) != 2 || blocks[0].Type != "input_text" || blocks[1].Type != "input_image" {
-		t.Fatalf("custom image output = %#v", customItems[1].Output)
+		t.Fatalf("image output = %#v", items[1].Output)
 	}
 }
 
@@ -161,46 +139,6 @@ func TestOpenAINativeStreamResponse_ReasoningSummary(t *testing.T) {
 	}
 	if resp.Usage.PromptTokens != 3 || resp.Usage.CompletionTokens != 2 || resp.Usage.CachedTokens != 1 {
 		t.Fatalf("Usage = %+v", resp.Usage)
-	}
-}
-
-func TestOpenAINativeStreamResponse_ComputerCallActions(t *testing.T) {
-	stream := strings.NewReader(strings.Join([]string{
-		`data: {"type":"response.output_item.added","item":{"id":"cu_item_123","type":"computer_call","call_id":"call_cu_456"}}`,
-		`data: {"type":"response.output_item.done","item":{"id":"cu_item_123","type":"computer_call","call_id":"call_cu_456","actions":[{"type":"click","x":10,"y":20,"button":"left"},{"type":"type","text":"penguin"}]}}`,
-		`data: [DONE]`,
-		``,
-	}, "\n"))
-
-	resp, err := (&OpenAINativeProvider{}).streamResponse(stream, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("streamResponse: %v", err)
-	}
-	if len(resp.ToolCalls) != 2 {
-		t.Fatalf("ToolCalls len = %d, want 2: %#v", len(resp.ToolCalls), resp.ToolCalls)
-	}
-	if resp.ToolCalls[0].ID != "call_cu_456" || resp.ToolCalls[0].Name != "computer_use" || resp.ToolCalls[0].Args["action"] != "click" || resp.ToolCalls[0].Args["coordinate"] != "[10, 20]" {
-		t.Fatalf("first tool call = %#v", resp.ToolCalls[0])
-	}
-	if resp.ToolCalls[1].ID != "call_cu_456_1" || resp.ToolCalls[1].Args["action"] != "type" || resp.ToolCalls[1].Args["text"] != "penguin" {
-		t.Fatalf("second tool call = %#v", resp.ToolCalls[1])
-	}
-}
-
-func TestOpenAINativeStreamResponse_LegacyComputerCallAction(t *testing.T) {
-	stream := strings.NewReader(strings.Join([]string{
-		`data: {"type":"response.output_item.added","item":{"id":"cu_item_123","type":"computer_call","call_id":"call_cu_456"}}`,
-		`data: {"type":"response.output_item.done","item":{"id":"cu_item_123","type":"computer_call","call_id":"call_cu_456","action":{"type":"screenshot"}}}`,
-		`data: [DONE]`,
-		``,
-	}, "\n"))
-
-	resp, err := (&OpenAINativeProvider{}).streamResponse(stream, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("streamResponse: %v", err)
-	}
-	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Args["action"] != "screenshot" {
-		t.Fatalf("ToolCalls = %#v", resp.ToolCalls)
 	}
 }
 
@@ -285,6 +223,56 @@ func TestOpenAINativeStreamResponse_BuffersToolChunkUntilCallID(t *testing.T) {
 		t.Fatalf("chunk = %q", chunks[0])
 	}
 	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_final_456" {
+		t.Fatalf("ToolCalls = %#v", resp.ToolCalls)
+	}
+}
+
+func TestOpenAINativeStreamResponse_BuffersToolChunkUntilNameAndCallID(t *testing.T) {
+	stream := strings.NewReader(strings.Join([]string{
+		`data: {"type":"response.output_item.added","item":{"id":"fc_item_123","type":"function_call"}}`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_item_123","delta":"{\"text\":\"hello\"}"}`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_item_123","type":"function_call","call_id":"call_final_456","name":"channels_respond","arguments":"{\"text\":\"hello\"}"}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n"))
+
+	var chunks []string
+	resp, err := (&OpenAINativeProvider{}).streamResponse(stream, nil, nil, func(toolName, callID, argChunk string) {
+		chunks = append(chunks, toolName+"|"+callID+"|"+argChunk)
+	})
+	if err != nil {
+		t.Fatalf("streamResponse: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("chunks len = %d, want 1: %#v", len(chunks), chunks)
+	}
+	if chunks[0] != `channels_respond|call_final_456|{"text":"hello"}` {
+		t.Fatalf("chunk = %q", chunks[0])
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "channels_respond" || resp.ToolCalls[0].ID != "call_final_456" {
+		t.Fatalf("ToolCalls = %#v", resp.ToolCalls)
+	}
+}
+
+func TestOpenAINativeStreamResponse_FinalArgumentsEmitToolChunkWhenNoDeltas(t *testing.T) {
+	stream := strings.NewReader(strings.Join([]string{
+		`data: {"type":"response.output_item.added","item":{"id":"fc_item_123","type":"function_call"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_item_123","type":"function_call","call_id":"call_final_456","name":"channels_respond","arguments":"{\"text\":\"hello\"}"}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n"))
+
+	var chunks []string
+	resp, err := (&OpenAINativeProvider{}).streamResponse(stream, nil, nil, func(toolName, callID, argChunk string) {
+		chunks = append(chunks, toolName+"|"+callID+"|"+argChunk)
+	})
+	if err != nil {
+		t.Fatalf("streamResponse: %v", err)
+	}
+	if len(chunks) != 1 || chunks[0] != `channels_respond|call_final_456|{"text":"hello"}` {
+		t.Fatalf("chunks = %#v", chunks)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Args["text"] != "hello" {
 		t.Fatalf("ToolCalls = %#v", resp.ToolCalls)
 	}
 }

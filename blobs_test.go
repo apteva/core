@@ -213,11 +213,11 @@ type handlerMCP struct {
 	lastArgs map[string]string
 }
 
-func (m *handlerMCP) GetName() string                     { return m.name }
-func (m *handlerMCP) ListTools() ([]mcpToolDef, error)    { return nil, nil }
-func (m *handlerMCP) CallTool(_ string, a map[string]string) (string, error) {
+func (m *handlerMCP) GetName() string                  { return m.name }
+func (m *handlerMCP) ListTools() ([]mcpToolDef, error) { return nil, nil }
+func (m *handlerMCP) CallTool(_ string, a map[string]string) (ToolResponse, error) {
 	m.lastArgs = a
-	return m.result, nil
+	return ToolResponse{Text: m.result}, nil
 }
 func (m *handlerMCP) Close() {}
 
@@ -283,44 +283,33 @@ func TestMCPProxyHandler_RehydratesBeforeDispatch(t *testing.T) {
 	}
 }
 
-// TestBlobStore_DoesNotInterfereWithComputerUse proves that the blob
-// system's two interception points are both scoped to the MCP path and
-// never touch computer_use screenshots. Computer_use is registered with
-// a direct Handler (not wrapped by mcpProxyHandler) that returns
-// ToolResponse{Text, Image: []byte}. The blob store operates only on
-// result TEXT inside mcpProxyHandler, and only on string args in
-// RehydrateFileRefs (also inside mcpProxyHandler). So the two paths
-// never intersect — this test locks that in.
-func TestBlobStore_DoesNotInterfereWithComputerUse(t *testing.T) {
+// TestBlobStore_DoesNotInterfereWithPlainToolText proves that blob
+// rewriting only treats structured binary envelopes as blob material.
+func TestBlobStore_DoesNotInterfereWithPlainToolText(t *testing.T) {
 	bs := NewBlobStore(1<<20, time.Hour)
 	defer bs.Close()
 
-	// Simulate the text output a computer_use handler produces.
-	// Screenshots are bytes carried separately on ToolResponse.Image,
-	// never JSON-serialized into Text.
-	computerText := "clicked at (100, 100) — element: <button>Submit</button>"
-	if got := bs.RewriteBinaryToHandle(computerText); got != computerText {
-		t.Fatalf("computer_use text mutated by blob rewrite:\nin:  %q\nout: %q", computerText, got)
+	toolText := "clicked at (100, 100) - element: <button>Submit</button>"
+	if got := bs.RewriteBinaryToHandle(toolText); got != toolText {
+		t.Fatalf("plain tool text mutated by blob rewrite:\nin:  %q\nout: %q", toolText, got)
 	}
 	if bs.Count() != 0 {
-		t.Fatal("computer_use text must not create blob store entries")
+		t.Fatal("plain tool text must not create blob store entries")
 	}
 
-	// Args for computer_use look nothing like file refs — confirm they
-	// flow through rehydration unchanged.
-	computerArgs := map[string]string{
-		"action":      "left_click",
-		"coordinate":  "[100, 100]",
-		"text":        "Submit",
+	toolArgs := map[string]string{
+		"action":     "left_click",
+		"coordinate": "[100, 100]",
+		"text":       "Submit",
 	}
-	out := bs.RehydrateFileRefs(computerArgs)
-	for k, v := range computerArgs {
+	out := bs.RehydrateFileRefs(toolArgs)
+	for k, v := range toolArgs {
 		if out[k] != v {
-			t.Errorf("computer_use arg %q was mutated: %q → %q", k, v, out[k])
+			t.Errorf("plain tool arg %q was mutated: %q -> %q", k, v, out[k])
 		}
 	}
 
-	// Pathological case: a computer_use text that happens to contain
+	// Pathological case: plain text that happens to contain
 	// the substring "_binary" (e.g. a page screenshot's extracted text
 	// mentions the word). Must NOT be treated as an envelope — the
 	// JSON unmarshal will fail and the original text is returned.

@@ -299,7 +299,7 @@ func (s *MCPHTTPServer) ListTools() ([]mcpToolDef, error) {
 	return list.Tools, nil
 }
 
-func (s *MCPHTTPServer) CallTool(name string, args map[string]string) (string, error) {
+func (s *MCPHTTPServer) CallTool(name string, args map[string]string) (ToolResponse, error) {
 	// Convert string args to any — parse JSON arrays/objects so they're sent as proper types
 	arguments := make(map[string]any)
 	for k, v := range args {
@@ -318,12 +318,12 @@ func (s *MCPHTTPServer) CallTool(name string, args map[string]string) (string, e
 		"arguments": arguments,
 	})
 	if err != nil {
-		return "", err
+		return ToolResponse{}, err
 	}
 
 	var callResult mcpCallResult
 	if err := json.Unmarshal(result, &callResult); err != nil {
-		return "", fmt.Errorf("parse result: %w", err)
+		return ToolResponse{}, fmt.Errorf("parse result: %w", err)
 	}
 
 	var texts []string
@@ -332,7 +332,7 @@ func (s *MCPHTTPServer) CallTool(name string, args map[string]string) (string, e
 			texts = append(texts, c.Text)
 		}
 	}
-	return strings.Join(texts, "\n"), nil
+	return ToolResponse{Text: strings.Join(texts, "\n"), IsError: callResult.IsError}, nil
 }
 
 func (s *MCPHTTPServer) GetName() string { return s.Name }

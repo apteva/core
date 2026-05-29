@@ -9,24 +9,49 @@ import (
 
 // ToolResponse is the return value from a tool handler.
 type ToolResponse struct {
-	Text  string // text result (always present)
-	Image []byte // optional image (screenshot etc.) — sent as part of tool result to LLM
+	Text    string // text result (always present)
+	Image   []byte // optional image (screenshot etc.) — sent as part of tool result to LLM
+	IsError bool   // true when the tool returned an MCP-level isError result
+}
+
+type WakeOnResultPolicy string
+
+const (
+	WakeOnResultAlways  WakeOnResultPolicy = "always"
+	WakeOnResultOnError WakeOnResultPolicy = "on_error"
+)
+
+const wakeOnResultMetaKey = "io.apteva/wakeOnResult"
+
+func normalizeWakeOnResultPolicy(v any) WakeOnResultPolicy {
+	switch strings.ToLower(strings.TrimSpace(fmt.Sprint(v))) {
+	case string(WakeOnResultOnError):
+		return WakeOnResultOnError
+	case "", string(WakeOnResultAlways):
+		return WakeOnResultAlways
+	default:
+		return WakeOnResultAlways
+	}
 }
 
 // ToolDef defines a tool available to threads.
 type ToolDef struct {
 	Name        string
-	Description string // human-readable
-	Syntax      string // example usage
-	Rules       string // usage rules for the prompt
-	Core        bool   // always in prompt (pace, send, done, evolve, search_tools)
-	MainOnly    bool   // only for main thread (spawn, kill)
-	ThreadOnly  bool   // only for sub-threads, not main (reply)
-	SystemOnly  bool   // only for system threads (unconscious)
-	MCP         bool   // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
-	MCPServer   string // name of the MCP server that provides this tool
+	Description string                                    // human-readable
+	Syntax      string                                    // example usage
+	Rules       string                                    // usage rules for the prompt
+	Core        bool                                      // always in prompt (pace, send, done, evolve, search_tools)
+	MainOnly    bool                                      // only for main thread (spawn, kill)
+	ThreadOnly  bool                                      // only for sub-threads, not main (reply)
+	SystemOnly  bool                                      // only for system threads (unconscious)
+	MCP         bool                                      // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
+	MCPServer   string                                    // name of the MCP server that provides this tool
 	Handler     func(args map[string]string) ToolResponse // nil = handled inline by tool handler
-	InputSchema map[string]any // JSON Schema for native tool calling (nil = auto-generated from Syntax)
+	InputSchema map[string]any                            // JSON Schema for native tool calling (nil = auto-generated from Syntax)
+	// WakeOnResult controls whether an async tool result wakes the thinker.
+	// Default is always. MCP tools may override this via
+	// _meta["io.apteva/wakeOnResult"] = "on_error".
+	WakeOnResult WakeOnResultPolicy
 }
 
 // ToolRegistry holds all tool definitions.
@@ -65,18 +90,20 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Core tools — always in prompt
 	tr.Register(&ToolDef{
 		Name:        "pace",
-		Description: "Control sleep duration, model tier, and provider. Events always wake you immediately.",
-		Syntax:      `[[pace sleep="5m" model="small" provider="anthropic"]]`,
-		Rules:       `sleep accepts any duration: "2s", "30s", "5m", "1h", "6h". Named aliases also work: rate="fast" (2s), rate="normal" (10s), rate="slow" (30s), rate="sleep" (2m). Models: "large", "medium", "small". provider: switch to a different LLM provider by name (optional, only when multiple providers are configured). Sleep long when idle — you'll be woken by events.`,
+		Description: "Control sleep duration, model tier, provider, and reasoning effort. Events always wake you immediately.",
+		Syntax:      `[[pace sleep="5m" model="small" reasoning="low" provider="anthropic"]]`,
+		Rules:       `sleep accepts any duration: "2s", "30s", "5m", "1h", "6h". Named aliases also work: rate="fast" (2s), rate="normal" (10s), rate="slow" (30s), rate="sleep" (2m). Models: "large", "medium", "small". reasoning/thinking: "auto", "none", "minimal", "low", "medium", "high", "xhigh" (provider support varies; unsupported providers ignore it). provider: switch to a different LLM provider by name (optional, only when multiple providers are configured). Sleep long when idle — you'll be woken by events.`,
 		Core:        true,
 		// All fields optional — pace() with no args continues current state.
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"sleep":    map[string]any{"type": "string", "description": "Duration like \"2s\", \"5m\", \"1h\". Mutually exclusive with rate."},
-				"rate":     map[string]any{"type": "string", "description": "Named alias: \"fast\" (2s), \"normal\" (10s), \"slow\" (30s), \"sleep\" (2m)."},
-				"model":    map[string]any{"type": "string", "description": "Model tier: \"large\", \"medium\", \"small\"."},
-				"provider": map[string]any{"type": "string", "description": "LLM provider name (optional)."},
+				"sleep":     map[string]any{"type": "string", "description": "Duration like \"2s\", \"5m\", \"1h\". Mutually exclusive with rate."},
+				"rate":      map[string]any{"type": "string", "description": "Named alias: \"fast\" (2s), \"normal\" (10s), \"slow\" (30s), \"sleep\" (2m)."},
+				"model":     map[string]any{"type": "string", "description": "Model tier: \"large\", \"medium\", \"small\"."},
+				"reasoning": map[string]any{"type": "string", "description": "Reasoning effort: \"auto\", \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\". Alias: thinking."},
+				"thinking":  map[string]any{"type": "string", "description": "Alias for reasoning effort."},
+				"provider":  map[string]any{"type": "string", "description": "LLM provider name (optional)."},
 			},
 		},
 	})
@@ -154,8 +181,8 @@ func (tr *ToolRegistry) registerDefaults() {
 	tr.Register(&ToolDef{
 		Name:        "spawn",
 		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. By default the worker starts thinking immediately on its directive; pass paused=\"true\" to spawn it dormant — it'll wake on the first `send` you give it. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
-		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec", mcp="store,stripe", paused="true")`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools. provider: LLM provider name (optional). paused: "true" to spawn dormant — useful when you want to spawn several workers atomically before any think, or when you want to attach a message to the worker's first turn rather than letting it act on the directive alone. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
+		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec", mcp="store,stripe", model="medium", reasoning="low", paused="true")`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools. provider: LLM provider name (optional). model: starting tier ("large", "medium", "small"). reasoning/thinking: starting reasoning effort ("auto", "none", "minimal", "low", "medium", "high", "xhigh"; provider support varies). paused: "true" to spawn dormant — useful when you want to spawn several workers atomically before any think, or when you want to attach a message to the worker's first turn rather than letting it act on the directive alone. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
 		Core:        true,
 		MainOnly:    true,
 		InputSchema: map[string]any{
@@ -166,6 +193,9 @@ func (tr *ToolRegistry) registerDefaults() {
 				"tools":     map[string]any{"type": "string", "description": "Comma-separated local tool names (web, exec, read_file, ...). Optional."},
 				"mcp":       map[string]any{"type": "string", "description": "Comma-separated MCP server names. Optional."},
 				"provider":  map[string]any{"type": "string", "description": "LLM provider name. Optional."},
+				"model":     map[string]any{"type": "string", "description": "Starting model tier: \"large\", \"medium\", \"small\". Optional."},
+				"reasoning": map[string]any{"type": "string", "description": "Starting reasoning effort: \"auto\", \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\". Optional."},
+				"thinking":  map[string]any{"type": "string", "description": "Alias for reasoning effort."},
 				"paused":    map[string]any{"type": "string", "description": "Set to \"true\" to spawn the worker in paused state; it will not think until you send it a message. Default: not paused (auto-starts on directive)."},
 				"media":     map[string]any{"type": "string", "description": "Space-separated media URLs passed to the new thread's LLM. Optional."},
 			},
@@ -361,7 +391,6 @@ func (tr *ToolRegistry) Dispatch(name string, args map[string]string) (ToolRespo
 	}
 	return tool.Handler(args), true
 }
-
 
 // AllToolNames returns all non-core tool names (for spawn docs).
 func (tr *ToolRegistry) AllToolNames() []string {

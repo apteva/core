@@ -86,8 +86,6 @@ Discoverable (RAG-retrieved when relevant):
 |------|-------------|
 | `web` | Fetch a URL |
 | `exec` | Run a shell command |
-| `computer_use` | Screen interaction (click, type, scroll, screenshot) |
-| `browser_session` | Navigate URLs, manage browser sessions |
 
 All tools support `_reason` — an optional observability field for explaining why the tool is being called.
 
@@ -117,7 +115,7 @@ Conversation history persists across restarts:
 | Provider | Env Var | Native Tool Calling |
 |----------|---------|-------------------|
 | Fireworks (Kimi K2.5) | `FIREWORKS_API_KEY` | Yes |
-| Anthropic (Claude) | `ANTHROPIC_API_KEY` | Yes + native computer use |
+| Anthropic (Claude) | `ANTHROPIC_API_KEY` | Yes |
 | OpenAI (GPT-4) | `OPENAI_API_KEY` | Yes |
 | Google (Gemini) | `GOOGLE_API_KEY` | Yes |
 
@@ -131,30 +129,16 @@ Conversation history persists across restarts:
     "name": "fireworks",
     "models": { "large": "accounts/fireworks/models/kimi-k2p5", "small": "accounts/fireworks/models/kimi-k2p5" }
   },
-  "computer": { "type": "local", "width": 1280, "height": 800 },
   "mcp_servers": [
     { "name": "myservice", "command": "./my-server", "main_access": true }
   ]
 }
 ```
 
-## Browser / Computer Use
-
-```json
-{ "computer": { "type": "local" } }
-```
-
-Two tools registered when a computer is connected:
-- `browser_session` — open URLs, close, status (no screenshots)
-- `computer_use` — click, type, scroll, screenshot (returns images)
-
-Implementations: local Chrome (auto-launched), Browserbase (cloud), custom HTTP service.
-
 ## Testing
 
 ```bash
 go test ./... -short              # unit tests
-RUN_COMPUTER_TESTS=1 go test -run TestComputerUse_Local  # browser tests
 go test -v -run TestScenario      # full agent scenarios
 ```
 

@@ -77,9 +77,6 @@ func isEagerMode(toolCount int) bool {
 // Resolved per-turn so a runtime connect / app-install that pushes the
 // surface past the auto threshold flips the mode without a restart.
 func (t *Thinker) useEagerTools() bool {
-	if t != nil && t.provider != nil && t.provider.Name() == "openai-codex" {
-		return false
-	}
 	n := 0
 	if t.toolIndex != nil {
 		n = t.toolIndex.Count()
@@ -88,9 +85,6 @@ func (t *Thinker) useEagerTools() bool {
 }
 
 func poolUsesEagerTools(pool *ProviderPool, toolCount int) bool {
-	if pool != nil && pool.DefaultName() == "openai-codex" {
-		return false
-	}
 	return isEagerMode(toolCount)
 }
 

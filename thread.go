@@ -98,6 +98,7 @@ type ThreadInfo struct {
 	Iteration    int
 	Rate         ThinkRate
 	Model        ModelTier
+	Reasoning    ReasoningLevel
 	Provider     string // active provider name
 	Started      time.Time
 	ContextMsgs  int
@@ -141,6 +142,8 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 type SpawnOpts struct {
 	MediaParts      []ContentPart
 	ProviderName    string // override provider from pool (empty = inherit parent)
+	Model           string // starting model tier (empty = default large)
+	Reasoning       ReasoningLevel
 	InitialMessages []string
 	ParentID        string   // "main" or parent thread ID (empty = "main")
 	Depth           int      // depth in the spawn tree (0 = child of main)
@@ -375,6 +378,13 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if opts.BuiltinTools != nil && threadProvider != nil {
 		threadProvider = threadProvider.WithBuiltins(opts.BuiltinTools)
 	}
+	initialModel := ModelLarge
+	if opts.Model != "" {
+		if m, ok := modelNames[strings.ToLower(strings.TrimSpace(opts.Model))]; ok {
+			initialModel = m
+		}
+	}
+	initialReasoning := normalizeReasoningLevel(opts.Reasoning)
 
 	// Build thread-local registry: core tools + allowed local tools + MCP tools
 	// Auto-detect MCP server names from tool prefixes if not explicitly set.
@@ -471,28 +481,31 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		messages: []Message{
 			{Role: "system", Content: threadSystemPrompt},
 		},
-		bus:           tm.parent.bus,
-		sub:           tm.parent.bus.Subscribe(id, 100),
-		pause:         make(chan bool),
-		quit:          make(chan struct{}),
-		rate:          RateReactive,
-		agentRate:     RateNormal,
-		agentSleep:    10 * time.Second,
-		maxHistory:    historyLimit,
-		memory:        tm.parent.memory,
-		session:       NewSession(".", id),
-		onStop:        func() { tm.cleanupThread(id) },
-		threadID:      id,
-		apiLog:        tm.parent.apiLog,
-		apiMu:         tm.parent.apiMu,
-		apiNotify:     tm.parent.apiNotify,
-		registry:      threadRegistry,
-		toolAllowlist: threadAllowlist,
-		config:        tm.parent.config,
-		mcpServers:    threadMCPServers,
-		toolIndex:     tm.parent.toolIndex,
-		activeTools:   preloadActive,
-		directive:     directive,
+		bus:            tm.parent.bus,
+		sub:            tm.parent.bus.Subscribe(id, 100),
+		pause:          make(chan bool),
+		quit:           make(chan struct{}),
+		rate:           RateReactive,
+		agentRate:      RateNormal,
+		agentSleep:     10 * time.Second,
+		model:          initialModel,
+		agentModel:     initialModel,
+		agentReasoning: initialReasoning,
+		maxHistory:     historyLimit,
+		memory:         tm.parent.memory,
+		session:        NewSession(".", id),
+		onStop:         func() { tm.cleanupThread(id) },
+		threadID:       id,
+		apiLog:         tm.parent.apiLog,
+		apiMu:          tm.parent.apiMu,
+		apiNotify:      tm.parent.apiNotify,
+		registry:       threadRegistry,
+		toolAllowlist:  threadAllowlist,
+		config:         tm.parent.config,
+		mcpServers:     threadMCPServers,
+		toolIndex:      tm.parent.toolIndex,
+		activeTools:    preloadActive,
+		directive:      directive,
 		rebuildPrompt: func(_ string) string {
 			cd := ""
 			if threadRegistry != nil {
@@ -774,6 +787,24 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					spawnTools = strings.Split(toolsStr, ",")
 				}
 				providerName := call.Args["provider"]
+				modelName := strings.ToLower(strings.TrimSpace(call.Args["model"]))
+				if modelName != "" {
+					if _, ok := modelNames[modelName]; !ok {
+						emitResult(call, fmt.Sprintf("error: invalid model %q (use large, medium, or small)", modelName))
+						toolNames = append(toolNames, call.Raw)
+						continue
+					}
+				}
+				reasoning := ReasoningAuto
+				if rawReasoning := reasoningArgValue(call.Args); rawReasoning != "" {
+					parsed, ok := parseReasoningLevel(rawReasoning)
+					if !ok {
+						emitResult(call, fmt.Sprintf("error: invalid reasoning %q (use auto, none, minimal, low, medium, high, or xhigh)", rawReasoning))
+						toolNames = append(toolNames, call.Raw)
+						continue
+					}
+					reasoning = parsed
+				}
 				// MCP scoping — preload these servers' tools into the
 				// child's activeTools at boot. Accept `mcps` (new) or
 				// `mcp` (transitional alias) for the same effect.
@@ -808,6 +839,8 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				} else {
 					err := thread.Children.SpawnWithOpts(sid, directive, spawnTools, SpawnOpts{
 						ProviderName: providerName,
+						Model:        modelName,
+						Reasoning:    reasoning,
 						ParentID:     thread.ID,
 						Depth:        thread.Depth + 1,
 						MCPNames:     mcpNames,
@@ -820,6 +853,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						t.config.SaveThread(PersistentThread{
 							ID: sid, ParentID: thread.ID, Depth: thread.Depth + 1,
 							Directive: directive, Tools: spawnTools, MCPNames: mcpNames,
+							Model: modelName, Reasoning: reasoning.String(),
 						})
 						if paused {
 							emitResult(call, fmt.Sprintf("thread %s spawned (depth %d, paused — send a message to wake)", sid, thread.Depth+1))
@@ -907,6 +941,15 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					t.agentModel = m
 					parts = append(parts, "model="+call.Args["model"])
 				}
+				if rawReasoning := reasoningArgValue(call.Args); rawReasoning != "" {
+					if r, ok := parseReasoningLevel(rawReasoning); ok {
+						t.agentReasoning = r
+						parts = append(parts, "reasoning="+r.String())
+					} else {
+						emitResult(call, fmt.Sprintf("error: invalid reasoning %q (use auto, none, minimal, low, medium, high, or xhigh)", rawReasoning))
+						continue
+					}
+				}
 				if pn := call.Args["provider"]; pn != "" && t.pool != nil {
 					if p := t.pool.Get(pn); p != nil {
 						t.provider = p
@@ -931,6 +974,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					tm.parent.config.SaveThread(PersistentThread{
 						ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
 						Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
+						Model: t.agentModel.String(), Reasoning: t.agentReasoning.String(),
 					})
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
 					emitResult(call, "directive updated")
@@ -1038,6 +1082,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Iteration:   t.Thinker.iteration,
 			Rate:        t.Thinker.rate,
 			Model:       t.Thinker.model,
+			Reasoning:   t.Thinker.agentReasoning,
 			Provider:    providerName,
 			Started:     t.Started,
 			ContextMsgs: len(t.Thinker.messages),

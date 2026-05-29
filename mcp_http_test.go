@@ -14,10 +14,10 @@ import (
 // TestMCPHTTP_FollowsRedirectAndParsesSSE verifies the two fixes in
 // connectMCPHTTP:
 //
-//   1. The client manually follows 307/308 redirects with the POST body
-//      preserved (Go's default client drops the body on 307 for POSTs).
-//   2. The client parses SSE-framed response bodies (event: / data: lines)
-//      in addition to plain JSON.
+//  1. The client manually follows 307/308 redirects with the POST body
+//     preserved (Go's default client drops the body on 307 for POSTs).
+//  2. The client parses SSE-framed response bodies (event: / data: lines)
+//     in addition to plain JSON.
 //
 // The mock server mimics Composio's hosted MCP:
 //   - POST /mcp → 307 Location /mcp/inner
@@ -137,14 +137,83 @@ func TestMCPHTTP_FollowsRedirectAndParsesSSE(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
-	if got != "echoed" {
-		t.Errorf("CallTool: got %q, want %q", got, "echoed")
+	if got.Text != "echoed" {
+		t.Errorf("CallTool: got %q, want %q", got.Text, "echoed")
+	}
+	if got.IsError {
+		t.Errorf("CallTool: IsError=true, want false")
 	}
 
 	// At least 3 hits on /mcp/inner (initialize + tools/list + tools/call);
 	// more OK (notifications/initialized, etc.)
 	if innerHits.Load() < 3 {
 		t.Errorf("expected >=3 inner hits, got %d", innerHits.Load())
+	}
+}
+
+func TestMCPToolMetaWakeOnResultRegistered(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req jsonRPCRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("body not valid JSON-RPC: %v", err)
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		var result map[string]any
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{
+				"protocolVersion": "2025-03-26",
+				"serverInfo":      map[string]string{"name": "mock", "version": "1.0"},
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+			}
+		case "tools/list":
+			result = map[string]any{
+				"tools": []map[string]any{{
+					"name":        "respond",
+					"description": "send a message",
+					"inputSchema": map[string]any{"type": "object"},
+					"_meta":       map[string]any{wakeOnResultMetaKey: "on_error"},
+				}},
+			}
+		case "notifications/initialized":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+			return
+		default:
+			t.Errorf("unexpected method %q", req.Method)
+			http.Error(w, "bad method", http.StatusBadRequest)
+			return
+		}
+		resp := jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}
+		resp.Result, _ = json.Marshal(result)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	registry := NewToolRegistry("")
+	index := NewToolIndex()
+	conns := connectAndRegisterMCP([]MCPServerConfig{{
+		Name:      "channels",
+		Transport: "http",
+		URL:       server.URL + "/mcp",
+	}}, registry, index, nil)
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	def := registry.Get("channels_respond")
+	if def == nil {
+		t.Fatal("channels_respond not registered")
+	}
+	if def.WakeOnResult != WakeOnResultOnError {
+		t.Fatalf("WakeOnResult=%q, want %q", def.WakeOnResult, WakeOnResultOnError)
 	}
 }
 

@@ -17,6 +17,8 @@ type PersistentThread struct {
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
 	MCPNames  []string `json:"mcp_names,omitempty"` // MCP servers to connect on respawn
+	Model     string   `json:"model,omitempty"`     // starting model tier: large, medium, small
+	Reasoning string   `json:"reasoning,omitempty"` // starting reasoning effort: auto, low, medium, high, ...
 	Realtime  bool     `json:"realtime,omitempty"`  // spawn as a realtime (voice/audio) thread
 	Voice     string   `json:"voice,omitempty"`     // realtime voice id (e.g. "alloy"); empty = provider default
 }
@@ -39,16 +41,6 @@ type ProviderConfig struct {
 	RealtimeVoice string            `json:"realtime_voice,omitempty"` // default voice for realtime providers (e.g. "alloy")
 }
 
-// ComputerConfig holds the configuration for a computer use environment.
-type ComputerConfig struct {
-	Type      string `json:"type"`                 // "browserbase", "service"
-	URL       string `json:"url,omitempty"`        // for "service" type
-	APIKey    string `json:"api_key,omitempty"`    // for "browserbase"
-	ProjectID string `json:"project_id,omitempty"` // for "browserbase"
-	Width     int    `json:"width,omitempty"`      // display width (default 2000)
-	Height    int    `json:"height,omitempty"`     // display height (default 1000)
-}
-
 type Config struct {
 	mu              sync.RWMutex
 	path            string
@@ -58,7 +50,6 @@ type Config struct {
 	RealtimeEnabled bool                   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
 	Providers       []ProviderConfig       `json:"providers,omitempty"`        // multi-provider pool
 	Provider        *ProviderConfig        `json:"provider,omitempty"`         // legacy single-provider (auto-migrated to Providers on load)
-	Computer        *ComputerConfig        `json:"computer,omitempty"`
 	Threads         []PersistentThread     `json:"threads,omitempty"`
 	MCPServers      []MCPServerConfig      `json:"mcp_servers,omitempty"`
 	Execution       ExecutionControlConfig `json:"execution_control,omitempty"`

@@ -10,8 +10,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/apteva/core/pkg/computer"
 )
 
 // sanitizeToolID ensures tool call IDs only contain characters Anthropic accepts: [a-zA-Z0-9_-]
@@ -95,10 +93,10 @@ func NewAnthropicProvider(apiKey string) LLMProvider {
 	}
 }
 
-func (p *AnthropicProvider) Name() string                            { return "anthropic" }
-func (p *AnthropicProvider) Models() map[ModelTier]string            { return p.models }
+func (p *AnthropicProvider) Name() string                           { return "anthropic" }
+func (p *AnthropicProvider) Models() map[ModelTier]string           { return p.models }
 func (p *AnthropicProvider) CostPer1M() (float64, float64, float64) { return 3.00, 0.30, 15.00 }
-func (p *AnthropicProvider) SupportsNativeTools() bool               { return true }
+func (p *AnthropicProvider) SupportsNativeTools() bool              { return true }
 
 func (p *AnthropicProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
@@ -128,13 +126,13 @@ type anthropicRequest struct {
 	Stream    bool               `json:"stream"`
 	System    any                `json:"system,omitempty"` // string or []anthropicSystemBlock
 	Messages  []anthropicMessage `json:"messages"`
-	Tools     []any              `json:"tools,omitempty"` // mixed: anthropicTool or anthropicBuiltinTool
+	Tools     []any              `json:"tools,omitempty"` // mixed: anthropicTool or provider builtin maps
 }
 
 type anthropicSystemBlock struct {
-	Type         string                  `json:"type"`
-	Text         string                  `json:"text"`
-	CacheControl *anthropicCacheControl  `json:"cache_control,omitempty"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthropicCacheControl struct {
@@ -142,18 +140,10 @@ type anthropicCacheControl struct {
 }
 
 type anthropicTool struct {
-	Name         string                  `json:"name"`
-	Description  string                  `json:"description"`
-	InputSchema  map[string]any          `json:"input_schema"`
-	CacheControl *anthropicCacheControl  `json:"cache_control,omitempty"`
-}
-
-// anthropicBuiltinTool is for Anthropic-specific tool types (computer_use, text_editor, bash).
-type anthropicBuiltinTool struct {
-	Type           string `json:"type"`                      // "computer_20250124"
-	Name           string `json:"name"`                      // "computer"
-	DisplayWidthPx  int   `json:"display_width_px,omitempty"`
-	DisplayHeightPx int   `json:"display_height_px,omitempty"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  map[string]any         `json:"input_schema"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -162,16 +152,16 @@ type anthropicMessage struct {
 }
 
 type anthropicContentBlock struct {
-	Type         string                  `json:"type"`                    // "text", "image", "tool_use", "tool_result"
-	Text         string                  `json:"text,omitempty"`          // type=text
-	Source       *anthropicSource        `json:"source,omitempty"`        // type=image
-	ID           string                  `json:"id,omitempty"`            // type=tool_use
-	Name         string                  `json:"name,omitempty"`          // type=tool_use
-	Input        json.RawMessage         `json:"input,omitempty"`         // type=tool_use — use RawMessage to preserve empty {}
-	ToolUseID    string                  `json:"tool_use_id,omitempty"`   // type=tool_result
-	Content      any                     `json:"content,omitempty"`       // type=tool_result (string or blocks)
-	IsError      bool                    `json:"is_error,omitempty"`      // type=tool_result
-	CacheControl *anthropicCacheControl  `json:"cache_control,omitempty"` // mark this block as a cache breakpoint
+	Type         string                 `json:"type"`                    // "text", "image", "tool_use", "tool_result"
+	Text         string                 `json:"text,omitempty"`          // type=text
+	Source       *anthropicSource       `json:"source,omitempty"`        // type=image
+	ID           string                 `json:"id,omitempty"`            // type=tool_use
+	Name         string                 `json:"name,omitempty"`          // type=tool_use
+	Input        json.RawMessage        `json:"input,omitempty"`         // type=tool_use — use RawMessage to preserve empty {}
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`   // type=tool_result
+	Content      any                    `json:"content,omitempty"`       // type=tool_result (string or blocks)
+	IsError      bool                   `json:"is_error,omitempty"`      // type=tool_result
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"` // mark this block as a cache breakpoint
 }
 
 type anthropicSource struct {
@@ -184,9 +174,9 @@ type anthropicSource struct {
 // --- Streaming response types ---
 
 type anthropicStreamEvent struct {
-	Type         string `json:"type"`
-	Index        int    `json:"index,omitempty"`
-	Delta        *anthropicDelta `json:"delta,omitempty"`
+	Type         string               `json:"type"`
+	Index        int                  `json:"index,omitempty"`
+	Delta        *anthropicDelta      `json:"delta,omitempty"`
 	ContentBlock *anthropicBlockStart `json:"content_block,omitempty"`
 	Message      *struct {
 		Usage *struct {
@@ -211,11 +201,11 @@ type anthropicDelta struct {
 }
 
 type anthropicBlockStart struct {
-	Type  string `json:"type"` // "text", "tool_use", "server_tool_use", "code_execution_tool_result"
-	Text  string `json:"text,omitempty"`
-	ID    string `json:"id,omitempty"`    // tool_use
-	Name  string `json:"name,omitempty"`  // tool_use / server_tool_use
-	Input map[string]any `json:"input"` // tool_use (may be empty at start)
+	Type  string         `json:"type"` // "text", "tool_use", "server_tool_use", "code_execution_tool_result"
+	Text  string         `json:"text,omitempty"`
+	ID    string         `json:"id,omitempty"`   // tool_use
+	Name  string         `json:"name,omitempty"` // tool_use / server_tool_use
+	Input map[string]any `json:"input"`          // tool_use (may be empty at start)
 	// code_execution_tool_result fields
 	Content []struct {
 		Type   string `json:"type"`
@@ -313,39 +303,14 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		anthropicMsgs = append(anthropicMsgs, anthropicMessage{Role: "user", Content: "Begin."})
 	}
 
-	// Convert tools — separate computer_use (builtin) from regular tools
+	// Convert tools.
 	var anthropicTools []any
-	hasComputerUse := false
-	computerBeta := ""
 	for _, t := range tools {
-		if t.Name == "computer_use" {
-			// Use the native Anthropic computer use format
-			// Parse display dimensions from parameters or defaults
-			width, height := 1024, 768
-			if w, ok := t.Parameters["_display_width"].(int); ok {
-				width = w
-			}
-			if h, ok := t.Parameters["_display_height"].(int); ok {
-				height = h
-			}
-			display := computer.DisplaySize{Width: width, Height: height}
-			// Computer tool version depends on model
-			toolVersion := "20250124" // default for older models
-			if strings.Contains(model, "opus-4-6") || strings.Contains(model, "sonnet-4-6") || strings.Contains(model, "opus-4-5") {
-				toolVersion = "20251124" // enhanced computer use for 4.5+ models
-			}
-			spec := computer.GetAnthropicToolSpec(display, toolVersion)
-			logMsg("ANTHROPIC", fmt.Sprintf("computer tool: type=%s display=%dx%d beta=%s", spec.Type, spec.DisplayWidthPx, spec.DisplayHeightPx, computer.AnthropicBetaHeader(toolVersion)))
-			anthropicTools = append(anthropicTools, spec)
-			computerBeta = computer.AnthropicBetaHeader(toolVersion)
-			hasComputerUse = true
-		} else {
-			anthropicTools = append(anthropicTools, anthropicTool{
-				Name:        t.Name,
-				Description: t.Description,
-				InputSchema: t.Parameters,
-			})
-		}
+		anthropicTools = append(anthropicTools, anthropicTool{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.Parameters,
+		})
 	}
 
 	// Add enabled built-in tools
@@ -417,10 +382,6 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", p.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
-	if hasComputerUse {
-		req.Header.Set("anthropic-beta", computerBeta)
-	}
-
 	resp, err := llmHTTPClient.Do(req)
 	if err != nil {
 		return ChatResponse{}, err

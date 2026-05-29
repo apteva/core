@@ -158,11 +158,8 @@ func TestBuildSystemPrompt_CodexVisibleActivity(t *testing.T) {
 	if !strings.Contains(codexPrompt, "[CODEX VISIBLE ACTIVITY]") {
 		t.Fatal("Codex prompt missing visible activity guidance")
 	}
-	if !strings.Contains(codexPrompt, `search_tools(query="..."`) {
-		t.Fatal("Codex prompt should describe MCP tool discovery mode")
-	}
-	if strings.Contains(codexPrompt, "ALL their tools are already in your tool list") {
-		t.Fatal("Codex prompt should not describe eager MCP tools")
+	if !strings.Contains(codexPrompt, "ALL their tools are already in your tool list") {
+		t.Fatal("Codex prompt should use eager MCP wording for small tool surfaces")
 	}
 
 	kimiPool := &ProviderPool{default_: "fireworks"}
@@ -175,13 +172,29 @@ func TestBuildSystemPrompt_CodexVisibleActivity(t *testing.T) {
 	}
 }
 
-func TestUseEagerTools_CodexForcesDiscovery(t *testing.T) {
+func TestUseEagerTools_CodexUsesNormalThreshold(t *testing.T) {
+	tk := &Thinker{
+		provider:  &OpenAINativeProvider{name: "openai-codex"},
+		toolIndex: NewToolIndex(),
+	}
+	if !tk.useEagerTools() {
+		t.Fatal("Codex should use eager mode for small tool surfaces in auto mode")
+	}
+}
+
+func TestToolSearchEnvOverrideAppliesToCodex(t *testing.T) {
+	t.Setenv("APTEVA_TOOL_SEARCH", "on")
 	tk := &Thinker{
 		provider:  &OpenAINativeProvider{name: "openai-codex"},
 		toolIndex: NewToolIndex(),
 	}
 	if tk.useEagerTools() {
-		t.Fatal("Codex should force discovery mode even for small tool surfaces")
+		t.Fatal("APTEVA_TOOL_SEARCH=on should force discovery for Codex")
+	}
+
+	t.Setenv("APTEVA_TOOL_SEARCH", "off")
+	if !tk.useEagerTools() {
+		t.Fatal("APTEVA_TOOL_SEARCH=off should force eager for Codex")
 	}
 }
 

@@ -45,10 +45,6 @@ var geminiModels = map[string]GoogleModel{
 	"gemini-2.5-flash": {
 		ID: "gemini-2.5-flash", InputPer1M: 0.30, CachedPer1M: 0.03, OutputPer1M: 2.50, MaxOutputTokens: 65536,
 	},
-	// Computer Use model
-	"gemini-2.5-computer-use-preview-10-2025": {
-		ID: "gemini-2.5-computer-use-preview-10-2025", InputPer1M: 1.00, CachedPer1M: 0.10, OutputPer1M: 4.00, MaxOutputTokens: 64000,
-	},
 }
 
 // GeminiModelOrder defines the cycle order for model switching in the TUI.
@@ -61,9 +57,9 @@ var GeminiModelOrder = []string{
 }
 
 type GoogleProvider struct {
-	apiKey       string
-	models       map[ModelTier]string
-	activeModel  string // current model ID for cost tracking
+	apiKey      string
+	models      map[ModelTier]string
+	activeModel string // current model ID for cost tracking
 }
 
 func NewGoogleProvider(apiKey string) LLMProvider {
@@ -79,8 +75,8 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 }
 
 func (p *GoogleProvider) Name() string                 { return "google" }
-func (p *GoogleProvider) Models() map[ModelTier]string  { return p.models }
-func (p *GoogleProvider) SupportsNativeTools() bool     { return true }
+func (p *GoogleProvider) Models() map[ModelTier]string { return p.models }
+func (p *GoogleProvider) SupportsNativeTools() bool    { return true }
 
 func (p *GoogleProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
@@ -121,21 +117,14 @@ func (p *GoogleProvider) AvailableModels() []string { return GeminiModelOrder }
 
 // Gemini API request format
 type geminiRequest struct {
-	Contents          []geminiContent        `json:"contents"`
-	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
-	GenerationConfig  map[string]any         `json:"generationConfig,omitempty"`
-	Tools             []geminiToolDecl       `json:"tools,omitempty"`
+	Contents          []geminiContent  `json:"contents"`
+	SystemInstruction *geminiContent   `json:"systemInstruction,omitempty"`
+	GenerationConfig  map[string]any   `json:"generationConfig,omitempty"`
+	Tools             []geminiToolDecl `json:"tools,omitempty"`
 }
 
 type geminiToolDecl struct {
 	FunctionDeclarations []geminiFunctionDecl `json:"functionDeclarations,omitempty"`
-	ComputerUse          *geminiComputerUse   `json:"computerUse,omitempty"`
-}
-
-// geminiComputerUse is the native Gemini Computer Use tool config.
-type geminiComputerUse struct {
-	Environment                string   `json:"environment"`                          // "ENVIRONMENT_BROWSER"
-	ExcludedPredefinedFunctions []string `json:"excludedPredefinedFunctions,omitempty"` // e.g. ["drag_and_drop"]
 }
 
 type geminiFunctionDecl struct {
@@ -150,11 +139,11 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text              string                  `json:"text,omitempty"`
-	InlineData        *geminiInline           `json:"inlineData,omitempty"`
-	FunctionCall      *geminiFunctionCall     `json:"functionCall,omitempty"`
-	FunctionResponse  *geminiFunctionResponse `json:"functionResponse,omitempty"`
-	ThoughtSignature  string                  `json:"thoughtSignature,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	InlineData       *geminiInline           `json:"inlineData,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -180,8 +169,8 @@ type geminiStreamResponse struct {
 		} `json:"content"`
 	} `json:"candidates"`
 	UsageMetadata *struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
+		PromptTokenCount        int `json:"promptTokenCount"`
+		CandidatesTokenCount    int `json:"candidatesTokenCount"`
 		CachedContentTokenCount int `json:"cachedContentTokenCount"`
 	} `json:"usageMetadata"`
 }
@@ -338,49 +327,21 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		maxTokens = m.MaxOutputTokens
 	}
 
-	// Convert native tools to Gemini function declarations
-	// Separate computer_use (native) from regular tools
+	// Convert native tools to Gemini function declarations.
 	var geminiTools []geminiToolDecl
-	// Models that support native Computer Use
-	// Note: gemini-3-flash-preview supports it but auto-triggers browsing unprompted.
-	// Only enable for the dedicated computer-use model for now.
-	computerUseModels := map[string]bool{
-		"gemini-2.5-computer-use-preview-10-2025": true,
-	}
-
-	hasComputerUse := false
 	if len(tools) > 0 {
 		var funcs []geminiFunctionDecl
 		for _, t := range tools {
-			if t.Name == "computer_use" {
-				if !computerUseModels[model] {
-					logMsg("GEMINI", fmt.Sprintf("skipping computer_use — not supported by %s", model))
-					continue
-				}
-				geminiTools = append(geminiTools, geminiToolDecl{
-					ComputerUse: &geminiComputerUse{
-						Environment: "ENVIRONMENT_BROWSER",
-					},
-				})
-				hasComputerUse = true
-				logMsg("GEMINI", "native computer_use tool enabled")
-			} else if t.Name == "browser_session" {
-				// browser_session is handled by Gemini's native navigate/search/go_back etc.
-				// Skip — these are built into the Computer Use tool
-				continue
-			} else {
-				funcs = append(funcs, geminiFunctionDecl{
-					Name:        t.Name,
-					Description: t.Description,
-					Parameters:  t.Parameters,
-				})
-			}
+			funcs = append(funcs, geminiFunctionDecl{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			})
 		}
 		if len(funcs) > 0 {
 			geminiTools = append(geminiTools, geminiToolDecl{FunctionDeclarations: funcs})
 		}
 	}
-	_ = hasComputerUse
 
 	reqBody := geminiRequest{
 		Contents:          contents,

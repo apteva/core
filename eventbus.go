@@ -26,7 +26,7 @@ type Event struct {
 	Text       string        // message payload
 	ToolName   string        // tool name (for EventToolChunk)
 	Parts      []ContentPart // optional media (images, audio) attached to this event
-	ToolResult *ToolResult   // optional: structured tool result (for computer_use etc.)
+	ToolResult *ToolResult   // optional: structured tool result
 
 	// Structured fields (populated for ThinkDone events)
 	Iteration      int
@@ -38,6 +38,7 @@ type Event struct {
 	Rate           ThinkRate
 	SleepDuration  time.Duration
 	Model          ModelTier
+	Reasoning      ReasoningLevel
 	MemoryCount    int
 	ThreadCount    int
 	ContextMsgs    int // number of messages in context window

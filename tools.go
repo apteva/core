@@ -98,15 +98,21 @@ func executeTool(t *Thinker, call toolCall) {
 				}
 			}
 		}()
+		wakePolicy := WakeOnResultAlways
+		if t.registry != nil {
+			if def := t.registry.Get(call.Name); def != nil && def.WakeOnResult != "" {
+				wakePolicy = def.WakeOnResult
+			}
+		}
 		var resp ToolResponse
 		if t.registry != nil {
 			if res, ok := t.registry.Dispatch(call.Name, call.Args); ok {
 				resp = res
 			} else {
-				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name)}
+				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
 			}
 		} else {
-			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name)}
+			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
 		}
 
 		resultPreview := resp.Text
@@ -123,7 +129,7 @@ func executeTool(t *Thinker, call toolCall) {
 			}
 			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
 				ID: call.NativeID, Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
-				Success: !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown"),
+				Success: !resp.IsError && !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown"),
 				Result:  resultSummary,
 			})
 		}
@@ -135,11 +141,16 @@ func executeTool(t *Thinker, call toolCall) {
 		}
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI + "\n", Iteration: t.iteration})
 
-		// Inject result as a proper ToolResult event (text + optional image)
-		// For channels_respond: inject minimal result so thinker wakes, but don't echo the full text
+		// Inject result as a proper ToolResult event (text + optional image).
+		// MCP tools may opt into success-only silent delivery via
+		// _meta["io.apteva/wakeOnResult"]="on_error"; those results are
+		// still queued for history pairing, but do not wake the model.
 		resultText := resp.Text
-		if call.Name == "channels_respond" {
-			resultText = "ok"
+		toolResult := ToolResult{
+			CallID:  call.NativeID,
+			Content: resultText,
+			Image:   resp.Image,
+			IsError: resp.IsError,
 		}
 
 		// Late-result routing. If the iter-boundary barrier already
@@ -170,14 +181,15 @@ func executeTool(t *Thinker, call toolCall) {
 			return
 		}
 
+		if wakePolicy == WakeOnResultOnError && !resp.IsError {
+			t.queueSilentToolResult(toolResult)
+			return
+		}
+
 		t.bus.Publish(Event{
 			Type: EventInbox, To: t.threadID,
-			Text: fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
-			ToolResult: &ToolResult{
-				CallID:  call.NativeID,
-				Content: resultText,
-				Image:   resp.Image,
-			},
+			Text:       fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
+			ToolResult: &toolResult,
 		})
 	}()
 }

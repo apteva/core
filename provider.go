@@ -229,6 +229,12 @@ type LLMProvider interface {
 	WithBuiltins(builtins []string) LLMProvider
 }
 
+// ReasoningProvider is an optional LLMProvider extension for APIs that
+// support request-level reasoning or thinking effort controls.
+type ReasoningProvider interface {
+	WithReasoning(settings ReasoningSettings) LLMProvider
+}
+
 // createRealtimeProviderByName creates a RealtimeProvider by name,
 // returning nil if the required API key is missing or the name is
 // unknown. Mirrors createProviderByName but for the realtime
@@ -510,6 +516,9 @@ func (pp *ProviderPool) ProviderSummary(name string) string {
 		for _, bt := range builtins {
 			summary += " " + bt.Name
 		}
+	}
+	if _, ok := p.(ReasoningProvider); ok {
+		summary += "\n    reasoning: auto none minimal low medium high xhigh"
 	}
 	return summary
 }

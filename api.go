@@ -7,8 +7,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	aptcomputer "github.com/apteva/computer"
 )
 
 type APIServer struct {
@@ -85,6 +83,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 		"iteration":             a.thinker.iteration,
 		"rate":                  formatSleep(a.thinker.agentSleep),
 		"model":                 a.thinker.model.String(),
+		"reasoning":             a.thinker.agentReasoning.String(),
 		"threads":               a.thinker.threads.Count() + 1, // +1 for main
 		"memories":              a.thinker.memory.Count(),
 		"paused":                a.thinker.paused,
@@ -105,6 +104,7 @@ type threadJSON struct {
 	Iteration int      `json:"iteration"`
 	Rate      string   `json:"rate"`
 	Model     string   `json:"model"`
+	Reasoning string   `json:"reasoning,omitempty"`
 	Age       string   `json:"age"`
 }
 
@@ -129,6 +129,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 		Iteration: a.thinker.iteration,
 		Rate:      a.thinker.rate.String(),
 		Model:     a.thinker.model.String(),
+		Reasoning: a.thinker.agentReasoning.String(),
 		Age:       formatAge(time.Since(a.startTime)),
 	}}
 
@@ -147,6 +148,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 				Iteration: t.Iteration,
 				Rate:      t.Rate.String(),
 				Model:     t.Model.String(),
+				Reasoning: t.Reasoning.String(),
 				Age:       formatAge(time.Since(t.Started)),
 			})
 			// Recurse into children
@@ -332,6 +334,8 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		Realtime        bool     `json:"realtime,omitempty"`
 		Voice           string   `json:"voice,omitempty"`
 		ProviderName    string   `json:"provider,omitempty"`
+		Model           string   `json:"model,omitempty"`
+		Reasoning       string   `json:"reasoning,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -375,6 +379,21 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		Realtime:      body.Realtime,
 		Voice:         body.Voice,
 		ProviderName:  body.ProviderName,
+		Model:         strings.ToLower(strings.TrimSpace(body.Model)),
+	}
+	if rawReasoning := strings.TrimSpace(body.Reasoning); rawReasoning != "" {
+		r, ok := parseReasoningLevel(rawReasoning)
+		if !ok {
+			http.Error(w, "invalid reasoning", http.StatusBadRequest)
+			return
+		}
+		opts.Reasoning = r
+	}
+	if opts.Model != "" {
+		if _, ok := modelNames[opts.Model]; !ok {
+			http.Error(w, "invalid model", http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Realtime spawns also need audio channels so an external caller
@@ -647,18 +666,6 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 		}
-		// Build live computer info
-		var computerInfo map[string]any
-		if a.thinker.computer != nil {
-			d := a.thinker.computer.DisplaySize()
-			computerInfo = map[string]any{
-				"connected": true,
-				"display":   map[string]int{"width": d.Width, "height": d.Height},
-			}
-			if a.thinker.config.Computer != nil {
-				computerInfo["type"] = a.thinker.config.Computer.Type
-			}
-		}
 		// Build live MCP server info. Every configured MCP is connected
 		// up-front (no main/catalog split anymore), so "connected" reflects
 		// the actual live state. The legacy `main_access` field is no
@@ -692,7 +699,6 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			"mode":                  a.thinker.config.GetMode(),
 			"provider":              providerInfo,
 			"providers":             a.thinker.config.GetProviders(),
-			"computer":              computerInfo,
 			"mcp_servers":           mcpInfo,
 			"execution_control":     a.thinker.executionStatus(),
 			"execution_checkpoints": a.thinker.executionCheckpointMeta(),
@@ -703,7 +709,7 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			Mode       RunMode                 `json:"mode,omitempty"`
 			Provider   *ProviderConfig         `json:"provider,omitempty"`
 			Providers  []ProviderConfig        `json:"providers,omitempty"`
-			Computer   *ComputerConfig         `json:"computer,omitempty"`
+			Computer   json.RawMessage         `json:"computer,omitempty"`
 			MCPServers []MCPServerConfig       `json:"mcp_servers,omitempty"`
 			Execution  *ExecutionControlConfig `json:"execution_control,omitempty"`
 			Reset      *struct {
@@ -714,6 +720,10 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if len(body.Computer) > 0 {
+			http.Error(w, "core computer config has been removed; use the Computer app MCP tools instead", http.StatusGone)
 			return
 		}
 		if body.Directive != "" {
@@ -778,59 +788,6 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				for tier, modelID := range body.Provider.Models {
 					a.thinker.config.SetProviderModel(tier, modelID)
 				}
-			}
-		}
-		if body.Computer != nil {
-			// Hot-connect or disconnect computer environment
-			if body.Computer.Type == "" {
-				// Disconnect
-				if a.thinker.computer != nil {
-					a.thinker.computer.Close()
-					a.thinker.computer = nil
-				}
-				a.thinker.config.mu.Lock()
-				a.thinker.config.Computer = nil
-				a.thinker.config.mu.Unlock()
-				a.thinker.config.Save()
-			} else {
-				// Pick a provider-aware viewport default when the caller
-				// didn't specify one. Anthropic's computer-use tool was
-				// trained on 1024×768 and Anthropic's docs specifically
-				// recommend keeping the screenshot at that exact size for
-				// best click accuracy. For non-Anthropic providers (Kimi,
-				// Gemini, etc.) we use 1600×800 — exact 2:1 widescreen,
-				// wide enough for desktop layouts but small enough to
-				// keep screenshot token counts modest on non-native
-				// vision models.
-				width, height := body.Computer.Width, body.Computer.Height
-				if width == 0 || height == 0 {
-					if a.thinker.provider != nil && a.thinker.provider.Name() == "anthropic" {
-						width, height = 1024, 768
-					} else {
-						width, height = 1600, 800
-					}
-				}
-				comp, err := aptcomputer.New(aptcomputer.Config{
-					Type:      body.Computer.Type,
-					URL:       body.Computer.URL,
-					APIKey:    body.Computer.APIKey,
-					ProjectID: body.Computer.ProjectID,
-					Width:     width,
-					Height:    height,
-				})
-				if err != nil {
-					http.Error(w, fmt.Sprintf("computer: %v", err), http.StatusBadRequest)
-					return
-				}
-				// Close old session if any
-				if a.thinker.computer != nil {
-					a.thinker.computer.Close()
-				}
-				a.thinker.SetComputer(comp)
-				a.thinker.config.mu.Lock()
-				a.thinker.config.Computer = body.Computer
-				a.thinker.config.mu.Unlock()
-				a.thinker.config.Save()
 			}
 		}
 		if body.MCPServers != nil {
