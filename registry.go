@@ -181,8 +181,8 @@ func (tr *ToolRegistry) registerDefaults() {
 	tr.Register(&ToolDef{
 		Name:        "spawn",
 		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. By default the worker starts thinking immediately on its directive; pass paused=\"true\" to spawn it dormant — it'll wake on the first `send` you give it. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
-		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec", mcp="store,stripe", model="medium", reasoning="low", paused="true")`,
-		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated local tools (web, exec, read_file, etc). mcp: comma-separated MCP server names — thread gets its own connection and only sees those tools. provider: LLM provider name (optional). model: starting tier ("large", "medium", "small"). reasoning/thinking: starting reasoning effort ("auto", "none", "minimal", "low", "medium", "high", "xhigh"; provider support varies). paused: "true" to spawn dormant — useful when you want to spawn several workers atomically before any think, or when you want to attach a message to the worker's first turn rather than letting it act on the directive alone. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
+		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec,store_lookup", mcp="store", model="medium", reasoning="low", paused="true")`,
+		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated FULL tool names the worker needs, including MCP tools exactly as visible (e.g. store_lookup). If a worker needs visible tools, do not leave tools empty. mcp: optional comma-separated MCP server names for catalog servers; it does not replace tools when full tool names are visible and may be unavailable for no_spawn/app servers. provider: LLM provider name (optional). model: starting tier ("large", "medium", "small"). reasoning/thinking: starting reasoning effort ("auto", "none", "minimal", "low", "medium", "high", "xhigh"; provider support varies). paused: "true" to spawn dormant — useful when you want to spawn several workers atomically before any think, or when you want to attach a message to the worker's first turn rather than letting it act on the directive alone. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
 		Core:        true,
 		MainOnly:    true,
 		InputSchema: map[string]any{
@@ -190,8 +190,8 @@ func (tr *ToolRegistry) registerDefaults() {
 			"properties": map[string]any{
 				"id":        map[string]any{"type": "string", "description": "Unique thread id for the new worker."},
 				"directive": map[string]any{"type": "string", "description": "What the thread does — its system prompt / role."},
-				"tools":     map[string]any{"type": "string", "description": "Comma-separated local tool names (web, exec, read_file, ...). Optional."},
-				"mcp":       map[string]any{"type": "string", "description": "Comma-separated MCP server names. Optional."},
+				"tools":     map[string]any{"type": "string", "description": "Comma-separated full tool names the worker needs, including visible MCP tools. Do not leave empty when the worker must call specific tools."},
+				"mcp":       map[string]any{"type": "string", "description": "Optional comma-separated MCP server names for catalog servers. Does not replace tools when full tool names are visible."},
 				"provider":  map[string]any{"type": "string", "description": "LLM provider name. Optional."},
 				"model":     map[string]any{"type": "string", "description": "Starting model tier: \"large\", \"medium\", \"small\". Optional."},
 				"reasoning": map[string]any{"type": "string", "description": "Starting reasoning effort: \"auto\", \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\". Optional."},

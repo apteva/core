@@ -227,7 +227,9 @@ EVENTS:
 
 SPAWNING THREADS — critical rules:
 - Before spawning, check [ACTIVE THREADS]: if an existing thread has matching tools and directive, send(id="...") to it instead. Spawn only when no existing thread fits, or when you need parallelism over independent inputs.
-- tools= lists which tools the worker can use. ALWAYS include EVERY tool the worker needs to carry out its directive — if the directive says "run a script", include exec; if "transcribe audio", include the deepgram tool. A missing tool = worker reports failure and can't act. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
+- For batches of independent repeated work, especially tool-heavy or waiting/polling work, prefer using main as a coordinator and spawning focused workers; keep simple or sequential work on main.
+- One-shot workers should own one clear unit of work, use the smallest required tool set, and send/done a concise result back.
+- tools= lists which tools the worker can use. ALWAYS include EVERY tool the worker needs to carry out its directive; do not use empty tools for a worker that needs specific visible tools. A missing tool = worker reports failure and can't act. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
 - Spawn for heavy output, not inline tool args. If a single tool call would carry >1KB of model-generated content (article body, multi-section report, generated code), instead spawn(id="...", directive="<focused write task — what to produce, where to store it, what to return>", tools="<storage/etc.>") and continue with other work. The sub-thread streams the content in its own context; you read its [thread:id done] notification when it finishes. Inlining large content in tool args blocks this loop while the model streams it.
 - directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
