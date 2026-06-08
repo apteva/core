@@ -93,6 +93,10 @@ type MCPConn interface {
 	Close()
 }
 
+type schemaAwareMCPConn interface {
+	CallToolTyped(name string, args map[string]string, inputSchema map[string]any) (ToolResponse, error)
+}
+
 // MCPServer manages a running MCP server subprocess (stdio transport)
 type MCPServer struct {
 	Name    string
@@ -251,21 +255,11 @@ func (s *MCPServer) ListTools() ([]mcpToolDef, error) {
 
 // CallTool invokes a tool on the MCP server
 func (s *MCPServer) CallTool(name string, args map[string]string) (ToolResponse, error) {
-	// Convert string args to any for JSON
-	// Parse string values that look like JSON arrays/objects/numbers/booleans
-	// so they're sent as proper JSON types to the MCP server
-	arguments := make(map[string]any)
-	for k, v := range args {
-		if len(v) > 0 && (v[0] == '[' || v[0] == '{') {
-			var parsed any
-			if json.Unmarshal([]byte(v), &parsed) == nil {
-				arguments[k] = parsed
-				continue
-			}
-		}
-		arguments[k] = v
-	}
+	return s.CallToolTyped(name, args, nil)
+}
 
+func (s *MCPServer) CallToolTyped(name string, args map[string]string, inputSchema map[string]any) (ToolResponse, error) {
+	arguments := mcpArgumentsFromStrings(args, inputSchema)
 	result, err := s.call("tools/call", map[string]any{
 		"name":      name,
 		"arguments": arguments,
@@ -302,12 +296,34 @@ func (s *MCPServer) Close() {
 // rewrites any _binary envelope returned by the tool into a compact
 // _file handle — so large binaries never traverse the LLM context.
 // Pass nil for blobs to get straight proxy behaviour (legacy path).
-func mcpProxyHandler(server MCPConn, toolName string, blobs *BlobStore) func(args map[string]string) ToolResponse {
+func mcpProxyHandler(server MCPConn, toolName string, opts ...any) func(args map[string]string) ToolResponse {
+	var inputSchema map[string]any
+	var blobs *BlobStore
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case map[string]any:
+			inputSchema = v
+		case *BlobStore:
+			blobs = v
+		}
+	}
 	return func(args map[string]string) ToolResponse {
 		if blobs != nil {
 			args = blobs.RehydrateFileRefs(args)
 		}
-		resp, err := server.CallTool(toolName, args)
+		var (
+			resp ToolResponse
+			err  error
+		)
+		if inputSchema != nil {
+			if typed, ok := server.(schemaAwareMCPConn); ok {
+				resp, err = typed.CallToolTyped(toolName, args, inputSchema)
+			} else {
+				resp, err = server.CallTool(toolName, args)
+			}
+		} else {
+			resp, err = server.CallTool(toolName, args)
+		}
 		if err != nil {
 			return ToolResponse{Text: fmt.Sprintf("error: %v", err), IsError: true}
 		}
@@ -459,7 +475,7 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 				Description: fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
 				Syntax:      syntax,
 				Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
-				Handler:     mcpProxyHandler(srv, tool.Name, blobs),
+				Handler:     mcpProxyHandler(srv, tool.Name, tool.InputSchema, blobs),
 				InputSchema: tool.InputSchema,
 				MCP:         true, // hidden until activated; old MainAccess flag is gone
 				MCPServer:   cfg.Name,

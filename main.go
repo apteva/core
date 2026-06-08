@@ -3,7 +3,10 @@ package core
 import (
 	"fmt"
 	"os"
+	"os/signal"
+	"runtime/debug"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
@@ -125,6 +128,15 @@ type StreamEvent struct {
 func Run() {
 	godotenv.Load()
 	initLogger()
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprintf("top-level panic: %v\n%s", r, string(debug.Stack()))
+			logMsg("CRASH", msg)
+			fmt.Fprintf(os.Stderr, "%s\n", msg)
+			os.Exit(2)
+		}
+	}()
+	installSignalLogger()
 
 	cfg := NewConfig()
 
@@ -187,6 +199,7 @@ func Run() {
 			go console.Run()
 		}
 		<-thinker.quit
+		logMsg("EXIT", "thinker quit channel closed")
 	} else {
 		p := tea.NewProgram(newModel(thinker), tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
@@ -194,4 +207,20 @@ func Run() {
 			os.Exit(1)
 		}
 	}
+}
+
+func installSignalLogger() {
+	ch := make(chan os.Signal, 4)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
+	go func() {
+		sig := <-ch
+		logMsg("SIGNAL", fmt.Sprintf("received %s pid=%d", sig, os.Getpid()))
+		if logFile != nil {
+			_ = logFile.Sync()
+		}
+		signal.Reset(sig)
+		if s, ok := sig.(syscall.Signal); ok {
+			_ = syscall.Kill(os.Getpid(), s)
+		}
+	}()
 }

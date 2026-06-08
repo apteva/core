@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -1550,7 +1551,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							Description: fmt.Sprintf("[%s] %s", name, tool.Description),
 							Syntax:      syntax,
 							Rules:       fmt.Sprintf("Provided by MCP server '%s'.", name),
-							Handler:     mcpProxyHandler(srv, tool.Name, t.blobs),
+							Handler:     mcpProxyHandler(srv, tool.Name, tool.InputSchema, t.blobs),
 							InputSchema: tool.InputSchema,
 							MCP:         true,
 							MCPServer:   name,
@@ -1609,6 +1610,28 @@ func mainToolHandler(t *Thinker) ToolHandler {
 
 func (t *Thinker) Run() {
 	defer func() {
+		if r := recover(); r != nil {
+			memoryCount := 0
+			if t.memory != nil {
+				memoryCount = t.memory.Count()
+			}
+			contextChars := 0
+			for _, m := range t.messages {
+				contextChars += len(m.TextContent())
+			}
+			logMsg("CRASH", fmt.Sprintf(
+				"thinker panic thread=%s iteration=%d messages=%d context_chars=%d memory=%d panic=%v\n%s",
+				t.threadID, t.iteration, len(t.messages), contextChars, memoryCount, r, string(debug.Stack()),
+			))
+			if t.telemetry != nil {
+				t.telemetry.Emit("llm.error", t.threadID, LLMErrorData{
+					Model:     t.modelID(),
+					Error:     fmt.Sprintf("thinker panic: %v", r),
+					Iteration: t.iteration,
+				})
+			}
+			t.Stop()
+		}
 		if t.restarting {
 			t.restarting = false
 			return
@@ -2076,17 +2099,7 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		// Compact session history if it's grown too large
-		if t.session != nil && t.session.NeedsCompaction() {
-			logMsg("SESSION", fmt.Sprintf("[%s] triggering compaction (count=%d)", t.threadID, t.session.Count()))
-			t.session.Compact(func(text string) string {
-				// Simple summary — truncate to key points (no LLM call to avoid cost)
-				if len(text) > 2000 {
-					text = text[:2000]
-				}
-				return fmt.Sprintf("Summary of %d earlier messages: %s", t.session.Count(), text)
-			})
-		}
+		t.compactSessionIfNeeded()
 
 		// After processing, fall back to agent's chosen rate/sleep
 		// (external events already set reactive above for this iteration)
@@ -2626,6 +2639,22 @@ func (t *Thinker) TogglePause() {
 	if t.threads != nil {
 		t.threads.PauseAll(newState)
 	}
+}
+
+func (t *Thinker) compactSessionIfNeeded() {
+	if t.session == nil || !t.session.NeedsCompaction() {
+		return
+	}
+	preCompactCount := t.session.Count()
+	logMsg("SESSION", fmt.Sprintf("[%s] triggering compaction (count=%d)", t.threadID, preCompactCount))
+	t.session.Compact(func(text string) string {
+		// Simple summary — truncate to key points (no LLM call to avoid cost)
+		if len(text) > 2000 {
+			text = text[:2000]
+		}
+		return fmt.Sprintf("Summary of %d earlier messages: %s", preCompactCount, text)
+	})
+	logMsg("SESSION", fmt.Sprintf("[%s] compaction complete (count=%d)", t.threadID, t.session.Count()))
 }
 
 func (t *Thinker) Stop() {

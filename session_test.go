@@ -1,7 +1,12 @@
 package core
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 // Pins the regression where sanitizeToolPairs preserved orphan tool
@@ -226,4 +231,145 @@ func TestSanitize_PostconditionReferentialIntegrity(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestSessionCompact_RewritesToSummaryAndRecentTail(t *testing.T) {
+	session := NewSession(t.TempDir(), "main")
+	for i := 0; i < compactThreshold+1; i++ {
+		session.Append(SessionEntry{
+			Role:    "user",
+			Content: fmt.Sprintf("message-%03d", i),
+		})
+	}
+	if !session.NeedsCompaction() {
+		t.Fatal("session should need compaction after threshold+1 appends")
+	}
+
+	session.Compact(func(text string) string {
+		if !strings.Contains(text, "message-000") {
+			t.Fatalf("summary input missing early history: %q", text)
+		}
+		return "custom compact summary"
+	})
+
+	entries := readSessionEntriesForTest(t, session.path)
+	wantCount := compactKeepRecent + 1
+	if len(entries) != wantCount {
+		t.Fatalf("compacted entry count = %d, want %d", len(entries), wantCount)
+	}
+	if session.Count() != wantCount {
+		t.Fatalf("session count = %d, want %d", session.Count(), wantCount)
+	}
+	if entries[0].Role != "_compacted" {
+		t.Fatalf("first entry role = %q, want _compacted", entries[0].Role)
+	}
+	if entries[0].Summary != "custom compact summary" {
+		t.Fatalf("summary = %q", entries[0].Summary)
+	}
+	wantOrig := compactThreshold + 1 - compactKeepRecent
+	if entries[0].OrigCount != wantOrig {
+		t.Fatalf("original_count = %d, want %d", entries[0].OrigCount, wantOrig)
+	}
+	if entries[1].Content != fmt.Sprintf("message-%03d", wantOrig) {
+		t.Fatalf("first retained content = %q, want message-%03d", entries[1].Content, wantOrig)
+	}
+	if entries[len(entries)-1].Content != fmt.Sprintf("message-%03d", compactThreshold) {
+		t.Fatalf("last retained content = %q, want message-%03d", entries[len(entries)-1].Content, compactThreshold)
+	}
+	if session.NeedsCompaction() {
+		t.Fatal("session should not still need compaction after rewrite")
+	}
+}
+
+func TestSessionCompact_CallbackCanReadSessionStateWithoutDeadlock(t *testing.T) {
+	session := NewSession(t.TempDir(), "main")
+	for i := 0; i < compactThreshold+1; i++ {
+		session.Append(SessionEntry{
+			Role:    "assistant",
+			Content: fmt.Sprintf("message-%03d", i),
+		})
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		callbackCount := 0
+		session.Compact(func(text string) string {
+			callbackCount = session.Count()
+			return fmt.Sprintf("summary saw count %d", callbackCount)
+		})
+		done <- callbackCount
+	}()
+
+	select {
+	case callbackCount := <-done:
+		if callbackCount != compactThreshold+1 {
+			t.Fatalf("callback session count = %d, want %d", callbackCount, compactThreshold+1)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Session.Compact deadlocked when callback read session state")
+	}
+
+	if session.Count() != compactKeepRecent+1 {
+		t.Fatalf("session count after compaction = %d, want %d", session.Count(), compactKeepRecent+1)
+	}
+}
+
+func TestThinkerCompactSessionIfNeeded_DoesNotDeadlock(t *testing.T) {
+	session := NewSession(t.TempDir(), "main")
+	for i := 0; i < compactThreshold+1; i++ {
+		session.Append(SessionEntry{
+			Role:    "assistant",
+			Content: fmt.Sprintf("message-%03d", i),
+		})
+	}
+	thinker := &Thinker{
+		session:  session,
+		threadID: "main",
+	}
+
+	done := make(chan struct{}, 1)
+	go func() {
+		thinker.compactSessionIfNeeded()
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Thinker.compactSessionIfNeeded deadlocked")
+	}
+
+	entries := readSessionEntriesForTest(t, session.path)
+	if len(entries) != compactKeepRecent+1 {
+		t.Fatalf("compacted entry count = %d, want %d", len(entries), compactKeepRecent+1)
+	}
+	if entries[0].Role != "_compacted" {
+		t.Fatalf("first entry role = %q, want _compacted", entries[0].Role)
+	}
+	if !strings.Contains(entries[0].Summary, fmt.Sprintf("Summary of %d earlier messages", compactThreshold+1)) {
+		t.Fatalf("thinker summary missing pre-compaction count: %q", entries[0].Summary)
+	}
+	if !strings.Contains(entries[0].Summary, "message-000") {
+		t.Fatalf("thinker summary missing early history: %q", entries[0].Summary)
+	}
+}
+
+func readSessionEntriesForTest(t *testing.T, path string) []SessionEntry {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read session file: %v", err)
+	}
+	var entries []SessionEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry SessionEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode session entry %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }

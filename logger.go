@@ -33,8 +33,11 @@ func initLogger() {
 
 // Categories shown on stderr. Everything else is file-only.
 var logStderrCategories = map[string]bool{
-	"BOOT": true,
-	"API":  true,
+	"BOOT":   true,
+	"API":    true,
+	"CRASH":  true,
+	"SIGNAL": true,
+	"EXIT":   true,
 }
 
 func logMsg(category, msg string) {

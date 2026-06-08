@@ -165,6 +165,57 @@ func TestCallToolParsesJSONArgs(t *testing.T) {
 	_ = atomic.Int64{}    // keep import
 }
 
+func TestMCPArgumentsFromStringsUsesInputSchemaForScalars(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"recursive":       map[string]any{"type": "boolean"},
+			"duration_max_ms": map[string]any{"type": "integer"},
+			"threshold":       map[string]any{"type": "number"},
+			"folder":          map[string]any{"type": "string"},
+			"ids":             map[string]any{"type": "array"},
+		},
+	}
+
+	got := mcpArgumentsFromStrings(map[string]string{
+		"recursive":       "true",
+		"duration_max_ms": "60000",
+		"threshold":       "0.75",
+		"folder":          "/monika",
+		"ids":             `["1","2"]`,
+	}, schema)
+
+	if v, ok := got["recursive"].(bool); !ok || !v {
+		t.Fatalf("recursive = %#v (%T), want true bool", got["recursive"], got["recursive"])
+	}
+	if v, ok := got["duration_max_ms"].(int64); !ok || v != 60000 {
+		t.Fatalf("duration_max_ms = %#v (%T), want int64 60000", got["duration_max_ms"], got["duration_max_ms"])
+	}
+	if v, ok := got["threshold"].(float64); !ok || v != 0.75 {
+		t.Fatalf("threshold = %#v (%T), want float64 0.75", got["threshold"], got["threshold"])
+	}
+	if v, ok := got["folder"].(string); !ok || v != "/monika" {
+		t.Fatalf("folder = %#v (%T), want string /monika", got["folder"], got["folder"])
+	}
+	if _, ok := got["ids"].([]any); !ok {
+		t.Fatalf("ids = %#v (%T), want []any", got["ids"], got["ids"])
+	}
+}
+
+func TestMCPArgumentsFromStringsKeepsNumericStringsWithoutSchema(t *testing.T) {
+	got := mcpArgumentsFromStrings(map[string]string{
+		"file_id": "00123",
+		"flag":    "true",
+	})
+
+	if v, ok := got["file_id"].(string); !ok || v != "00123" {
+		t.Fatalf("file_id = %#v (%T), want string 00123", got["file_id"], got["file_id"])
+	}
+	if v, ok := got["flag"].(string); !ok || v != "true" {
+		t.Fatalf("flag = %#v (%T), want string true", got["flag"], got["flag"])
+	}
+}
+
 func TestExtractMCPResultImageFromComputerScreenshot(t *testing.T) {
 	rawImage := []byte{0x89, 0x50, 0x4e, 0x47}
 	result := map[string]any{

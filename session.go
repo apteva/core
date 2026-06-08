@@ -11,32 +11,32 @@ import (
 )
 
 const (
-	defaultLoadTail    = 50  // messages loaded into context on startup
-	compactThreshold   = 500 // trigger compaction when file exceeds this
-	compactKeepRecent  = 100 // keep this many recent messages after compaction
-	historyDir         = "history"
+	defaultLoadTail   = 50  // messages loaded into context on startup
+	compactThreshold  = 500 // trigger compaction when file exceeds this
+	compactKeepRecent = 100 // keep this many recent messages after compaction
+	historyDir        = "history"
 )
 
 // SessionEntry is one line in the JSONL history file.
 type SessionEntry struct {
-	Timestamp    time.Time        `json:"ts"`
-	Role         string           `json:"role"`                    // "system", "user", "assistant", "tool_result", "_compacted"
-	Content      string           `json:"content"`
-	Parts        []ContentPart    `json:"parts,omitempty"`
-	ToolCalls    []NativeToolCall `json:"tool_calls,omitempty"`
-	ToolResults  []ToolResult     `json:"tool_results,omitempty"`
-	Summary      string           `json:"summary,omitempty"`       // for _compacted entries
-	OrigCount    int              `json:"original_count,omitempty"` // how many messages were compacted
-	TokensIn     int              `json:"tokens_in,omitempty"`
-	TokensOut    int              `json:"tokens_out,omitempty"`
-	Iteration    int              `json:"iteration,omitempty"`
+	Timestamp   time.Time        `json:"ts"`
+	Role        string           `json:"role"` // "system", "user", "assistant", "tool_result", "_compacted"
+	Content     string           `json:"content"`
+	Parts       []ContentPart    `json:"parts,omitempty"`
+	ToolCalls   []NativeToolCall `json:"tool_calls,omitempty"`
+	ToolResults []ToolResult     `json:"tool_results,omitempty"`
+	Summary     string           `json:"summary,omitempty"`        // for _compacted entries
+	OrigCount   int              `json:"original_count,omitempty"` // how many messages were compacted
+	TokensIn    int              `json:"tokens_in,omitempty"`
+	TokensOut   int              `json:"tokens_out,omitempty"`
+	Iteration   int              `json:"iteration,omitempty"`
 }
 
 // Session manages persistent JSONL history for one thread.
 type Session struct {
-	mu       sync.Mutex
-	path     string
-	count    int // approximate line count
+	mu    sync.Mutex
+	path  string
+	count int // approximate line count
 }
 
 // NewSession creates or opens a session file for a thread.
@@ -248,65 +248,47 @@ func (s *Session) NeedsCompaction() bool {
 // summarize is a function that takes messages text and returns a summary.
 func (s *Session) Compact(summarize func(text string) string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	f, err := os.Open(s.path)
+	entries, err := s.readEntriesLocked()
 	if err != nil {
+		s.mu.Unlock()
 		return
 	}
-
-	var entries []SessionEntry
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for scanner.Scan() {
-		var entry SessionEntry
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
-			entries = append(entries, entry)
-		}
-	}
-	f.Close()
 
 	if len(entries) <= compactThreshold {
+		s.count = len(entries)
+		s.mu.Unlock()
 		return
 	}
 
-	// Split: old entries to compact, recent to keep
-	splitAt := len(entries) - compactKeepRecent
-	old := entries[:splitAt]
-	recent := entries[splitAt:]
+	combined, _, _ := buildCompactionParts(entries)
+	s.mu.Unlock()
 
-	// Build text from old entries for summarization
-	var textParts []string
-	realCount := 0
-	for _, e := range old {
-		if e.Role == "_compacted" {
-			textParts = append(textParts, "[previous summary] "+e.Summary)
-			continue
-		}
-		if e.Role == "system" {
-			continue
-		}
-		realCount++
-		preview := e.Content
-		if len(preview) > 200 {
-			preview = preview[:200] + "..."
-		}
-		textParts = append(textParts, fmt.Sprintf("[%s] %s", e.Role, preview))
-	}
-
-	// Summarize
-	summaryText := fmt.Sprintf("Compacted %d messages.", realCount)
-	if summarize != nil && len(textParts) > 0 {
-		combined := ""
-		for _, p := range textParts {
-			combined += p + "\n"
-			if len(combined) > 4000 {
-				break
-			}
-		}
+	// Summarization can be arbitrary caller code. Run it outside the
+	// session lock so callbacks can inspect session state without
+	// deadlocking, and so a slow summarizer does not block appends.
+	summaryText := ""
+	if summarize != nil && combined != "" {
 		if result := summarize(combined); result != "" {
 			summaryText = result
 		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Re-read after the unlocked summarization window so entries appended
+	// concurrently are preserved when the file is rewritten.
+	entries, err = s.readEntriesLocked()
+	if err != nil {
+		return
+	}
+	if len(entries) <= compactThreshold {
+		s.count = len(entries)
+		return
+	}
+	_, realCount, recent := buildCompactionParts(entries)
+	if summaryText == "" {
+		summaryText = fmt.Sprintf("Compacted %d messages.", realCount)
 	}
 
 	compactedEntry := SessionEntry{
@@ -331,6 +313,53 @@ func (s *Session) Compact(summarize func(text string) string) {
 
 	os.Rename(tmpPath, s.path)
 	s.count = len(newEntries)
+}
+
+func (s *Session) readEntriesLocked() ([]SessionEntry, error) {
+	f, err := os.Open(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var entries []SessionEntry
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		var entry SessionEntry
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
+			entries = append(entries, entry)
+		}
+	}
+	return entries, scanner.Err()
+}
+
+func buildCompactionParts(entries []SessionEntry) (combined string, realCount int, recent []SessionEntry) {
+	splitAt := len(entries) - compactKeepRecent
+	old := entries[:splitAt]
+	recent = entries[splitAt:]
+
+	for _, e := range old {
+		if e.Role == "_compacted" {
+			if len(combined) < 4000 {
+				combined += "[previous summary] " + e.Summary + "\n"
+			}
+		} else if e.Role != "system" {
+			realCount++
+			if len(combined) < 4000 {
+				preview := e.Content
+				if len(preview) > 200 {
+					preview = preview[:200] + "..."
+				}
+				combined += fmt.Sprintf("[%s] %s\n", e.Role, preview)
+			}
+		}
+	}
+	if len(combined) > 4000 {
+		combined = combined[:4000]
+	}
+
+	return combined, realCount, recent
 }
 
 // Delete removes the history file.
