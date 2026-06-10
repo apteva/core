@@ -1,7 +1,9 @@
 package core
 
 import (
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -71,7 +73,7 @@ func TestParseSleepDuration(t *testing.T) {
 		{"500ms", 500 * time.Millisecond, true},
 		// Clamping
 		{"100ms", 500 * time.Millisecond, true}, // clamped to min
-		{"48h", 24 * time.Hour, true},             // clamped to max
+		{"48h", 24 * time.Hour, true},           // clamped to max
 		// Invalid
 		{"garbage", 0, false},
 		{"", 0, false},
@@ -204,6 +206,36 @@ func TestInjectConsoleMessage(t *testing.T) {
 	items := thinker.drainEventTexts()
 	if len(items) != 1 || items[0] != "[console] Hello" {
 		t.Errorf("expected '[console] Hello', got %v", items)
+	}
+}
+
+func TestMainEvolveKicksNextTurn(t *testing.T) {
+	events := []APIEvent{}
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "old directive"},
+		messages:  []Message{{Role: "system", Content: "old prompt"}},
+		registry:  NewToolRegistry("test"),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name:     "evolve",
+		Args:     map[string]string{"directive": "new directive"},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+
+	if thinker.config.GetDirective() != "new directive" {
+		t.Fatalf("directive = %q, want new directive", thinker.config.GetDirective())
+	}
+	if !thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should be true after evolve")
+	}
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "directive updated" {
+		t.Fatalf("unexpected tool results: %+v", results)
 	}
 }
 

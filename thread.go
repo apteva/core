@@ -971,6 +971,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					if t.rebuildPrompt != nil {
 						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
 					}
+					t.kickNextTurn = true
 					tm.parent.config.SaveThread(PersistentThread{
 						ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
 						Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,

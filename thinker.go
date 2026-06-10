@@ -1419,6 +1419,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					t.config.SetDirective(d)
 					t.directive = d
 					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
+					t.kickNextTurn = true
 					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 					if t.telemetry != nil {
 						t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
