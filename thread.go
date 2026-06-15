@@ -872,6 +872,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				} else {
 					thread.Children.Kill(sid)
 					t.config.RemoveThread(sid)
+					t.kickNextTurn = true
 					emitResult(call, fmt.Sprintf("thread %s killed", sid))
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -905,9 +906,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						if err := thread.Children.Rename(sid, newID); err != nil {
 							emitResult(call, fmt.Sprintf("error: %v", err))
 						} else {
+							t.kickNextTurn = true
 							emitResult(call, fmt.Sprintf("thread renamed %s → %s", sid, newID))
 						}
 					} else {
+						t.kickNextTurn = true
 						emitResult(call, fmt.Sprintf("thread %s updated", sid))
 					}
 				}

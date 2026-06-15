@@ -1333,6 +1333,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				} else {
 					t.threads.Kill(id)
 					t.config.RemoveThread(id)
+					t.kickNextTurn = true
 					// Result intentionally includes a notify-back reminder.
 					// kill (and other "terminal-feeling" tools like done /
 					// pace=sleep) bias the model toward ending the turn
@@ -1377,9 +1378,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						if err := t.threads.Rename(id, newID); err != nil {
 							addResult(fmt.Sprintf("error: %v", err))
 						} else {
+							t.kickNextTurn = true
 							addResult(fmt.Sprintf("thread renamed %s → %s", id, newID))
 						}
 					} else {
+						t.kickNextTurn = true
 						addResult(fmt.Sprintf("thread %s updated", id))
 					}
 				}

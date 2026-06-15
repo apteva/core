@@ -239,6 +239,68 @@ func TestMainEvolveKicksNextTurn(t *testing.T) {
 	}
 }
 
+func TestMainKillKicksNextTurn(t *testing.T) {
+	events := []APIEvent{}
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "test"},
+		messages:  []Message{{Role: "system", Content: "test"}},
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		quit:      make(chan struct{}),
+	}
+	thinker.threads = NewThreadManager(thinker)
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name:     "kill",
+		Args:     map[string]string{"id": "worker"},
+		Raw:      "kill",
+		NativeID: "call-1",
+	}}, nil)
+
+	if !thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should be true after kill")
+	}
+	if len(results) != 1 || results[0].CallID != "call-1" || !strings.Contains(results[0].Content, "thread worker killed") {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
+func TestMainUpdateKicksNextTurn(t *testing.T) {
+	events := []APIEvent{}
+	bus := NewEventBus()
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "test"},
+		messages:  []Message{{Role: "system", Content: "test"}},
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		quit:      make(chan struct{}),
+	}
+	thinker.threads = NewThreadManager(thinker)
+	if err := thinker.threads.SpawnWithOpts("worker", "old directive", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name:     "update",
+		Args:     map[string]string{"id": "worker", "directive": "new directive"},
+		Raw:      "update",
+		NativeID: "call-1",
+	}}, nil)
+
+	if !thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should be true after update")
+	}
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "thread worker updated" {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
 func TestPublish_NonBlocking(t *testing.T) {
 	bus := NewEventBus()
 	// Small buffer — should not block even when full
