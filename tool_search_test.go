@@ -311,6 +311,13 @@ func TestToolVisible_Matrix(t *testing.T) {
 			}
 		})
 	}
+
+	if !toolVisible(systemOnly, map[string]bool{"consolidate": true}, nil, true) {
+		t.Error("system thread should see allowlisted system-only tool")
+	}
+	if !toolVisible(systemOnly, nil, nil, true) {
+		t.Error("system main-equivalent should see system-only tool when explicitly enabled")
+	}
 }
 
 // TestNativeTools_ActiveOverridesMCPHidden is the end-to-end check on

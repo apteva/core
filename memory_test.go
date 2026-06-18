@@ -77,6 +77,69 @@ func TestNewULID_UniqueAndOrdered(t *testing.T) {
 	}
 }
 
+func TestDetectEmbeddingBackend_OllamaDefaults(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+	t.Setenv("OLLAMA_EMBED_MODEL", "")
+	t.Setenv("OLLAMA_EMBED_DIM", "")
+
+	backend := detectEmbeddingBackend()
+	if backend == nil {
+		t.Fatal("expected ollama embedding backend")
+	}
+	if backend.Source != "ollama" {
+		t.Fatalf("source = %q, want ollama", backend.Source)
+	}
+	if backend.URL != "http://127.0.0.1:11434/api/embeddings" {
+		t.Fatalf("url = %q", backend.URL)
+	}
+	if backend.Model != "nomic-embed-text" {
+		t.Fatalf("model = %q, want nomic-embed-text", backend.Model)
+	}
+	if backend.Dim != 768 {
+		t.Fatalf("dim = %d, want 768", backend.Dim)
+	}
+}
+
+func TestDetectEmbeddingBackend_OllamaEmbedOverrides(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434/")
+	t.Setenv("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b")
+	t.Setenv("OLLAMA_EMBED_DIM", "1024")
+
+	backend := detectEmbeddingBackend()
+	if backend == nil {
+		t.Fatal("expected ollama embedding backend")
+	}
+	if backend.URL != "http://127.0.0.1:11434/api/embeddings" {
+		t.Fatalf("url = %q", backend.URL)
+	}
+	if backend.Model != "qwen3-embedding:0.6b" {
+		t.Fatalf("model = %q, want qwen3-embedding:0.6b", backend.Model)
+	}
+	if backend.Dim != 1024 {
+		t.Fatalf("dim = %d, want 1024", backend.Dim)
+	}
+}
+
+func TestDetectEmbeddingBackend_OllamaInvalidDimFallsBack(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+	t.Setenv("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b")
+	t.Setenv("OLLAMA_EMBED_DIM", "not-a-number")
+
+	backend := detectEmbeddingBackend()
+	if backend == nil {
+		t.Fatal("expected ollama embedding backend")
+	}
+	if backend.Dim != 768 {
+		t.Fatalf("dim = %d, want fallback 768", backend.Dim)
+	}
+}
+
 // ---- write path: remember / supersede / drop --------------------------
 
 // newOfflineStore returns a MemoryStore with no embedding backend, a

@@ -646,6 +646,7 @@ type Thinker struct {
 	rebuildPrompt func(toolDocs string) string // rebuild system prompt with current tool docs
 	onStop        func()
 	toolAllowlist map[string]bool // nil = all tools allowed (main thread)
+	systemThread  bool
 
 	// API event log — shared across all threads, owned by main thinker
 	apiLog    *[]APIEvent
@@ -877,6 +878,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				Reasoning: ptReasoning,
 				Realtime:  pt.Realtime,
 				Voice:     pt.Voice,
+				System:    pt.System,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
@@ -890,6 +892,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					Reasoning: ptReasoning,
 					Realtime:  pt.Realtime,
 					Voice:     pt.Voice,
+					System:    pt.System,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -914,7 +917,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 			}
 			t.threads.SpawnWithOpts("unconscious", unconsciousDirective,
 				tools,
-				SpawnOpts{ParentID: "main", Depth: 0, DeferRun: true},
+				SpawnOpts{ParentID: "main", Depth: 0, DeferRun: true, System: true},
 			)
 			config.SaveThread(PersistentThread{
 				ID: "unconscious", ParentID: "main", Depth: 0, System: true,
@@ -2285,7 +2288,7 @@ func (t *Thinker) think() (ChatResponse, error) {
 			t.evictActiveToolsLRU(activeToolsCap)
 			active = t.activeTools
 		}
-		nativeTools = t.registry.NativeTools(t.toolAllowlist, active)
+		nativeTools = t.registry.NativeTools(t.toolAllowlist, active, t.systemThread)
 	}
 
 	onThinking := func(chunk string) {

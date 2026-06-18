@@ -611,15 +611,19 @@ func NewVeniceProvider(apiKey string) LLMProvider {
 
 func NewOllamaProvider(host string) LLMProvider {
 	url := strings.TrimRight(host, "/") + "/v1/chat/completions"
+	model := strings.TrimSpace(os.Getenv("OLLAMA_MODEL"))
+	if model == "" {
+		model = "llama3.1"
+	}
 	return &OpenAICompatProvider{
 		name:       "ollama",
 		apiKey:     "",
 		url:        url,
 		authHeader: "",
 		models: map[ModelTier]string{
-			ModelLarge:  "llama3.1",
-			ModelMedium: "llama3.1",
-			ModelSmall:  "llama3.1",
+			ModelLarge:  model,
+			ModelMedium: model,
+			ModelSmall:  model,
 		},
 		inputCost:  0,
 		cachedCost: 0,

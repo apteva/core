@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,8 +44,8 @@ import (
 // decides what dimensions matter.
 
 const (
-	memoryFile        = "memory.jsonl"
-	legacyMemoryBak   = "memory.jsonl.legacy.bak"
+	memoryFile      = "memory.jsonl"
+	legacyMemoryBak = "memory.jsonl.legacy.bak"
 
 	// Default decay half-life: a memory's effective weight halves
 	// every this many days unless reinforced. 90 days = a memory
@@ -82,23 +83,33 @@ type embeddingBackend struct {
 func detectEmbeddingBackend() *embeddingBackend {
 	if k := os.Getenv("FIREWORKS_API_KEY"); k != "" {
 		return &embeddingBackend{
-			URL: "https://api.fireworks.ai/inference/v1/embeddings",
-			Model: "nomic-ai/nomic-embed-text-v1.5",
+			URL:    "https://api.fireworks.ai/inference/v1/embeddings",
+			Model:  "nomic-ai/nomic-embed-text-v1.5",
 			APIKey: k, Header: "Bearer", Dim: 768, Source: "fireworks",
 		}
 	}
 	if k := os.Getenv("OPENAI_API_KEY"); k != "" {
 		return &embeddingBackend{
-			URL: "https://api.openai.com/v1/embeddings",
-			Model: "text-embedding-3-small",
+			URL:    "https://api.openai.com/v1/embeddings",
+			Model:  "text-embedding-3-small",
 			APIKey: k, Header: "Bearer", Dim: 1536, Source: "openai",
 		}
 	}
 	if h := os.Getenv("OLLAMA_HOST"); h != "" {
+		model := strings.TrimSpace(os.Getenv("OLLAMA_EMBED_MODEL"))
+		if model == "" {
+			model = "nomic-embed-text"
+		}
+		dim := 768
+		if raw := strings.TrimSpace(os.Getenv("OLLAMA_EMBED_DIM")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+				dim = parsed
+			}
+		}
 		return &embeddingBackend{
-			URL: strings.TrimRight(h, "/") + "/api/embeddings",
-			Model: "nomic-embed-text",
-			APIKey: "", Header: "", Dim: 768, Source: "ollama",
+			URL:    strings.TrimRight(h, "/") + "/api/embeddings",
+			Model:  model,
+			APIKey: "", Header: "", Dim: dim, Source: "ollama",
 		}
 	}
 	return nil
@@ -143,8 +154,8 @@ func NewMemoryStore(apiKey string) *MemoryStore {
 	backend := detectEmbeddingBackend()
 	if backend == nil && apiKey != "" {
 		backend = &embeddingBackend{
-			URL: "https://api.fireworks.ai/inference/v1/embeddings",
-			Model: "nomic-ai/nomic-embed-text-v1.5",
+			URL:    "https://api.fireworks.ai/inference/v1/embeddings",
+			Model:  "nomic-ai/nomic-embed-text-v1.5",
 			APIKey: apiKey, Header: "Bearer", Dim: 768, Source: "fireworks (param)",
 		}
 	}
@@ -171,13 +182,13 @@ func (ms *MemoryStore) Enabled() bool { return ms.backend != nil }
 // migrateLegacyIfNeeded looks at the first record on disk; if it has
 // the old shape (`text` field, no `id` field), the whole file is
 // treated as legacy and migrated in one shot:
-//   1. Rename memory.jsonl → memory.jsonl.legacy.bak
-//   2. Re-read each legacy entry, write a fresh new-format record
-//      with id=ULID, ts=original time, content=text, tags=["legacy",
-//      "migrated"], weight=0.5, supersedes="".
-//   3. Embeddings on legacy entries are preserved when their dim
-//      matches the current backend; otherwise dropped (will recompute
-//      on first recall if/when backend changes).
+//  1. Rename memory.jsonl → memory.jsonl.legacy.bak
+//  2. Re-read each legacy entry, write a fresh new-format record
+//     with id=ULID, ts=original time, content=text, tags=["legacy",
+//     "migrated"], weight=0.5, supersedes="".
+//  3. Embeddings on legacy entries are preserved when their dim
+//     matches the current backend; otherwise dropped (will recompute
+//     on first recall if/when backend changes).
 //
 // One-shot, idempotent: after migration the file has only new-format
 // records, the legacy bak stays for forensic reference.
@@ -616,7 +627,8 @@ type scoredRec struct {
 // whether embeddings are used and whether decay is applied.
 //
 // Scoring formula:
-//   score = signal(query, content+tags) * weight * decay(age)
+//
+//	score = signal(query, content+tags) * weight * decay(age)
 //
 // where signal is cosine similarity if we have an embedding backend
 // AND the record has an embedding of the matching dim, otherwise

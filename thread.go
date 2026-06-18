@@ -158,6 +158,7 @@ type SpawnOpts struct {
 	Tools        []string
 	BuiltinTools []string // provider builtin overrides (nil = inherit, empty = none)
 	DeferRun     bool     // if true, don't start Run() — call StartAll() later
+	System       bool     // true for platform-owned system threads such as unconscious
 	// Paused: if true, the thread spawns in paused state. Run() loop
 	// blocks at the top of its first iteration until either an inbox
 	// event arrives (an explicit `send` from the leader) OR the
@@ -277,11 +278,11 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 
 	// Check if this is a system thread (e.g. unconscious) and recover the
 	// persistent display Name if one was set on a previous run.
-	isSystem := false
+	isSystem := opts.System
 	persistedName := ""
 	for _, pt := range tm.parent.config.GetThreads() {
 		if pt.ID == id {
-			isSystem = pt.System
+			isSystem = isSystem || pt.System
 			persistedName = pt.Name
 			break
 		}
@@ -332,9 +333,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		// sub-thread's provider supports native tools, the schemas are
 		// already in tools[] and we skip duplicating them in prose.
 		if poolSupportsNativeTools(tm.parent.pool) {
-			coreDocs = "\n" + tm.parent.registry.CoreDocsSummary(false)
+			coreDocs = "\n" + tm.parent.registry.CoreDocsSummary(false, isSystem)
 		} else {
-			coreDocs = "\n" + tm.parent.registry.CoreDocs(false)
+			coreDocs = "\n" + tm.parent.registry.CoreDocs(false, isSystem)
 		}
 	}
 	// Inject safety mode from parent config. Child-thread wording is a
@@ -506,13 +507,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		toolIndex:      tm.parent.toolIndex,
 		activeTools:    preloadActive,
 		directive:      directive,
+		systemThread:   isSystem,
 		rebuildPrompt: func(_ string) string {
 			cd := ""
 			if threadRegistry != nil {
 				if poolSupportsNativeTools(tm.parent.pool) {
-					cd = "\n" + threadRegistry.CoreDocsSummary(false)
+					cd = "\n" + threadRegistry.CoreDocsSummary(false, isSystem)
 				} else {
-					cd = "\n" + threadRegistry.CoreDocs(false)
+					cd = "\n" + threadRegistry.CoreDocs(false, isSystem)
 				}
 			}
 			var bp string

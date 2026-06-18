@@ -61,7 +61,7 @@ func startRealtimeThinker(
 	// Native tool schemas — same registry the regular thinker uses.
 	var nativeTools []NativeTool
 	if thinker.registry != nil {
-		nativeTools = thinker.registry.NativeTools(thinker.toolAllowlist, thinker.activeTools)
+		nativeTools = thinker.registry.NativeTools(thinker.toolAllowlist, thinker.activeTools, thinker.systemThread)
 	}
 	// interrupt is realtime-only and not in the shared registry. It
 	// acts on the session itself (cancels the in-flight model

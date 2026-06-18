@@ -129,6 +129,18 @@ func TestModelTier_ProviderID(t *testing.T) {
 	}
 }
 
+func TestOllamaProviderUsesModelEnvOverride(t *testing.T) {
+	t.Setenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+	provider := NewOllamaProvider("http://127.0.0.1:11434")
+	models := provider.Models()
+	for _, tier := range []ModelTier{ModelLarge, ModelMedium, ModelSmall} {
+		if got := models[tier]; got != "qwen2.5:7b" {
+			t.Fatalf("models[%s] = %q, want qwen2.5:7b", tier, got)
+		}
+	}
+}
+
 func TestModelNames(t *testing.T) {
 	for name, tier := range modelNames {
 		if tier.String() != name {

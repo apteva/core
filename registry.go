@@ -457,13 +457,14 @@ func (tr *ToolRegistry) Counts() (core, rag, total int) {
 // their tool set; main passes nil). active is the live per-turn set
 // of MCP tools the thread has surfaced for use. Either argument may
 // be nil.
-func (tr *ToolRegistry) NativeTools(allowlist, active map[string]bool) []NativeTool {
+func (tr *ToolRegistry) NativeTools(allowlist, active map[string]bool, includeSystemOnly ...bool) []NativeTool {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
+	sysOnly := len(includeSystemOnly) > 0 && includeSystemOnly[0]
 	var out []NativeTool
 	for _, name := range tr.sortedToolKeys() {
 		tool := tr.tools[name]
-		if !toolVisible(tool, allowlist, active) {
+		if !toolVisible(tool, allowlist, active, sysOnly) {
 			continue
 		}
 
@@ -490,8 +491,9 @@ func (tr *ToolRegistry) NativeTools(allowlist, active map[string]bool) []NativeT
 // can apply the same rules without duplicating the logic. Order
 // matters: allowlist gates first (it's a hard boundary set at spawn
 // time), then non-MCP defaults, then MCP requires explicit activation.
-func toolVisible(tool *ToolDef, allowlist, active map[string]bool) bool {
-	if tool.SystemOnly {
+func toolVisible(tool *ToolDef, allowlist, active map[string]bool, includeSystemOnly ...bool) bool {
+	sysOnly := len(includeSystemOnly) > 0 && includeSystemOnly[0]
+	if tool.SystemOnly && !sysOnly {
 		return false
 	}
 	if allowlist != nil {

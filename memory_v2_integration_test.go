@@ -75,7 +75,7 @@ func TestIntegration_UnconsciousConsolidation_OneCycle(t *testing.T) {
 		"unconscious",
 		unconsciousDirectiveV2,
 		tools,
-		SpawnOpts{ParentID: "main", Depth: 0},
+		SpawnOpts{ParentID: "main", Depth: 0, System: true},
 	); err != nil {
 		t.Fatalf("spawn unconscious: %v", err)
 	}

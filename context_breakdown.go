@@ -42,19 +42,19 @@ type PromptComposition struct {
 // i.e. the main system prompt. Unknown text that falls between known
 // markers lands in Other so the total always reconciles with Total.
 type SystemBreakdown struct {
-	Base            int `json:"base"`              // up to "CORE TOOLS — always available:"
-	CoreTools       int `json:"core_tools"`        // "CORE TOOLS — always available:" to next [ marker
-	RetrievedTools  int `json:"retrieved_tools"`   // [available tools — matched to your current context] block (RAG per-turn)
-	MCPServers      int `json:"mcp_servers"`       // [AVAILABLE MCP SERVERS] block
-	MCPToolDocs     int `json:"mcp_tool_docs"`     // [MCP TOOLS — available for sub-threads] block
-	Providers       int `json:"providers"`         // [AVAILABLE PROVIDERS] block
-	ActiveThreads   int `json:"active_threads"`    // [ACTIVE THREADS] block
-	SafetyMode      int `json:"safety_mode"`       // [SAFETY MODE: ...] block
-	Skills          int `json:"skills"`            // [LEARNED SKILLS] block
-	BlobHint        int `json:"blob_hint"`         // [FILE HANDLES] block
-	PreviousContext int `json:"previous_context"`  // [PREVIOUS CONTEXT] block (from session load)
-	Directive       int `json:"directive"`         // [DIRECTIVE — EXECUTE ON STARTUP] block
-	Other           int `json:"other"`             // text not matching any known marker
+	Base            int `json:"base"`             // up to "CORE TOOLS — always available:"
+	CoreTools       int `json:"core_tools"`       // "CORE TOOLS — always available:" to next [ marker
+	RetrievedTools  int `json:"retrieved_tools"`  // [available tools — matched to your current context] block (RAG per-turn)
+	MCPServers      int `json:"mcp_servers"`      // [AVAILABLE MCP SERVERS] block
+	MCPToolDocs     int `json:"mcp_tool_docs"`    // [MCP TOOLS — available for sub-threads] block
+	Providers       int `json:"providers"`        // [AVAILABLE PROVIDERS] block
+	ActiveThreads   int `json:"active_threads"`   // [ACTIVE THREADS] block
+	SafetyMode      int `json:"safety_mode"`      // [SAFETY MODE: ...] block
+	Skills          int `json:"skills"`           // [LEARNED SKILLS] block
+	BlobHint        int `json:"blob_hint"`        // [FILE HANDLES] block
+	PreviousContext int `json:"previous_context"` // [PREVIOUS CONTEXT] block (from session load)
+	Directive       int `json:"directive"`        // [DIRECTIVE — EXECUTE ON STARTUP] block
+	Other           int `json:"other"`            // text not matching any known marker
 	Total           int `json:"total"`
 }
 
@@ -63,7 +63,7 @@ type SystemBreakdown struct {
 // tools so the user can see which flavor is burning bytes.
 type NativeToolSize struct {
 	Name  string `json:"name"`
-	Kind  string `json:"kind"`  // "core" | "mcp" | "local"
+	Kind  string `json:"kind"` // "core" | "mcp" | "local"
 	Bytes int    `json:"bytes"`
 }
 
@@ -118,7 +118,7 @@ func buildComposition(t *Thinker, msgs []Message) PromptComposition {
 
 	// Native tools — same code path the provider uses on the next call.
 	if t.registry != nil && t.provider != nil && t.provider.SupportsNativeTools() {
-		nativeTools := t.registry.NativeTools(t.toolAllowlist, t.activeTools)
+		nativeTools := t.registry.NativeTools(t.toolAllowlist, t.activeTools, t.systemThread)
 		for _, nt := range nativeTools {
 			size := nativeToolSize(nt)
 			kind := classifyToolKind(t, nt.Name)

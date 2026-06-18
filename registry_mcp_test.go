@@ -16,6 +16,7 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	tr.Register(&ToolDef{Name: "pace", Description: "Set pace", Syntax: `[[pace sleep="5m"]]`, Core: true})
 	tr.Register(&ToolDef{Name: "send", Description: "Send message", Syntax: `[[send id="x" message="y"]]`, Core: true})
 	tr.Register(&ToolDef{Name: "spawn", Description: "Spawn thread", Syntax: `[[spawn id="x"]]`, Core: true, MainOnly: true})
+	tr.Register(&ToolDef{Name: "review_history", Description: "Review history", Syntax: `[[review_history]]`, Core: true, SystemOnly: true})
 
 	// Register MCP tools (simulating connected servers)
 	tr.Register(&ToolDef{
@@ -59,6 +60,9 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	if !mainToolNames["spawn"] {
 		t.Error("main should have 'spawn'")
 	}
+	if mainToolNames["review_history"] {
+		t.Error("main should NOT have system-only 'review_history'")
+	}
 	if !mainToolNames["web"] {
 		t.Error("main should have 'web'")
 	}
@@ -79,9 +83,9 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	// Sub-thread with allowlist — SHOULD include requested MCP tools
 	allowlist := map[string]bool{
 		"socialcast_create_post": true,
-		"send":                  true,
-		"done":                  true,
-		"pace":                  true,
+		"send":                   true,
+		"done":                   true,
+		"pace":                   true,
 	}
 	threadTools := tr.NativeTools(allowlist, nil)
 	threadToolNames := make(map[string]bool)
@@ -97,6 +101,18 @@ func TestMCPToolsExcludedFromMainNativeTools(t *testing.T) {
 	}
 	if threadToolNames["github_list_repos"] {
 		t.Error("thread should NOT have 'github_list_repos' — not in allowlist")
+	}
+	if threadToolNames["review_history"] {
+		t.Error("ordinary thread should NOT have system-only 'review_history'")
+	}
+
+	systemTools := tr.NativeTools(map[string]bool{"review_history": true, "pace": true}, nil, true)
+	systemToolNames := make(map[string]bool)
+	for _, nt := range systemTools {
+		systemToolNames[nt.Name] = true
+	}
+	if !systemToolNames["review_history"] {
+		t.Error("system thread should have system-only 'review_history'")
 	}
 
 	t.Logf("Thread native tools (%d): %v", len(threadTools), threadToolNames)
