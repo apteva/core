@@ -81,6 +81,76 @@ func TestAPI_Status(t *testing.T) {
 	}
 }
 
+type fakeLiveMCP struct {
+	name   string
+	closed bool
+}
+
+func (f *fakeLiveMCP) GetName() string { return f.name }
+func (f *fakeLiveMCP) ListTools() ([]mcpToolDef, error) {
+	return nil, nil
+}
+func (f *fakeLiveMCP) Close() {
+	f.closed = true
+}
+func (f *fakeLiveMCP) CallTool(name string, args map[string]string) (ToolResponse, error) {
+	return ToolResponse{}, nil
+}
+
+func TestReconcileMCPKeepsLiveServerMissingFromPersistedConfig(t *testing.T) {
+	api, thinker := newTestAPI()
+	thinker.registry = NewToolRegistry("")
+	thinker.toolIndex = NewToolIndex()
+	thinker.config = &Config{}
+
+	live := &fakeLiveMCP{name: "apteva-server"}
+	thinker.mcpServers = []MCPConn{live}
+
+	api.reconcileMCP([]MCPServerConfig{{
+		Name:      "apteva-server",
+		Command:   "/tmp/apteva-server",
+		Transport: "stdio",
+		NoSpawn:   true,
+	}})
+
+	if live.closed {
+		t.Fatal("reconcileMCP closed a live MCP that was present in desired but missing from persisted config")
+	}
+	if len(thinker.mcpServers) != 1 || thinker.mcpServers[0].GetName() != "apteva-server" {
+		t.Fatalf("expected live apteva-server MCP to remain attached, got %#v", thinker.mcpServers)
+	}
+}
+
+func TestReconcileMCPKeepsLiveNoSpawnServerWhenConfigDiffers(t *testing.T) {
+	api, thinker := newTestAPI()
+	thinker.registry = NewToolRegistry("")
+	thinker.toolIndex = NewToolIndex()
+	thinker.config = &Config{}
+	thinker.config.SaveMCPServer(MCPServerConfig{
+		Name:      "apteva-server",
+		Command:   "/old/apteva-server",
+		Transport: "stdio",
+		NoSpawn:   true,
+	})
+
+	live := &fakeLiveMCP{name: "apteva-server"}
+	thinker.mcpServers = []MCPConn{live}
+
+	api.reconcileMCP([]MCPServerConfig{{
+		Name:      "apteva-server",
+		Command:   "/new/apteva-server",
+		Transport: "stdio",
+		NoSpawn:   true,
+	}})
+
+	if live.closed {
+		t.Fatal("reconcileMCP closed a live no_spawn MCP while it was still requested")
+	}
+	if len(thinker.mcpServers) != 1 || thinker.mcpServers[0].GetName() != "apteva-server" {
+		t.Fatalf("expected live no_spawn MCP to remain attached, got %#v", thinker.mcpServers)
+	}
+}
+
 func TestAPI_ControlStep(t *testing.T) {
 	api, _ := newTestAPI()
 	payload, _ := json.Marshal(map[string]string{"action": "step"})

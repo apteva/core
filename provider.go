@@ -14,16 +14,25 @@ import (
 )
 
 // llmHTTPClient is a shared HTTP client for all LLM provider calls.
-// It uses a response header timeout (30s to get first byte) but no overall
-// timeout since streaming responses can legitimately take minutes.
+// It uses a response header timeout to catch dead provider requests but no
+// overall timeout since streaming responses can legitimately take minutes.
 var llmHTTPClient = &http.Client{
 	Transport: &http.Transport{
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: llmResponseHeaderTimeout(),
 		DialContext: (&net.Dialer{
 			Timeout: 10 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 	},
+}
+
+func llmResponseHeaderTimeout() time.Duration {
+	if v := os.Getenv("APTEVA_LLM_RESPONSE_HEADER_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 180 * time.Second
 }
 
 // streamIdleTimeout is how long we wait between bytes on a streaming

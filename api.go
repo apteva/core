@@ -206,6 +206,7 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		composition := buildComposition(t, msgs)
+		composition.ModelMaxTokens = ModelContextWindow(model)
 		writeJSON(w, map[string]any{
 			"id":          id,
 			"iteration":   iter,
@@ -924,7 +925,26 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 	for _, srv := range t.mcpServers {
 		name := srv.GetName()
 		desiredCfg, stillWant := want[name]
-		if stillWant && !changed(currentCfg[name], desiredCfg) {
+		current, hasCurrent := currentCfg[name]
+		if stillWant && desiredCfg.NoSpawn {
+			// Host-owned MCPs (for example apteva-server and channels)
+			// are injected by the server and are already live. Runtime
+			// config updates may round-trip them with slightly different
+			// connection details; reconnecting them can deadlock the
+			// management request they are serving.
+			kept = append(kept, srv)
+			continue
+		}
+		if stillWant && !hasCurrent {
+			// Some host-injected system MCPs are live without being
+			// persisted in config.json. A PUT /config from the server may
+			// round-trip those live entries back in `desired`; do not close
+			// the very MCP connection currently serving the request just
+			// because there is no persisted baseline to compare against.
+			kept = append(kept, srv)
+			continue
+		}
+		if stillWant && !changed(current, desiredCfg) {
 			kept = append(kept, srv)
 			continue
 		}

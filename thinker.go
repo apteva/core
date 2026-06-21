@@ -1353,11 +1353,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				id := call.Args["id"]
 				newID := call.Args["new_id"]
 				name := call.Args["name"]
-				directive := call.Args["directive"]
 				toolsStr := call.Args["tools"]
+				directiveEditRequested := hasDirectiveEditArgs(call.Args)
 				if id == "" {
 					addResult("error: update requires id")
-				} else if newID == "" && name == "" && directive == "" && toolsStr == "" {
+				} else if newID == "" && name == "" && !directiveEditRequested && toolsStr == "" {
 					addResult("error: update requires at least one of new_id, name, directive, tools")
 				} else {
 					// Apply non-id changes first under the existing id, then
@@ -1368,10 +1368,21 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					if toolsStr != "" {
 						tools = strings.Split(toolsStr, ",")
 					}
+					directive := ""
+					directiveChanged := false
 					applyErr := error(nil)
-					if name != "" || directive != "" || len(tools) > 0 {
+					if directiveEditRequested {
+						currentDirective, err := t.threads.Directive(id)
+						if err != nil {
+							applyErr = err
+						} else {
+							directive, _, applyErr = applyDirectiveEdit(currentDirective, call.Args)
+							directiveChanged = applyErr == nil
+						}
+					}
+					if applyErr == nil && (name != "" || directiveChanged || len(tools) > 0) {
 						applyErr = t.threads.Update(id, name, directive, tools)
-						if applyErr == nil && directive != "" {
+						if applyErr == nil && directiveChanged {
 							t.threads.Send(id, fmt.Sprintf("[directive updated] %s", directive))
 						}
 					}
@@ -1418,19 +1429,27 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "evolve":
-				d := call.Args["directive"]
-				if d == "" {
-					addResult("error: evolve requires directive")
+				if !hasDirectiveEditArgs(call.Args) {
+					addResult("error: evolve requires directive or directive edit args")
 				} else {
-					t.config.SetDirective(d)
-					t.directive = d
-					t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
-					t.kickNextTurn = true
-					t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
-					if t.telemetry != nil {
-						t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
+					currentDirective := t.directive
+					if currentDirective == "" && t.config != nil {
+						currentDirective = t.config.GetDirective()
 					}
-					addResult("directive updated")
+					d, _, err := applyDirectiveEdit(currentDirective, call.Args)
+					if err != nil {
+						addResult(fmt.Sprintf("error: %v", err))
+					} else {
+						t.config.SetDirective(d)
+						t.directive = d
+						t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
+						t.kickNextTurn = true
+						t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
+						if t.telemetry != nil {
+							t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
+						}
+						addResult("directive updated")
+					}
 				}
 			case "remember":
 				// Memory v2: main has no write tools. The unconscious is

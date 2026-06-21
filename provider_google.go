@@ -161,6 +161,95 @@ type geminiInline struct {
 	Data     string `json:"data"`
 }
 
+func geminiToolParameters(schema map[string]any) map[string]any {
+	normalized, ok := normalizeGeminiSchema("", schema).(map[string]any)
+	if !ok || len(normalized) == 0 {
+		return map[string]any{"type": "object"}
+	}
+	if _, ok := normalized["type"]; !ok {
+		normalized["type"] = "object"
+	}
+	return normalized
+}
+
+func normalizeGeminiSchema(name string, v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x)+1)
+		for k, val := range x {
+			if k == "properties" {
+				props, ok := val.(map[string]any)
+				if !ok {
+					out[k] = normalizeGeminiSchema(k, val)
+					continue
+				}
+				normalizedProps := make(map[string]any, len(props))
+				for propName, propSchema := range props {
+					normalizedProps[propName] = normalizeGeminiSchema(propName, propSchema)
+				}
+				out[k] = normalizedProps
+				continue
+			}
+			out[k] = normalizeGeminiSchema(k, val)
+		}
+		if schemaTypeIncludes(out["type"], "array") {
+			if items, ok := out["items"]; !ok || isEmptyGeminiSchema(items) {
+				out["items"] = defaultGeminiArrayItems(name)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, val := range x {
+			out[i] = normalizeGeminiSchema(name, val)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func defaultGeminiArrayItems(name string) map[string]any {
+	switch name {
+	case "attributes", "channels", "definition", "filters":
+		return map[string]any{"type": "object"}
+	case "enum_values", "list_ids", "tags":
+		return map[string]any{"type": "string"}
+	default:
+		return map[string]any{"type": "object"}
+	}
+}
+
+func schemaTypeIncludes(raw any, want string) bool {
+	switch x := raw.(type) {
+	case string:
+		return strings.EqualFold(x, want)
+	case []any:
+		for _, val := range x {
+			if s, ok := val.(string); ok && strings.EqualFold(s, want) {
+				return true
+			}
+		}
+	case []string:
+		for _, s := range x {
+			if strings.EqualFold(s, want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isEmptyGeminiSchema(v any) bool {
+	if v == nil {
+		return true
+	}
+	if m, ok := v.(map[string]any); ok {
+		return len(m) == 0
+	}
+	return false
+}
+
 // Gemini streaming response
 type geminiStreamResponse struct {
 	Candidates []struct {
@@ -335,7 +424,7 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 			funcs = append(funcs, geminiFunctionDecl{
 				Name:        t.Name,
 				Description: t.Description,
-				Parameters:  t.Parameters,
+				Parameters:  geminiToolParameters(t.Parameters),
 			})
 		}
 		if len(funcs) > 0 {

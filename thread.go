@@ -882,23 +882,34 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				sid := call.Args["id"]
 				newID := call.Args["new_id"]
 				name := call.Args["name"]
-				directive := call.Args["directive"]
 				toolsStr := call.Args["tools"]
+				directiveEditRequested := hasDirectiveEditArgs(call.Args)
 				if sid == "" {
 					emitResult(call, "error: update requires id")
 				} else if thread.Children == nil {
 					emitResult(call, "error: cannot update (not a leader thread)")
-				} else if newID == "" && name == "" && directive == "" && toolsStr == "" {
+				} else if newID == "" && name == "" && !directiveEditRequested && toolsStr == "" {
 					emitResult(call, "error: update requires at least one of new_id, name, directive, tools")
 				} else {
 					var updateTools []string
 					if toolsStr != "" {
 						updateTools = strings.Split(toolsStr, ",")
 					}
+					directive := ""
+					directiveChanged := false
 					applyErr := error(nil)
-					if name != "" || directive != "" || len(updateTools) > 0 {
+					if directiveEditRequested {
+						currentDirective, err := thread.Children.Directive(sid)
+						if err != nil {
+							applyErr = err
+						} else {
+							directive, _, applyErr = applyDirectiveEdit(currentDirective, call.Args)
+							directiveChanged = applyErr == nil
+						}
+					}
+					if applyErr == nil && (name != "" || directiveChanged || len(updateTools) > 0) {
 						applyErr = thread.Children.Update(sid, name, directive, updateTools)
-						if applyErr == nil && directive != "" {
+						if applyErr == nil && directiveChanged {
 							thread.Children.Send(sid, fmt.Sprintf("[directive updated] %s", directive))
 						}
 					}
@@ -967,23 +978,27 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, "ok")
 				}
 			case "evolve":
-				d := call.Args["directive"]
-				if d == "" {
-					emitResult(call, "error: evolve requires directive")
+				if !hasDirectiveEditArgs(call.Args) {
+					emitResult(call, "error: evolve requires directive or directive edit args")
 				} else {
-					thread.Directive = d
-					t.directive = d
-					if t.rebuildPrompt != nil {
-						t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
+					d, _, err := applyDirectiveEdit(thread.Directive, call.Args)
+					if err != nil {
+						emitResult(call, fmt.Sprintf("error: %v", err))
+					} else {
+						thread.Directive = d
+						t.directive = d
+						if t.rebuildPrompt != nil {
+							t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
+						}
+						t.kickNextTurn = true
+						tm.parent.config.SaveThread(PersistentThread{
+							ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
+							Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
+							Model: t.agentModel.String(), Reasoning: t.agentReasoning.String(),
+						})
+						t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
+						emitResult(call, "directive updated")
 					}
-					t.kickNextTurn = true
-					tm.parent.config.SaveThread(PersistentThread{
-						ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
-						Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
-						Model: t.agentModel.String(), Reasoning: t.agentReasoning.String(),
-					})
-					t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
-					emitResult(call, "directive updated")
 				}
 			case "remember":
 				// Memory v2: sub-threads can't write either. The unconscious
@@ -1114,6 +1129,16 @@ func (tm *ThreadManager) Count() int {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	return len(tm.threads)
+}
+
+func (tm *ThreadManager) Directive(id string) (string, error) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	thread, exists := tm.threads[id]
+	if !exists {
+		return "", fmt.Errorf("thread %q not found", id)
+	}
+	return thread.Directive, nil
 }
 
 // StartAll starts Run() on all threads (and their children) that were spawned with DeferRun.

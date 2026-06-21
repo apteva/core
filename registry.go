@@ -144,16 +144,20 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "evolve",
-		Description: "Rewrite ONLY the mission portion of your directive — the prose between the [DIRECTIVE] markers in your system prompt. Do NOT include framework rules (THINKING/EVENTS/SPAWNING/PACING/TOOL CALLS sections, the opening 'You are the main coordinating thread…' sentence, [ACTIVE THREADS], [AVAILABLE MCP SERVERS]) — those are injected by the platform and are not part of your directive.",
-		Syntax:      `[[evolve directive="Updated mission text"]]`,
-		Rules:       `Persisted to config. Use sparingly — only when you've learned something worth remembering in your mission. The text you submit fully replaces the current directive; keep it focused on goals, constraints, and learned rules. Submitting platform boilerplate is rejected with an error.`,
+		Description: "Update ONLY the mission portion of your directive — the prose between the [DIRECTIVE] markers in your system prompt. Use directive=\"...\" for a full replacement, or use Markdown section edit modes to patch structured directives without rewriting the whole thing. Do NOT include framework rules (THINKING/EVENTS/SPAWNING/PACING/TOOL CALLS sections, the opening 'You are the main coordinating thread…' sentence, [ACTIVE THREADS], [AVAILABLE MCP SERVERS]) — those are injected by the platform and are not part of your directive.",
+		Syntax:      `[[evolve directive="Updated mission text"]] or [[evolve edit_mode="section_replace_line" section="Schedule" match="daily_check:" content="- daily_check: 07:30 Europe/Madrid — Check uploads."]]`,
+		Rules:       `Persisted to config. Backward compatible: directive with no edit_mode fully replaces the current directive, so plain-text directives still work. For Markdown directives, edit_mode can be replace, section_append, section_replace, section_rename, section_replace_line, or section_remove_line. section_* modes match Markdown headings like "# Schedule". section_rename changes only the heading line and preserves the heading depth and body. Use edits='[...]' to apply several edits atomically in one call; each edit object uses mode/edit_mode, section, match, content, and/or directive. Use sparingly — only when you've learned something worth remembering in your mission. Submitting platform boilerplate is rejected with an error.`,
 		Core:        true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"directive": map[string]any{"type": "string", "description": "New mission text. JUST the mission — not the framework rules, not section headers like THINKING/EVENTS/SPAWNING."},
+				"directive": map[string]any{"type": "string", "description": "Full replacement mission text when edit_mode is omitted or set to replace. JUST the mission — not the framework rules, not section headers like THINKING/EVENTS/SPAWNING."},
+				"edit_mode": map[string]any{"type": "string", "description": "Optional edit mode: replace, section_append, section_replace, section_rename, section_replace_line, or section_remove_line."},
+				"section":   map[string]any{"type": "string", "description": "Markdown heading name to edit, for section_* modes. Example: Schedule matches '# Schedule'."},
+				"match":     map[string]any{"type": "string", "description": "Line fragment to find inside the section for section_replace_line or section_remove_line."},
+				"content":   map[string]any{"type": "string", "description": "Replacement or appended content for the selected edit mode."},
+				"edits":     map[string]any{"type": "string", "description": "JSON array of edit objects to apply sequentially in one directive update."},
 			},
-			"required": []string{"directive"},
 		},
 	})
 
@@ -218,9 +222,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "update",
-		Description: "Update a running thread's id, display name, directive, and/or tools. Renaming the id cascades through children's parent_id and the on-disk session file.",
-		Syntax:      `[[update id="thread-id" new_id="renamed" name="Friendly Label" directive="New directive" tools="tool1,tool2"]]`,
-		Rules:       `Provide at least one of new_id, name, directive, or tools. The thread is notified of directive changes. Tools replace the full set (builtins are always included). new_id renames the immutable id (children + session storage follow); name is just a display label.`,
+		Description: "Update a running thread's id, display name, directive, and/or tools. Use directive=\"...\" for a full directive replacement, or use Markdown section edit modes to patch structured directives without rewriting the whole thing. Renaming the id cascades through children's parent_id and the on-disk session file.",
+		Syntax:      `[[update id="thread-id" new_id="renamed" name="Friendly Label" directive="New directive" tools="tool1,tool2"]] or [[update id="thread-id" edit_mode="section_replace_line" section="Schedule" match="daily_check:" content="- daily_check: 07:30 Europe/Madrid — Check uploads."]]`,
+		Rules:       `Provide at least one of new_id, name, directive/directive edit args, or tools. Backward compatible: directive with no edit_mode fully replaces the child directive. For Markdown directives, edit_mode can be replace, section_append, section_replace, section_rename, section_replace_line, or section_remove_line. section_* modes match Markdown headings like "# Schedule". section_rename changes only the heading line and preserves the heading depth and body. Use edits='[...]' to apply several edits atomically in one call; each edit object uses mode/edit_mode, section, match, content, and/or directive. The thread is notified of directive changes. Tools replace the full set (builtins are always included). new_id renames the immutable id (children + session storage follow); name is just a display label.`,
 		Core:        true,
 		MainOnly:    true,
 		InputSchema: map[string]any{
@@ -229,7 +233,12 @@ func (tr *ToolRegistry) registerDefaults() {
 				"id":        map[string]any{"type": "string", "description": "Target thread id."},
 				"new_id":    map[string]any{"type": "string", "description": "Replacement id. Cascades through children's parent_id and the on-disk session file. Must be unique among siblings."},
 				"name":      map[string]any{"type": "string", "description": "Human-readable label for display. Independent of id."},
-				"directive": map[string]any{"type": "string", "description": "Replacement directive."},
+				"directive": map[string]any{"type": "string", "description": "Full replacement directive when edit_mode is omitted or set to replace."},
+				"edit_mode": map[string]any{"type": "string", "description": "Optional directive edit mode: replace, section_append, section_replace, section_rename, section_replace_line, or section_remove_line."},
+				"section":   map[string]any{"type": "string", "description": "Markdown heading name to edit, for section_* modes. Example: Schedule matches '# Schedule'."},
+				"match":     map[string]any{"type": "string", "description": "Line fragment to find inside the section for section_replace_line or section_remove_line."},
+				"content":   map[string]any{"type": "string", "description": "Replacement or appended directive content for the selected edit mode."},
+				"edits":     map[string]any{"type": "string", "description": "JSON array of directive edit objects to apply sequentially in one update."},
 				"tools":     map[string]any{"type": "string", "description": "Comma-separated tool names replacing the current set."},
 			},
 			"required": []string{"id"},

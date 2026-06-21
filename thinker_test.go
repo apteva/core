@@ -251,6 +251,79 @@ func TestMainEvolveKicksNextTurn(t *testing.T) {
 	}
 }
 
+func TestMainEvolveSectionPatch(t *testing.T) {
+	events := []APIEvent{}
+	directive := "# Schedule\n- daily_check: 09:00 Europe/Madrid\n# Goals\n- Ship"
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive},
+		messages:  []Message{{Role: "system", Content: "old prompt"}},
+		registry:  NewToolRegistry("test"),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace_line",
+			"section":   "Schedule",
+			"match":     "daily_check:",
+			"content":   "- daily_check: 07:30 Europe/Madrid",
+		},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+
+	want := "# Schedule\n- daily_check: 07:30 Europe/Madrid\n# Goals\n- Ship"
+	if got := thinker.config.GetDirective(); got != want {
+		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+	if !thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should be true after evolve")
+	}
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "directive updated" {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
+func TestMainEvolveSectionRename(t *testing.T) {
+	events := []APIEvent{}
+	directive := "# Daily Schedule\n- daily_check: 09:00 Europe/Madrid\n# Goals\n- Ship"
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive},
+		messages:  []Message{{Role: "system", Content: "old prompt"}},
+		registry:  NewToolRegistry("test"),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_rename",
+			"section":   "Daily Schedule",
+			"content":   "Schedule",
+		},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+
+	want := "# Schedule\n- daily_check: 09:00 Europe/Madrid\n# Goals\n- Ship"
+	if got := thinker.config.GetDirective(); got != want {
+		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+	if !thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should be true after evolve")
+	}
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "directive updated" {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
 func TestMainKillKicksNextTurn(t *testing.T) {
 	events := []APIEvent{}
 	thinker := &Thinker{
@@ -310,6 +383,54 @@ func TestMainUpdateKicksNextTurn(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "thread worker updated" {
 		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
+func TestMainUpdateDirectiveBatchPatch(t *testing.T) {
+	events := []APIEvent{}
+	bus := NewEventBus()
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "test"},
+		messages:  []Message{{Role: "system", Content: "test"}},
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		quit:      make(chan struct{}),
+	}
+	thinker.threads = NewThreadManager(thinker)
+	if err := thinker.threads.SpawnWithOpts("worker", "# Schedule\n- daily_check: 09:00 Europe/Madrid\n# Goals\n- Ship", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "update",
+		Args: map[string]string{
+			"id": "worker",
+			"edits": `[
+				{"mode":"section_replace_line","section":"Schedule","match":"daily_check:","content":"- daily_check: 07:30 Europe/Madrid"},
+				{"mode":"section_append","section":"Goals","content":"- Report release readiness"}
+			]`,
+		},
+		Raw:      "update",
+		NativeID: "call-1",
+	}}, nil)
+
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "thread worker updated" {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+	got, err := thinker.threads.Directive("worker")
+	if err != nil {
+		t.Fatalf("worker directive: %v", err)
+	}
+	want := "# Schedule\n- daily_check: 07:30 Europe/Madrid\n# Goals\n- Ship\n- Report release readiness"
+	if got != want {
+		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+	if !thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should be true after update")
 	}
 }
 

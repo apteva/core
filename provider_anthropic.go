@@ -98,6 +98,19 @@ func (p *AnthropicProvider) Models() map[ModelTier]string           { return p.m
 func (p *AnthropicProvider) CostPer1M() (float64, float64, float64) { return 3.00, 0.30, 15.00 }
 func (p *AnthropicProvider) SupportsNativeTools() bool              { return true }
 
+func anthropicMaxTokens(model string) int {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(model)), "-")
+	if len(parts) >= 3 && parts[0] == "claude" {
+		switch parts[1] {
+		case "fable", "haiku", "mythos", "opus", "sonnet":
+			if parts[2] == "4" || parts[2] == "5" {
+				return 64000
+			}
+		}
+	}
+	return 4096
+}
+
 func (p *AnthropicProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
 		{Type: "code_execution_20250825", Name: "code_execution"},
@@ -195,9 +208,11 @@ type anthropicStreamEvent struct {
 }
 
 type anthropicDelta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text,omitempty"`
-	PartialJSON string `json:"partial_json,omitempty"` // for tool_use input streaming
+	Type         string `json:"type"`
+	Text         string `json:"text,omitempty"`
+	PartialJSON  string `json:"partial_json,omitempty"` // for tool_use input streaming
+	StopReason   string `json:"stop_reason,omitempty"`
+	StopSequence string `json:"stop_sequence,omitempty"`
 }
 
 type anthropicBlockStart struct {
@@ -363,7 +378,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 
 	reqBody := anthropicRequest{
 		Model:     model,
-		MaxTokens: 4096,
+		MaxTokens: anthropicMaxTokens(model),
 		Stream:    true,
 		System:    systemContent,
 		Messages:  anthropicMsgs,
@@ -398,6 +413,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	var toolCalls []NativeToolCall
 	var serverResults []ServerToolResult
 	var currentServerTool string // name of server tool being executed
+	var stopReason string
 
 	// Track current tool_use block being streamed
 	type pendingTool struct {
@@ -537,6 +553,9 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 				}
 			}
 		case "message_delta":
+			if event.Delta != nil && event.Delta.StopReason != "" {
+				stopReason = event.Delta.StopReason
+			}
 			if event.Usage != nil {
 				usage.CompletionTokens = event.Usage.OutputTokens
 				// Cache tokens can also appear in message_delta — refresh
@@ -548,6 +567,16 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 				}
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return ChatResponse{}, fmt.Errorf("Anthropic stream read error: %w", err)
+	}
+	if currentTool != nil {
+		reason := stopReason
+		if reason == "" {
+			reason = "stream ended"
+		}
+		return ChatResponse{}, fmt.Errorf("Anthropic response ended with incomplete tool input for %s after %d bytes (stop_reason=%s)", currentTool.name, currentTool.json.Len(), reason)
 	}
 
 	return ChatResponse{
