@@ -80,6 +80,8 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, map[string]any{
 		"uptime_seconds":        int(elapsed.Seconds()),
+		"core_version":          Version,
+		"core_build_time":       BuildTime,
 		"iteration":             a.thinker.iteration,
 		"rate":                  formatSleep(a.thinker.agentSleep),
 		"model":                 a.thinker.model.String(),

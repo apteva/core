@@ -76,6 +76,12 @@ func TestAPI_Status(t *testing.T) {
 	if body["model"] != "large" {
 		t.Errorf("expected model large, got %v", body["model"])
 	}
+	if body["core_version"] == "" {
+		t.Errorf("expected core_version in status")
+	}
+	if body["core_build_time"] == "" {
+		t.Errorf("expected core_build_time in status")
+	}
 	if body["execution_control"] == nil {
 		t.Errorf("expected execution_control in status")
 	}
