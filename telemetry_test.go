@@ -15,8 +15,11 @@ func TestTelemetry_Emit(t *testing.T) {
 	tel.Emit("llm.done", "main", LLMDoneData{
 		Model:    "test-model",
 		TokensIn: 100, TokensOut: 50,
-		DurationMs: 1500,
-		Iteration:  1,
+		DurationMs:      1500,
+		Iteration:       1,
+		NativeToolCount: 12,
+		ActiveMCPCount:  3,
+		ToolMode:        "discovery",
 	})
 
 	events, cursor := tel.Events(0)
@@ -45,6 +48,9 @@ func TestTelemetry_Emit(t *testing.T) {
 	}
 	if data.TokensIn != 100 {
 		t.Errorf("expected 100, got %d", data.TokensIn)
+	}
+	if data.NativeToolCount != 12 || data.ActiveMCPCount != 3 || data.ToolMode != "discovery" {
+		t.Errorf("cache diagnostics missing from llm.done: %+v", data)
 	}
 }
 
@@ -220,7 +226,6 @@ func TestModelContextWindow(t *testing.T) {
 		}
 	}
 }
-
 
 func TestTelemetry_EmitLive(t *testing.T) {
 	tel := &Telemetry{

@@ -247,6 +247,17 @@ func (s *Session) NeedsCompaction() bool {
 // Compact summarizes old messages and rewrites the file.
 // summarize is a function that takes messages text and returns a summary.
 func (s *Session) Compact(summarize func(text string) string) {
+	s.compact(compactKeepRecent, false, summarize)
+}
+
+func (s *Session) ForceCompact(keepRecent int, summarize func(text string) string) {
+	if keepRecent < 1 {
+		keepRecent = 1
+	}
+	s.compact(keepRecent, true, summarize)
+}
+
+func (s *Session) compact(keepRecent int, force bool, summarize func(text string) string) {
 	s.mu.Lock()
 	entries, err := s.readEntriesLocked()
 	if err != nil {
@@ -254,13 +265,18 @@ func (s *Session) Compact(summarize func(text string) string) {
 		return
 	}
 
-	if len(entries) <= compactThreshold {
+	if !force && len(entries) <= compactThreshold {
+		s.count = len(entries)
+		s.mu.Unlock()
+		return
+	}
+	if force && len(entries) <= keepRecent {
 		s.count = len(entries)
 		s.mu.Unlock()
 		return
 	}
 
-	combined, _, _ := buildCompactionParts(entries)
+	combined, _, _ := buildCompactionParts(entries, keepRecent)
 	s.mu.Unlock()
 
 	// Summarization can be arbitrary caller code. Run it outside the
@@ -282,11 +298,15 @@ func (s *Session) Compact(summarize func(text string) string) {
 	if err != nil {
 		return
 	}
-	if len(entries) <= compactThreshold {
+	if !force && len(entries) <= compactThreshold {
 		s.count = len(entries)
 		return
 	}
-	_, realCount, recent := buildCompactionParts(entries)
+	if force && len(entries) <= keepRecent {
+		s.count = len(entries)
+		return
+	}
+	_, realCount, recent := buildCompactionParts(entries, keepRecent)
 	if summaryText == "" {
 		summaryText = fmt.Sprintf("Compacted %d messages.", realCount)
 	}
@@ -300,19 +320,22 @@ func (s *Session) Compact(summarize func(text string) string) {
 
 	// Rewrite file
 	newEntries := append([]SessionEntry{compactedEntry}, recent...)
+	s.rewriteEntriesLocked(newEntries)
+	s.count = len(newEntries)
+}
+
+func (s *Session) rewriteEntriesLocked(entries []SessionEntry) {
 	tmpPath := s.path + ".tmp"
 	tf, err := os.Create(tmpPath)
 	if err != nil {
 		return
 	}
 	enc := json.NewEncoder(tf)
-	for _, e := range newEntries {
+	for _, e := range entries {
 		enc.Encode(e)
 	}
 	tf.Close()
-
 	os.Rename(tmpPath, s.path)
-	s.count = len(newEntries)
 }
 
 func (s *Session) readEntriesLocked() ([]SessionEntry, error) {
@@ -334,8 +357,14 @@ func (s *Session) readEntriesLocked() ([]SessionEntry, error) {
 	return entries, scanner.Err()
 }
 
-func buildCompactionParts(entries []SessionEntry) (combined string, realCount int, recent []SessionEntry) {
-	splitAt := len(entries) - compactKeepRecent
+func buildCompactionParts(entries []SessionEntry, keepRecent int) (combined string, realCount int, recent []SessionEntry) {
+	if keepRecent < 1 {
+		keepRecent = 1
+	}
+	if keepRecent > len(entries) {
+		keepRecent = len(entries)
+	}
+	splitAt := len(entries) - keepRecent
 	old := entries[:splitAt]
 	recent = entries[splitAt:]
 

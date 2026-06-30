@@ -152,13 +152,15 @@ func openAIModelSupportsXHigh(model string) bool {
 // --- Responses API types ---
 
 type oaiResponsesRequest struct {
-	Model        string         `json:"model"`
-	Instructions string         `json:"instructions,omitempty"`
-	Input        []oaiInputItem `json:"input"`
-	Tools        []any          `json:"tools,omitempty"`
-	Stream       bool           `json:"stream"`
-	Store        *bool          `json:"store,omitempty"`
-	Reasoning    *oaiReasoning  `json:"reasoning,omitempty"`
+	Model                string         `json:"model"`
+	Instructions         string         `json:"instructions,omitempty"`
+	Input                []oaiInputItem `json:"input"`
+	Tools                []any          `json:"tools,omitempty"`
+	Stream               bool           `json:"stream"`
+	Store                *bool          `json:"store,omitempty"`
+	Reasoning            *oaiReasoning  `json:"reasoning,omitempty"`
+	PromptCacheKey       string         `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string         `json:"prompt_cache_retention,omitempty"`
 }
 
 type oaiReasoning struct {
@@ -260,6 +262,13 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		reqBody.Store = &store
 		reqBody.Instructions = p.instructionsFromMessages(messages)
 	}
+	stablePrefix := reqBody.Instructions
+	if stablePrefix == "" {
+		stablePrefix = p.instructionsFromMessages(messages)
+	}
+	cacheHints := openAIPromptCacheHintsFor(p.Name(), model, stablePrefix, apiTools)
+	reqBody.PromptCacheKey = cacheHints.Key
+	reqBody.PromptCacheRetention = cacheHints.Retention
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -278,38 +287,62 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	if responsesURL == "" {
 		responsesURL = "https://api.openai.com/v1/responses"
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(body))
-	if err != nil {
-		return ChatResponse{}, err
+	doRequest := func(payload []byte) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		return llmHTTPClient.Do(req)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := llmHTTPClient.Do(req)
+	resp, err := doRequest(body)
 	if err != nil {
 		return ChatResponse{}, err
 	}
 	if p.Name() == "openai-codex" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
 		_ = resp.Body.Close()
-		req, err = http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(body))
-		if err != nil {
-			return ChatResponse{}, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-		resp, err = llmHTTPClient.Do(req)
+		resp, err = doRequest(body)
 		if err != nil {
 			return ChatResponse{}, err
 		}
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if cacheHints.Key != "" && openAICacheHintsUnsupported(resp.StatusCode, string(respBody)) {
+			reqBody.PromptCacheKey = ""
+			reqBody.PromptCacheRetention = ""
+			retryBody, err := json.Marshal(reqBody)
+			if err != nil {
+				return ChatResponse{}, err
+			}
+			logMsg("OPENAI-NATIVE", fmt.Sprintf("cache hints unsupported, retrying without them: %d %s", resp.StatusCode, string(respBody)))
+			resp, err = doRequest(retryBody)
+			if err != nil {
+				return ChatResponse{}, err
+			}
+			if p.Name() == "openai-codex" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
+				_ = resp.Body.Close()
+				resp, err = doRequest(retryBody)
+				if err != nil {
+					return ChatResponse{}, err
+				}
+			}
+			if resp.StatusCode == http.StatusOK {
+				defer resp.Body.Close()
+				return p.streamResponse(resp.Body, onChunk, onThinking, onToolChunk)
+			}
+			respBody, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+		}
 		logMsg("OPENAI-NATIVE", fmt.Sprintf("ERROR %d: %s", resp.StatusCode, string(respBody)))
 		return ChatResponse{}, fmt.Errorf("OpenAI Responses API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	defer resp.Body.Close()
 	return p.streamResponse(resp.Body, onChunk, onThinking, onToolChunk)
 }
 

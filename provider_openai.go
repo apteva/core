@@ -227,9 +227,10 @@ func toOpenAIMessages(messages []Message) []any {
 
 func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	// Build request
+	openAIMessages := toOpenAIMessages(messages)
 	reqMap := map[string]any{
 		"model":    model,
-		"messages": toOpenAIMessages(messages),
+		"messages": openAIMessages,
 		"stream":   true,
 	}
 	// OpenAI supports stream_options for usage in streaming; Fireworks may not
@@ -249,6 +250,10 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		}
 		reqMap["tools"] = defs
 	}
+	if hints := openAIPromptCacheHintsFor(p.name, model, openAIPromptCacheStablePrefix(openAIMessages), reqMap["tools"]); hints.Key != "" {
+		reqMap["prompt_cache_key"] = hints.Key
+		reqMap["prompt_cache_retention"] = hints.Retention
+	}
 
 	body, err := json.Marshal(reqMap)
 	if err != nil {
@@ -267,16 +272,19 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.url, bytes.NewReader(body))
-	if err != nil {
-		return ChatResponse{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" && p.authHeader != "" {
-		req.Header.Set("Authorization", p.authHeader+" "+p.apiKey)
+	doRequest := func(payload []byte) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", p.url, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if p.apiKey != "" && p.authHeader != "" {
+			req.Header.Set("Authorization", p.authHeader+" "+p.apiKey)
+		}
+		return llmHTTPClient.Do(req)
 	}
 
-	resp, err := llmHTTPClient.Do(req)
+	resp, err := doRequest(body)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -294,9 +302,29 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if _, ok := reqMap["prompt_cache_key"]; ok && openAICacheHintsUnsupported(resp.StatusCode, string(respBody)) {
+			delete(reqMap, "prompt_cache_key")
+			delete(reqMap, "prompt_cache_retention")
+			retryBody, err := json.Marshal(reqMap)
+			if err != nil {
+				return ChatResponse{}, err
+			}
+			logMsg("OPENAI", fmt.Sprintf("cache hints unsupported, retrying without them: %d %s", resp.StatusCode, string(respBody)))
+			resp, err = doRequest(retryBody)
+			if err != nil {
+				return ChatResponse{}, err
+			}
+			reqIDs = extractProviderRequestIDs(resp.Header)
+			if resp.StatusCode == http.StatusOK {
+				goto streamOK
+			}
+			respBody, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
 		return ChatResponse{}, fmt.Errorf("API error %d: %s (request_ids=%v)", resp.StatusCode, string(respBody), reqIDs)
 	}
 
+streamOK:
 	// Wrap the streaming body in an idle-read monitor. Any pause longer
 	// than streamIdleTimeout without a single byte arriving is treated
 	// as a provider stall — we close the body so the scanner unblocks

@@ -12,17 +12,16 @@ import (
 // defaultToolSearchAutoThreshold: at or below this many indexed
 // tools, APTEVA_TOOL_SEARCH=auto loads everything eagerly. The
 // original A/B runs put the crossover above ~21 tools (discovery
-// lost there) and well below 113 (discovery won big); we ship 100
-// as the default so typical apteva agents (channels + a handful of
-// integrations + a handful of apps) stay on the cheaper eager path
-// where the per-turn `tools` array is stable and the prompt prefix
-// caches without the model having to call search_tools first.
+// lost there) and well below 113 (discovery won big). We ship 60 as
+// the default so typical agents stay on the cheaper eager path, while
+// large app surfaces (60+ MCP tools, common for media/channel managers)
+// use discovery instead of sending every schema on each scheduled wake.
 //
 // Override at runtime via APTEVA_EAGER_TOOL_LIMIT=<int>. The two
 // env vars compose: APTEVA_TOOL_SEARCH=off forces eager regardless
 // of count; APTEVA_TOOL_SEARCH=on forces discovery regardless;
 // APTEVA_TOOL_SEARCH=auto (default) consults APTEVA_EAGER_TOOL_LIMIT.
-const defaultToolSearchAutoThreshold = 100
+const defaultToolSearchAutoThreshold = 60
 
 func eagerToolLimit() int {
 	if raw := strings.TrimSpace(os.Getenv("APTEVA_EAGER_TOOL_LIMIT")); raw != "" {
@@ -227,6 +226,16 @@ func (t *Thinker) touchActiveTool(name string) {
 	}
 	t.activeTools[name] = true
 	t.activeToolAge[name] = t.iteration
+}
+
+func countActiveMCPTools(active map[string]bool) int {
+	n := 0
+	for _, ok := range active {
+		if ok {
+			n++
+		}
+	}
+	return n
 }
 
 // evictActiveToolsLRU bounds the sticky active-tool set. Sticky preload

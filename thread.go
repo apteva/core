@@ -1093,29 +1093,23 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			subCount = t.Children.Count()
 		}
 		infos = append(infos, ThreadInfo{
-			ID:          t.ID,
-			Name:        t.Name,
-			ParentID:    t.ParentID,
-			Depth:       t.Depth,
-			Directive:   t.Directive,
-			Tools:       toolSetToSlice(t.Tools),
-			Running:     true,
-			Iteration:   t.Thinker.iteration,
-			Rate:        t.Thinker.rate,
-			Model:       t.Thinker.model,
-			Reasoning:   t.Thinker.agentReasoning,
-			Provider:    providerName,
-			Started:     t.Started,
-			ContextMsgs: len(t.Thinker.messages),
-			ContextChars: func() int {
-				n := 0
-				for _, m := range t.Thinker.messages {
-					n += len(m.Content)
-				}
-				return n
-			}(),
-			MCPNames:   t.MCPNames,
-			SubThreads: subCount,
+			ID:           t.ID,
+			Name:         t.Name,
+			ParentID:     t.ParentID,
+			Depth:        t.Depth,
+			Directive:    t.Directive,
+			Tools:        toolSetToSlice(t.Tools),
+			Running:      true,
+			Iteration:    t.Thinker.iteration,
+			Rate:         t.Thinker.rate,
+			Model:        t.Thinker.model,
+			Reasoning:    t.Thinker.agentReasoning,
+			Provider:     providerName,
+			Started:      t.Started,
+			ContextMsgs:  len(t.Thinker.messages),
+			ContextChars: contextChars(t.Thinker.messages),
+			MCPNames:     t.MCPNames,
+			SubThreads:   subCount,
 		})
 	}
 	// Sort by ID for deterministic order

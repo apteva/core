@@ -7,8 +7,6 @@ import (
 	"time"
 )
 
-const maxToolResultLen = 4000
-
 type toolCall struct {
 	Name     string
 	Args     map[string]string

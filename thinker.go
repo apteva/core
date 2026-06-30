@@ -707,6 +707,10 @@ type Thinker struct {
 	mcpCatalog   []MCPServerInfo
 	pendingTools sync.Map // tool call IDs with pending async results
 
+	lastNativeToolCount int
+	lastActiveMCPCount  int
+	lastToolMode        string
+
 	silentToolMu      sync.Mutex
 	silentToolResults []ToolResult
 
@@ -1667,6 +1671,7 @@ func (t *Thinker) Run() {
 		}
 	}()
 
+	emptyLLMResponses := 0
 	for {
 		// Pause / quit handling.
 		//
@@ -1914,7 +1919,17 @@ func (t *Thinker) Run() {
 		// (e.g. "send a pushover" → pushover_* tools preloaded). Cleared
 		// after think() so a subsequent quiet iteration reverts to the
 		// stable directive-only preload that lets the prompt prefix cache.
-		t.lastInboundForPreload = strings.Join(consumed, "\n")
+		var preloadEvents []string
+		for _, ev := range consumed {
+			if !strings.HasPrefix(ev, "[tool:") {
+				preloadEvents = append(preloadEvents, ev)
+			}
+		}
+		t.lastInboundForPreload = strings.Join(preloadEvents, "\n")
+
+		if shouldCompactBeforeLLM(t.modelID(), t.messages) {
+			t.compactForContextPressure("pre_llm", TokenUsage{}, emptyLLMResponses)
+		}
 
 		start := time.Now()
 		if !t.executionGate(ExecutionPhaseLLMStart, ExecutionGate{Summary: fmt.Sprintf("Calling %s", t.modelID())}) {
@@ -1983,9 +1998,29 @@ func (t *Thinker) Run() {
 		// tool calls there's nothing for the agent to act on or the
 		// provider to replay.
 		if reply == "" && len(chatResp.ToolCalls) == 0 {
-			logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls — skipping assistant turn", t.threadID, t.iteration))
+			emptyLLMResponses++
+			if shouldRecoverFromEmptyResponse(usage, t.modelID(), t.messages, emptyLLMResponses) {
+				reduced := t.compactForContextPressure("empty_response", usage, emptyLLMResponses)
+				emptyLLMResponses = 0
+				if !reduced {
+					logMsg("RUN", fmt.Sprintf("[%s] context pressure compaction made no progress after empty response; backing off before retry", t.threadID))
+					select {
+					case <-time.After(30 * time.Second):
+					case <-t.quit:
+						return
+					}
+				}
+			} else {
+				logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls — skipping assistant turn (empty_streak=%d)", t.threadID, t.iteration, emptyLLMResponses))
+				select {
+				case <-time.After(5 * time.Second):
+				case <-t.quit:
+					return
+				}
+			}
 			continue
 		}
+		emptyLLMResponses = 0
 		assistantMsg := Message{Role: "assistant", Content: reply, ToolCalls: chatResp.ToolCalls, Reasoning: chatResp.Reasoning}
 		t.messages = append(t.messages, assistantMsg)
 
@@ -2145,10 +2180,7 @@ func (t *Thinker) Run() {
 		}
 
 		// Context size
-		ctxChars := 0
-		for _, msg := range t.messages {
-			ctxChars += len(msg.Content)
-		}
+		ctxChars := contextChars(t.messages)
 
 		t.bus.Publish(Event{
 			Type: EventThinkDone, From: t.threadID,
@@ -2191,6 +2223,9 @@ func (t *Thinker) Run() {
 				MemoryCount:      t.memory.Count(),
 				ThreadCount:      threadCount,
 				Message:          thoughtLog,
+				NativeToolCount:  t.lastNativeToolCount,
+				ActiveMCPCount:   t.lastActiveMCPCount,
+				ToolMode:         t.lastToolMode,
 			})
 		}
 		if !t.executionGate(ExecutionPhaseIterationDone, ExecutionGate{Summary: fmt.Sprintf("Iteration done; sleeping %s", sleepSummary(sleepDur))}) {
@@ -2285,6 +2320,7 @@ func (t *Thinker) think() (ChatResponse, error) {
 	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
 		active := t.activeTools
 		if t.useEagerTools() {
+			t.lastToolMode = "eager"
 			all := t.toolIndex.AllNames(t.threadID == "main")
 			if len(all) > 0 {
 				// Transient merge — eager's "everything" set is already
@@ -2299,6 +2335,7 @@ func (t *Thinker) think() (ChatResponse, error) {
 				active = merged
 			}
 		} else {
+			t.lastToolMode = "discovery"
 			preloadK := 5
 			if t.provider.Name() == "openai-codex" {
 				preloadK = 3
@@ -2308,6 +2345,12 @@ func (t *Thinker) think() (ChatResponse, error) {
 			active = t.activeTools
 		}
 		nativeTools = t.registry.NativeTools(t.toolAllowlist, active, t.systemThread)
+		t.lastNativeToolCount = len(nativeTools)
+		t.lastActiveMCPCount = countActiveMCPTools(active)
+	} else {
+		t.lastNativeToolCount = 0
+		t.lastActiveMCPCount = 0
+		t.lastToolMode = ""
 	}
 
 	onThinking := func(chunk string) {
@@ -2681,6 +2724,128 @@ func (t *Thinker) compactSessionIfNeeded() {
 		return fmt.Sprintf("Summary of %d earlier messages: %s", preCompactCount, text)
 	})
 	logMsg("SESSION", fmt.Sprintf("[%s] compaction complete (count=%d)", t.threadID, t.session.Count()))
+}
+
+func (t *Thinker) compactForContextPressure(reason string, usage TokenUsage, emptyStreak int) bool {
+	beforeMsgs := len(t.messages)
+	beforeChars := contextChars(t.messages)
+	modelID := t.modelID()
+	maxTokens := ModelContextWindow(modelID)
+	logMsg("SESSION", fmt.Sprintf("[%s] context pressure compaction: reason=%s empty_streak=%d tokens_in=%d max_tokens=%d msgs=%d chars=%d",
+		t.threadID, reason, emptyStreak, usage.PromptTokens, maxTokens, beforeMsgs, beforeChars))
+
+	if t.telemetry != nil {
+		t.telemetry.Emit("llm.compaction_started", t.threadID, map[string]any{
+			"iteration":    t.iteration,
+			"reason":       reason,
+			"empty_streak": emptyStreak,
+			"tokens_in":    usage.PromptTokens,
+			"max_tokens":   maxTokens,
+			"before_msgs":  beforeMsgs,
+			"before_chars": beforeChars,
+			"mode":         "semantic",
+		})
+	}
+
+	summary := ""
+	semanticUsed := false
+	compactionModel := ""
+	compactionUsage := TokenUsage{}
+	compactionDuration := time.Duration(0)
+	summarizedCount := 0
+	retainedCount := 0
+	if result, err := t.semanticCompactContext(reason); err == nil {
+		if contextChars(result.messages) < beforeChars {
+			t.messages = result.messages
+			summary = result.summary
+			semanticUsed = true
+			compactionModel = result.model
+			compactionUsage = result.usage
+			compactionDuration = result.duration
+			summarizedCount = result.summarizedCount
+			retainedCount = result.retainedCount
+		} else if t.telemetry != nil {
+			t.telemetry.Emit("llm.compaction_failed", t.threadID, map[string]any{
+				"iteration":    t.iteration,
+				"reason":       reason,
+				"empty_streak": emptyStreak,
+				"error":        "semantic compaction made no progress",
+				"fallback":     "emergency_trim",
+			})
+		}
+	} else if t.telemetry != nil {
+		t.telemetry.Emit("llm.compaction_failed", t.threadID, map[string]any{
+			"iteration":    t.iteration,
+			"reason":       reason,
+			"empty_streak": emptyStreak,
+			"error":        err.Error(),
+			"fallback":     "emergency_trim",
+		})
+	}
+
+	if !semanticUsed {
+		summarizedCount = beforeMsgs - len(trimMessagesForContextPressure(t.messages, contextPressureKeepRecent))
+		retainedCount = len(t.messages) - summarizedCount
+	}
+
+	if len(t.messages) > 1 {
+		if !semanticUsed {
+			t.messages = trimMessagesForContextPressure(t.messages, contextPressureKeepRecent)
+		}
+	}
+
+	if t.session != nil {
+		preCompactCount := t.session.Count()
+		t.session.ForceCompact(contextPressureKeepRecent, func(text string) string {
+			if summary != "" {
+				return summary
+			}
+			if len(text) > toolResultContextPreviewChars {
+				text = text[:toolResultContextPreviewChars]
+			}
+			return fmt.Sprintf("Context-pressure compaction (%s). Summary of %d earlier messages: %s", reason, preCompactCount, text)
+		})
+	}
+
+	afterChars := contextChars(t.messages)
+	reduced := afterChars < beforeChars
+	if t.telemetry != nil {
+		t.telemetry.Emit("llm.compaction_done", t.threadID, map[string]any{
+			"iteration":                t.iteration,
+			"reason":                   reason,
+			"mode":                     map[bool]string{true: "semantic", false: "emergency_trim"}[semanticUsed],
+			"model":                    compactionModel,
+			"duration_ms":              compactionDuration.Milliseconds(),
+			"compaction_prompt_tokens": compactionUsage.PromptTokens,
+			"compaction_output_tokens": compactionUsage.CompletionTokens,
+			"compaction_cached_tokens": compactionUsage.CachedTokens,
+			"summarized_msgs":          summarizedCount,
+			"retained_msgs":            retainedCount,
+			"summary_chars":            len(summary),
+			"before_msgs":              beforeMsgs,
+			"after_msgs":               len(t.messages),
+			"before_chars":             beforeChars,
+			"after_chars":              afterChars,
+			"keep_recent":              contextPressureKeepRecent,
+			"reduced":                  reduced,
+		})
+		t.telemetry.Emit("llm.context_compacted", t.threadID, map[string]any{
+			"iteration":    t.iteration,
+			"reason":       reason,
+			"mode":         map[bool]string{true: "semantic", false: "emergency_trim"}[semanticUsed],
+			"empty_streak": emptyStreak,
+			"tokens_in":    usage.PromptTokens,
+			"max_tokens":   maxTokens,
+			"before_msgs":  beforeMsgs,
+			"after_msgs":   len(t.messages),
+			"before_chars": beforeChars,
+			"after_chars":  afterChars,
+			"keep_recent":  contextPressureKeepRecent,
+		})
+	}
+	logMsg("SESSION", fmt.Sprintf("[%s] context pressure compaction complete: msgs %d→%d chars %d→%d",
+		t.threadID, beforeMsgs, len(t.messages), beforeChars, afterChars))
+	return reduced
 }
 
 func (t *Thinker) Stop() {

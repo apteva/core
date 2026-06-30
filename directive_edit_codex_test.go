@@ -71,3 +71,112 @@ func TestCodexDirectiveEditSmoke(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexEmptyDirectiveSectionInitSmoke(t *testing.T) {
+	if os.Getenv("RUN_CODEX_DIRECTIVE_EDIT_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_DIRECTIVE_EDIT_SMOKE=1 to run the Codex directive edit smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex directive edit smoke in short mode")
+	}
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+	}
+
+	t.Chdir(t.TempDir())
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: "",
+		Mode:      ModeAutonomous,
+	}
+	provider := NewOpenAICodexProvider(token)
+	thinker := NewThinker("", provider, cfg)
+	defer thinker.Stop()
+
+	go thinker.Run()
+	thinker.InjectConsole(strings.Join([]string{
+		"Initialize your own empty directive now as structured Markdown.",
+		`Use the evolve tool with section="Goals" and content="- Keep blank directive initialization structured.".`,
+		"Do not include edit_mode. Do not use the directive argument. Do not spawn, update children, or change tools.",
+		"After the tool succeeds, reply exactly: RESULT: blank directive initialized",
+	}, "\n"))
+
+	deadline := time.After(4 * time.Minute)
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("empty directive was not initialized as Markdown; current directive:\n%s", cfg.GetDirective())
+		case <-tick.C:
+			directive := cfg.GetDirective()
+			if strings.Contains(directive, "# Goals\n- Keep blank directive initialization structured.") {
+				t.Logf("final directive:\n%s", directive)
+				return
+			}
+			if strings.TrimSpace(directive) == "- Keep blank directive initialization structured." {
+				t.Fatalf("directive initialized as plain text instead of Markdown:\n%s", directive)
+			}
+		}
+	}
+}
+
+func TestCodexMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T) {
+	if os.Getenv("RUN_CODEX_DIRECTIVE_EDIT_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_DIRECTIVE_EDIT_SMOKE=1 to run the Codex directive edit smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex directive edit smoke in short mode")
+	}
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+	}
+
+	t.Chdir(t.TempDir())
+	original := strings.Join([]string{
+		"# Role",
+		"You maintain this directive when asked.",
+		"",
+		"# Goals",
+		"- Keep the directive structured.",
+	}, "\n")
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: original,
+		Mode:      ModeAutonomous,
+	}
+	provider := NewOpenAICodexProvider(token)
+	thinker := NewThinker("", provider, cfg)
+	defer thinker.Stop()
+
+	go thinker.Run()
+	thinker.InjectConsole(strings.Join([]string{
+		"Test the directive replacement guard now.",
+		`Call evolve with directive="# Role\nReplacement should be rejected" and no section/edit mode.`,
+		"Do not use section edits. Do not spawn, update children, or change tools.",
+		"After the tool returns, reply exactly: RESULT: replacement rejected",
+	}, "\n"))
+
+	deadline := time.After(4 * time.Minute)
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("full replacement rejection was not observed; current directive:\n%s", cfg.GetDirective())
+		case <-tick.C:
+			if got := cfg.GetDirective(); got != original {
+				t.Fatalf("markdown directive changed after full replacement attempt:\n%s\nwant:\n%s", got, original)
+			}
+			events, _ := thinker.telemetry.StoredEvents(0)
+			for _, ev := range events {
+				if ev.Type == "tool.result" && strings.Contains(string(ev.Data), "full directive replacement is disabled") {
+					t.Logf("directive replacement rejected as expected")
+					return
+				}
+			}
+		}
+	}
+}

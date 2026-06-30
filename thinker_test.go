@@ -251,6 +251,38 @@ func TestMainEvolveKicksNextTurn(t *testing.T) {
 	}
 }
 
+func TestMainEvolveRejectsFullReplaceForMarkdown(t *testing.T) {
+	events := []APIEvent{}
+	directive := "# Role\nOld role\n# Goals\n- Ship"
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive},
+		messages:  []Message{{Role: "system", Content: "old prompt"}},
+		registry:  NewToolRegistry("test"),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+	}
+	thinker.directive = directive
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name:     "evolve",
+		Args:     map[string]string{"directive": "# Role\nNew role"},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+
+	if got := thinker.config.GetDirective(); got != directive {
+		t.Fatalf("directive changed:\n%s\nwant:\n%s", got, directive)
+	}
+	if thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should remain false after rejected evolve")
+	}
+	if len(results) != 1 || results[0].CallID != "call-1" || !strings.Contains(results[0].Content, "full directive replacement is disabled") {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
 func TestMainEvolveSectionPatch(t *testing.T) {
 	events := []APIEvent{}
 	directive := "# Schedule\n- daily_check: 09:00 Europe/Madrid\n# Goals\n- Ship"
@@ -284,6 +316,33 @@ func TestMainEvolveSectionPatch(t *testing.T) {
 		t.Fatal("kickNextTurn should be true after evolve")
 	}
 	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "directive updated" {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
+func TestMainUpdateRejectsFullReplaceForMarkdownChildDirective(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	directive := "# Role\nWorker\n# Goals\n- Ship"
+	if err := thinker.threads.SpawnWithOpts("worker", directive, nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name:     "update",
+		Args:     map[string]string{"id": "worker", "directive": "# Role\nNew worker"},
+		Raw:      "update",
+		NativeID: "call-1",
+	}}, nil)
+
+	got, err := thinker.threads.Directive("worker")
+	if err != nil {
+		t.Fatalf("worker directive: %v", err)
+	}
+	if got != directive {
+		t.Fatalf("directive changed:\n%s\nwant:\n%s", got, directive)
+	}
+	if len(results) != 1 || results[0].CallID != "call-1" || !strings.Contains(results[0].Content, "full directive replacement is disabled") {
 		t.Fatalf("unexpected tool results: %+v", results)
 	}
 }
@@ -383,6 +442,52 @@ func TestMainUpdateKicksNextTurn(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "thread worker updated" {
 		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
+func TestMainUpdateEmptyDirectiveSectionPayloadCreatesMarkdown(t *testing.T) {
+	events := []APIEvent{}
+	bus := NewEventBus()
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "test"},
+		messages:  []Message{{Role: "system", Content: "test"}},
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		quit:      make(chan struct{}),
+	}
+	thinker.threads = NewThreadManager(thinker)
+	if err := thinker.threads.SpawnWithOpts("worker", "", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "update",
+		Args: map[string]string{
+			"id":      "worker",
+			"section": "Goals",
+			"content": "- Ship",
+		},
+		Raw:      "update",
+		NativeID: "call-1",
+	}}, nil)
+
+	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "thread worker updated" {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+	got, err := thinker.threads.Directive("worker")
+	if err != nil {
+		t.Fatalf("worker directive: %v", err)
+	}
+	want := "# Goals\n- Ship"
+	if got != want {
+		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+	if !thinker.kickNextTurn {
+		t.Fatal("kickNextTurn should be true after update")
 	}
 }
 

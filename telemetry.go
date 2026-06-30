@@ -391,6 +391,9 @@ type LLMDoneData struct {
 	MemoryCount      int    `json:"memory_count"`
 	ThreadCount      int    `json:"thread_count"`
 	Message          string `json:"message,omitempty"`
+	NativeToolCount  int    `json:"native_tool_count,omitempty"`
+	ActiveMCPCount   int    `json:"active_mcp_count,omitempty"`
+	ToolMode         string `json:"tool_mode,omitempty"`
 }
 
 type LLMChunkData struct {

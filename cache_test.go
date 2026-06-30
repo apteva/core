@@ -182,6 +182,27 @@ func TestUseEagerTools_CodexUsesNormalThreshold(t *testing.T) {
 	}
 }
 
+func TestUseEagerTools_LargeSurfaceUsesDiscoveryByDefault(t *testing.T) {
+	ix := NewToolIndex()
+	var tools []mcpToolDef
+	for i := 0; i < defaultToolSearchAutoThreshold+1; i++ {
+		tools = append(tools, mcpToolDef{Name: fmt.Sprintf("tool_%02d", i), Description: "tool"})
+	}
+	ix.Add("large", tools, false)
+	tk := &Thinker{
+		provider:  &OpenAINativeProvider{name: "openai-codex"},
+		toolIndex: ix,
+	}
+	if tk.useEagerTools() {
+		t.Fatalf("tool surface above %d should use discovery by default", defaultToolSearchAutoThreshold)
+	}
+
+	t.Setenv("APTEVA_EAGER_TOOL_LIMIT", "999")
+	if !tk.useEagerTools() {
+		t.Fatal("APTEVA_EAGER_TOOL_LIMIT should allow rollback to eager mode")
+	}
+}
+
 func TestToolSearchEnvOverrideAppliesToCodex(t *testing.T) {
 	t.Setenv("APTEVA_TOOL_SEARCH", "on")
 	tk := &Thinker{
@@ -300,4 +321,76 @@ func TestIntegration_CacheHitRatio_Kimi(t *testing.T) {
 	// can grep it without parsing testing's verbose output.
 	fmt.Fprintf(os.Stdout, "[CACHE-RATIO] kimi-k2p6 turns=%d ratio=%.1f%% prompt=%d cached=%d\n",
 		len(stats), ratio, promptSum, cachedSum)
+}
+
+func TestIntegration_CacheHitRatio_OpenAICodex(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Codex cache test in short mode")
+	}
+	loadIntegrationEnv()
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set, skipping live Codex cache test")
+	}
+
+	provider := NewOpenAICodexProvider(token)
+	stableSystem := strings.Repeat("Stable Codex prompt-cache fixture. Keep this prefix identical across turns.\n", 260)
+	messages := []Message{{Role: "system", Content: stableSystem}}
+	turns := []string{
+		"Reply with exactly one word: alpha",
+		"Reply with exactly one word: beta",
+		"Reply with exactly one word: gamma",
+		"Reply with exactly one word: delta",
+	}
+
+	type turnStat struct {
+		Prompt int
+		Cached int
+		Out    int
+	}
+	var stats []turnStat
+	for i, turn := range turns {
+		messages = append(messages, Message{Role: "user", Content: turn})
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		resp, err := provider.Chat(ctx, messages, "gpt-5.5", nil, nil, nil, nil)
+		cancel()
+		if err != nil {
+			if isExpiredCodexCredentialError(err) {
+				t.Skipf("OPENAI_CODEX_ACCESS_TOKEN is expired: %v", err)
+			}
+			t.Fatalf("turn %d Chat: %v", i+1, err)
+		}
+		messages = append(messages, Message{Role: "assistant", Content: resp.Text})
+		stats = append(stats, turnStat{
+			Prompt: resp.Usage.PromptTokens,
+			Cached: resp.Usage.CachedTokens,
+			Out:    resp.Usage.CompletionTokens,
+		})
+		t.Logf("codex turn %d: prompt=%d cached=%d out=%d", i+1, resp.Usage.PromptTokens, resp.Usage.CachedTokens, resp.Usage.CompletionTokens)
+	}
+
+	var promptSum, cachedSum int
+	for _, stat := range stats[1:] {
+		promptSum += stat.Prompt
+		cachedSum += stat.Cached
+	}
+	ratio := 0.0
+	if promptSum > 0 {
+		ratio = float64(cachedSum) / float64(promptSum) * 100
+	}
+	fmt.Fprintf(os.Stdout, "[CACHE-RATIO] openai-codex turns=%d ratio=%.1f%% prompt=%d cached=%d\n",
+		len(stats), ratio, promptSum, cachedSum)
+	if cachedSum == 0 {
+		t.Fatalf("Codex live cache test reported zero cached tokens across steady-state turns")
+	}
+}
+
+func isExpiredCodexCredentialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "token_expired") ||
+		strings.Contains(msg, "session expired") ||
+		strings.Contains(msg, "authentication token is expired")
 }

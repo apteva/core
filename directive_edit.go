@@ -65,7 +65,7 @@ func applyDirectiveEdit(current string, args map[string]string) (string, string,
 }
 
 func applySingleDirectiveEdit(current string, edit directiveEdit) (string, error) {
-	mode := normalizeDirectiveEditMode(firstNonEmptyDirectiveEdit(edit.EditMode, edit.Mode))
+	mode := directiveEditMode(edit)
 	switch mode {
 	case "replace":
 		replacement := edit.Directive
@@ -74,6 +74,9 @@ func applySingleDirectiveEdit(current string, edit directiveEdit) (string, error
 		}
 		if strings.TrimSpace(replacement) == "" {
 			return "", fmt.Errorf("replace requires directive or content")
+		}
+		if directiveHasMarkdownSections(current) {
+			return "", fmt.Errorf("full directive replacement is disabled for structured Markdown directives; use section edit modes")
 		}
 		return replacement, nil
 	case "section_append":
@@ -125,8 +128,19 @@ func normalizeDirectiveEditMode(mode string) string {
 	}
 }
 
+func directiveEditMode(edit directiveEdit) string {
+	raw := firstNonEmptyDirectiveEdit(edit.EditMode, edit.Mode)
+	if strings.TrimSpace(raw) != "" {
+		return normalizeDirectiveEditMode(raw)
+	}
+	if strings.TrimSpace(edit.Section) != "" {
+		return "section_append"
+	}
+	return "replace"
+}
+
 func directiveEditSummary(edit directiveEdit) string {
-	mode := normalizeDirectiveEditMode(firstNonEmptyDirectiveEdit(edit.EditMode, edit.Mode))
+	mode := directiveEditMode(edit)
 	if mode == "replace" {
 		return "directive replaced"
 	}
@@ -226,9 +240,11 @@ func findMarkdownSection(lines []string, section string) (header, bodyStart, bod
 		if !isHeading || normalizeSectionName(name) != want {
 			continue
 		}
+		level, _ := markdownHeadingLevel(line)
 		end := len(lines)
 		for j := i + 1; j < len(lines); j++ {
-			if _, isNextHeading := markdownHeadingName(lines[j]); isNextHeading {
+			nextLevel, isNextHeading := markdownHeadingLevel(lines[j])
+			if isNextHeading && nextLevel <= level {
 				end = j
 				break
 			}
@@ -252,6 +268,15 @@ func markdownHeadingLevel(line string) (int, bool) {
 		return 0, false
 	}
 	return len(m[1]), true
+}
+
+func directiveHasMarkdownSections(s string) bool {
+	for _, line := range directiveLines(s) {
+		if _, ok := markdownHeadingName(line); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeSectionName(s string) string {

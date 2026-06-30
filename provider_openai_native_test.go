@@ -1,7 +1,11 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -45,6 +49,97 @@ func TestOpenAINativeChat_BuildsFunctionToolsOnly(t *testing.T) {
 	}
 	if decoded["type"] != "function" || decoded["name"] != "app_tool" {
 		t.Fatalf("tool = %#v", decoded)
+	}
+}
+
+func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		raw, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("request JSON: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`data: {"type":"response.output_text.delta","delta":"ok"}`,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":5}}}}`,
+			`data: [DONE]`,
+			``,
+		}, "\n")))
+	}))
+	defer srv.Close()
+
+	p := &OpenAINativeProvider{
+		name:            "openai-codex",
+		apiKey:          "test",
+		responsesURL:    srv.URL,
+		forceStoreFalse: true,
+	}
+	resp, err := p.Chat(context.Background(),
+		[]Message{{Role: "system", Content: "stable system"}, {Role: "user", Content: "hello"}},
+		"gpt-5.5",
+		[]NativeTool{{Name: "app_tool", Description: "tool", Parameters: map[string]any{"type": "object"}}},
+		nil, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if resp.Text != "ok" || resp.Usage.CachedTokens != 5 {
+		t.Fatalf("response = %+v", resp)
+	}
+	if body["prompt_cache_retention"] != "24h" {
+		t.Fatalf("prompt_cache_retention = %v, want 24h", body["prompt_cache_retention"])
+	}
+	key, _ := body["prompt_cache_key"].(string)
+	if !strings.HasPrefix(key, "apteva-v1-") {
+		t.Fatalf("prompt_cache_key = %q", key)
+	}
+	if body["instructions"] != "stable system" {
+		t.Fatalf("instructions = %v", body["instructions"])
+	}
+}
+
+func TestOpenAINativeChat_RetriesWithoutUnsupportedPromptCacheHints(t *testing.T) {
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("request JSON: %v", err)
+		}
+		bodies = append(bodies, body)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unknown parameter: prompt_cache_retention"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`data: {"type":"response.output_text.delta","delta":"ok"}`,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}`,
+			`data: [DONE]`,
+			``,
+		}, "\n")))
+	}))
+	defer srv.Close()
+
+	p := &OpenAINativeProvider{name: "openai-codex", apiKey: "test", responsesURL: srv.URL, forceStoreFalse: true}
+	if _, err := p.Chat(context.Background(), []Message{{Role: "system", Content: "stable"}, {Role: "user", Content: "hi"}}, "gpt-5.5", nil, nil, nil, nil); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("requests = %d, want 2", len(bodies))
+	}
+	if bodies[0]["prompt_cache_key"] == "" || bodies[0]["prompt_cache_retention"] == "" {
+		t.Fatalf("first request missing cache hints: %#v", bodies[0])
+	}
+	if _, ok := bodies[1]["prompt_cache_key"]; ok {
+		t.Fatalf("retry kept prompt_cache_key: %#v", bodies[1])
+	}
+	if _, ok := bodies[1]["prompt_cache_retention"]; ok {
+		t.Fatalf("retry kept prompt_cache_retention: %#v", bodies[1])
 	}
 }
 
