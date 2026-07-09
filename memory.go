@@ -481,6 +481,46 @@ func (ms *MemoryStore) HasID(id string) bool {
 	return ok
 }
 
+// UpsertTargetID returns the active record that should be superseded
+// when a caller upserts a deterministic id. The first push writes the
+// deterministic id itself. Later pushes create replacement records with
+// generated ids, so a repeated push of the original id must supersede the
+// latest active replacement, not the already-dead original.
+func (ms *MemoryStore) UpsertTargetID(id string) (string, bool) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	if _, ok := ms.byID[id]; !ok {
+		return "", false
+	}
+	tombstoned, superseded := ms.deadIDs()
+	for _, r := range ms.records {
+		if r.Tombstone || tombstoned[r.ID] || superseded[r.ID] {
+			continue
+		}
+		if r.ID == id || ms.supersedesLocked(r.ID, id) {
+			return r.ID, true
+		}
+	}
+	return id, true
+}
+
+func (ms *MemoryStore) supersedesLocked(candidateID, targetID string) bool {
+	seen := map[string]bool{}
+	for candidateID != "" && !seen[candidateID] {
+		seen[candidateID] = true
+		idx, ok := ms.byID[candidateID]
+		if !ok {
+			return false
+		}
+		parent := ms.records[idx].Supersedes
+		if parent == targetID {
+			return true
+		}
+		candidateID = parent
+	}
+	return false
+}
+
 // Supersede writes a NEW memory and a tombstone for oldID, linking
 // them via the new record's Supersedes field. Both records are
 // appended atomically (one after the other, no other writer in

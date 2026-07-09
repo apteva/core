@@ -1096,17 +1096,17 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"id": newID, "action": "inserted"})
 		return
 	}
-	if a.thinker.memory.HasID(id) {
+	if targetID, ok := a.thinker.memory.UpsertTargetID(id); ok {
 		reason := body.Reason
 		if reason == "" {
 			reason = "upsert via POST /memory"
 		}
-		newID, err := a.thinker.memory.Supersede(id, body.Content, body.Tags, body.Weight, reason)
+		newID, err := a.thinker.memory.Supersede(targetID, body.Content, body.Tags, body.Weight, reason)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, map[string]any{"id": newID, "supersedes": id, "action": "upserted"})
+		writeJSON(w, map[string]any{"id": newID, "supersedes": targetID, "source_id": id, "action": "upserted"})
 		return
 	}
 	newID, err := a.thinker.memory.RememberWithID(id, body.Content, body.Tags, body.Weight)

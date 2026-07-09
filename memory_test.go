@@ -281,6 +281,33 @@ func TestRememberWithID_InsertsWithSuppliedID(t *testing.T) {
 	}
 }
 
+func TestUpsertTargetID_FollowsActiveReplacementChain(t *testing.T) {
+	ms := newOfflineStore(t)
+	original, err := ms.RememberWithID("skill_abc_0", "first playbook", []string{"skill"}, 0.8)
+	if err != nil {
+		t.Fatalf("RememberWithID: %v", err)
+	}
+	second, err := ms.Supersede(original, "second playbook", []string{"skill"}, 0.8, "changed")
+	if err != nil {
+		t.Fatalf("Supersede second: %v", err)
+	}
+	target, ok := ms.UpsertTargetID(original)
+	if !ok {
+		t.Fatal("expected deterministic id to resolve")
+	}
+	if target != second {
+		t.Fatalf("upsert target = %q, want active replacement %q", target, second)
+	}
+	third, err := ms.Supersede(target, "third playbook", []string{"skill"}, 0.8, "changed again")
+	if err != nil {
+		t.Fatalf("Supersede third: %v", err)
+	}
+	active := ms.Active()
+	if len(active) != 1 || active[0].ID != third || active[0].Content != "third playbook" {
+		t.Fatalf("active records = %+v, want only latest replacement %s", active, third)
+	}
+}
+
 func TestRememberWithID_RejectsEmptyID(t *testing.T) {
 	ms := newOfflineStore(t)
 	if _, err := ms.RememberWithID("", "x", nil, 0.5); err == nil {
@@ -383,6 +410,51 @@ func TestRecall_RanksByLexicalScore_NoEmbedding(t *testing.T) {
 	// "user" + "replies" overlap; weather should rank lowest.
 	if !strings.Contains(results[0].Content, "terse replies") {
 		t.Errorf("expected 'terse replies' to rank first, got: %q", results[0].Content)
+	}
+}
+
+func TestSearch_RanksSkillMemoryLexically_NoEmbedding(t *testing.T) {
+	ms := newOfflineStore(t)
+	if _, err := ms.RememberWithID(
+		"skill_storage_upload_0",
+		"When uploading files to storage, validate MIME type, create a signed URL, then confirm checksum.",
+		[]string{"skill", "storage", "upload", "signed-url"},
+		0.95,
+	); err != nil {
+		t.Fatalf("RememberWithID: %v", err)
+	}
+	if _, err := ms.Remember("Billing imports use the invoices queue.", []string{"billing", "invoices"}, 0.8); err != nil {
+		t.Fatalf("Remember distractor: %v", err)
+	}
+	results := ms.Search("upload storage signed url", 1)
+	if len(results) != 1 {
+		t.Fatalf("Search returned %d results, want 1", len(results))
+	}
+	if results[0].ID != "skill_storage_upload_0" {
+		t.Fatalf("top lexical skill memory = %q (%q), want skill_storage_upload_0", results[0].ID, results[0].Content)
+	}
+	if len(results[0].Embedding) != 0 {
+		t.Fatalf("offline skill memory unexpectedly has embedding len=%d", len(results[0].Embedding))
+	}
+}
+
+func TestDynamicTurnContext_IncludesLexicalMemoryWithoutEmbedding(t *testing.T) {
+	ms := newOfflineStore(t)
+	const sentinel = "ultramarine-blue-742"
+	if _, err := ms.Remember(
+		"For lexical memory smoke tests, the deployment color is "+sentinel+".",
+		[]string{"deployment", "color", "lexical-memory"},
+		0.95,
+	); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	recalled := ms.Recall("What deployment color should the lexical memory test use?", 1)
+	ctx := buildDynamicTurnContext(nil, ms.BuildContext(recalled))
+	if !strings.Contains(ctx, sentinel) {
+		t.Fatalf("dynamic context did not include recalled lexical memory:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "[memories") {
+		t.Fatalf("dynamic context missing memories block:\n%s", ctx)
 	}
 }
 

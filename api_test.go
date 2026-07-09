@@ -768,6 +768,40 @@ func TestAPI_MemoryPost_UpsertsExistingID(t *testing.T) {
 	}
 }
 
+func TestAPI_MemoryPost_RepeatedDeterministicUpsertKeepsOneActiveSkillMemory(t *testing.T) {
+	api, _ := newTestAPI()
+	withWritableMemory(t, api)
+
+	for _, body := range []map[string]any{
+		{"id": "skill_42_0", "content": "first version", "tags": []string{"skill"}},
+		{"id": "skill_42_0", "content": "second version", "tags": []string{"skill"}, "reason": "skill changed"},
+		{"id": "skill_42_0", "content": "third version", "tags": []string{"skill"}, "reason": "skill changed again"},
+	} {
+		payload, _ := json.Marshal(body)
+		req := httptest.NewRequest("POST", "/memory", bytes.NewReader(payload))
+		w := httptest.NewRecorder()
+		api.memoryRoot(w, req)
+		if w.Code != 200 {
+			t.Fatalf("POST body=%v: expected 200, got %d (%s)", body, w.Code, w.Body.String())
+		}
+	}
+
+	active := api.thinker.memory.Active()
+	if len(active) != 1 {
+		t.Fatalf("expected one active skill memory after repeated upserts, got %+v", active)
+	}
+	if active[0].Content != "third version" {
+		t.Fatalf("active content = %q, want third version", active[0].Content)
+	}
+	if active[0].ID == "skill_42_0" {
+		t.Fatalf("active replacement should use generated id after supersede, got original id")
+	}
+	target, ok := api.thinker.memory.UpsertTargetID("skill_42_0")
+	if !ok || target != active[0].ID {
+		t.Fatalf("upsert target = %q, %v; want active id %q", target, ok, active[0].ID)
+	}
+}
+
 func TestAPI_MemoryPost_RequiresContent(t *testing.T) {
 	api, _ := newTestAPI()
 	withWritableMemory(t, api)
