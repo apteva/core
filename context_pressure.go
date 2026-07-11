@@ -1,8 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"strings"
 	"time"
 )
@@ -48,17 +54,171 @@ func contextChars(messages []Message) int {
 	return n
 }
 
+// estimatedContextTokens approximates provider-visible tokens without treating
+// compressed media bytes as text. Image tokenization is based primarily on
+// dimensions, not JPEG/PNG byte size; using len(image)/4 caused screenshots to
+// look hundreds of thousands of tokens larger than the provider reported.
+func estimatedContextTokens(messages []Message) int {
+	textChars := 0
+	imageTokens := 0
+	for _, msg := range messages {
+		textChars += len(msg.Role) + len(msg.Content) + len(msg.Reasoning)
+		for _, part := range msg.Parts {
+			textChars += len(part.Type) + len(part.Text)
+			if part.ImageURL != nil {
+				textChars += len(part.ImageURL.Detail)
+				if data, ok := decodeImageDataURL(part.ImageURL.URL); ok {
+					imageTokens += estimateImageTokens(data)
+				} else {
+					textChars += len(part.ImageURL.URL)
+					imageTokens += defaultImageTokenEstimate
+				}
+			}
+			// Audio estimation remains byte-based until providers expose a
+			// duration-aware estimator. It is intentionally separate from images.
+			if part.InputAudio != nil {
+				textChars += len(part.InputAudio.Data) + len(part.InputAudio.Format)
+			}
+			if part.AudioURL != nil {
+				textChars += len(part.AudioURL.URL) + len(part.AudioURL.MimeType)
+			}
+		}
+		for _, call := range msg.ToolCalls {
+			textChars += len(call.ID) + len(call.Name) + len(call.ThoughtSignature)
+			for key, value := range call.Args {
+				textChars += len(key) + len(value)
+			}
+		}
+		for _, result := range msg.ToolResults {
+			textChars += len(result.CallID) + len(result.Content)
+			if len(result.Image) > 0 {
+				imageTokens += estimateImageTokens(result.Image)
+			}
+		}
+	}
+	return (textChars+3)/4 + imageTokens
+}
+
+const defaultImageTokenEstimate = 2048
+
+func estimateImageTokens(data []byte) int {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return defaultImageTokenEstimate
+	}
+	tilesWide := (cfg.Width + 511) / 512
+	tilesHigh := (cfg.Height + 511) / 512
+	// Twice the common 85 + 170-per-512px-tile formula is deliberately
+	// conservative across providers while remaining independent of compression.
+	estimate := 2 * (85 + 170*tilesWide*tilesHigh)
+	if estimate < 512 {
+		return 512
+	}
+	return estimate
+}
+
+func decodeImageDataURL(url string) ([]byte, bool) {
+	if !strings.HasPrefix(url, "data:image/") {
+		return nil, false
+	}
+	comma := strings.IndexByte(url, ',')
+	if comma < 0 || !strings.Contains(url[:comma], ";base64") {
+		return nil, false
+	}
+	data, err := base64.StdEncoding.DecodeString(url[comma+1:])
+	return data, err == nil
+}
+
+const evictedScreenshotPlaceholder = "[previous screenshot replaced — see latest for current screen state]"
+
+func toolNamesByCallID(messages []Message) map[string]string {
+	names := make(map[string]string)
+	for _, msg := range messages {
+		for _, call := range msg.ToolCalls {
+			if call.ID != "" {
+				names[call.ID] = call.Name
+			}
+		}
+	}
+	return names
+}
+
+func isComputerToolName(name string) bool {
+	return strings.HasPrefix(name, "computer_")
+}
+
+// evictStaleComputerScreenshots keeps only the newest computer frame. Unlike
+// generated/user images, browser screenshots are transient observations: once
+// a subsequent action returns a newer frame, replaying older frames adds cost
+// and can confuse the model about the current UI state.
+func evictStaleComputerScreenshots(messages []Message, keep int) int {
+	if keep < 0 {
+		keep = 0
+	}
+	names := toolNamesByCallID(messages)
+	seen := 0
+	removed := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
+			result := &messages[i].ToolResults[j]
+			if len(result.Image) == 0 || !isComputerToolName(names[result.CallID]) {
+				continue
+			}
+			seen++
+			if seen > keep {
+				result.Image = nil
+				result.Content = evictedScreenshotPlaceholder
+				removed++
+			}
+		}
+	}
+	return removed
+}
+
+// messageForSession removes transient computer pixels from the durable copy.
+// The live message retains its image for the next model decision; after a
+// restart, a fresh screenshot is safer than replaying an old browser frame.
+func messageForSession(history []Message, msg Message) Message {
+	names := toolNamesByCallID(history)
+	if len(msg.ToolResults) == 0 {
+		return msg
+	}
+	msg.ToolResults = append([]ToolResult(nil), msg.ToolResults...)
+	for i := range msg.ToolResults {
+		result := &msg.ToolResults[i]
+		if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
+			result.Image = nil
+		}
+	}
+	return msg
+}
+
 func shouldCompactBeforeLLM(modelID string, messages []Message) bool {
 	maxTokens := ModelEffectiveContextWindow(modelID)
-	chars := contextChars(messages)
-	underPressure := false
-	if maxTokens > 0 && chars/4 >= int(float64(maxTokens)*semanticCompactionTokenRatio) {
-		underPressure = true
+	trimmed := trimMessagesForContextPressure(messages, contextPressureKeepRecent)
+	if len(trimmed) >= len(messages) {
+		return false
 	}
-	if chars >= semanticCompactionCharFallback {
-		underPressure = true
+
+	if maxTokens > 0 {
+		threshold := int(float64(maxTokens) * semanticCompactionTokenRatio)
+		before := estimatedContextTokens(messages)
+		if before < threshold {
+			return false
+		}
+		after := estimatedContextTokens(trimmed)
+		return after < threshold || before-after >= before/10
 	}
-	return underPressure && len(trimMessagesForContextPressure(messages, contextPressureKeepRecent)) < len(messages)
+
+	// The byte fallback exists only for models whose context window is unknown.
+	// Applying it to a known 372K-token model caused 100KB JPEG screenshots to
+	// trigger compaction while actual provider usage was only ~25K tokens.
+	before := contextChars(messages)
+	if before < semanticCompactionCharFallback {
+		return false
+	}
+	after := contextChars(trimmed)
+	return after < semanticCompactionCharFallback || before-after >= before/10
 }
 
 func shouldRecoverFromEmptyResponse(usage TokenUsage, modelID string, messages []Message, emptyStreak int) bool {
@@ -66,11 +226,11 @@ func shouldRecoverFromEmptyResponse(usage TokenUsage, modelID string, messages [
 	if usage.PromptTokens > 0 && maxTokens > 0 && float64(usage.PromptTokens) >= float64(maxTokens)*contextPressureTokenRatio {
 		return true
 	}
-	chars := contextChars(messages)
-	if maxTokens > 0 && chars/4 >= int(float64(maxTokens)*contextPressureTokenRatio) {
-		return true
-	}
-	if chars >= contextPressureCharFallback {
+	if maxTokens > 0 {
+		if estimatedContextTokens(messages) >= int(float64(maxTokens)*contextPressureTokenRatio) {
+			return true
+		}
+	} else if contextChars(messages) >= contextPressureCharFallback {
 		return true
 	}
 	return emptyStreak >= contextPressureEmptyStreak

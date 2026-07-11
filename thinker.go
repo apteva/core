@@ -2013,7 +2013,7 @@ func (t *Thinker) Run() {
 			trMsg := Message{Role: "user", ToolResults: toolResults}
 			t.messages = append(t.messages, trMsg)
 			if t.session != nil {
-				t.session.AppendMessage(trMsg, t.iteration, TokenUsage{})
+				t.session.AppendMessage(messageForSession(t.messages, trMsg), t.iteration, TokenUsage{})
 			}
 		}
 
@@ -2059,6 +2059,9 @@ func (t *Thinker) Run() {
 		}
 
 		t.sanitizeConversationMessages()
+		// A computer result's newest screenshot is useful for the next action;
+		// older frames are stale and must not drive context-pressure decisions.
+		evictStaleComputerScreenshots(t.messages, 1)
 
 		// Recall uses the current event, otherwise the latest durable task,
 		// otherwise the standing directive. It never queries generated assistant
@@ -2324,7 +2327,8 @@ func (t *Thinker) Run() {
 			// (no pending IDs needed here — this runs during the same iteration)
 		}
 
-		// Evict old screenshots — keep the 3 most recent images
+		// Evict old non-computer images — computer screenshots are already
+		// reduced to the latest frame before context-pressure evaluation.
 		imageCount := 0
 		maxImages := 3
 		for i := len(t.messages) - 1; i >= 1; i-- {
@@ -2334,7 +2338,7 @@ func (t *Thinker) Run() {
 					if imageCount > maxImages {
 						// Replace old screenshot with text placeholder
 						t.messages[i].ToolResults[j].Image = nil
-						t.messages[i].ToolResults[j].Content = "[previous screenshot replaced — see latest for current screen state]"
+						t.messages[i].ToolResults[j].Content = evictedScreenshotPlaceholder
 					}
 				}
 			}
@@ -2402,8 +2406,10 @@ func (t *Thinker) Run() {
 				Rate:                formatSleep(sleepDur),
 				ContextMsgs:         len(t.messages),
 				ContextChars:        ctxChars,
+				ContextTokensEst:    estimatedContextTokens(t.messages),
 				RequestContextMsgs:  len(requestMessages),
 				RequestContextChars: contextChars(requestMessages),
+				RequestTokensEst:    estimatedContextTokens(requestMessages),
 				MaxContextTokens:    ModelContextWindow(model),
 				MemoryCount:         t.memory.Count(),
 				ThreadCount:         threadCount,
@@ -3067,6 +3073,7 @@ func (t *Thinker) summarizePersistentSession(text string) (string, error) {
 func (t *Thinker) compactForContextPressure(reason string, usage TokenUsage, emptyStreak int) bool {
 	beforeMsgs := len(t.messages)
 	beforeChars := contextChars(t.messages)
+	beforeTokensEst := estimatedContextTokens(t.messages)
 	modelID := t.modelID()
 	maxTokens := ModelEffectiveContextWindow(modelID)
 	logMsg("SESSION", fmt.Sprintf("[%s] context pressure compaction: reason=%s empty_streak=%d tokens_in=%d max_tokens=%d msgs=%d chars=%d",
@@ -3074,14 +3081,15 @@ func (t *Thinker) compactForContextPressure(reason string, usage TokenUsage, emp
 
 	if t.telemetry != nil {
 		t.telemetry.Emit("llm.compaction_started", t.threadID, map[string]any{
-			"iteration":    t.iteration,
-			"reason":       reason,
-			"empty_streak": emptyStreak,
-			"tokens_in":    usage.PromptTokens,
-			"max_tokens":   maxTokens,
-			"before_msgs":  beforeMsgs,
-			"before_chars": beforeChars,
-			"mode":         "semantic",
+			"iteration":         t.iteration,
+			"reason":            reason,
+			"empty_streak":      emptyStreak,
+			"tokens_in":         usage.PromptTokens,
+			"max_tokens":        maxTokens,
+			"before_msgs":       beforeMsgs,
+			"before_chars":      beforeChars,
+			"before_tokens_est": beforeTokensEst,
+			"mode":              "semantic",
 		})
 	}
 
@@ -3146,6 +3154,7 @@ func (t *Thinker) compactForContextPressure(reason string, usage TokenUsage, emp
 	}
 
 	afterChars := contextChars(t.messages)
+	afterTokensEst := estimatedContextTokens(t.messages)
 	reduced := afterChars < beforeChars
 	if reduced {
 		t.requestContext.reset()
@@ -3167,6 +3176,8 @@ func (t *Thinker) compactForContextPressure(reason string, usage TokenUsage, emp
 			"after_msgs":               len(t.messages),
 			"before_chars":             beforeChars,
 			"after_chars":              afterChars,
+			"before_tokens_est":        beforeTokensEst,
+			"after_tokens_est":         afterTokensEst,
 			"keep_recent":              contextPressureKeepRecent,
 			"reduced":                  reduced,
 		})

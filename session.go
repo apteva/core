@@ -197,6 +197,9 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 
 	// Sanitize: remove orphaned tool_results that have no matching tool_use
 	messages = sanitizeToolPairs(messages)
+	// Computer screenshots are transient. Old session files may contain raw
+	// frames from before this policy; never reload them into a new process.
+	evictStaleComputerScreenshots(messages, 0)
 
 	return messages, compactedSummaries
 }
@@ -404,6 +407,7 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		return
 	}
 	recent := append([]SessionEntry(nil), entries[compactPrefix:]...)
+	stripComputerImagesFromSessionEntries(recent)
 	if summaryText == "" {
 		summaryText = fmt.Sprintf("Compacted %d messages.", realCount)
 	}
@@ -419,6 +423,25 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 	newEntries := append([]SessionEntry{compactedEntry}, recent...)
 	if s.rewriteEntriesLocked(newEntries) == nil {
 		s.count = len(newEntries)
+	}
+}
+
+func stripComputerImagesFromSessionEntries(entries []SessionEntry) {
+	names := make(map[string]string)
+	for _, entry := range entries {
+		for _, call := range entry.ToolCalls {
+			if call.ID != "" {
+				names[call.ID] = call.Name
+			}
+		}
+	}
+	for i := range entries {
+		for j := range entries[i].ToolResults {
+			result := &entries[i].ToolResults[j]
+			if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
+				result.Image = nil
+			}
+		}
 	}
 }
 

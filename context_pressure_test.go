@@ -1,11 +1,40 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"strings"
 	"testing"
 )
+
+func computerScreenshotJPEG(t *testing.T, targetBytes int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 1280, 800))
+	for y := 0; y < 800; y += 32 {
+		for x := 0; x < 1280; x += 32 {
+			c := color.RGBA{R: uint8(x / 8), G: uint8(y / 4), B: uint8((x + y) / 12), A: 255}
+			for yy := y; yy < y+32; yy++ {
+				for xx := x; xx < x+32; xx++ {
+					img.SetRGBA(xx, yy, c)
+				}
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
+		t.Fatalf("encode screenshot: %v", err)
+	}
+	data := buf.Bytes()
+	if len(data) < targetBytes {
+		data = append(data, make([]byte, targetBytes-len(data))...)
+	}
+	return data
+}
 
 func TestContextCharsCountsStructuredAndMultimodalPayloads(t *testing.T) {
 	messages := []Message{{
@@ -85,6 +114,93 @@ func TestShouldCompactBeforeLLMFalseWhenNoCompactionRoom(t *testing.T) {
 	}
 	if shouldCompactBeforeLLM("unknown-model", messages) {
 		t.Fatal("did not expect pre-LLM compaction when there is no older context to remove")
+	}
+}
+
+func TestShouldCompactBeforeLLMIgnoresCompressedScreenshotByteSize(t *testing.T) {
+	messages := []Message{{Role: "system", Content: strings.Repeat("system", 1000)}}
+	for i := 0; i < contextPressureKeepRecent+5; i++ {
+		messages = append(messages, Message{Role: "user", Content: "ordinary conversation"})
+	}
+	for i, size := range []int{105_000, 120_000, 145_000, 163_000} {
+		id := fmt.Sprintf("computer-%d", i)
+		messages = append(messages,
+			Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: id, Name: "computer_computer_use"}}},
+			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: strings.Repeat("som", 1600), Image: computerScreenshotJPEG(t, size)}}},
+		)
+	}
+
+	if contextChars(messages) < semanticCompactionCharFallback {
+		t.Fatalf("fixture raw chars = %d, want above old false-positive threshold", contextChars(messages))
+	}
+	if tokens := estimatedContextTokens(messages); tokens >= 40_000 {
+		t.Fatalf("estimated tokens = %d, expected screenshot context well below pressure", tokens)
+	}
+	if shouldCompactBeforeLLM("kimi-k2.6", messages) {
+		t.Fatal("compressed screenshot bytes triggered compaction for a known large-context model")
+	}
+	if shouldRecoverFromEmptyResponse(TokenUsage{}, "kimi-k2.6", messages, 1) {
+		t.Fatal("compressed screenshot bytes triggered empty-response pressure recovery")
+	}
+}
+
+func TestShouldCompactBeforeLLMStillDetectsKnownModelTextPressure(t *testing.T) {
+	messages := []Message{{Role: "system", Content: "system"}}
+	for i := 0; i < contextPressureKeepRecent+10; i++ {
+		messages = append(messages, Message{Role: "user", Content: strings.Repeat("text ", 8_000)})
+	}
+	if !shouldCompactBeforeLLM("kimi-k2.6", messages) {
+		t.Fatal("genuine text token pressure should still trigger compaction")
+	}
+}
+
+func TestEvictStaleComputerScreenshotsKeepsLatestFrame(t *testing.T) {
+	messages := []Message{{Role: "system", Content: "system"}}
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("call-%d", i)
+		messages = append(messages,
+			Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: id, Name: "computer_computer_use"}}},
+			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: "screen", Image: computerScreenshotJPEG(t, 110_000+i*10_000)}}},
+		)
+	}
+
+	if removed := evictStaleComputerScreenshots(messages, 1); removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	images := 0
+	for _, msg := range messages {
+		for _, result := range msg.ToolResults {
+			if len(result.Image) > 0 {
+				images++
+				if result.CallID != "call-2" {
+					t.Fatalf("retained stale screenshot %s", result.CallID)
+				}
+			}
+		}
+	}
+	if images != 1 {
+		t.Fatalf("retained images = %d, want 1", images)
+	}
+}
+
+func TestMessageForSessionDropsComputerPixelsOnly(t *testing.T) {
+	history := []Message{{Role: "assistant", ToolCalls: []NativeToolCall{
+		{ID: "computer", Name: "computer_computer_use"},
+		{ID: "generated", Name: "image_generate"},
+	}}}
+	msg := Message{Role: "user", ToolResults: []ToolResult{
+		{CallID: "computer", Content: "screen metadata", Image: []byte("screen")},
+		{CallID: "generated", Content: "generated image", Image: []byte("art")},
+	}}
+	persisted := messageForSession(history, msg)
+	if persisted.ToolResults[0].Image != nil {
+		t.Fatal("computer screenshot should not be persisted")
+	}
+	if string(persisted.ToolResults[1].Image) != "art" {
+		t.Fatal("non-computer image should remain persisted")
+	}
+	if string(msg.ToolResults[0].Image) != "screen" {
+		t.Fatal("durable-copy sanitization mutated the live screenshot")
 	}
 }
 

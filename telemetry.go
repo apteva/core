@@ -452,8 +452,10 @@ type LLMDoneData struct {
 	Rate                string `json:"rate"`
 	ContextMsgs         int    `json:"context_msgs"`
 	ContextChars        int    `json:"context_chars"`
+	ContextTokensEst    int    `json:"context_tokens_est,omitempty"`
 	RequestContextMsgs  int    `json:"request_context_msgs,omitempty"`
 	RequestContextChars int    `json:"request_context_chars,omitempty"`
+	RequestTokensEst    int    `json:"request_context_tokens_est,omitempty"`
 	// MaxContextTokens is the model's advertised input-context window
 	// (in tokens). Comes from a static lookup keyed on the model id —
 	// see ModelContextWindow. 0 when the model isn't in the table; UI

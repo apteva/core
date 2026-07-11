@@ -457,3 +457,48 @@ func TestSessionLoadAfterUsesMonotonicCursor(t *testing.T) {
 		t.Fatalf("second history page = %#v, cursor=%d", second, next)
 	}
 }
+
+func TestSessionLoadTailDoesNotReloadComputerScreenshots(t *testing.T) {
+	session := NewSession(t.TempDir(), "computer-history")
+	if err := session.AppendMessage(Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "call-screen", Name: "computer_computer_use"}}}, 1, TokenUsage{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-screen", Content: "screen metadata", Image: []byte("stale pixels")}}}, 2, TokenUsage{}); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, _ := session.LoadTail(10)
+	if len(messages) != 2 || len(messages[1].ToolResults) != 1 {
+		t.Fatalf("loaded messages = %+v", messages)
+	}
+	if messages[1].ToolResults[0].Image != nil {
+		t.Fatal("stale computer screenshot was reloaded")
+	}
+	if messages[1].ToolResults[0].Content != evictedScreenshotPlaceholder {
+		t.Fatalf("loaded result = %q, want screenshot placeholder", messages[1].ToolResults[0].Content)
+	}
+}
+
+func TestSessionForceCompactStripsRecentComputerScreenshots(t *testing.T) {
+	session := NewSession(t.TempDir(), "computer-compaction")
+	for i := 0; i < 5; i++ {
+		if err := session.Append(SessionEntry{Role: "user", Content: fmt.Sprintf("old-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := session.AppendMessage(Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "call-screen", Name: "computer_computer_use"}}}, 6, TokenUsage{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-screen", Content: "screen metadata", Image: []byte("pixels")}}}, 7, TokenUsage{}); err != nil {
+		t.Fatal(err)
+	}
+
+	session.ForceCompact(2, func(string) string { return "summary" })
+	entries := readSessionEntriesForTest(t, session.path)
+	if len(entries) != 3 || len(entries[2].ToolResults) != 1 {
+		t.Fatalf("compacted entries = %+v", entries)
+	}
+	if entries[2].ToolResults[0].Image != nil {
+		t.Fatal("recent computer screenshot remained in compacted session")
+	}
+}
