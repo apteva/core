@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
 
 // OpenAICompatProvider works with any OpenAI-compatible API:
@@ -24,6 +25,20 @@ type OpenAICompatProvider struct {
 	cachedCost float64
 	outputCost float64
 	authHeader string // "Bearer" or empty for no auth (Ollama)
+	cacheMu    sync.RWMutex
+	cacheOff   bool
+}
+
+func (p *OpenAICompatProvider) promptCacheHintsEnabled() bool {
+	p.cacheMu.RLock()
+	defer p.cacheMu.RUnlock()
+	return !p.cacheOff
+}
+
+func (p *OpenAICompatProvider) disablePromptCacheHints() {
+	p.cacheMu.Lock()
+	p.cacheOff = true
+	p.cacheMu.Unlock()
 }
 
 func (p *OpenAICompatProvider) Name() string                 { return p.name }
@@ -250,7 +265,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		}
 		reqMap["tools"] = defs
 	}
-	if hints := openAIPromptCacheHintsFor(p.name, model, openAIPromptCacheStablePrefix(openAIMessages), reqMap["tools"]); hints.Key != "" {
+	if hints := openAIPromptCacheHintsFor(p.name, model, openAIPromptCacheStablePrefix(openAIMessages), reqMap["tools"]); hints.Key != "" && p.promptCacheHintsEnabled() {
 		reqMap["prompt_cache_key"] = hints.Key
 		reqMap["prompt_cache_retention"] = hints.Retention
 	}
@@ -303,6 +318,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if _, ok := reqMap["prompt_cache_key"]; ok && openAICacheHintsUnsupported(resp.StatusCode, string(respBody)) {
+			p.disablePromptCacheHints()
 			delete(reqMap, "prompt_cache_key")
 			delete(reqMap, "prompt_cache_retention")
 			retryBody, err := json.Marshal(reqMap)
@@ -356,6 +372,7 @@ streamOK:
 	})
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -373,6 +390,11 @@ streamOK:
 		}
 
 		var event struct {
+			Error *struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+				Code    any    `json:"code"`
+			} `json:"error,omitempty"`
 			Choices []struct {
 				Delta struct {
 					Content          string                `json:"content"`
@@ -385,6 +407,9 @@ streamOK:
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
+		}
+		if event.Error != nil {
+			return ChatResponse{}, fmt.Errorf("provider stream error (%s/%v): %s", event.Error.Type, event.Error.Code, event.Error.Message)
 		}
 		if len(event.Choices) > 0 {
 			delta := event.Choices[0].Delta
@@ -455,6 +480,7 @@ streamOK:
 			usage.CompletionTokens = event.Usage.CompletionTokens
 			if event.Usage.PromptTokensDetails != nil {
 				usage.CachedTokens = event.Usage.PromptTokensDetails.CachedTokens
+				usage.CacheWriteTokens = event.Usage.PromptTokensDetails.CacheWriteTokens
 			}
 		}
 	}

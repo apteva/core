@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,6 +65,12 @@ type Subscription struct {
 	// Rate-limit drop logging — one line per (sub, ~1s window) is enough
 	// to alert operators without flooding the log during sustained spikes.
 	lastDropLogNano int64 // atomic
+
+	// Targeted thinker events are reliable. Once C fills, events queue here
+	// in publication order until the thinker drains them. Observer streams do
+	// not use this queue and remain lossy under backpressure.
+	queueMu  sync.Mutex
+	overflow []Event
 }
 
 // Publishes (on drop) emit a log line at most once per logDropThrottle.
@@ -83,30 +90,57 @@ func NewEventBus() *EventBus {
 
 // Subscribe creates a targeted subscription. Receives events where To == id, plus broadcasts (To == "").
 func (b *EventBus) Subscribe(id string, buffer int) *Subscription {
+	sub, _ := b.subscribe(id, buffer, false, false)
+	return sub
+}
+
+// SubscribeUnique atomically reserves an ID. Thinker subscriptions use this
+// path so two branches cannot silently replace each other's routing entry.
+func (b *EventBus) SubscribeUnique(id string, buffer int) (*Subscription, error) {
+	return b.subscribe(id, buffer, false, true)
+}
+
+func (b *EventBus) subscribe(id string, buffer int, all, unique bool) (*Subscription, error) {
 	sub := &Subscription{
 		ID:   id,
 		C:    make(chan Event, buffer),
 		Wake: make(chan struct{}, 1),
+		all:  all,
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	if unique {
+		if _, exists := b.subs[id]; exists {
+			return nil, fmt.Errorf("subscription %q already exists", id)
+		}
+	}
 	b.subs[id] = sub
-	b.mu.Unlock()
-	return sub
+	return sub, nil
 }
 
 // SubscribeAll creates an observer subscription that receives ALL events.
 // Used by TUI, API SSE, tests.
 func (b *EventBus) SubscribeAll(id string, buffer int) *Subscription {
-	sub := &Subscription{
-		ID:   id,
-		C:    make(chan Event, buffer),
-		Wake: make(chan struct{}, 1),
-		all:  true,
-	}
-	b.mu.Lock()
-	b.subs[id] = sub
-	b.mu.Unlock()
+	sub, _ := b.subscribe(id, buffer, true, false)
 	return sub
+}
+
+// RenameSubscription moves an existing subscription without replacing a
+// different subscriber. The channel itself is preserved, including backlog.
+func (b *EventBus) RenameSubscription(oldID, newID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	sub, ok := b.subs[oldID]
+	if !ok {
+		return fmt.Errorf("subscription %q not found", oldID)
+	}
+	if existing, taken := b.subs[newID]; taken && existing != sub {
+		return fmt.Errorf("subscription %q already exists", newID)
+	}
+	delete(b.subs, oldID)
+	sub.ID = newID
+	b.subs[newID] = sub
+	return nil
 }
 
 func (b *EventBus) HasSubscriber(id string) bool {
@@ -149,11 +183,51 @@ func (b *EventBus) Publish(ev Event) {
 			// Targeted delivery — also signal Wake so consumers using the
 			// wake channel (e.g. the thinker's drain loop) spin even if
 			// the buffered channel was already full.
-			deliver(sub, ev, true)
+			deliverTargeted(sub, ev)
 		}
 		// Broadcasts (To=="") to non-observers are silently skipped —
 		// they're observational (chunks, think_done) and would flood the
 		// channel.
+	}
+}
+
+func deliverTargeted(sub *Subscription, ev Event) {
+	sub.queueMu.Lock()
+	if len(sub.overflow) > 0 {
+		sub.overflow = append(sub.overflow, ev)
+	} else {
+		select {
+		case sub.C <- ev:
+		default:
+			sub.overflow = append(sub.overflow, ev)
+		}
+	}
+	sub.queueMu.Unlock()
+	select {
+	case sub.Wake <- struct{}{}:
+	default:
+	}
+}
+
+// DrainTargeted returns every currently queued event in publication order.
+// Holding queueMu while draining C prevents a concurrent publisher from
+// placing a newer event in C ahead of an older overflow event.
+func (sub *Subscription) DrainTargeted() []Event {
+	if sub == nil {
+		return nil
+	}
+	sub.queueMu.Lock()
+	defer sub.queueMu.Unlock()
+	events := make([]Event, 0, len(sub.C)+len(sub.overflow))
+	for {
+		select {
+		case ev := <-sub.C:
+			events = append(events, ev)
+		default:
+			events = append(events, sub.overflow...)
+			sub.overflow = nil
+			return events
+		}
 	}
 }
 

@@ -60,6 +60,9 @@ func executeTool(t *Thinker, call toolCall) {
 	// Extract _reason before dispatch (observability field, not passed to handler)
 	reason := call.Args["_reason"]
 	delete(call.Args, "_reason")
+	if !t.acquireToolSlot() {
+		return
+	}
 
 	// Telemetry: tool.call
 	if t.telemetry != nil {
@@ -77,6 +80,7 @@ func executeTool(t *Thinker, call toolCall) {
 	}
 
 	go func() {
+		defer t.releaseToolSlot()
 		logMsg("TOOL", fmt.Sprintf("dispatch %s reason=%q args=%v", call.Name, reason, call.Args))
 		start := time.Now()
 		defer func() {
@@ -137,7 +141,7 @@ func executeTool(t *Thinker, call toolCall) {
 		if len(resultPreviewForTUI) > 120 {
 			resultPreviewForTUI = resultPreviewForTUI[:120] + "..."
 		}
-		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI + "\n", Iteration: t.iteration})
+		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: "\n← " + call.Name + ": " + resultPreviewForTUI + "\n", Iteration: t.status().Iteration})
 
 		// Inject result as a proper ToolResult event (text + optional image).
 		// MCP tools may opt into success-only silent delivery via

@@ -3,11 +3,15 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
+
+const maxAPIRequestBytes = 16 << 20
 
 type APIServer struct {
 	thinker   *Thinker
@@ -25,15 +29,42 @@ func (a *APIServer) apiAuth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
+		if r.Body != nil {
+			if r.ContentLength > maxAPIRequestBytes {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestBytes)
+		}
 		next(w, r)
 	}
 }
 
 func startAPI(thinker *Thinker, addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return serveAPI(thinker, listener)
+}
+
+func serveAPI(thinker *Thinker, listener net.Listener) error {
+	server, err := newCoreHTTPServer(thinker)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	return server.Serve(listener)
+}
+
+func newCoreHTTPServer(thinker *Thinker) (*http.Server, error) {
 	api := &APIServer{
 		thinker:   thinker,
 		startTime: time.Now(),
 		apiKey:    os.Getenv("APTEVA_API_KEY"),
+	}
+	if api.apiKey == "" && managedCoreProcess() {
+		return nil, fmt.Errorf("APTEVA_API_KEY is required for a managed core process")
 	}
 	if api.apiKey != "" {
 		logMsg("API", "API key auth enabled")
@@ -65,8 +96,18 @@ func startAPI(thinker *Thinker, addr string) error {
 	//                                 platform-driven cleanup)
 	mux.HandleFunc("/memory", api.apiAuth(api.memoryRoot))
 	mux.HandleFunc("/memory/", api.apiAuth(api.memoryItem))
-	mux.Handle("/", http.FileServer(http.Dir("web")))
-	return http.ListenAndServe(addr, mux)
+	mux.HandleFunc("/", api.apiAuth(http.FileServer(http.Dir("web")).ServeHTTP))
+	return &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}, nil
+}
+
+func managedCoreProcess() bool {
+	return os.Getenv("AGENT_ID") != "" || os.Getenv("INSTANCE_ID") != "" ||
+		os.Getenv("SERVER_URL") != "" || os.Getenv("TELEMETRY_URL") != ""
 }
 
 func (a *APIServer) health(w http.ResponseWriter, r *http.Request) {
@@ -77,18 +118,19 @@ func (a *APIServer) health(w http.ResponseWriter, r *http.Request) {
 func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	logMsg("API", "GET /status")
 	elapsed := time.Since(a.startTime)
+	status := a.thinker.status()
 
 	writeJSON(w, map[string]any{
 		"uptime_seconds":        int(elapsed.Seconds()),
 		"core_version":          Version,
 		"core_build_time":       BuildTime,
-		"iteration":             a.thinker.iteration,
-		"rate":                  formatSleep(a.thinker.agentSleep),
-		"model":                 a.thinker.model.String(),
-		"reasoning":             a.thinker.agentReasoning.String(),
+		"iteration":             status.Iteration,
+		"rate":                  formatSleep(status.Sleep),
+		"model":                 status.Model.String(),
+		"reasoning":             status.Reasoning.String(),
 		"threads":               a.thinker.threads.Count() + 1, // +1 for main
 		"memories":              a.thinker.memory.Count(),
-		"paused":                a.thinker.paused,
+		"paused":                status.Paused,
 		"mode":                  a.thinker.config.GetMode(),
 		"execution_control":     a.thinker.executionStatus(),
 		"execution_checkpoints": a.thinker.executionCheckpointMeta(),
@@ -119,19 +161,17 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	// using them. Sub-threads that spawn with mcp="X" are the ones that
 	// actually use catalog entries, and those appear in their own rows
 	// via tm.List() below with their own MCPNames populated.
-	var mainMCPs []string
-	for _, srv := range a.thinker.mcpServers {
-		mainMCPs = append(mainMCPs, srv.GetName())
-	}
+	status := a.thinker.status()
+	mainMCPs := append([]string(nil), status.MCPNames...)
 	// Always include main
 	out := []threadJSON{{
 		ID:        "main",
 		Directive: a.thinker.config.GetDirective(),
 		MCPNames:  mainMCPs,
-		Iteration: a.thinker.iteration,
-		Rate:      a.thinker.rate.String(),
-		Model:     a.thinker.model.String(),
-		Reasoning: a.thinker.agentReasoning.String(),
+		Iteration: status.Iteration,
+		Rate:      status.Rate.String(),
+		Model:     status.Model.String(),
+		Reasoning: status.Reasoning.String(),
 		Age:       formatAge(time.Since(a.startTime)),
 	}}
 
@@ -170,7 +210,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
-	// Path is /threads/{id} or /threads/{id}/context.
+	// Path is /threads/{id}, /threads/{id}/context, or /threads/{id}/history.
 	path := strings.TrimPrefix(r.URL.Path, "/threads/")
 	if path == "" {
 		http.Error(w, "thread ID required", http.StatusBadRequest)
@@ -179,6 +219,12 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 	id, sub := path, ""
 	if i := strings.Index(path, "/"); i >= 0 {
 		id, sub = path[:i], path[i+1:]
+	}
+	if id != "main" {
+		if err := validateThreadID(id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	logMsg("API", fmt.Sprintf("%s /threads/%s/%s", r.Method, id, sub))
 
@@ -192,22 +238,13 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "thread not found", http.StatusNotFound)
 			return
 		}
-		// Copy the slice so the caller doesn't race with Run()
-		// appending to it on the next iteration. Individual Message
-		// fields remain shared — acceptable for a read-only inspect
-		// endpoint, same convention as ThreadManager.List().
-		msgs := make([]Message, len(t.messages))
-		copy(msgs, t.messages)
-		iter := t.iteration
-		model := t.modelID()
-		totalChars := 0
-		for _, m := range msgs {
-			totalChars += len(m.Content)
-			for _, p := range m.Parts {
-				totalChars += len(p.Text)
-			}
-		}
-		composition := buildComposition(t, msgs)
+		contextStatus := t.contextSnapshot()
+		status := t.status()
+		msgs := contextStatus.Messages
+		iter := status.Iteration
+		model := status.ModelID
+		totalChars := contextChars(msgs)
+		composition := contextStatus.Composition
 		composition.ModelMaxTokens = ModelContextWindow(model)
 		writeJSON(w, map[string]any{
 			"id":          id,
@@ -217,6 +254,43 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 			"total_chars": totalChars,
 			"messages":    msgs,
 			"composition": composition,
+		})
+		return
+	}
+
+	if sub == "history" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		t := findThinkerByID(a.thinker, id)
+		if t == nil || t.session == nil {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
+		after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		if err != nil || after < 0 {
+			http.Error(w, "after must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil || limit < 0 {
+			http.Error(w, "limit must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		if limit == 0 || limit > 500 {
+			limit = 500
+		}
+		entries, nextCursor, err := t.session.LoadAfter(after, limit)
+		if err != nil {
+			http.Error(w, "read thread history: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"id":          id,
+			"after":       after,
+			"next_cursor": nextCursor,
+			"entries":     entries,
 		})
 		return
 	}
@@ -243,6 +317,8 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 		if len(t.messages) > 0 {
 			t.messages = t.messages[:1]
 		}
+		t.publishRuntimeStatus()
+		t.publishContextStatus()
 		logMsg("API", fmt.Sprintf("reset thread %s: history wiped, messages=[system]", id))
 		writeJSON(w, map[string]any{"status": "reset", "id": id, "count": len(t.messages)})
 		return
@@ -260,7 +336,10 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.thinker.threads.Kill(id)
-		a.thinker.config.RemoveThread(id)
+		if err := a.thinker.config.RemoveThread(id); err != nil {
+			http.Error(w, "persist thread removal: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		writeJSON(w, map[string]string{"status": "killed", "id": id})
 	case http.MethodPost:
 		a.spawnThread(w, r, id)
@@ -327,6 +406,10 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id string) {
 	if id == "main" {
 		http.Error(w, "cannot spawn over main", http.StatusBadRequest)
+		return
+	}
+	if err := validateThreadID(id); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	var body struct {
@@ -482,6 +565,8 @@ func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	tel := a.thinker.telemetry
+	notify, unsubscribe := tel.Subscribe()
+	defer unsubscribe()
 
 	// Skip to current position — only stream new events, no history replay
 	_, cursor := tel.Events(0)
@@ -492,7 +577,7 @@ func (a *APIServer) events(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tel.notify:
+		case <-notify:
 			newEvents, newCursor := tel.Events(cursor)
 			cursor = newCursor
 			for _, ev := range newEvents {
@@ -512,7 +597,7 @@ func (a *APIServer) pause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.thinker.TogglePause()
-	paused := a.thinker.paused
+	paused := a.thinker.status().Paused
 	if paused {
 		a.thinker.telemetry.Emit("instance.paused", "main", map[string]string{"status": "paused"})
 	} else {
@@ -547,7 +632,10 @@ func (a *APIServer) control(w http.ResponseWriter, r *http.Request) {
 			cfg.Mode = body.Mode
 		}
 		a.thinker.execution.ApplyConfig(cfg)
-		a.thinker.config.SetExecutionControl(cfg)
+		if err := a.thinker.config.SetExecutionControl(cfg); err != nil {
+			http.Error(w, "persist execution control: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		status := a.thinker.executionStatus()
 		if a.thinker.telemetry != nil {
 			a.thinker.telemetry.Emit("execution.mode_changed", "main", status)
@@ -565,7 +653,10 @@ func (a *APIServer) control(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := a.thinker.execution.Config()
-	a.thinker.config.SetExecutionControl(cfg)
+	if err := a.thinker.config.SetExecutionControl(cfg); err != nil {
+		http.Error(w, "persist execution control: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if a.thinker.telemetry != nil {
 		a.thinker.telemetry.Emit("execution.mode_changed", "main", status)
 	}
@@ -615,6 +706,12 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	if threadID == "" {
 		threadID = "main"
 	}
+	if threadID != "main" {
+		if err := validateThreadID(threadID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 
 	// Lazy auto-spawn: if the event addresses a non-main thread that
 	// doesn't exist (yet), spawn it with inherit-from-main defaults
@@ -659,10 +756,11 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		// Build live provider info
 		var providerInfo map[string]any
-		if a.thinker.provider != nil {
-			models := a.thinker.provider.Models()
+		status := a.thinker.status()
+		if status.Provider != "" {
+			models := status.ProviderModels
 			providerInfo = map[string]any{
-				"name": a.thinker.provider.Name(),
+				"name": status.Provider,
 				"models": map[string]string{
 					"large": models[ModelLarge],
 					"small": models[ModelSmall],
@@ -674,9 +772,9 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 		// the actual live state. The legacy `main_access` field is no
 		// longer surfaced — the dashboard's filter UI for it should be
 		// retired alongside this change.
-		liveNames := make(map[string]bool, len(a.thinker.mcpServers))
-		for _, srv := range a.thinker.mcpServers {
-			liveNames[srv.GetName()] = true
+		liveNames := make(map[string]bool, len(status.MCPNames))
+		for _, name := range status.MCPNames {
+			liveNames[name] = true
 		}
 		var mcpInfo []map[string]any
 		for _, cfg := range a.thinker.config.GetMCPServers() {
@@ -730,17 +828,26 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if body.Directive != "" {
-			a.thinker.config.SetDirective(body.Directive)
+			if err := a.thinker.config.SetDirective(body.Directive); err != nil {
+				http.Error(w, "persist directive: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 			a.thinker.ReloadDirectiveQuiet()
 		}
 		if body.Mode == ModeAutonomous || body.Mode == ModeCautious || body.Mode == ModeLearn {
-			a.thinker.config.SetMode(body.Mode)
+			if err := a.thinker.config.SetMode(body.Mode); err != nil {
+				http.Error(w, "persist mode: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 			if a.thinker.telemetry != nil {
 				a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
 			}
 		}
 		if body.Execution != nil {
-			a.thinker.config.SetExecutionControl(*body.Execution)
+			if err := a.thinker.config.SetExecutionControl(*body.Execution); err != nil {
+				http.Error(w, "persist execution control: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 			if a.thinker.execution != nil {
 				a.thinker.execution.ApplyConfig(*body.Execution)
 			}
@@ -749,52 +856,38 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		logMsg("API", fmt.Sprintf("PUT /config: providers=%d provider=%v", len(body.Providers), body.Provider != nil))
-		if len(body.Providers) > 0 {
-			// Rebuild provider pool from new config
-			logMsg("API", fmt.Sprintf("rebuilding pool with %d providers", len(body.Providers)))
-			oldDefault := ""
-			if a.thinker.provider != nil {
-				oldDefault = a.thinker.provider.Name()
+		if len(body.Providers) > 0 || body.Provider != nil {
+			providers := a.thinker.config.GetProviders()
+			if len(body.Providers) > 0 {
+				providers = cloneProviderConfigs(body.Providers)
 			}
-			a.thinker.config.mu.Lock()
-			a.thinker.config.Providers = body.Providers
-			a.thinker.config.mu.Unlock()
-			a.thinker.config.Save()
-			pool, err := buildProviderPool(a.thinker.config)
-			if err == nil && pool != nil {
-				a.thinker.pool = pool
-				a.thinker.provider = pool.Default()
-				// Clear conversation history if provider changed (tool IDs are incompatible across providers)
-				if a.thinker.provider.Name() != oldDefault {
-					a.thinker.messages = a.thinker.messages[:1] // keep system prompt only
-				}
+			if body.Provider != nil {
+				providers = mergeProviderConfig(providers, *body.Provider)
 			}
-		}
-		if body.Provider != nil {
-			// Hot-swap provider if name changed
-			if body.Provider.Name != "" {
-				newProvider := createProviderByName(body.Provider.Name)
-				if newProvider != nil {
-					if body.Provider.Models != nil {
-						applyModelOverrides(newProvider, body.Provider.Models)
-					}
-					a.thinker.provider = newProvider
-					a.thinker.config.SetProvider(body.Provider)
-				} else {
-					http.Error(w, fmt.Sprintf("provider %q not available (missing API key?)", body.Provider.Name), http.StatusBadRequest)
-					return
-				}
-			} else if body.Provider.Models != nil {
-				// Just update models on current provider
-				applyModelOverrides(a.thinker.provider, body.Provider.Models)
-				// Merge into config
-				for tier, modelID := range body.Provider.Models {
-					a.thinker.config.SetProviderModel(tier, modelID)
-				}
+			candidate := &Config{Providers: providers, RealtimeEnabled: a.thinker.config.RealtimeEnabledFlag()}
+			pool, err := buildProviderPool(candidate)
+			if err != nil {
+				http.Error(w, "invalid provider configuration: "+err.Error(), http.StatusBadRequest)
+				return
 			}
+			if err := a.thinker.config.ReplaceProviders(providers); err != nil {
+				http.Error(w, "persist providers: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			oldDefault := a.thinker.status().Provider
+			a.thinker.pool = pool
+			a.thinker.provider = pool.Default()
+			if a.thinker.provider != nil && a.thinker.provider.Name() != oldDefault && len(a.thinker.messages) > 0 {
+				a.thinker.messages = a.thinker.messages[:1]
+			}
+			a.thinker.publishRuntimeStatus()
+			a.thinker.publishContextStatus()
 		}
 		if body.MCPServers != nil {
-			a.reconcileMCP(body.MCPServers)
+			if err := a.reconcileMCP(body.MCPServers); err != nil {
+				http.Error(w, "persist MCP configuration: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 			// DO NOT rebuild t.mcpCatalog here — reconcileMCP already
 			// manages it correctly (populates for non-main-access
 			// servers in the connect pass at reconcileMCP:690, prunes
@@ -818,12 +911,17 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 					Content: a.thinker.rebuildPrompt(""),
 				}
 			}
+			a.thinker.publishRuntimeStatus()
+			a.thinker.publishContextStatus()
 		}
 		if body.Reset != nil {
 			logMsg("API", fmt.Sprintf("PUT /config reset: history=%v memory=%v threads=%v", body.Reset.History, body.Reset.Memory, body.Reset.Threads))
 			if body.Reset.Threads {
+				if err := a.thinker.config.ClearThreads(); err != nil {
+					http.Error(w, "persist thread reset: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
 				a.thinker.threads.KillAll()
-				a.thinker.config.ClearThreads()
 			}
 			if body.Reset.History {
 				if a.thinker.session != nil {
@@ -844,6 +942,8 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			// Reset message context to just system prompt
 			if body.Reset.History {
 				a.thinker.messages = a.thinker.messages[:1]
+				a.thinker.publishRuntimeStatus()
+				a.thinker.publishContextStatus()
 			}
 		}
 		writeJSON(w, map[string]string{"status": "updated"})
@@ -863,7 +963,7 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 // (eagerly visible) and "catalog" servers (connected per-thread on
 // demand) is gone — see the proposal note in mcp.go's MCPServerConfig
 // comment.
-func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
+func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
 
 	names := make([]string, len(desired))
 	for i, c := range desired {
@@ -951,8 +1051,10 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 			continue
 		}
 		// Disconnect: either removed or replaced.
+		if err := t.config.RemoveMCPServer(name); err != nil {
+			return err
+		}
 		srv.Close()
-		t.config.RemoveMCPServer(name)
 		t.registry.RemoveByMCPServer(name)
 		if t.toolIndex != nil {
 			t.toolIndex.Remove(name)
@@ -982,9 +1084,21 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 	}
 	if len(toConnect) > 0 {
 		connected := connectAndRegisterMCP(toConnect, t.registry, t.toolIndex, t.blobs)
-		t.mcpServers = append(t.mcpServers, connected...)
+		byName := make(map[string]MCPServerConfig, len(toConnect))
 		for _, cfg := range toConnect {
-			t.config.SaveMCPServer(cfg)
+			byName[cfg.Name] = cfg
+		}
+		for _, srv := range connected {
+			cfg := byName[srv.GetName()]
+			if err := t.config.SaveMCPServer(cfg); err != nil {
+				srv.Close()
+				t.registry.RemoveByMCPServer(srv.GetName())
+				if t.toolIndex != nil {
+					t.toolIndex.Remove(srv.GetName())
+				}
+				return err
+			}
+			t.mcpServers = append(t.mcpServers, srv)
 		}
 		if t.telemetry != nil {
 			for _, srv := range connected {
@@ -994,6 +1108,7 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) {
 	}
 	// Refresh the prompt catalog snapshot — tool counts may have moved.
 	t.mcpCatalog = computeMCPCatalog(t.toolIndex)
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

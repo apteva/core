@@ -539,6 +539,7 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		providers:         map[string]LLMProvider{},
 		realtimeProviders: map[string]RealtimeProvider{},
 	}
+	resetRuntimeModelCapabilities()
 
 	// 1. Config providers array
 	configs := cfg.GetProviders()
@@ -548,7 +549,7 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		// silently skipped so HasRealtimeProvider() returns false and
 		// the feature is completely invisible to main.
 		if isRealtimeProviderName(pc.Name) {
-			if !cfg.RealtimeEnabled {
+			if !cfg.RealtimeEnabledFlag() {
 				continue
 			}
 			rp := createRealtimeProviderByName(pc.Name)
@@ -567,6 +568,10 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 			continue
 		}
 		applyModelOverrides(p, pc.Models)
+		registerModelCapabilities(pc.ModelCapabilities)
+		if native, ok := p.(*OpenAINativeProvider); ok {
+			native.modelCapabilities = cloneModelCapabilitiesMap(pc.ModelCapabilities)
+		}
 		if len(pc.BuiltinTools) > 0 {
 			p.SetBuiltinTools(pc.BuiltinTools)
 		}

@@ -2,6 +2,22 @@ package core
 
 import "testing"
 
+func TestExecutionGateDoesNotCaptureInAutoMode(t *testing.T) {
+	thinker := &Thinker{
+		threadID:    "main",
+		execution:   NewExecutionController(ExecutionControlConfig{Mode: ExecutionAuto}),
+		checkpoints: NewExecutionCheckpointStore(),
+		quit:        make(chan struct{}),
+		messages:    []Message{{Role: "system", Content: "large stable prompt"}},
+	}
+	if !thinker.executionGate(ExecutionPhaseLLMStart, ExecutionGate{Summary: "call"}) {
+		t.Fatal("auto gate unexpectedly stopped")
+	}
+	if got := len(thinker.checkpoints.ListMeta()); got != 0 {
+		t.Fatalf("auto mode captured %d deep-copy checkpoints", got)
+	}
+}
+
 func TestExecutionCheckpointRestoreTargetBeforeCurrentGate(t *testing.T) {
 	store := NewExecutionCheckpointStore()
 	th := &Thinker{

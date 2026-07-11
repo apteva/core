@@ -1,10 +1,70 @@
 package core
 
 import (
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestExecuteToolBoundsParallelism(t *testing.T) {
+	registry := NewToolRegistry("test")
+	var active atomic.Int32
+	var maximum atomic.Int32
+	var completed atomic.Int32
+	release := make(chan struct{})
+	registry.Register(&ToolDef{
+		Name: "blocking_test_tool",
+		Handler: func(map[string]string) ToolResponse {
+			current := active.Add(1)
+			for {
+				old := maximum.Load()
+				if current <= old || maximum.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			<-release
+			active.Add(-1)
+			completed.Add(1)
+			return ToolResponse{Text: "ok"}
+		},
+	})
+	bus := NewEventBus()
+	thinker := &Thinker{
+		registry:           registry,
+		bus:                bus,
+		sub:                bus.Subscribe("main", 1),
+		threadID:           "main",
+		quit:               make(chan struct{}),
+		maxConcurrentTools: 3,
+	}
+	thinker.publishRuntimeStatus()
+	dispatched := make(chan struct{})
+	go func() {
+		for i := 0; i < 20; i++ {
+			executeTool(thinker, toolCall{Name: "blocking_test_tool"})
+		}
+		close(dispatched)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if got := maximum.Load(); got != 3 {
+		t.Fatalf("maximum parallel tools = %d, want 3", got)
+	}
+	close(release)
+	select {
+	case <-dispatched:
+	case <-time.After(time.Second):
+		t.Fatal("tool dispatch did not resume after capacity became available")
+	}
+	deadline := time.Now().Add(time.Second)
+	for completed.Load() != 20 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := completed.Load(); got != 20 {
+		t.Fatalf("completed = %d, want 20", got)
+	}
+}
 
 func TestParseToolCalls_Single(t *testing.T) {
 	text := `Some thought [[web url="https://example.com"]] more text`
@@ -139,7 +199,7 @@ func TestConfig_DefaultMode(t *testing.T) {
 }
 
 func TestConfig_SetMode(t *testing.T) {
-	c := &Config{path: "/dev/null"}
+	c := &Config{path: filepath.Join(t.TempDir(), "config.json")}
 	c.SetMode(ModeCautious)
 	if c.GetMode() != ModeCautious {
 		t.Errorf("expected cautious, got %s", c.GetMode())

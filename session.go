@@ -2,29 +2,40 @@ package core
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	defaultLoadTail   = 50  // messages loaded into context on startup
-	compactThreshold  = 500 // trigger compaction when file exceeds this
-	compactKeepRecent = 100 // keep this many recent messages after compaction
-	historyDir        = "history"
+	defaultLoadTail         = 50  // messages loaded into context on startup
+	compactThreshold        = 500 // trigger compaction when file exceeds this
+	compactKeepRecent       = 100 // keep this many recent messages after compaction
+	historyDir              = "history"
+	maxSessionEntryBytes    = 32 << 20
+	maxCompactionInputBytes = 128 << 10
 )
 
 // SessionEntry is one line in the JSONL history file.
 type SessionEntry struct {
+	// Sequence is a per-session, monotonically increasing cursor. It makes the
+	// durable history safe for consumers that need to observe a running thread:
+	// unlike the in-memory context window, this cursor does not move when old
+	// messages are trimmed from the model prompt.
+	Sequence    int64            `json:"seq,omitempty"`
 	Timestamp   time.Time        `json:"ts"`
 	Role        string           `json:"role"` // "system", "user", "assistant", "tool_result", "_compacted"
 	Content     string           `json:"content"`
 	Parts       []ContentPart    `json:"parts,omitempty"`
 	ToolCalls   []NativeToolCall `json:"tool_calls,omitempty"`
 	ToolResults []ToolResult     `json:"tool_results,omitempty"`
+	Reasoning   string           `json:"reasoning,omitempty"`
 	Summary     string           `json:"summary,omitempty"`        // for _compacted entries
 	OrigCount   int              `json:"original_count,omitempty"` // how many messages were compacted
 	TokensIn    int              `json:"tokens_in,omitempty"`
@@ -34,24 +45,32 @@ type SessionEntry struct {
 
 // Session manages persistent JSONL history for one thread.
 type Session struct {
-	mu    sync.Mutex
-	path  string
-	count int // approximate line count
+	mu        sync.Mutex
+	compactMu sync.Mutex
+	path      string
+	count     int // approximate line count
+	nextSeq   int64
 }
 
 // NewSession creates or opens a session file for a thread.
 func NewSession(baseDir, threadID string) *Session {
 	dir := filepath.Join(baseDir, historyDir)
-	os.MkdirAll(dir, 0755)
-	path := filepath.Join(dir, threadID+".jsonl")
+	_ = os.MkdirAll(dir, 0700)
+	_ = os.Chmod(dir, 0700)
+	path := safeSessionPath(dir, threadID)
 
 	s := &Session{path: path}
 
 	// Count existing lines
 	if f, err := os.Open(path); err == nil {
 		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 64*1024), maxSessionEntryBytes)
 		for scanner.Scan() {
 			s.count++
+			var entry SessionEntry
+			if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.Sequence > s.nextSeq {
+				s.nextSeq = entry.Sequence
+			}
 		}
 		f.Close()
 	}
@@ -59,27 +78,47 @@ func NewSession(baseDir, threadID string) *Session {
 	return s
 }
 
+func safeSessionPath(dir, threadID string) string {
+	candidate := filepath.Join(dir, threadID+".jsonl")
+	rel, err := filepath.Rel(dir, candidate)
+	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return candidate
+	}
+	sum := sha256.Sum256([]byte(threadID))
+	return filepath.Join(dir, fmt.Sprintf("invalid-%x.jsonl", sum[:8]))
+}
+
 // Append writes one entry to the history file.
-func (s *Session) Append(entry SessionEntry) {
+func (s *Session) Append(entry SessionEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now()
 	}
-
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
+	if entry.Sequence <= 0 {
+		s.nextSeq++
+		entry.Sequence = s.nextSeq
+	} else if entry.Sequence > s.nextSeq {
+		s.nextSeq = entry.Sequence
 	}
+
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	_ = f.Chmod(0600)
 	defer f.Close()
 
-	json.NewEncoder(f).Encode(entry)
+	if err := json.NewEncoder(f).Encode(entry); err != nil {
+		return err
+	}
 	s.count++
+	return nil
 }
 
 // AppendMessage is a convenience to append a Message as a SessionEntry.
-func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) {
+func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) error {
 	entry := SessionEntry{
 		Timestamp:   time.Now(),
 		Role:        msg.Role,
@@ -87,11 +126,12 @@ func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) {
 		Parts:       msg.Parts,
 		ToolCalls:   msg.ToolCalls,
 		ToolResults: msg.ToolResults,
+		Reasoning:   msg.Reasoning,
 		TokensIn:    usage.PromptTokens,
 		TokensOut:   usage.CompletionTokens,
 		Iteration:   iteration,
 	}
-	s.Append(entry)
+	return s.Append(entry)
 }
 
 // LoadTail reads the last n messages from the history file and converts them to Messages.
@@ -108,13 +148,14 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 
 	var entries []SessionEntry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxSessionEntryBytes)
 	for scanner.Scan() {
 		var entry SessionEntry
 		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
 			entries = append(entries, entry)
 		}
 	}
+	entries = sanitizeLegacyDynamicEntries(entries)
 
 	// Collect compacted summaries
 	for _, e := range entries {
@@ -145,6 +186,7 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 			Parts:       e.Parts,
 			ToolCalls:   e.ToolCalls,
 			ToolResults: e.ToolResults,
+			Reasoning:   e.Reasoning,
 		}
 		// Normalize role: "tool_result" → "user" with ToolResults
 		if e.Role == "tool_result" {
@@ -157,6 +199,47 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 	messages = sanitizeToolPairs(messages)
 
 	return messages, compactedSummaries
+}
+
+// LoadAfter returns durable session entries strictly newer than after. The
+// cursor is the entry Sequence, not the current in-memory context index, so a
+// consumer can keep observing a long-running thread even while its prompt is
+// compacted or trimmed. Entries written before sequence support return no
+// cursor and are intentionally excluded; callers use this endpoint only for
+// fresh, live sessions.
+func (s *Session) LoadAfter(after int64, limit int) (entries []SessionEntry, nextCursor int64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	all, err := s.readEntriesLocked()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []SessionEntry{}, after, nil
+		}
+		return nil, after, err
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	capacity := limit
+	if len(all) < capacity {
+		capacity = len(all)
+	}
+	entries = make([]SessionEntry, 0, capacity)
+	nextCursor = after
+	for _, entry := range all {
+		if entry.Sequence <= after {
+			continue
+		}
+		entries = append(entries, entry)
+		if entry.Sequence > nextCursor {
+			nextCursor = entry.Sequence
+		}
+		if len(entries) >= limit {
+			break
+		}
+	}
+	return entries, nextCursor, nil
 }
 
 // sanitizeToolPairs fixes mismatched tool_use/tool_result pairs that
@@ -258,6 +341,8 @@ func (s *Session) ForceCompact(keepRecent int, summarize func(text string) strin
 }
 
 func (s *Session) compact(keepRecent int, force bool, summarize func(text string) string) {
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
 	s.mu.Lock()
 	entries, err := s.readEntriesLocked()
 	if err != nil {
@@ -265,6 +350,7 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		return
 	}
 
+	entries = sanitizeLegacyDynamicEntries(entries)
 	if !force && len(entries) <= compactThreshold {
 		s.count = len(entries)
 		s.mu.Unlock()
@@ -276,7 +362,11 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		return
 	}
 
-	combined, _, _ := buildCompactionParts(entries, keepRecent)
+	combined, realCount, _ := buildCompactionParts(entries, keepRecent)
+	compactPrefix := len(entries) - keepRecent
+	if compactPrefix < 0 {
+		compactPrefix = 0
+	}
 	s.mu.Unlock()
 
 	// Summarization can be arbitrary caller code. Run it outside the
@@ -288,6 +378,9 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 			summaryText = result
 		}
 	}
+	if summarize != nil && combined != "" && summaryText == "" {
+		return
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -298,6 +391,7 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 	if err != nil {
 		return
 	}
+	entries = sanitizeLegacyDynamicEntries(entries)
 	if !force && len(entries) <= compactThreshold {
 		s.count = len(entries)
 		return
@@ -306,7 +400,10 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		s.count = len(entries)
 		return
 	}
-	_, realCount, recent := buildCompactionParts(entries, keepRecent)
+	if compactPrefix > len(entries) {
+		return
+	}
+	recent := append([]SessionEntry(nil), entries[compactPrefix:]...)
 	if summaryText == "" {
 		summaryText = fmt.Sprintf("Compacted %d messages.", realCount)
 	}
@@ -320,22 +417,20 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 
 	// Rewrite file
 	newEntries := append([]SessionEntry{compactedEntry}, recent...)
-	s.rewriteEntriesLocked(newEntries)
-	s.count = len(newEntries)
+	if s.rewriteEntriesLocked(newEntries) == nil {
+		s.count = len(newEntries)
+	}
 }
 
-func (s *Session) rewriteEntriesLocked(entries []SessionEntry) {
-	tmpPath := s.path + ".tmp"
-	tf, err := os.Create(tmpPath)
-	if err != nil {
-		return
-	}
-	enc := json.NewEncoder(tf)
+func (s *Session) rewriteEntriesLocked(entries []SessionEntry) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	for _, e := range entries {
-		enc.Encode(e)
+		if err := enc.Encode(e); err != nil {
+			return err
+		}
 	}
-	tf.Close()
-	os.Rename(tmpPath, s.path)
+	return atomicWriteFile(s.path, buf.Bytes(), 0600)
 }
 
 func (s *Session) readEntriesLocked() ([]SessionEntry, error) {
@@ -347,7 +442,7 @@ func (s *Session) readEntriesLocked() ([]SessionEntry, error) {
 
 	var entries []SessionEntry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxSessionEntryBytes)
 	for scanner.Scan() {
 		var entry SessionEntry
 		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
@@ -358,6 +453,7 @@ func (s *Session) readEntriesLocked() ([]SessionEntry, error) {
 }
 
 func buildCompactionParts(entries []SessionEntry, keepRecent int) (combined string, realCount int, recent []SessionEntry) {
+	entries = sanitizeLegacyDynamicEntries(entries)
 	if keepRecent < 1 {
 		keepRecent = 1
 	}
@@ -370,25 +466,63 @@ func buildCompactionParts(entries []SessionEntry, keepRecent int) (combined stri
 
 	for _, e := range old {
 		if e.Role == "_compacted" {
-			if len(combined) < 4000 {
-				combined += "[previous summary] " + e.Summary + "\n"
-			}
+			combined += "[previous summary]\n" + excerptForCompaction(e.Summary, compactionInputMessagePreviewChars) + "\n"
 		} else if e.Role != "system" {
 			realCount++
-			if len(combined) < 4000 {
-				preview := e.Content
-				if len(preview) > 200 {
-					preview = preview[:200] + "..."
+			combined += fmt.Sprintf("[%s]\n%s\n", e.Role, excerptForCompaction(e.Content, compactionInputMessagePreviewChars))
+			if len(e.ToolCalls) > 0 {
+				combined += "Tool calls:\n"
+				for _, call := range e.ToolCalls {
+					combined += fmt.Sprintf("- id=%s name=%s args=%v\n", call.ID, call.Name, call.Args)
 				}
-				combined += fmt.Sprintf("[%s] %s\n", e.Role, preview)
+			}
+			if len(e.ToolResults) > 0 {
+				combined += "Tool results:\n"
+				for _, result := range e.ToolResults {
+					combined += fmt.Sprintf("- call_id=%s is_error=%v content:\n%s\n", result.CallID, result.IsError, excerptForCompaction(result.Content, toolResultContextPreviewChars))
+				}
 			}
 		}
+		if len(combined) >= maxCompactionInputBytes {
+			break
+		}
 	}
-	if len(combined) > 4000 {
-		combined = combined[:4000]
+	if len(combined) > maxCompactionInputBytes {
+		combined = combined[:maxCompactionInputBytes]
 	}
 
 	return combined, realCount, recent
+}
+
+func sanitizeLegacyDynamicEntries(entries []SessionEntry) []SessionEntry {
+	cleaned := make([]SessionEntry, 0, len(entries))
+	for _, entry := range entries {
+		content, synthetic := stripLegacyDynamicContext(entry.Content)
+		if !synthetic {
+			cleaned = append(cleaned, entry)
+			continue
+		}
+		entry.Content = content
+		if len(entry.Parts) > 0 {
+			parts := make([]ContentPart, 0, len(entry.Parts))
+			for _, part := range entry.Parts {
+				if part.Type == "text" {
+					if content != "" {
+						part.Text = content
+						parts = append(parts, part)
+					}
+					continue
+				}
+				parts = append(parts, part)
+			}
+			entry.Parts = parts
+		}
+		if content == "" && len(entry.Parts) == 0 && len(entry.ToolCalls) == 0 && len(entry.ToolResults) == 0 {
+			continue
+		}
+		cleaned = append(cleaned, entry)
+	}
+	return cleaned
 }
 
 // Delete removes the history file.
@@ -406,7 +540,7 @@ func (s *Session) Rename(newThreadID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dir := filepath.Dir(s.path)
-	newPath := filepath.Join(dir, newThreadID+".jsonl")
+	newPath := safeSessionPath(dir, newThreadID)
 	if newPath == s.path {
 		return nil
 	}

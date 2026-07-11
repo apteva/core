@@ -7,8 +7,59 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestOpenAINativeRuntimeTokenRefreshIsSingleFlight(t *testing.T) {
+	var requests atomic.Int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "new-token"})
+	}))
+	defer server.Close()
+	p := &OpenAINativeProvider{apiKey: "old-token", runtimeTokenURL: server.URL, serverAPIKey: "server-key"}
+
+	const callers = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- p.refreshRuntimeToken(context.Background(), true)
+		}()
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("refresh request did not start")
+	}
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("refresh HTTP requests = %d, want 1", got)
+	}
+	if got := p.token(); got != "new-token" {
+		t.Fatalf("token = %q", got)
+	}
+}
 
 func TestOpenAINativeBuildInput_SystemPromptHandling(t *testing.T) {
 	messages := []Message{
@@ -63,7 +114,7 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(strings.Join([]string{
 			`data: {"type":"response.output_text.delta","delta":"ok"}`,
-			`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":5}}}}`,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":5,"cache_write_tokens":2}}}}`,
 			`data: [DONE]`,
 			``,
 		}, "\n")))
@@ -85,11 +136,11 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
-	if resp.Text != "ok" || resp.Usage.CachedTokens != 5 {
+	if resp.Text != "ok" || resp.Usage.CachedTokens != 5 || resp.Usage.CacheWriteTokens != 2 {
 		t.Fatalf("response = %+v", resp)
 	}
-	if body["prompt_cache_retention"] != "24h" {
-		t.Fatalf("prompt_cache_retention = %v, want 24h", body["prompt_cache_retention"])
+	if _, ok := body["prompt_cache_retention"]; ok {
+		t.Fatalf("Codex request sent unsupported prompt_cache_retention: %#v", body)
 	}
 	key, _ := body["prompt_cache_key"].(string)
 	if !strings.HasPrefix(key, "apteva-v1-") {
@@ -97,6 +148,75 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 	}
 	if body["instructions"] != "stable system" {
 		t.Fatalf("instructions = %v", body["instructions"])
+	}
+}
+
+func TestOpenAICodexChatUsesAccountAndCatalogCapabilities(t *testing.T) {
+	var body map[string]any
+	var accountID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accountID = r.Header.Get("ChatGPT-Account-ID")
+		defer r.Body.Close()
+		raw, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("request JSON: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	parallel := true
+	p := &OpenAINativeProvider{
+		name:            "openai-codex",
+		apiKey:          "token",
+		accountID:       "account-a",
+		responsesURL:    srv.URL,
+		forceStoreFalse: true,
+		modelCapabilities: map[string]ModelCapabilities{
+			"gpt-5.6-terra": {
+				SupportsParallelToolCalls: &parallel,
+				SupportedReasoningLevels:  []ModelReasoningCapability{{Effort: "low"}, {Effort: "high"}},
+			},
+		},
+		reasoning: ReasoningSettings{Level: ReasoningXHigh},
+	}
+	if _, err := p.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, "gpt-5.6-terra", nil, nil, nil, nil); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if accountID != "account-a" {
+		t.Fatalf("ChatGPT-Account-ID = %q", accountID)
+	}
+	if body["parallel_tool_calls"] != true {
+		t.Fatalf("parallel_tool_calls = %#v", body["parallel_tool_calls"])
+	}
+	if key, _ := body["prompt_cache_key"].(string); key == "" {
+		t.Fatalf("GPT-5.6 Codex request omitted stable prompt_cache_key: %#v", body)
+	}
+	if _, ok := body["prompt_cache_retention"]; ok {
+		t.Fatalf("GPT-5.6 Codex request included deprecated retention: %#v", body)
+	}
+	reasoning, _ := body["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" {
+		t.Fatalf("reasoning = %#v, want catalog-clamped high", reasoning)
+	}
+}
+
+func TestOpenAICodexReasoningOmitsUnsupportedSummary(t *testing.T) {
+	summaries := false
+	p := &OpenAINativeProvider{
+		name: "openai-codex",
+		modelCapabilities: map[string]ModelCapabilities{
+			"gpt-5.6-luna": {SupportsReasoningSummaries: &summaries},
+		},
+	}
+	if got := p.requestReasoning("gpt-5.6-luna"); got != nil {
+		t.Fatalf("auto reasoning = %#v, want nil when summaries are unsupported", got)
+	}
+	p.reasoning = ReasoningSettings{Level: ReasoningHigh}
+	got := p.requestReasoning("gpt-5.6-luna")
+	if got == nil || got.Effort != "high" || got.Summary != "" {
+		t.Fatalf("high reasoning = %#v, want effort without summary", got)
 	}
 }
 
@@ -110,9 +230,9 @@ func TestOpenAINativeChat_RetriesWithoutUnsupportedPromptCacheHints(t *testing.T
 			t.Fatalf("request JSON: %v", err)
 		}
 		bodies = append(bodies, body)
-		if len(bodies) == 1 {
+		if _, hasHint := body["prompt_cache_key"]; hasHint {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":{"message":"Unknown parameter: prompt_cache_retention"}}`))
+			_, _ = w.Write([]byte(`{"error":{"message":"Unknown parameter: prompt_cache_key"}}`))
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -129,17 +249,24 @@ func TestOpenAINativeChat_RetriesWithoutUnsupportedPromptCacheHints(t *testing.T
 	if _, err := p.Chat(context.Background(), []Message{{Role: "system", Content: "stable"}, {Role: "user", Content: "hi"}}, "gpt-5.5", nil, nil, nil, nil); err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
-	if len(bodies) != 2 {
-		t.Fatalf("requests = %d, want 2", len(bodies))
+	clone := p.WithReasoning(ReasoningSettings{Level: ReasoningLow})
+	if _, err := clone.Chat(context.Background(), []Message{{Role: "system", Content: "stable"}, {Role: "user", Content: "again"}}, "gpt-5.5", nil, nil, nil, nil); err != nil {
+		t.Fatalf("second Chat: %v", err)
 	}
-	if bodies[0]["prompt_cache_key"] == "" || bodies[0]["prompt_cache_retention"] == "" {
-		t.Fatalf("first request missing cache hints: %#v", bodies[0])
+	if len(bodies) != 3 {
+		t.Fatalf("requests = %d, want first failure + retry + one remembered no-hint request", len(bodies))
+	}
+	if bodies[0]["prompt_cache_key"] == "" {
+		t.Fatalf("first request missing cache key: %#v", bodies[0])
+	}
+	if _, ok := bodies[0]["prompt_cache_retention"]; ok {
+		t.Fatalf("first Codex request included retention: %#v", bodies[0])
 	}
 	if _, ok := bodies[1]["prompt_cache_key"]; ok {
 		t.Fatalf("retry kept prompt_cache_key: %#v", bodies[1])
 	}
-	if _, ok := bodies[1]["prompt_cache_retention"]; ok {
-		t.Fatalf("retry kept prompt_cache_retention: %#v", bodies[1])
+	if _, ok := bodies[2]["prompt_cache_key"]; ok {
+		t.Fatalf("later call forgot unsupported-hint downgrade: %#v", bodies[2])
 	}
 }
 
@@ -369,5 +496,21 @@ func TestOpenAINativeStreamResponse_FinalArgumentsEmitToolChunkWhenNoDeltas(t *t
 	}
 	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Args["text"] != "hello" {
 		t.Fatalf("ToolCalls = %#v", resp.ToolCalls)
+	}
+}
+
+func TestOpenAINativeStreamResponseReturnsProviderFailure(t *testing.T) {
+	stream := strings.NewReader("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"upstream failed\"}}}\n\n")
+	_, err := (&OpenAINativeProvider{}).streamResponse(stream, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "upstream failed") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestOpenAINativeStreamResponseReturnsScannerError(t *testing.T) {
+	stream := strings.NewReader("data: " + strings.Repeat("x", 1024*1024+1))
+	_, err := (&OpenAINativeProvider{}).streamResponse(stream, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "stream read error") {
+		t.Fatalf("error = %v", err)
 	}
 }

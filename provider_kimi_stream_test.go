@@ -21,12 +21,12 @@ import (
 //
 // Two probes per endpoint:
 //
-//   "freeform" — a question that should make a reasoning model emit
-//                reasoning_content tokens before the visible answer.
-//   "tooluse"  — same prompt + a tool that satisfies the answer; we
-//                want to see whether the model emits reasoning around
-//                the tool call (Fireworks Kimi does; some gateways
-//                drop reasoning when tools are present).
+//	"freeform" — a question that should make a reasoning model emit
+//	             reasoning_content tokens before the visible answer.
+//	"tooluse"  — same prompt + a tool that satisfies the answer; we
+//	             want to see whether the model emits reasoning around
+//	             the tool call (Fireworks Kimi does; some gateways
+//	             drop reasoning when tools are present).
 //
 // Skips automatically when keys aren't set, so CI without credentials
 // is silent.
@@ -34,12 +34,15 @@ func TestIntegration_Kimi_StreamShape(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test, skipping in -short")
 	}
+	if os.Getenv("RUN_LLM_INTEGRATION_TESTS") != "1" {
+		t.Skip("set RUN_LLM_INTEGRATION_TESTS=1 to run paid live-provider integration tests")
+	}
 
 	type endpoint struct {
-		name    string
-		envVar  string
-		url     string
-		model   string
+		name   string
+		envVar string
+		url    string
+		model  string
 	}
 	endpoints := []endpoint{
 		{"fireworks", "FIREWORKS_API_KEY", "https://api.fireworks.ai/inference/v1/chat/completions", "accounts/fireworks/models/kimi-k2p6"},
@@ -184,10 +187,10 @@ func TestIntegration_Kimi_StreamShape(t *testing.T) {
 					var event struct {
 						Choices []struct {
 							Delta struct {
-								Content          string         `json:"content"`
-								ReasoningContent string         `json:"reasoning_content,omitempty"`
-								Reasoning        string         `json:"reasoning,omitempty"`
-								Thinking         string         `json:"thinking,omitempty"`
+								Content          string            `json:"content"`
+								ReasoningContent string            `json:"reasoning_content,omitempty"`
+								Reasoning        string            `json:"reasoning,omitempty"`
+								Thinking         string            `json:"thinking,omitempty"`
 								ToolCalls        []json.RawMessage `json:"tool_calls,omitempty"`
 							} `json:"delta"`
 						} `json:"choices"`

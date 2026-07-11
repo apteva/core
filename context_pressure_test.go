@@ -7,6 +7,24 @@ import (
 	"testing"
 )
 
+func TestContextCharsCountsStructuredAndMultimodalPayloads(t *testing.T) {
+	messages := []Message{{
+		Role:      "assistant",
+		Content:   "content",
+		Reasoning: "reasoning",
+		Parts: []ContentPart{
+			{Type: "text", Text: "part text"},
+			{Type: "image_url", ImageURL: &ImageURL{URL: "data:image/png;base64,abcdef", Detail: "high"}},
+			{Type: "input_audio", InputAudio: &InputAudio{Data: "audio-data", Format: "wav"}},
+		},
+		ToolCalls:   []NativeToolCall{{ID: "call", Name: "tool", Args: map[string]string{"large": "argument"}, ThoughtSignature: "signature"}},
+		ToolResults: []ToolResult{{CallID: "call", Content: "result", Image: []byte("pixels")}},
+	}}
+	if got := contextChars(messages); got < 100 {
+		t.Fatalf("contextChars = %d; structured payloads were not fully counted", got)
+	}
+}
+
 type testCompactionProvider struct {
 	response string
 	err      error

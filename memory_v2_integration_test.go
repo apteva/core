@@ -26,7 +26,7 @@ func TestIntegration_UnconsciousConsolidation_OneCycle(t *testing.T) {
 	tp := getTestProvider(t)
 	t.Logf("provider=%s", tp.Source)
 
-	// Sandbox: temp cwd so memory.jsonl + history/ + skills/ are isolated.
+	// Sandbox: temp cwd so memory.jsonl + history/ are isolated.
 	dir := t.TempDir()
 	prev, _ := os.Getwd()
 	t.Cleanup(func() { _ = os.Chdir(prev) })
@@ -69,7 +69,7 @@ func TestIntegration_UnconsciousConsolidation_OneCycle(t *testing.T) {
 	tools := []string{
 		"review_history", "memory_search", "memory_list",
 		"memory_remember", "memory_supersede", "memory_drop",
-		"skill_write", "pace",
+		"pace",
 	}
 	if err := parent.threads.SpawnWithOpts(
 		"unconscious",

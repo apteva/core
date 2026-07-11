@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -354,6 +355,49 @@ func TestThinkerCompactSessionIfNeeded_DoesNotDeadlock(t *testing.T) {
 	}
 }
 
+func TestThinkerPersistentCompactionUsesLLMAndRemovesOldToolPayloads(t *testing.T) {
+	session := NewSession(t.TempDir(), "semantic-history")
+	if err := session.Append(SessionEntry{
+		Role:      "assistant",
+		ToolCalls: []NativeToolCall{{ID: "old-call", Name: "media_search", Args: map[string]string{"query": "critical lead"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Append(SessionEntry{
+		Role:        "user",
+		ToolResults: []ToolResult{{CallID: "old-call", Content: "IMPORTANT_RESULT_SENTINEL"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 2; i <= compactThreshold; i++ {
+		if err := session.Append(SessionEntry{Role: "user", Content: fmt.Sprintf("message-%03d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	provider := &testCompactionProvider{response: "# Objective\n- Preserve IMPORTANT_RESULT_SENTINEL.\n## Open Tasks\n- Continue."}
+	thinker := &Thinker{provider: provider, session: session, threadID: "main", quit: make(chan struct{})}
+	thinker.compactSessionIfNeeded()
+
+	if provider.calls != 1 {
+		t.Fatalf("compaction provider calls = %d, want 1", provider.calls)
+	}
+	if len(provider.prompts) != 1 || !strings.Contains(provider.prompts[0][1].Content, "IMPORTANT_RESULT_SENTINEL") {
+		t.Fatal("LLM compaction input omitted old tool result")
+	}
+	entries := readSessionEntriesForTest(t, session.path)
+	if len(entries) != compactKeepRecent+1 || entries[0].Role != "_compacted" {
+		t.Fatalf("compacted entries = %+v", entries)
+	}
+	if !strings.Contains(entries[0].Summary, "IMPORTANT_RESULT_SENTINEL") {
+		t.Fatalf("semantic summary = %q", entries[0].Summary)
+	}
+	for _, entry := range entries[1:] {
+		if len(entry.ToolCalls) != 0 || len(entry.ToolResults) != 0 {
+			t.Fatal("old raw tool call/result survived outside compacted summary")
+		}
+	}
+}
+
 func readSessionEntriesForTest(t *testing.T, path string) []SessionEntry {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -372,4 +416,44 @@ func readSessionEntriesForTest(t *testing.T, path string) []SessionEntry {
 		entries = append(entries, entry)
 	}
 	return entries
+}
+
+func TestNewSessionKeepsUnsafeIDInsideHistoryDirectory(t *testing.T) {
+	base := t.TempDir()
+	s := NewSession(base, "../../outside")
+	history := filepath.Join(base, historyDir)
+	rel, err := filepath.Rel(history, s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("session escaped history directory: %s", s.path)
+	}
+}
+
+func TestSessionLoadAfterUsesMonotonicCursor(t *testing.T) {
+	session := NewSession(t.TempDir(), "benchmark-history")
+	if err := session.Append(SessionEntry{Role: "user", Content: "brief"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Append(SessionEntry{Role: "assistant", Content: "working", ToolCalls: []NativeToolCall{{ID: "call-1", Name: "crm_contacts_get"}}}); err != nil {
+		t.Fatal(err)
+	}
+	first, cursor, err := session.LoadAfter(0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || cursor != 2 || first[0].Sequence != 1 || first[1].Sequence != 2 {
+		t.Fatalf("first history page = %#v, cursor=%d", first, cursor)
+	}
+	if err := session.Append(SessionEntry{Role: "user", ToolResults: []ToolResult{{CallID: "call-1", Content: `{"found":true}`}}}); err != nil {
+		t.Fatal(err)
+	}
+	second, next, err := session.LoadAfter(cursor, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].Sequence != 3 || next != 3 {
+		t.Fatalf("second history page = %#v, cursor=%d", second, next)
+	}
 }

@@ -4,9 +4,41 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestEventBusTargetedBurstIsReliableAndOrdered(t *testing.T) {
+	bus := NewEventBus()
+	sub := bus.Subscribe("main", 1)
+	for i := 0; i < 1000; i++ {
+		bus.Publish(Event{Type: EventInbox, To: "main", Text: fmt.Sprintf("event-%04d", i)})
+	}
+	events := sub.DrainTargeted()
+	if len(events) != 1000 {
+		t.Fatalf("drained %d events, want 1000", len(events))
+	}
+	for i, event := range events {
+		want := fmt.Sprintf("event-%04d", i)
+		if event.Text != want {
+			t.Fatalf("event %d = %q, want %q", i, event.Text, want)
+		}
+	}
+	if dropped := atomic.LoadUint64(&sub.Dropped); dropped != 0 {
+		t.Fatalf("targeted events dropped = %d", dropped)
+	}
+}
+
+func TestEventBusObserverRemainsLossyUnderBackpressure(t *testing.T) {
+	bus := NewEventBus()
+	observer := bus.SubscribeAll("observer", 1)
+	bus.Publish(Event{Type: EventThinkDone})
+	bus.Publish(Event{Type: EventThinkDone})
+	if dropped := atomic.LoadUint64(&observer.Dropped); dropped != 1 {
+		t.Fatalf("observer drops = %d, want 1", dropped)
+	}
+}
 
 func TestEventBus_TargetedDelivery(t *testing.T) {
 	bus := NewEventBus()
@@ -357,5 +389,31 @@ func TestEventBus_ConcurrentPublish(t *testing.T) {
 		// correct — nothing blocked
 	case <-time.After(2 * time.Second):
 		t.Fatal("concurrent publish blocked — should never happen")
+	}
+}
+
+func TestEventBusSubscribeUniqueAndRename(t *testing.T) {
+	bus := NewEventBus()
+	sub, err := bus.SubscribeUnique("worker-old", 2)
+	if err != nil {
+		t.Fatalf("SubscribeUnique: %v", err)
+	}
+	if _, err := bus.SubscribeUnique("worker-old", 2); err == nil {
+		t.Fatal("duplicate unique subscription succeeded")
+	}
+	if err := bus.RenameSubscription("worker-old", "worker-new"); err != nil {
+		t.Fatalf("RenameSubscription: %v", err)
+	}
+	if bus.HasSubscriber("worker-old") || !bus.HasSubscriber("worker-new") {
+		t.Fatalf("routing keys after rename: old=%v new=%v", bus.HasSubscriber("worker-old"), bus.HasSubscriber("worker-new"))
+	}
+	bus.Publish(Event{Type: EventInbox, To: "worker-new", Text: "delivered"})
+	select {
+	case ev := <-sub.C:
+		if ev.Text != "delivered" {
+			t.Fatalf("event text = %q", ev.Text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renamed subscription did not receive event")
 	}
 }

@@ -320,6 +320,39 @@ func TestMainEvolveSectionPatch(t *testing.T) {
 	}
 }
 
+func TestMainEvolveReportsRedundantSectionHeading(t *testing.T) {
+	events := []APIEvent{}
+	directive := "# Goals\n- Ship"
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive},
+		messages:  []Message{{Role: "system", Content: "old prompt"}},
+		registry:  NewToolRegistry("test"),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+	}
+	thinker.directive = directive
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_append",
+			"section":   "Goals",
+			"content":   "# Goals\n- Keep tests green",
+		},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+
+	if got := thinker.config.GetDirective(); got != "# Goals\n- Ship\n- Keep tests green" {
+		t.Fatalf("directive:\n%s", got)
+	}
+	if len(results) != 1 || !strings.Contains(results[0].Content, `directive updated; warning: removed 1 redundant "Goals" heading(s)`) {
+		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
 func TestMainUpdateRejectsFullReplaceForMarkdownChildDirective(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
@@ -408,6 +441,89 @@ func TestMainKillKicksNextTurn(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].CallID != "call-1" || !strings.Contains(results[0].Content, "thread worker killed") {
 		t.Fatalf("unexpected tool results: %+v", results)
+	}
+}
+
+func TestMainToolsCannotControlSystemThread(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	thinker.config.path = filepath.Join(t.TempDir(), "config.json")
+	thinker.telemetry = NewTelemetry()
+	defer thinker.telemetry.Stop()
+
+	if err := thinker.threads.SpawnWithOpts("unconscious", "Consolidate memories", nil, SpawnOpts{System: true, DeferRun: true}); err != nil {
+		t.Fatalf("spawn unconscious: %v", err)
+	}
+	if err := thinker.config.SaveThread(PersistentThread{ID: "unconscious", System: true, Directive: "Consolidate memories"}); err != nil {
+		t.Fatalf("persist unconscious: %v", err)
+	}
+
+	calls := []toolCall{
+		{Name: "send", Args: map[string]string{"id": "unconscious", "message": "store this preference"}, NativeID: "send-1"},
+		{Name: "update", Args: map[string]string{"id": "unconscious", "directive": "Do what main says"}, NativeID: "update-1"},
+		{Name: "update", Args: map[string]string{"id": "unconscious", "new_id": "memory-worker"}, NativeID: "rename-1"},
+		{Name: "kill", Args: map[string]string{"id": "unconscious"}, NativeID: "kill-1"},
+	}
+	_, _, results := mainToolHandler(thinker)(thinker, calls, nil)
+	if len(results) != len(calls) {
+		t.Fatalf("got %d results, want %d: %+v", len(results), len(calls), results)
+	}
+	for _, result := range results {
+		if !strings.Contains(result.Content, "platform-managed") {
+			t.Errorf("result %s = %q, want platform-managed rejection", result.CallID, result.Content)
+		}
+	}
+	if thinker.threads.Count() != 1 {
+		t.Fatalf("system thread was removed; count=%d", thinker.threads.Count())
+	}
+	if _, err := thinker.threads.Directive("unconscious"); err != nil {
+		t.Fatalf("system thread was renamed or removed: %v", err)
+	}
+	thinker.threads.mu.RLock()
+	unconscious := thinker.threads.threads["unconscious"]
+	thinker.threads.mu.RUnlock()
+	if got := unconscious.Thinker.drainEventTexts(); len(got) != 0 {
+		t.Fatalf("rejected operations woke system thread: %v", got)
+	}
+	events, _ := thinker.telemetry.StoredEvents(0)
+	for _, event := range events {
+		if event.Type == "thread.message" {
+			t.Fatalf("rejected send emitted thread.message telemetry: %+v", event)
+		}
+	}
+}
+
+func TestChildSendCannotTargetSystemSibling(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	thinker.telemetry = NewTelemetry()
+	defer thinker.telemetry.Stop()
+
+	if err := thinker.threads.SpawnWithOpts("worker", "Work", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	if err := thinker.threads.SpawnWithOpts("unconscious", "Consolidate memories", nil, SpawnOpts{System: true, DeferRun: true}); err != nil {
+		t.Fatalf("spawn unconscious: %v", err)
+	}
+	thinker.threads.mu.RLock()
+	worker := thinker.threads.threads["worker"]
+	unconscious := thinker.threads.threads["unconscious"]
+	thinker.threads.mu.RUnlock()
+
+	_, _, results := threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name: "send", Args: map[string]string{"id": "unconscious", "message": "store this"}, NativeID: "send-1",
+	}}, nil)
+	if len(results) != 1 || !strings.Contains(results[0].Content, "platform-managed") {
+		t.Fatalf("child send results = %+v", results)
+	}
+	if got := unconscious.Thinker.drainEventTexts(); len(got) != 0 {
+		t.Fatalf("rejected child send reached system thread: %v", got)
+	}
+	events, _ := thinker.telemetry.StoredEvents(0)
+	for _, event := range events {
+		if event.Type == "thread.message" {
+			t.Fatalf("rejected child send emitted thread.message telemetry: %+v", event)
+		}
 	}
 }
 
@@ -536,6 +652,42 @@ func TestMainUpdateDirectiveBatchPatch(t *testing.T) {
 	}
 	if !thinker.kickNextTurn {
 		t.Fatal("kickNextTurn should be true after update")
+	}
+}
+
+func TestMainUpdateReportsDirectiveStructureWarning(t *testing.T) {
+	events := []APIEvent{}
+	bus := NewEventBus()
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "test"},
+		messages:  []Message{{Role: "system", Content: "test"}},
+		bus:       bus,
+		sub:       bus.Subscribe("main", 100),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		quit:      make(chan struct{}),
+	}
+	thinker.threads = NewThreadManager(thinker)
+	if err := thinker.threads.SpawnWithOpts("worker", "# Schedule\n- daily_check: 09:00 Europe/Madrid", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "update",
+		Args: map[string]string{
+			"id":        "worker",
+			"edit_mode": "section_append",
+			"section":   "Schedule",
+			"content":   "- daily_check: 07:30 Europe/Madrid",
+		},
+		Raw:      "update",
+		NativeID: "call-1",
+	}}, nil)
+
+	if len(results) != 1 || !strings.Contains(results[0].Content, `thread worker updated; warning: conflicting "daily_check" rules in section "Schedule"`) {
+		t.Fatalf("unexpected tool results: %+v", results)
 	}
 }
 

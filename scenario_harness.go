@@ -125,6 +125,9 @@ func getTestProvider(t *testing.T) testProvider {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
+	if os.Getenv("RUN_LLM_INTEGRATION_TESTS") != "1" {
+		t.Skip("set RUN_LLM_INTEGRATION_TESTS=1 to run paid live-provider integration tests")
+	}
 	loadIntegrationEnv()
 
 	// Wipe persistent agent state BEFORE handing back a provider.

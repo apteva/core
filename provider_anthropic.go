@@ -78,6 +78,7 @@ func sanitizeToolID(id string) string {
 
 type AnthropicProvider struct {
 	apiKey       string
+	url          string
 	models       map[ModelTier]string
 	builtinTools []string // enabled built-in tools: "code_execution", "web_search"
 }
@@ -85,6 +86,7 @@ type AnthropicProvider struct {
 func NewAnthropicProvider(apiKey string) LLMProvider {
 	return &AnthropicProvider{
 		apiKey: apiKey,
+		url:    "https://api.anthropic.com/v1/messages",
 		models: map[ModelTier]string{
 			ModelLarge:  "claude-sonnet-4-6",
 			ModelMedium: "claude-haiku-4-5-20251001",
@@ -205,6 +207,10 @@ type anthropicStreamEvent struct {
 		CacheRead     int `json:"cache_read_input_tokens"`
 		CacheCreation int `json:"cache_creation_input_tokens"`
 	} `json:"usage,omitempty"`
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 type anthropicDelta struct {
@@ -390,7 +396,11 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		return ChatResponse{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	url := p.url
+	if url == "" {
+		url = "https://api.anthropic.com/v1/messages"
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -446,6 +456,11 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		}
 
 		switch event.Type {
+		case "error":
+			if event.Error != nil {
+				return ChatResponse{}, fmt.Errorf("Anthropic stream error (%s): %s", event.Error.Type, event.Error.Message)
+			}
+			return ChatResponse{}, fmt.Errorf("Anthropic stream error")
 		case "content_block_start":
 			if event.ContentBlock != nil {
 				switch event.ContentBlock.Type {

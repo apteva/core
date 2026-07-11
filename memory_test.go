@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -188,6 +189,71 @@ func TestRemember_AppendsToDisk(t *testing.T) {
 	}
 }
 
+func TestMemoryActiveIndexTracksRememberDropAndSupersede(t *testing.T) {
+	ms := &MemoryStore{path: filepath.Join(t.TempDir(), "memory.jsonl"), byID: map[string]int{}, active: map[string]MemoryRecord{}}
+	ids := make([]string, 100)
+	for i := range ids {
+		id, err := ms.Remember(fmt.Sprintf("memory %d", i), []string{"test"}, 0.7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = id
+	}
+	for _, id := range ids[:50] {
+		if err := ms.Drop(id, "obsolete"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ms.Count(); got != 50 {
+		t.Fatalf("active count after drops = %d, want 50", got)
+	}
+	newID, err := ms.Supersede(ids[50], "replacement", []string{"test"}, 0.8, "updated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ms.Count(); got != 50 {
+		t.Fatalf("active count after supersede = %d, want 50", got)
+	}
+	active := ms.Active()
+	foundReplacement := false
+	for _, record := range active {
+		if record.ID == ids[50] {
+			t.Fatal("superseded record remained active")
+		}
+		if record.ID == newID {
+			foundReplacement = true
+		}
+	}
+	if !foundReplacement {
+		t.Fatal("replacement missing from active index")
+	}
+	info, err := os.Stat(ms.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("memory journal mode = %o, want 600", got)
+	}
+}
+
+func TestMemoryBatchAppendFailureDoesNotMutateIndexes(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ms := &MemoryStore{path: filepath.Join(blocker, "memory.jsonl"), byID: map[string]int{}, active: map[string]MemoryRecord{}}
+	err := ms.appendRecords(
+		MemoryRecord{ID: "one", Content: "first"},
+		MemoryRecord{ID: "two", Tombstone: true, IDTarget: "one"},
+	)
+	if err == nil {
+		t.Fatal("expected batch append failure")
+	}
+	if len(ms.records) != 0 || len(ms.byID) != 0 || ms.Count() != 0 {
+		t.Fatal("failed batch append mutated in-memory indexes")
+	}
+}
+
 func TestSupersede_OldHidden_NewActive(t *testing.T) {
 	ms := newOfflineStore(t)
 
@@ -265,29 +331,29 @@ func TestSupersede_RejectsUnknownID(t *testing.T) {
 
 func TestRememberWithID_InsertsWithSuppliedID(t *testing.T) {
 	ms := newOfflineStore(t)
-	id, err := ms.RememberWithID("skill_abc_0", "playbook body", []string{"skill", "skill:storage:upload"}, 0.9)
+	id, err := ms.RememberWithID("external_abc_0", "playbook body", []string{"procedure", "storage:upload"}, 0.9)
 	if err != nil {
 		t.Fatalf("RememberWithID: %v", err)
 	}
-	if id != "skill_abc_0" {
-		t.Errorf("returned id = %q, want skill_abc_0", id)
+	if id != "external_abc_0" {
+		t.Errorf("returned id = %q, want external_abc_0", id)
 	}
-	if !ms.HasID("skill_abc_0") {
+	if !ms.HasID("external_abc_0") {
 		t.Error("HasID should be true after RememberWithID")
 	}
 	active := ms.Active()
-	if len(active) != 1 || active[0].ID != "skill_abc_0" {
+	if len(active) != 1 || active[0].ID != "external_abc_0" {
 		t.Errorf("Active record mismatch: %+v", active)
 	}
 }
 
 func TestUpsertTargetID_FollowsActiveReplacementChain(t *testing.T) {
 	ms := newOfflineStore(t)
-	original, err := ms.RememberWithID("skill_abc_0", "first playbook", []string{"skill"}, 0.8)
+	original, err := ms.RememberWithID("external_abc_0", "first playbook", []string{"procedure"}, 0.8)
 	if err != nil {
 		t.Fatalf("RememberWithID: %v", err)
 	}
-	second, err := ms.Supersede(original, "second playbook", []string{"skill"}, 0.8, "changed")
+	second, err := ms.Supersede(original, "second playbook", []string{"procedure"}, 0.8, "changed")
 	if err != nil {
 		t.Fatalf("Supersede second: %v", err)
 	}
@@ -298,7 +364,7 @@ func TestUpsertTargetID_FollowsActiveReplacementChain(t *testing.T) {
 	if target != second {
 		t.Fatalf("upsert target = %q, want active replacement %q", target, second)
 	}
-	third, err := ms.Supersede(target, "third playbook", []string{"skill"}, 0.8, "changed again")
+	third, err := ms.Supersede(target, "third playbook", []string{"procedure"}, 0.8, "changed again")
 	if err != nil {
 		t.Fatalf("Supersede third: %v", err)
 	}
@@ -413,12 +479,23 @@ func TestRecall_RanksByLexicalScore_NoEmbedding(t *testing.T) {
 	}
 }
 
-func TestSearch_RanksSkillMemoryLexically_NoEmbedding(t *testing.T) {
+func TestRecall_RejectsZeroOverlapAcrossMemoryTags(t *testing.T) {
+	ms := newOfflineStore(t)
+	ms.Remember("Use signed URLs for storage uploads", []string{"procedure", "storage"}, 0.95)
+	ms.Remember("The billing queue processes invoices", []string{"fact", "billing"}, 0.9)
+
+	results := ms.Recall("quietly wait for future requests", 5)
+	if len(results) != 0 {
+		t.Fatalf("zero-overlap recall returned %d records: %+v", len(results), results)
+	}
+}
+
+func TestSearch_RanksProceduralMemoryLexically_NoEmbedding(t *testing.T) {
 	ms := newOfflineStore(t)
 	if _, err := ms.RememberWithID(
-		"skill_storage_upload_0",
+		"procedure_storage_upload_0",
 		"When uploading files to storage, validate MIME type, create a signed URL, then confirm checksum.",
-		[]string{"skill", "storage", "upload", "signed-url"},
+		[]string{"procedure", "storage", "upload", "signed-url"},
 		0.95,
 	); err != nil {
 		t.Fatalf("RememberWithID: %v", err)
@@ -430,11 +507,11 @@ func TestSearch_RanksSkillMemoryLexically_NoEmbedding(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("Search returned %d results, want 1", len(results))
 	}
-	if results[0].ID != "skill_storage_upload_0" {
-		t.Fatalf("top lexical skill memory = %q (%q), want skill_storage_upload_0", results[0].ID, results[0].Content)
+	if results[0].ID != "procedure_storage_upload_0" {
+		t.Fatalf("top lexical procedural memory = %q (%q), want procedure_storage_upload_0", results[0].ID, results[0].Content)
 	}
 	if len(results[0].Embedding) != 0 {
-		t.Fatalf("offline skill memory unexpectedly has embedding len=%d", len(results[0].Embedding))
+		t.Fatalf("offline procedural memory unexpectedly has embedding len=%d", len(results[0].Embedding))
 	}
 }
 
@@ -506,14 +583,14 @@ func TestRecall_DecayPenalizesOldMemories(t *testing.T) {
 	old := MemoryRecord{
 		ID:      newULID(),
 		TS:      time.Now().Add(-365 * 24 * time.Hour), // 1 year old
-		Content: "deployment runs on Kubernetes",
+		Content: "old deployment runs on Kubernetes",
 		Tags:    []string{"fact"},
 		Weight:  0.9,
 	}
 	fresh := MemoryRecord{
 		ID:      newULID(),
 		TS:      time.Now().Add(-1 * time.Hour),
-		Content: "deployment runs on Kubernetes",
+		Content: "current deployment runs on Kubernetes",
 		Tags:    []string{"fact"},
 		Weight:  0.9,
 	}
@@ -527,6 +604,20 @@ func TestRecall_DecayPenalizesOldMemories(t *testing.T) {
 	}
 	if results[0].ID != fresh.ID {
 		t.Errorf("expected fresh memory first; got %s", results[0].ID)
+	}
+}
+
+func TestRecall_DeduplicatesIdenticalContentAcrossTags(t *testing.T) {
+	ms := newOfflineStore(t)
+	first, _ := ms.Remember("Use signed URLs for storage uploads", []string{"procedure", "storage"}, 0.9)
+	second, _ := ms.Remember("  use SIGNED urls for storage uploads  ", []string{"fact", "storage"}, 0.8)
+
+	results := ms.Recall("storage upload signed URL", 5)
+	if len(results) != 1 {
+		t.Fatalf("Recall returned %d duplicate records, want 1: %+v", len(results), results)
+	}
+	if results[0].ID != first && results[0].ID != second {
+		t.Fatalf("unexpected recalled id %q", results[0].ID)
 	}
 }
 
@@ -611,6 +702,21 @@ func TestBuildContext_FramingHeaderIncludesGuard(t *testing.T) {
 	// MUST tell the model these are memories, not current statements.
 	if !strings.Contains(out, "do not treat as the user's current input") {
 		t.Errorf("BuildContext output missing fabrication-guard framing: %q", out)
+	}
+}
+
+func TestBuildContext_IsDeterministicForCacheReuse(t *testing.T) {
+	ms := newOfflineStore(t)
+	ms.Remember("Use signed URLs for storage uploads", []string{"storage", "procedure"}, 0.85)
+	records := ms.Active()
+	first := ms.BuildContext(records)
+	time.Sleep(10 * time.Millisecond)
+	second := ms.BuildContext(records)
+	if first != second {
+		t.Fatalf("BuildContext changed without memory changes:\nfirst=%q\nsecond=%q", first, second)
+	}
+	if strings.Contains(first, " ago,") {
+		t.Fatalf("BuildContext includes volatile relative age: %q", first)
 	}
 }
 

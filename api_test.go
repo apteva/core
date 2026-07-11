@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,7 @@ func TestAPI_Status(t *testing.T) {
 	thinker.rate = RateFast
 	thinker.agentSleep = 2 * time.Second
 	thinker.model = ModelLarge
+	thinker.publishRuntimeStatus()
 
 	req := httptest.NewRequest("GET", "/status", nil)
 	w := httptest.NewRecorder()
@@ -456,6 +458,25 @@ func TestAPI_Config_Put(t *testing.T) {
 	case ev := <-thinker.sub.C:
 		t.Fatalf("directive config update should not inject a wake event, got %s %q", ev.Type, ev.Text)
 	default:
+	}
+}
+
+func TestAPIConfigPutReportsPersistenceFailureAndRollsBack(t *testing.T) {
+	api, thinker := newTestAPI()
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	thinker.config.path = filepath.Join(blocker, "config.json")
+	payload, _ := json.Marshal(map[string]string{"directive": "must-not-apply"})
+	req := httptest.NewRequest(http.MethodPut, "/config", bytes.NewReader(payload))
+	w := httptest.NewRecorder()
+	api.config(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", w.Code, w.Body.String())
+	}
+	if got := thinker.config.GetDirective(); got != "test directive" {
+		t.Fatalf("directive changed after failed persistence: %q", got)
 	}
 }
 

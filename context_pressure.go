@@ -22,16 +22,34 @@ const (
 func contextChars(messages []Message) int {
 	n := 0
 	for _, msg := range messages {
-		n += len(msg.Content)
+		n += len(msg.Role) + len(msg.Content) + len(msg.Reasoning)
+		for _, part := range msg.Parts {
+			n += len(part.Type) + len(part.Text)
+			if part.ImageURL != nil {
+				n += len(part.ImageURL.URL) + len(part.ImageURL.Detail)
+			}
+			if part.InputAudio != nil {
+				n += len(part.InputAudio.Data) + len(part.InputAudio.Format)
+			}
+			if part.AudioURL != nil {
+				n += len(part.AudioURL.URL) + len(part.AudioURL.MimeType)
+			}
+		}
+		for _, call := range msg.ToolCalls {
+			n += len(call.ID) + len(call.Name) + len(call.ThoughtSignature)
+			for key, value := range call.Args {
+				n += len(key) + len(value)
+			}
+		}
 		for _, result := range msg.ToolResults {
-			n += len(result.Content)
+			n += len(result.CallID) + len(result.Content) + len(result.Image)
 		}
 	}
 	return n
 }
 
 func shouldCompactBeforeLLM(modelID string, messages []Message) bool {
-	maxTokens := ModelContextWindow(modelID)
+	maxTokens := ModelEffectiveContextWindow(modelID)
 	chars := contextChars(messages)
 	underPressure := false
 	if maxTokens > 0 && chars/4 >= int(float64(maxTokens)*semanticCompactionTokenRatio) {
@@ -44,7 +62,7 @@ func shouldCompactBeforeLLM(modelID string, messages []Message) bool {
 }
 
 func shouldRecoverFromEmptyResponse(usage TokenUsage, modelID string, messages []Message, emptyStreak int) bool {
-	maxTokens := ModelContextWindow(modelID)
+	maxTokens := ModelEffectiveContextWindow(modelID)
 	if usage.PromptTokens > 0 && maxTokens > 0 && float64(usage.PromptTokens) >= float64(maxTokens)*contextPressureTokenRatio {
 		return true
 	}

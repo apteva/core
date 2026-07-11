@@ -146,6 +146,12 @@ func TestActiveThreadsInjectedInDynamicContext(t *testing.T) {
 			Model:     ModelLarge,
 			Started:   time.Now().Add(-2 * time.Minute),
 		},
+		{
+			ID:        "unconscious",
+			System:    true,
+			Directive: "Consolidate durable memories",
+			Tools:     []string{"memory_remember"},
+		},
 	}
 
 	prompt := buildSystemPrompt("Test directive", ModeAutonomous, reg, "", nil, threads, nil, nil)
@@ -175,6 +181,9 @@ func TestActiveThreadsInjectedInDynamicContext(t *testing.T) {
 	}
 	if !strings.Contains(dyn, "Manage social media") {
 		t.Error("dynamic context should include social-media-manager directive")
+	}
+	if strings.Contains(dyn, "unconscious") || strings.Contains(dyn, "Consolidate durable memories") {
+		t.Error("dynamic context should not expose platform-managed system threads")
 	}
 	if !strings.Contains(dyn, "stocks_get_quote") {
 		t.Error("dynamic context should list price-monitor tools")

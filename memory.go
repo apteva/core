@@ -52,6 +52,10 @@ const (
 	// from 6 months ago contributes 1/4 of its original weight.
 	memoryHalfLifeDays = 90.0
 
+	// Below this cosine score, embedding similarity is usually background
+	// correlation rather than useful recall evidence.
+	minEmbeddingRecallSimilarity = 0.20
+
 	// Soft target the unconscious is told about each cycle. The
 	// directive uses this to decide when to be more aggressive on
 	// drops. Not a hard cap — exceeding it doesn't lose data.
@@ -138,11 +142,13 @@ func (r MemoryRecord) IsTombstone() bool { return r.Tombstone }
 // MemoryStore is the in-process journal owner. Append-only on disk,
 // rebuilds the active-set on load.
 type MemoryStore struct {
-	mu      sync.RWMutex
-	records []MemoryRecord    // full sequence, in insertion order
-	byID    map[string]int    // id → index in records
-	backend *embeddingBackend // nil → no embeddings, lexical-only
-	path    string
+	mu          sync.RWMutex
+	records     []MemoryRecord // full sequence, in insertion order
+	byID        map[string]int // id → index in records
+	active      map[string]MemoryRecord
+	activeOrder []string
+	backend     *embeddingBackend // nil → no embeddings, lexical-only
+	path        string
 }
 
 // NewMemoryStore opens (or creates) memory.jsonl at the cwd, picks
@@ -163,6 +169,7 @@ func NewMemoryStore(apiKey string) *MemoryStore {
 		backend: backend,
 		path:    memoryFile,
 		byID:    map[string]int{},
+		active:  map[string]MemoryRecord{},
 	}
 	if backend == nil {
 		logMsg("MEMORY", "embeddings disabled — lexical-only retrieval (set FIREWORKS_API_KEY / OPENAI_API_KEY / OLLAMA_HOST to enable embeddings)")
@@ -230,11 +237,12 @@ func (ms *MemoryStore) migrateLegacyIfNeeded() {
 	logMsg("MEMORY", "migrating legacy memory.jsonl → new journal format (backup at memory.jsonl.legacy.bak)")
 
 	migrated := 0
-	out, err := os.OpenFile(ms.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	out, err := os.OpenFile(ms.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		logMsg("MEMORY", fmt.Sprintf("migration: failed to open new file: %v", err))
 		return
 	}
+	_ = out.Chmod(0600)
 	defer out.Close()
 	enc := json.NewEncoder(out)
 
@@ -294,24 +302,59 @@ func (ms *MemoryStore) load() {
 		ms.records = append(ms.records, rec)
 		ms.byID[rec.ID] = len(ms.records) - 1
 	}
+	ms.rebuildActiveLocked()
 	logMsg("MEMORY", fmt.Sprintf("loaded %d records (%d active)", len(ms.records), ms.activeCount()))
 }
 
 // activeCount counts active (non-tombstoned, non-superseded) memories.
 // Caller holds ms.mu.RLock() OR is within a write-locked section.
 func (ms *MemoryStore) activeCount() int {
-	tombstoned, superseded := ms.deadIDs()
-	n := 0
-	for _, r := range ms.records {
-		if r.Tombstone {
-			continue
-		}
-		if tombstoned[r.ID] || superseded[r.ID] {
-			continue
-		}
-		n++
+	ms.ensureActiveLocked()
+	return len(ms.active)
+}
+
+func (ms *MemoryStore) ensureActiveLocked() {
+	if ms.active == nil {
+		ms.rebuildActiveLocked()
 	}
-	return n
+}
+
+func (ms *MemoryStore) rebuildActiveLocked() {
+	ms.active = make(map[string]MemoryRecord)
+	ms.activeOrder = nil
+	for _, rec := range ms.records {
+		ms.applyActiveRecordLocked(rec)
+	}
+}
+
+func (ms *MemoryStore) applyActiveRecordLocked(rec MemoryRecord) {
+	if rec.Tombstone {
+		ms.removeActiveLocked(rec.IDTarget)
+		return
+	}
+	if rec.Supersedes != "" {
+		ms.removeActiveLocked(rec.Supersedes)
+	}
+	if _, exists := ms.active[rec.ID]; !exists {
+		ms.activeOrder = append(ms.activeOrder, rec.ID)
+	}
+	ms.active[rec.ID] = rec
+}
+
+func (ms *MemoryStore) removeActiveLocked(id string) {
+	if id == "" {
+		return
+	}
+	if _, exists := ms.active[id]; !exists {
+		return
+	}
+	delete(ms.active, id)
+	for i, activeID := range ms.activeOrder {
+		if activeID == id {
+			ms.activeOrder = append(ms.activeOrder[:i], ms.activeOrder[i+1:]...)
+			break
+		}
+	}
 }
 
 // deadIDs returns the sets of ids that are tombstoned (explicitly
@@ -337,16 +380,20 @@ func (ms *MemoryStore) deadIDs() (tombstoned, superseded map[string]bool) {
 func (ms *MemoryStore) Active() []MemoryRecord {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
-	tombstoned, superseded := ms.deadIDs()
-	out := make([]MemoryRecord, 0, len(ms.records))
-	for _, r := range ms.records {
-		if r.Tombstone {
-			continue
+	// Stores loaded/created through public constructors always have this
+	// index. The nil case is only possible in legacy test literals.
+	if ms.active == nil {
+		ms.mu.RUnlock()
+		ms.mu.Lock()
+		ms.ensureActiveLocked()
+		ms.mu.Unlock()
+		ms.mu.RLock()
+	}
+	out := make([]MemoryRecord, 0, len(ms.active))
+	for _, id := range ms.activeOrder {
+		if rec, ok := ms.active[id]; ok {
+			out = append(out, rec)
 		}
-		if tombstoned[r.ID] || superseded[r.ID] {
-			continue
-		}
-		out = append(out, r)
 	}
 	return out
 }
@@ -355,8 +402,16 @@ func (ms *MemoryStore) Active() []MemoryRecord {
 // telemetry and the unconscious's directive ("you have N memories").
 func (ms *MemoryStore) Count() int {
 	ms.mu.RLock()
-	defer ms.mu.RUnlock()
-	return ms.activeCount()
+	if ms.active != nil {
+		n := len(ms.active)
+		ms.mu.RUnlock()
+		return n
+	}
+	ms.mu.RUnlock()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.ensureActiveLocked()
+	return len(ms.active)
 }
 
 // All returns every record in insertion order, including tombstones
@@ -373,19 +428,38 @@ func (ms *MemoryStore) All() []MemoryRecord {
 // append writes a record to disk and updates in-memory state. Caller
 // must NOT hold ms.mu — append takes it.
 func (ms *MemoryStore) append(rec MemoryRecord) error {
+	return ms.appendRecords(rec)
+}
+
+func (ms *MemoryStore) appendRecords(records ...MemoryRecord) error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	f, err := os.OpenFile(ms.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	var payload bytes.Buffer
+	enc := json.NewEncoder(&payload)
+	for i := range records {
+		if err := enc.Encode(&records[i]); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(ms.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
+	_ = f.Chmod(0600)
 	defer f.Close()
-	if err := json.NewEncoder(f).Encode(&rec); err != nil {
+	if _, err := f.Write(payload.Bytes()); err != nil {
 		return err
 	}
-	ms.records = append(ms.records, rec)
-	if rec.ID != "" {
-		ms.byID[rec.ID] = len(ms.records) - 1
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	ms.ensureActiveLocked()
+	for _, rec := range records {
+		ms.records = append(ms.records, rec)
+		if rec.ID != "" {
+			ms.byID[rec.ID] = len(ms.records) - 1
+		}
+		ms.applyActiveRecordLocked(rec)
 	}
 	return nil
 }
@@ -424,10 +498,9 @@ func (ms *MemoryStore) Remember(content string, tags []string, weight float64) (
 }
 
 // RememberWithID is Remember with a caller-supplied id instead of a
-// freshly-minted ULID. Required for deterministic ids — the platform
-// uses this to push skill-as-memory records keyed by the skill's
-// primary key, so re-pushing the same skill upserts via Supersede
-// rather than creating a duplicate row.
+// freshly-minted ULID. Required for deterministic platform-managed
+// records, where re-pushing the same source upserts via Supersede rather
+// than creating a duplicate row.
 //
 // Errors if id is empty (use Remember) or if the id already exists
 // (caller should call HasID first and route to Supersede). Refusing
@@ -492,9 +565,10 @@ func (ms *MemoryStore) UpsertTargetID(id string) (string, bool) {
 	if _, ok := ms.byID[id]; !ok {
 		return "", false
 	}
-	tombstoned, superseded := ms.deadIDs()
-	for _, r := range ms.records {
-		if r.Tombstone || tombstoned[r.ID] || superseded[r.ID] {
+	ms.ensureActiveLocked()
+	for _, activeID := range ms.activeOrder {
+		r, ok := ms.active[activeID]
+		if !ok {
 			continue
 		}
 		if r.ID == id || ms.supersedesLocked(r.ID, id) {
@@ -569,16 +643,8 @@ func (ms *MemoryStore) Supersede(oldID, content string, tags []string, weight fl
 		IDTarget:  oldID,
 		Reason:    "superseded by " + newRec.ID + ": " + reason,
 	}
-	if err := ms.append(newRec); err != nil {
+	if err := ms.appendRecords(newRec, tomb); err != nil {
 		return "", err
-	}
-	if err := ms.append(tomb); err != nil {
-		// New memory landed; tombstone failed. The supersede field
-		// on the new memory still flags the old as superseded at
-		// read time (deadIDs collects both signals), so we're
-		// not in an inconsistent state — just missing the
-		// audit-trail line. Log and move on.
-		logMsg("MEMORY", fmt.Sprintf("supersede: tombstone write failed for %s: %v (supersede field still applies)", oldID, err))
 	}
 	logMsg("MEMORY", fmt.Sprintf("supersede: %s → %s (%s)", oldID, newRec.ID, reason))
 	return newRec.ID, nil
@@ -638,16 +704,40 @@ func (ms *MemoryStore) Search(query string, limit int) []MemoryRecord {
 // Used by buildDynamicTurnContext for auto-injection at every turn. N
 // is typically 3–5 with a token-budget cap applied by the caller.
 func (ms *MemoryStore) Recall(query string, n int) []MemoryRecord {
+	matches := ms.RecallMatches(query, n)
+	out := make([]MemoryRecord, len(matches))
+	for i, match := range matches {
+		out[i] = match.Record
+	}
+	return out
+}
+
+// MemoryRecallMatch retains scoring metadata for request telemetry. All
+// records intentionally share one path regardless of their free-form tags.
+type MemoryRecallMatch struct {
+	Record MemoryRecord
+	Score  float64
+	Signal float64
+}
+
+// RecallMatches is Recall with score metadata and content deduplication.
+func (ms *MemoryStore) RecallMatches(query string, n int) []MemoryRecallMatch {
 	if n <= 0 {
 		n = 5
 	}
 	scored := ms.scoreActive(query, scoreOpts{useEmbedding: ms.backend != nil, applyDecay: true})
-	if len(scored) > n {
-		scored = scored[:n]
-	}
-	out := make([]MemoryRecord, len(scored))
-	for i, s := range scored {
-		out[i] = s.rec
+	out := make([]MemoryRecallMatch, 0, min(n, len(scored)))
+	seenContent := make(map[string]struct{}, len(scored))
+	for _, item := range scored {
+		contentKey := normalizeMemoryContent(item.rec.Content)
+		if _, duplicate := seenContent[contentKey]; duplicate {
+			continue
+		}
+		seenContent[contentKey] = struct{}{}
+		out = append(out, MemoryRecallMatch{Record: item.rec, Score: item.score, Signal: item.signal})
+		if len(out) == n {
+			break
+		}
 	}
 	return out
 }
@@ -658,8 +748,9 @@ type scoreOpts struct {
 }
 
 type scoredRec struct {
-	rec   MemoryRecord
-	score float64
+	rec    MemoryRecord
+	score  float64
+	signal float64
 }
 
 // scoreActive ranks all currently-active memories by relevance to a
@@ -690,7 +781,7 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 			queryEmb = emb
 		}
 	}
-	queryTokens := tokenize(query)
+	queryTokens := meaningfulMemoryTokens(tokenize(query))
 	now := time.Now().UTC()
 
 	out := make([]scoredRec, 0, len(active))
@@ -698,13 +789,17 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 		// Signal: prefer embedding cosine when both sides have one
 		// of matching dim; fall back to lexical otherwise.
 		var signal float64
-		if queryEmb != nil && len(r.Embedding) == len(queryEmb) {
+		usedEmbedding := queryEmb != nil && len(r.Embedding) == len(queryEmb)
+		if usedEmbedding {
 			signal = cosineSimilarity(queryEmb, r.Embedding)
 			if signal < 0 {
 				signal = 0
 			}
 		} else {
 			signal = lexicalScore(queryTokens, r)
+		}
+		if signal <= 0 || (usedEmbedding && signal < minEmbeddingRecallSimilarity) {
+			continue
 		}
 
 		// Weight floor at 0.05 so a memory with weight=0 doesn't
@@ -723,12 +818,18 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 		}
 
 		out = append(out, scoredRec{
-			rec:   r,
-			score: signal * w * decay,
+			rec:    r,
+			score:  signal * w * decay,
+			signal: signal,
 		})
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].score > out[j].score })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].score == out[j].score {
+			return out[i].rec.ID < out[j].rec.ID
+		}
+		return out[i].score > out[j].score
+	})
 	return out
 }
 
@@ -743,13 +844,14 @@ func (ms *MemoryStore) BuildContext(records []MemoryRecord) string {
 	var buf bytes.Buffer
 	buf.WriteString("[memories — surfaced because they may be relevant; check the dates, do not treat as the user's current input]\n")
 	for _, r := range records {
-		age := time.Since(r.TS)
 		tagStr := ""
 		if len(r.Tags) > 0 {
-			tagStr = " [" + strings.Join(r.Tags, ",") + "]"
+			tags := append([]string(nil), r.Tags...)
+			sort.Strings(tags)
+			tagStr = " [" + strings.Join(tags, ",") + "]"
 		}
-		buf.WriteString(fmt.Sprintf("- (%s ago, w=%.2f)%s %s\n",
-			formatAge(age), r.Weight, tagStr, r.Content))
+		buf.WriteString(fmt.Sprintf("- (remembered %s, w=%.2f)%s %s\n",
+			r.TS.UTC().Format("2006-01-02"), r.Weight, tagStr, r.Content))
 	}
 	return buf.String()
 }
@@ -901,6 +1003,34 @@ func lexicalScore(queryTokens map[string]int, r MemoryRecord) float64 {
 		return 0
 	}
 	return float64(hits) / float64(total)
+}
+
+var memoryRecallStopwords = map[string]struct{}{
+	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "at": {}, "be": {}, "been": {},
+	"but": {}, "by": {}, "do": {}, "for": {}, "from": {}, "had": {}, "has": {}, "have": {},
+	"he": {}, "her": {}, "his": {}, "i": {}, "if": {}, "in": {}, "is": {}, "it": {}, "its": {},
+	"me": {}, "my": {}, "of": {}, "on": {}, "or": {}, "our": {}, "she": {}, "that": {}, "the": {},
+	"their": {}, "them": {}, "they": {}, "this": {}, "to": {}, "was": {}, "we": {}, "were": {},
+	"what": {}, "when": {}, "where": {}, "which": {}, "who": {}, "will": {}, "with": {}, "you": {},
+	"your": {},
+}
+
+func meaningfulMemoryTokens(tokens map[string]int) map[string]int {
+	filtered := make(map[string]int, len(tokens))
+	for token, count := range tokens {
+		if len(token) < 3 {
+			continue
+		}
+		if _, stopword := memoryRecallStopwords[token]; stopword {
+			continue
+		}
+		filtered[token] = count
+	}
+	return filtered
+}
+
+func normalizeMemoryContent(content string) string {
+	return strings.ToLower(strings.Join(strings.Fields(content), " "))
 }
 
 // newULID returns a sortable, globally-unique id. We don't pull in a

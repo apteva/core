@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestGeminiToolParametersAddsArrayItems(t *testing.T) {
 	schema := map[string]any{
@@ -37,5 +40,13 @@ func TestGeminiToolParametersAddsArrayItems(t *testing.T) {
 	originalTags := schema["properties"].(map[string]any)["tags"].(map[string]any)
 	if _, ok := originalTags["items"]; ok {
 		t.Fatal("geminiToolParameters mutated the original schema")
+	}
+}
+
+func TestParseGeminiStreamReturnsScannerError(t *testing.T) {
+	stream := strings.NewReader("data: " + strings.Repeat("x", 1024*1024+1))
+	_, err := parseGeminiStream(stream, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "stream read error") {
+		t.Fatalf("error = %v", err)
 	}
 }

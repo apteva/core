@@ -2,9 +2,64 @@ package core
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestTelemetryLiveForwardBatchesBurstIntoOneRequest(t *testing.T) {
+	requests := make(chan []TelemetryEvent, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var events []TelemetryEvent
+		if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+			t.Errorf("decode live batch: %v", err)
+		}
+		requests <- events
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	tel := &Telemetry{
+		forwardCh:        make(chan TelemetryEvent, 100),
+		quit:             make(chan struct{}),
+		telemetryLiveURL: server.URL,
+	}
+	for i := 0; i < 20; i++ {
+		tel.forwardCh <- TelemetryEvent{ID: string(rune('a' + i)), Type: "llm.chunk"}
+	}
+	go tel.liveForwardLoop()
+	defer close(tel.quit)
+	select {
+	case events := <-requests:
+		if len(events) != 20 {
+			t.Fatalf("live batch size = %d, want 20", len(events))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live telemetry batch was not posted")
+	}
+	select {
+	case extra := <-requests:
+		t.Fatalf("burst produced an extra request with %d events", len(extra))
+	case <-time.After(75 * time.Millisecond):
+	}
+}
+
+func TestTelemetryNotificationsBroadcastToAllSubscribers(t *testing.T) {
+	tel := &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})}
+	first, cancelFirst := tel.Subscribe()
+	defer cancelFirst()
+	second, cancelSecond := tel.Subscribe()
+	defer cancelSecond()
+	tel.EmitLive("llm.chunk", "main", map[string]string{"text": "x"})
+	for i, ch := range []<-chan struct{}{first, second} {
+		select {
+		case <-ch:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("subscriber %d was not notified", i)
+		}
+	}
+}
 
 func TestTelemetry_Emit(t *testing.T) {
 	tel := &Telemetry{
@@ -14,7 +69,7 @@ func TestTelemetry_Emit(t *testing.T) {
 
 	tel.Emit("llm.done", "main", LLMDoneData{
 		Model:    "test-model",
-		TokensIn: 100, TokensOut: 50,
+		TokensIn: 100, TokensCached: 40, CacheWriteTokens: 25, TokensOut: 50,
 		DurationMs:      1500,
 		Iteration:       1,
 		NativeToolCount: 12,
@@ -48,6 +103,9 @@ func TestTelemetry_Emit(t *testing.T) {
 	}
 	if data.TokensIn != 100 {
 		t.Errorf("expected 100, got %d", data.TokensIn)
+	}
+	if data.TokensCached != 40 || data.CacheWriteTokens != 25 {
+		t.Errorf("cache usage missing from llm.done: %+v", data)
 	}
 	if data.NativeToolCount != 12 || data.ActiveMCPCount != 3 || data.ToolMode != "discovery" {
 		t.Errorf("cache diagnostics missing from llm.done: %+v", data)

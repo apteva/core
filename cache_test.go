@@ -327,6 +327,9 @@ func TestIntegration_CacheHitRatio_OpenAICodex(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live Codex cache test in short mode")
 	}
+	if os.Getenv("RUN_CODEX_CACHE_SMOKE") != "1" {
+		t.Skip("set RUN_CODEX_CACHE_SMOKE=1 to run the paid Codex cache smoke")
+	}
 	loadIntegrationEnv()
 	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
 	if token == "" {

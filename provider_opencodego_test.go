@@ -95,12 +95,12 @@ func TestIntegration_OpenCodeGo_NativeToolCalls(t *testing.T) {
 // that already contains an assistant tool_calls turn. So this test
 // runs a real two-turn sequence:
 //
-//   1. user → "what's 17 * 23"  (with a calc tool defined)
-//   2. capture the model's tool_call response
-//   3. send turn 2: prior assistant message (carrying the tool_call)
-//      + a tool result + a follow-up user message
-//   4. assert no 400, and that the model can still produce a coherent
-//      answer
+//  1. user → "what's 17 * 23"  (with a calc tool defined)
+//  2. capture the model's tool_call response
+//  3. send turn 2: prior assistant message (carrying the tool_call)
+//     + a tool result + a follow-up user message
+//  4. assert no 400, and that the model can still produce a coherent
+//     answer
 //
 // If toOpenAIMessages omits `content` from the assistant turn in
 // step 3, OpenCode Go returns 400 and the test fails on Chat error.
@@ -198,6 +198,9 @@ func getOpenCodeGoKey(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
+	}
+	if os.Getenv("RUN_LLM_INTEGRATION_TESTS") != "1" {
+		t.Skip("set RUN_LLM_INTEGRATION_TESTS=1 to run paid live-provider integration tests")
 	}
 	godotenv.Load()
 	key := os.Getenv("OPENCODE_GO_API_KEY")

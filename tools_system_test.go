@@ -8,6 +8,41 @@ import (
 	"testing"
 )
 
+func TestSkillWriteIsNotACoreToolAndSkillFilesAreNotPromptLoaded(t *testing.T) {
+	t.Chdir(t.TempDir())
+	registry := NewToolRegistry("")
+	registerSystemTools(registry, &MemoryStore{path: memoryFile, byID: map[string]int{}})
+	if tool := registry.Get("skill_write"); tool != nil {
+		t.Fatalf("skill_write remains registered in core: %+v", tool)
+	}
+	if err := os.MkdirAll("skills", 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("skills", "server-owned.md"), []byte("SERVER_SKILL_SENTINEL"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prompt := buildSystemPrompt("Idle.", ModeAutonomous, registry, "", nil, nil, nil, nil)
+	if strings.Contains(prompt, "SERVER_SKILL_SENTINEL") || strings.Contains(prompt, "[LEARNED SKILLS") {
+		t.Fatalf("server-owned skill file leaked into core prompt: %q", prompt)
+	}
+}
+
+func TestReadTailLinesBoundsLargeHistoryAndKeepsOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	largeOldPrefix := strings.Repeat("old-data", 1<<18) + "\n"
+	data := largeOldPrefix + "latest-one\nlatest-two\n"
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := readTailLines(path, 2, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 || lines[0] != "latest-one" || lines[1] != "latest-two" {
+		t.Fatalf("tail lines = %#v", lines)
+	}
+}
+
 // TestReviewHistory_ReturnsAllPlantedLines verifies the tool actually
 // hands the unconscious every line we planted, not a truncated preview.
 // The previous integration-test debugging suggested the model was

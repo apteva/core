@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 const defaultOpenAIPromptCacheRetention = "24h"
@@ -15,13 +17,42 @@ type openAIPromptCacheHints struct {
 	Retention string
 }
 
+type openAIPromptCacheState struct {
+	mu       sync.RWMutex
+	disabled bool
+}
+
+func (s *openAIPromptCacheState) enabled() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.disabled
+}
+
+func (s *openAIPromptCacheState) disable() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.disabled = true
+	s.mu.Unlock()
+}
+
 func openAIPromptCacheHintsFor(providerName, model, stablePrefix string, tools any) openAIPromptCacheHints {
 	if !openAIPromptCacheEnabled(providerName) {
 		return openAIPromptCacheHints{}
 	}
-	retention := strings.TrimSpace(os.Getenv("APTEVA_OPENAI_PROMPT_CACHE_RETENTION"))
-	if retention == "" {
-		retention = defaultOpenAIPromptCacheRetention
+	// The ChatGPT Codex endpoint does not implement the public API's legacy
+	// retention field. GPT-5.6+ deprecates it on the public API as well; both
+	// paths still benefit from a stable prompt_cache_key and automatic caching.
+	retention := ""
+	if providerName != "openai-codex" && !openAIModelUsesModernPromptCache(model) {
+		retention = strings.TrimSpace(os.Getenv("APTEVA_OPENAI_PROMPT_CACHE_RETENTION"))
+		if retention == "" {
+			retention = defaultOpenAIPromptCacheRetention
+		}
 	}
 
 	h := sha256.New()
@@ -42,6 +73,36 @@ func openAIPromptCacheHintsFor(providerName, model, stablePrefix string, tools a
 		Key:       "apteva-v1-" + hex.EncodeToString(sum[:16]),
 		Retention: retention,
 	}
+}
+
+func openAIModelUsesModernPromptCache(model string) bool {
+	value := strings.ToLower(strings.TrimSpace(model))
+	idx := strings.Index(value, "gpt-")
+	if idx < 0 {
+		return false
+	}
+	version := value[idx+len("gpt-"):]
+	majorText, rest, found := strings.Cut(version, ".")
+	major, err := strconv.Atoi(leadingDigits(majorText))
+	if err != nil {
+		return false
+	}
+	if major > 5 {
+		return true
+	}
+	if major < 5 || !found {
+		return false
+	}
+	minor, err := strconv.Atoi(leadingDigits(rest))
+	return err == nil && minor >= 6
+}
+
+func leadingDigits(value string) string {
+	end := 0
+	for end < len(value) && value[end] >= '0' && value[end] <= '9' {
+		end++
+	}
+	return value[:end]
 }
 
 func openAIPromptCacheEnabled(providerName string) bool {

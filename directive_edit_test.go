@@ -107,6 +107,24 @@ func TestApplyDirectiveEditSectionAppendExisting(t *testing.T) {
 	}
 }
 
+func TestApplyDirectiveEditSectionAppendStripsMatchingHeading(t *testing.T) {
+	got, summary, err := applyDirectiveEdit("# Goals\n- Ship", map[string]string{
+		"edit_mode": "section_append",
+		"section":   "Goals",
+		"content":   "# Goals\n\n- Keep tests green",
+	})
+	if err != nil {
+		t.Fatalf("applyDirectiveEdit error: %v", err)
+	}
+	want := "# Goals\n- Ship\n- Keep tests green"
+	if got != want {
+		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+	if !strings.Contains(summary, `warning: removed 1 redundant "Goals" heading(s)`) {
+		t.Fatalf("summary = %q", summary)
+	}
+}
+
 func TestApplyDirectiveEditSectionReplace(t *testing.T) {
 	got, _, err := applyDirectiveEdit("# Schedule\n- old\n# Goals\n- Ship", map[string]string{
 		"edit_mode": "section_replace",
@@ -119,6 +137,71 @@ func TestApplyDirectiveEditSectionReplace(t *testing.T) {
 	want := "# Schedule\n- daily_check: 07:30 Europe/Madrid\n# Goals\n- Ship"
 	if got != want {
 		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestApplyDirectiveEditSectionReplaceStripsMatchingHeading(t *testing.T) {
+	got, summary, err := applyDirectiveEdit("# Schedule\n- old\n# Goals\n- Ship", map[string]string{
+		"edit_mode": "section_replace",
+		"section":   "Schedule",
+		"content":   "## Schedule ##\n- daily_check: 07:30 Europe/Madrid",
+	})
+	if err != nil {
+		t.Fatalf("applyDirectiveEdit error: %v", err)
+	}
+	want := "# Schedule\n- daily_check: 07:30 Europe/Madrid\n# Goals\n- Ship"
+	if got != want {
+		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+	if !strings.Contains(summary, `warning: removed 1 redundant "Schedule" heading(s)`) {
+		t.Fatalf("summary = %q", summary)
+	}
+}
+
+func TestApplyDirectiveEditSectionReplaceConsolidatesDuplicateSections(t *testing.T) {
+	before := "# Schedule\n- old first\n# Goals\n- Ship\n# Schedule\n- stale duplicate\n# Notes\n- Keep"
+	got, summary, err := applyDirectiveEdit(before, map[string]string{
+		"edit_mode": "section_replace",
+		"section":   "Schedule",
+		"content":   "- daily_check: 07:30 Europe/Madrid",
+	})
+	if err != nil {
+		t.Fatalf("applyDirectiveEdit error: %v", err)
+	}
+	want := "# Schedule\n- daily_check: 07:30 Europe/Madrid\n# Goals\n- Ship\n# Notes\n- Keep"
+	if got != want {
+		t.Fatalf("directive:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(summary, "warning:") {
+		t.Fatalf("resolved duplicate should not produce a warning: %q", summary)
+	}
+}
+
+func TestApplyDirectiveEditWarnsWhenContentIntroducesDuplicateHeading(t *testing.T) {
+	_, summary, err := applyDirectiveEdit("# Schedule\n- daily\n# Goals\n- Ship", map[string]string{
+		"edit_mode": "section_append",
+		"section":   "Schedule",
+		"content":   "# Goals\n- Added in the wrong section",
+	})
+	if err != nil {
+		t.Fatalf("applyDirectiveEdit error: %v", err)
+	}
+	if !strings.Contains(summary, `warning: directive contains 2 "Goals" headings`) {
+		t.Fatalf("summary = %q", summary)
+	}
+}
+
+func TestApplyDirectiveEditWarnsWhenAppendIntroducesConflictingRule(t *testing.T) {
+	_, summary, err := applyDirectiveEdit("# Schedule\n- daily_check: 09:00 Europe/Madrid", map[string]string{
+		"edit_mode": "section_append",
+		"section":   "Schedule",
+		"content":   "- daily_check: 07:30 Europe/Madrid",
+	})
+	if err != nil {
+		t.Fatalf("applyDirectiveEdit error: %v", err)
+	}
+	if !strings.Contains(summary, `warning: conflicting "daily_check" rules in section "Schedule"`) {
+		t.Fatalf("summary = %q", summary)
 	}
 }
 

@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 )
@@ -33,17 +34,38 @@ const (
 )
 
 // ProviderConfig persists a provider and its model selections.
+type ModelReasoningCapability struct {
+	Effort      string `json:"effort"`
+	Description string `json:"description,omitempty"`
+}
+
+type ModelCapabilities struct {
+	ContextWindow                 int                        `json:"context_window,omitempty"`
+	MaxContextWindow              int                        `json:"max_context_window,omitempty"`
+	EffectiveContextWindowPercent int                        `json:"effective_context_window_percent,omitempty"`
+	DefaultReasoningLevel         string                     `json:"default_reasoning_level,omitempty"`
+	SupportedReasoningLevels      []ModelReasoningCapability `json:"supported_reasoning_levels,omitempty"`
+	InputModalities               []string                   `json:"input_modalities,omitempty"`
+	SupportsParallelToolCalls     *bool                      `json:"supports_parallel_tool_calls,omitempty"`
+	SupportsReasoningSummaries    *bool                      `json:"supports_reasoning_summaries,omitempty"`
+	SupportsImageDetailOriginal   *bool                      `json:"supports_image_detail_original,omitempty"`
+	SupportsSearchTool            *bool                      `json:"supports_search_tool,omitempty"`
+}
+
 type ProviderConfig struct {
-	Name          string            `json:"name"`                     // "google", "openai", "anthropic", "fireworks", "ollama", "openai-realtime"
-	Default       bool              `json:"default,omitempty"`        // true = default provider (first match wins)
-	Models        map[string]string `json:"models,omitempty"`         // "large" → model ID, "medium" → ..., "small" → ...
-	BuiltinTools  []string          `json:"builtin_tools,omitempty"`  // e.g. ["code_execution"]
-	RealtimeVoice string            `json:"realtime_voice,omitempty"` // default voice for realtime providers (e.g. "alloy")
+	Name              string                       `json:"name"`                         // "google", "openai", "anthropic", "fireworks", "ollama", "openai-realtime"
+	Default           bool                         `json:"default,omitempty"`            // true = default provider (first match wins)
+	Models            map[string]string            `json:"models,omitempty"`             // "large" → model ID, "medium" → ..., "small" → ...
+	ModelCapabilities map[string]ModelCapabilities `json:"model_capabilities,omitempty"` // selected model metadata keyed by model ID
+	BuiltinTools      []string                     `json:"builtin_tools,omitempty"`      // e.g. ["code_execution"]
+	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "alloy")
 }
 
 type Config struct {
 	mu              sync.RWMutex
+	saveMu          sync.Mutex
 	path            string
+	loadErr         error
 	Directive       string                 `json:"directive"`
 	Mode            RunMode                `json:"mode,omitempty"`
 	Unconscious     bool                   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
@@ -60,18 +82,23 @@ func NewConfig() *Config {
 		path:      configFile,
 		Directive: "Idle. Waiting for configuration via directive.",
 	}
-	c.load()
+	c.loadErr = c.load()
 	return c
 }
 
-func (c *Config) load() {
+func (c *Config) load() error {
 	data, err := os.ReadFile(c.path)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	json.Unmarshal(data, c)
+	if err := json.Unmarshal(data, c); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
 
 	// Migrate legacy single Provider → Providers array
 	if c.Provider != nil && c.Provider.Name != "" && len(c.Providers) == 0 {
@@ -79,16 +106,70 @@ func (c *Config) load() {
 		c.Providers = []ProviderConfig{*c.Provider}
 		c.Provider = nil
 	}
+	return nil
+}
+
+func (c *Config) LoadError() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.loadErr
 }
 
 func (c *Config) Save() error {
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	data, err := json.MarshalIndent(c, "", "  ")
+	path := c.path
+	c.mu.RUnlock()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, data, 0644)
+	if path == "" {
+		return nil
+	}
+	return atomicWriteFile(path, data, 0600)
+}
+
+// update applies a configuration mutation and persists it as one serialized
+// transaction. If the write fails, the previous in-memory configuration is
+// restored so callers never observe a setting that was not durable.
+func (c *Config) update(fn func()) error {
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+
+	c.mu.Lock()
+	before, err := json.Marshal(c)
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	fn()
+	after, err := json.MarshalIndent(c, "", "  ")
+	path := c.path
+	c.mu.Unlock()
+	if err != nil {
+		c.restore(before)
+		return err
+	}
+	if path == "" {
+		return nil
+	}
+	if err := atomicWriteFile(path, after, 0600); err != nil {
+		c.restore(before)
+		return err
+	}
+	return nil
+}
+
+func (c *Config) restore(data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// The byte slice came from this exact type immediately before mutation.
+	// Preserve runtime-only fields, which are intentionally absent from JSON.
+	path, loadErr := c.path, c.loadErr
+	_ = json.Unmarshal(data, c)
+	c.path, c.loadErr = path, loadErr
 }
 
 func (c *Config) GetDirective() string {
@@ -110,77 +191,78 @@ func (c *Config) RealtimeEnabledFlag() bool {
 	return c.RealtimeEnabled
 }
 
-func (c *Config) SetDirective(d string) {
-	c.mu.Lock()
-	c.Directive = d
-	c.mu.Unlock()
-	c.Save()
+func (c *Config) SetDirective(d string) error {
+	return c.update(func() { c.Directive = d })
 }
 
-func (c *Config) ClearThreads() {
-	c.mu.Lock()
-	c.Threads = nil
-	c.mu.Unlock()
-	c.Save()
+func (c *Config) ClearThreads() error {
+	return c.update(func() { c.Threads = nil })
 }
 
-func (c *Config) SaveThread(pt PersistentThread) {
-	c.mu.Lock()
-	// Update if exists, otherwise append
-	found := false
-	for i, t := range c.Threads {
-		if t.ID == pt.ID {
-			c.Threads[i] = pt
-			found = true
-			break
+func (c *Config) SaveThread(pt PersistentThread) error {
+	return c.update(func() {
+		found := false
+		for i, t := range c.Threads {
+			if t.ID == pt.ID {
+				c.Threads[i] = pt
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
+		if !found {
+			c.Threads = append(c.Threads, pt)
+		}
+	})
+}
+
+func (c *Config) RemoveThread(id string) error {
+	return c.update(func() {
+		for i, t := range c.Threads {
+			if t.ID == id {
+				c.Threads = append(c.Threads[:i], c.Threads[i+1:]...)
+				break
+			}
+		}
+	})
+}
+
+func (c *Config) RenameThread(oldID string, pt PersistentThread) error {
+	return c.update(func() {
+		for i, t := range c.Threads {
+			if t.ID == oldID {
+				c.Threads[i] = pt
+				return
+			}
+		}
 		c.Threads = append(c.Threads, pt)
-	}
-	c.mu.Unlock()
-	c.Save()
+	})
 }
 
-func (c *Config) RemoveThread(id string) {
-	c.mu.Lock()
-	for i, t := range c.Threads {
-		if t.ID == id {
-			c.Threads = append(c.Threads[:i], c.Threads[i+1:]...)
-			break
+func (c *Config) SaveMCPServer(cfg MCPServerConfig) error {
+	return c.update(func() {
+		found := false
+		for i, s := range c.MCPServers {
+			if s.Name == cfg.Name {
+				c.MCPServers[i] = cfg
+				found = true
+				break
+			}
 		}
-	}
-	c.mu.Unlock()
-	c.Save()
+		if !found {
+			c.MCPServers = append(c.MCPServers, cfg)
+		}
+	})
 }
 
-func (c *Config) SaveMCPServer(cfg MCPServerConfig) {
-	c.mu.Lock()
-	found := false
-	for i, s := range c.MCPServers {
-		if s.Name == cfg.Name {
-			c.MCPServers[i] = cfg
-			found = true
-			break
+func (c *Config) RemoveMCPServer(name string) error {
+	return c.update(func() {
+		for i, s := range c.MCPServers {
+			if s.Name == name {
+				c.MCPServers = append(c.MCPServers[:i], c.MCPServers[i+1:]...)
+				break
+			}
 		}
-	}
-	if !found {
-		c.MCPServers = append(c.MCPServers, cfg)
-	}
-	c.mu.Unlock()
-	c.Save()
-}
-
-func (c *Config) RemoveMCPServer(name string) {
-	c.mu.Lock()
-	for i, s := range c.MCPServers {
-		if s.Name == name {
-			c.MCPServers = append(c.MCPServers[:i], c.MCPServers[i+1:]...)
-			break
-		}
-	}
-	c.mu.Unlock()
-	c.Save()
+	})
 }
 
 func (c *Config) GetThreads() []PersistentThread {
@@ -208,11 +290,8 @@ func (c *Config) GetMode() RunMode {
 	return c.Mode
 }
 
-func (c *Config) SetMode(m RunMode) {
-	c.mu.Lock()
-	c.Mode = m
-	c.mu.Unlock()
-	c.Save()
+func (c *Config) SetMode(m RunMode) error {
+	return c.update(func() { c.Mode = m })
 }
 
 func (c *Config) GetExecutionControl() ExecutionControlConfig {
@@ -225,14 +304,11 @@ func (c *Config) GetExecutionControl() ExecutionControlConfig {
 	return out
 }
 
-func (c *Config) SetExecutionControl(ec ExecutionControlConfig) {
-	c.mu.Lock()
+func (c *Config) SetExecutionControl(ec ExecutionControlConfig) error {
 	if len(ec.Breakpoints) > 0 {
 		ec.Breakpoints = append([]string(nil), ec.Breakpoints...)
 	}
-	c.Execution = ec
-	c.mu.Unlock()
-	c.Save()
+	return c.update(func() { c.Execution = ec })
 }
 
 // GetProviders returns a copy of the providers list.
@@ -248,6 +324,7 @@ func (c *Config) GetProviders() []ProviderConfig {
 				cp.Models[k] = v
 			}
 		}
+		cp.ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
 		out[i] = cp
 	}
 	return out
@@ -290,91 +367,175 @@ func (c *Config) GetProviderByName(name string) *ProviderConfig {
 }
 
 // SetProvider adds or updates a provider in the list. If it's the only one, marks it default.
-func (c *Config) SetProvider(pc *ProviderConfig) {
-	c.mu.Lock()
-	found := false
-	for i, p := range c.Providers {
-		if p.Name == pc.Name {
-			c.Providers[i] = *pc
-			found = true
-			break
+func (c *Config) SetProvider(pc *ProviderConfig) error {
+	return c.update(func() {
+		found := false
+		for i, p := range c.Providers {
+			if p.Name == pc.Name {
+				c.Providers[i] = *pc
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		c.Providers = append(c.Providers, *pc)
-	}
-	// If only one provider, make it default
-	if len(c.Providers) == 1 {
-		c.Providers[0].Default = true
-	}
-	c.Provider = nil // clear legacy field
-	c.mu.Unlock()
-	c.Save()
+		if !found {
+			c.Providers = append(c.Providers, *pc)
+		}
+		if len(c.Providers) == 1 {
+			c.Providers[0].Default = true
+		}
+		c.Provider = nil
+	})
+}
+
+func (c *Config) ReplaceProviders(providers []ProviderConfig) error {
+	providers = cloneProviderConfigs(providers)
+	return c.update(func() {
+		c.Providers = providers
+		c.Provider = nil
+	})
 }
 
 // SetProviderName adds or updates a provider by name with default flag.
-func (c *Config) SetProviderName(name string) {
-	c.mu.Lock()
-	found := false
-	for i, p := range c.Providers {
-		if p.Name == name {
-			found = true
-			_ = i
-			break
+func (c *Config) SetProviderName(name string) error {
+	return c.update(func() {
+		found := false
+		for _, p := range c.Providers {
+			if p.Name == name {
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		pc := ProviderConfig{Name: name}
-		if len(c.Providers) == 0 {
-			pc.Default = true
+		if !found {
+			pc := ProviderConfig{Name: name}
+			if len(c.Providers) == 0 {
+				pc.Default = true
+			}
+			c.Providers = append(c.Providers, pc)
 		}
-		c.Providers = append(c.Providers, pc)
-	}
-	c.Provider = nil
-	c.mu.Unlock()
-	c.Save()
+		c.Provider = nil
+	})
 }
 
 // SetProviderModel updates a single model tier for a provider (default if not specified).
-func (c *Config) SetProviderModel(tier string, modelID string) {
-	c.mu.Lock()
-	if len(c.Providers) == 0 {
-		c.Providers = []ProviderConfig{{Name: "unknown", Default: true}}
-	}
-	// Update the default provider
-	for i, p := range c.Providers {
-		if p.Default || i == 0 {
-			if c.Providers[i].Models == nil {
-				c.Providers[i].Models = make(map[string]string)
-			}
-			c.Providers[i].Models[tier] = modelID
-			break
+func (c *Config) SetProviderModel(tier string, modelID string) error {
+	return c.update(func() {
+		if len(c.Providers) == 0 {
+			c.Providers = []ProviderConfig{{Name: "unknown", Default: true}}
 		}
-	}
-	c.Provider = nil
-	c.mu.Unlock()
-	c.Save()
+		for i, p := range c.Providers {
+			if p.Default || i == 0 {
+				if c.Providers[i].Models == nil {
+					c.Providers[i].Models = make(map[string]string)
+				}
+				c.Providers[i].Models[tier] = modelID
+				break
+			}
+		}
+		c.Provider = nil
+	})
 }
 
 // SetDefaultProvider marks a provider as default (clears default on others).
-func (c *Config) SetDefaultProvider(name string) {
-	c.mu.Lock()
-	for i := range c.Providers {
-		c.Providers[i].Default = c.Providers[i].Name == name
-	}
-	c.mu.Unlock()
-	c.Save()
+func (c *Config) SetDefaultProvider(name string) error {
+	return c.update(func() {
+		for i := range c.Providers {
+			c.Providers[i].Default = c.Providers[i].Name == name
+		}
+	})
 }
 
 // RemoveProvider removes a provider by name.
-func (c *Config) RemoveProvider(name string) {
-	c.mu.Lock()
-	for i, p := range c.Providers {
-		if p.Name == name {
-			c.Providers = append(c.Providers[:i], c.Providers[i+1:]...)
-			break
+func (c *Config) RemoveProvider(name string) error {
+	return c.update(func() {
+		for i, p := range c.Providers {
+			if p.Name == name {
+				c.Providers = append(c.Providers[:i], c.Providers[i+1:]...)
+				break
+			}
+		}
+	})
+}
+
+func cloneProviderConfigs(in []ProviderConfig) []ProviderConfig {
+	out := make([]ProviderConfig, len(in))
+	for i, p := range in {
+		out[i] = p
+		out[i].BuiltinTools = append([]string(nil), p.BuiltinTools...)
+		if p.Models != nil {
+			out[i].Models = make(map[string]string, len(p.Models))
+			for tier, model := range p.Models {
+				out[i].Models[tier] = model
+			}
+		}
+		out[i].ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
+	}
+	return out
+}
+
+func cloneModelCapabilitiesMap(in map[string]ModelCapabilities) map[string]ModelCapabilities {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]ModelCapabilities, len(in))
+	for model, caps := range in {
+		caps.SupportedReasoningLevels = append([]ModelReasoningCapability(nil), caps.SupportedReasoningLevels...)
+		caps.InputModalities = append([]string(nil), caps.InputModalities...)
+		out[model] = caps
+	}
+	return out
+}
+
+func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []ProviderConfig {
+	providers = cloneProviderConfigs(providers)
+	index := -1
+	if update.Name != "" {
+		for i := range providers {
+			if providers[i].Name == update.Name {
+				index = i
+				break
+			}
+		}
+	} else {
+		for i := range providers {
+			if providers[i].Default {
+				index = i
+				break
+			}
+		}
+		if index < 0 && len(providers) > 0 {
+			index = 0
 		}
 	}
-	c.mu.Unlock()
-	c.Save()
+	if index < 0 {
+		if update.Name != "" {
+			providers = append(providers, update)
+			if len(providers) == 1 {
+				providers[0].Default = true
+			}
+		}
+		return providers
+	}
+	if update.Name != "" {
+		providers[index].Name = update.Name
+	}
+	if update.Models != nil {
+		if providers[index].Models == nil {
+			providers[index].Models = make(map[string]string)
+		}
+		for tier, model := range update.Models {
+			providers[index].Models[tier] = model
+		}
+	}
+	if update.BuiltinTools != nil {
+		providers[index].BuiltinTools = append([]string(nil), update.BuiltinTools...)
+	}
+	if update.RealtimeVoice != "" {
+		providers[index].RealtimeVoice = update.RealtimeVoice
+	}
+	if update.Default {
+		for i := range providers {
+			providers[i].Default = i == index
+		}
+	}
+	return providers
 }

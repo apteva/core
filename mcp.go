@@ -107,6 +107,7 @@ type MCPServer struct {
 	nextID  atomic.Int64
 	pending map[int64]chan jsonRPCResponse
 	pendMu  sync.Mutex
+	deadErr error
 }
 
 func connectMCP(cfg MCPServerConfig) (*MCPServer, error) {
@@ -139,7 +140,7 @@ func connectMCP(cfg MCPServerConfig) (*MCPServer, error) {
 		scanner: bufio.NewScanner(stdout),
 		pending: make(map[int64]chan jsonRPCResponse),
 	}
-	srv.scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
+	srv.scanner.Buffer(make([]byte, 64*1024), 16<<20)
 
 	// Read responses in background
 	go srv.readLoop()
@@ -181,6 +182,23 @@ func (s *MCPServer) readLoop() {
 		}
 		s.pendMu.Unlock()
 	}
+	err := s.scanner.Err()
+	if err == nil {
+		err = io.EOF
+	}
+	s.failPending(fmt.Errorf("MCP connection closed: %w", err))
+}
+
+func (s *MCPServer) failPending(err error) {
+	s.pendMu.Lock()
+	defer s.pendMu.Unlock()
+	if s.deadErr == nil {
+		s.deadErr = err
+	}
+	for id, ch := range s.pending {
+		ch <- jsonRPCResponse{ID: id, Error: &jsonRPCError{Code: -32000, Message: s.deadErr.Error()}}
+		delete(s.pending, id)
+	}
 }
 
 func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
@@ -188,6 +206,11 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 
 	ch := make(chan jsonRPCResponse, 1)
 	s.pendMu.Lock()
+	if s.deadErr != nil {
+		err := s.deadErr
+		s.pendMu.Unlock()
+		return nil, err
+	}
 	s.pending[id] = ch
 	s.pendMu.Unlock()
 
@@ -204,6 +227,9 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 	s.mu.Unlock()
 
 	if err != nil {
+		s.pendMu.Lock()
+		delete(s.pending, id)
+		s.pendMu.Unlock()
 		return nil, fmt.Errorf("write: %w", err)
 	}
 
@@ -285,9 +311,14 @@ func (s *MCPServer) CallToolTyped(name string, args map[string]string, inputSche
 func (s *MCPServer) GetName() string { return s.Name }
 
 func (s *MCPServer) Close() {
-	s.stdin.Close()
-	s.cmd.Process.Kill()
-	s.cmd.Wait()
+	s.failPending(fmt.Errorf("MCP connection closed"))
+	if s.stdin != nil {
+		_ = s.stdin.Close()
+	}
+	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Kill()
+		_ = s.cmd.Wait()
+	}
 }
 
 // mcpProxyHandler returns a tool handler that proxies calls to an MCP

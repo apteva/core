@@ -37,6 +37,9 @@ func TestIntegration_Kimi_VisionInput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test, skipping in -short")
 	}
+	if os.Getenv("RUN_LLM_INTEGRATION_TESTS") != "1" {
+		t.Skip("set RUN_LLM_INTEGRATION_TESTS=1 to run paid live-provider integration tests")
+	}
 
 	endpoints := []struct {
 		name   string

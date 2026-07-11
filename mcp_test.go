@@ -8,7 +8,58 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestMCPReadFailureImmediatelyFailsPendingAndFutureCalls(t *testing.T) {
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+	defer stdinReader.Close()
+	go io.Copy(io.Discard, stdinReader)
+
+	srv := &MCPServer{
+		Name:    "broken",
+		stdin:   stdinWriter,
+		scanner: bufio.NewScanner(stdoutReader),
+		pending: make(map[int64]chan jsonRPCResponse),
+	}
+	srv.scanner.Buffer(make([]byte, 64*1024), 16<<20)
+	go srv.readLoop()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := srv.call("tools/list", nil)
+		result <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		srv.pendMu.Lock()
+		pending := len(srv.pending)
+		srv.pendMu.Unlock()
+		if pending == 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = stdoutWriter.Close()
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "connection closed") {
+			t.Fatalf("pending call error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending call waited for the three-minute timeout after transport EOF")
+	}
+
+	start := time.Now()
+	if _, err := srv.call("tools/list", nil); err == nil {
+		t.Fatal("future call succeeded on dead MCP connection")
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("future call did not fail immediately")
+	}
+}
 
 // TestCallToolParsesJSONArgs verifies that string values containing JSON arrays
 // and objects are parsed into proper types before being sent over MCP.

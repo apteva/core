@@ -1,3 +1,3 @@
 module mcp-creative
 
-go 1.25.1
+go 1.26.5

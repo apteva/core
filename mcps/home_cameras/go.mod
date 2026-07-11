@@ -1,3 +1,3 @@
 module mcp-home-cameras
 
-go 1.25.1
+go 1.26.5

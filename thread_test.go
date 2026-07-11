@@ -1,6 +1,7 @@
 package core
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -122,6 +123,74 @@ func TestThreadManager_Send(t *testing.T) {
 	ok = thinker.threads.Send("nonexistent", "should fail")
 	if ok {
 		t.Error("expected Send to fail for nonexistent thread")
+	}
+}
+
+func TestThreadManager_SystemThreadsAreOperationalButNotAgentVisible(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+
+	if err := thinker.threads.SpawnWithOpts("worker", "Handle operator work", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	if err := thinker.threads.SpawnWithOpts("unconscious", "Consolidate memories", nil, SpawnOpts{System: true, DeferRun: true}); err != nil {
+		t.Fatalf("spawn unconscious: %v", err)
+	}
+
+	all := thinker.threads.List()
+	if len(all) != 2 {
+		t.Fatalf("List() returned %d threads, want 2", len(all))
+	}
+	if !all[0].System || all[0].ID != "unconscious" {
+		t.Fatalf("system metadata missing from complete list: %+v", all)
+	}
+	visible := thinker.threads.ListAgentVisible()
+	if len(visible) != 1 || visible[0].ID != "worker" {
+		t.Fatalf("ListAgentVisible() = %+v, want only worker", visible)
+	}
+
+	if err := thinker.threads.SendAgentWithParts("unconscious", "store this", nil); err == nil || !strings.Contains(err.Error(), "platform-managed") {
+		t.Fatalf("agent send error = %v, want platform-managed rejection", err)
+	}
+
+	thinker.threads.mu.RLock()
+	unconscious := thinker.threads.threads["unconscious"]
+	thinker.threads.mu.RUnlock()
+	if got := unconscious.Thinker.drainEventTexts(); len(got) != 0 {
+		t.Fatalf("rejected agent send reached system thread: %v", got)
+	}
+
+	if !thinker.threads.Send("unconscious", "runtime wake") {
+		t.Fatal("privileged runtime send should reach system thread")
+	}
+	got := drainEventTextsWait(t, unconscious.Thinker, 1, time.Second)
+	if len(got) != 1 || got[0] != "runtime wake" {
+		t.Fatalf("privileged runtime delivery = %v", got)
+	}
+}
+
+func TestThreadManager_SystemFlagSurvivesPrivilegedUpdateAndRename(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	thinker.config.path = filepath.Join(t.TempDir(), "config.json")
+
+	if err := thinker.threads.SpawnWithOpts("unconscious", "old", nil, SpawnOpts{System: true, DeferRun: true}); err != nil {
+		t.Fatalf("spawn unconscious: %v", err)
+	}
+	if err := thinker.config.SaveThread(PersistentThread{ID: "unconscious", System: true, Directive: "old"}); err != nil {
+		t.Fatalf("persist unconscious: %v", err)
+	}
+	if err := thinker.threads.Update("unconscious", "Memory", "new", nil); err != nil {
+		t.Fatalf("privileged update: %v", err)
+	}
+	if threads := thinker.config.GetThreads(); len(threads) != 1 || !threads[0].System {
+		t.Fatalf("system flag lost after update: %+v", threads)
+	}
+	if err := thinker.threads.Rename("unconscious", "memory-system"); err != nil {
+		t.Fatalf("privileged rename: %v", err)
+	}
+	if threads := thinker.config.GetThreads(); len(threads) != 1 || !threads[0].System || threads[0].ID != "memory-system" {
+		t.Fatalf("system flag lost after rename: %+v", threads)
 	}
 }
 
@@ -290,5 +359,76 @@ func TestToolRegistry_Dispatch(t *testing.T) {
 	_, ok = reg.Dispatch("nonexistent", nil)
 	if ok {
 		t.Error("nonexistent should not dispatch")
+	}
+}
+
+func TestThreadManagerRejectsUnsafeID(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	if err := thinker.threads.SpawnWithOpts("../../outside", "test", nil, SpawnOpts{DeferRun: true}); err == nil {
+		t.Fatal("unsafe thread id was accepted")
+	}
+	if thinker.bus.HasSubscriber("../../outside") {
+		t.Fatal("unsafe thread id reserved an event subscription")
+	}
+}
+
+func TestThreadManagerRejectsDuplicateIDAcrossBranches(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	for _, id := range []string{"leader-a", "leader-b"} {
+		if err := thinker.threads.SpawnWithOpts(id, "lead", []string{"spawn"}, SpawnOpts{DeferRun: true}); err != nil {
+			t.Fatalf("spawn %s: %v", id, err)
+		}
+	}
+	a := thinker.threads.threads["leader-a"]
+	b := thinker.threads.threads["leader-b"]
+	if a.Children == nil || b.Children == nil {
+		t.Fatal("leaders did not receive child managers")
+	}
+	if err := a.Children.SpawnWithOpts("shared-worker", "first", nil, SpawnOpts{Depth: 1, DeferRun: true}); err != nil {
+		t.Fatalf("first branch spawn: %v", err)
+	}
+	if err := b.Children.SpawnWithOpts("shared-worker", "second", nil, SpawnOpts{Depth: 1, DeferRun: true}); err == nil {
+		t.Fatal("duplicate id in a separate branch was accepted")
+	}
+}
+
+func TestThreadManagerRenameMovesIdentityRoutingAndCleanup(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	if err := thinker.threads.SpawnWithOpts("worker-old", "test", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	thread := thinker.threads.threads["worker-old"]
+	if err := thinker.threads.Rename("worker-old", "worker-new"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if thread.ID != "worker-new" || thread.Thinker.threadID != "worker-new" {
+		t.Fatalf("identity not moved: thread=%q thinker=%q", thread.ID, thread.Thinker.threadID)
+	}
+	if thinker.bus.HasSubscriber("worker-old") || !thinker.bus.HasSubscriber("worker-new") {
+		t.Fatal("event route not moved")
+	}
+	if !strings.Contains(thread.Thinker.messages[0].Content, `id="worker-new"`) {
+		t.Fatalf("prompt kept old identity: %q", thread.Thinker.messages[0].Content)
+	}
+	if got := filepath.Base(thread.Thinker.session.path); got != "worker-new.jsonl" {
+		t.Fatalf("session filename = %q", got)
+	}
+	if !thinker.threads.Send("worker-new", "hello after rename") {
+		t.Fatal("send to renamed thread failed")
+	}
+	select {
+	case ev := <-thread.Thinker.sub.C:
+		if ev.Text != "hello after rename" {
+			t.Fatalf("delivered text = %q", ev.Text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renamed thread did not receive message")
+	}
+	thinker.threads.cleanupThread("worker-new")
+	if thinker.threads.Count() != 0 || thinker.bus.HasSubscriber("worker-new") {
+		t.Fatal("cleanup left renamed thread or subscription behind")
 	}
 }

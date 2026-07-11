@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func base64Encode(data []byte) string {
@@ -466,13 +467,20 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		return ChatResponse{}, fmt.Errorf("Gemini API error %d: %s", resp.StatusCode, string(respBody))
 	}
 	logMsg("GEMINI", "streaming response started")
+	idleBody := newIdleReader(resp.Body, streamIdleTimeout(), func() {
+		logMsg("GEMINI", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
+	})
+	defer idleBody.Close()
+	return parseGeminiStream(idleBody, onChunk, onToolChunk)
+}
 
+func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
 	toolCallSeq := 0
 
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(stream)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	for scanner.Scan() {
@@ -529,6 +537,9 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 			usage.CachedTokens = event.UsageMetadata.CachedContentTokenCount
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return ChatResponse{}, fmt.Errorf("Gemini stream read error: %w", err)
+	}
 
 	response := full.String()
 	preview := response
@@ -554,13 +565,17 @@ var imageMimeTypes = map[string]string{
 
 // fetchMediaAsBase64 downloads a URL and returns (base64data, mimeType, error).
 func fetchMediaAsBase64(url string) (string, string, error) {
-	logMsg("GEMINI", fmt.Sprintf("fetching media: %s", url))
-	req, err := http.NewRequest("GET", url, nil)
+	parsed, err := validatePublicHTTPURL(url)
+	if err != nil {
+		return "", "", fmt.Errorf("fetch refused: %w", err)
+	}
+	logMsg("GEMINI", fmt.Sprintf("fetching media: %s://%s%s", parsed.Scheme, parsed.Host, parsed.EscapedPath()))
+	req, err := http.NewRequest("GET", parsed.String(), nil)
 	if err != nil {
 		return "", "", fmt.Errorf("fetch failed: %w", err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AptevaCore/1.0)")
-	resp, err := llmHTTPClient.Do(req)
+	resp, err := newPublicHTTPClient(30*time.Second, 4).Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("fetch failed: %w", err)
 	}
@@ -570,9 +585,13 @@ func fetchMediaAsBase64(url string) (string, string, error) {
 		return "", "", fmt.Errorf("fetch failed: HTTP %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024)) // 20MB max
+	const maxMediaBytes = 20 * 1024 * 1024
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxMediaBytes+1))
 	if err != nil {
 		return "", "", fmt.Errorf("read failed: %w", err)
+	}
+	if len(data) > maxMediaBytes {
+		return "", "", fmt.Errorf("media exceeds %d-byte limit", maxMediaBytes)
 	}
 
 	// Detect MIME from Content-Type header or URL extension

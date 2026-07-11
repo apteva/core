@@ -149,7 +149,11 @@ func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []
 			if perr != nil {
 				return nil, nil, resp.StatusCode, fmt.Errorf("parse Location: %w", perr)
 			}
-			currentURL = base.ResolveReference(target).String()
+			resolved := base.ResolveReference(target)
+			if !sameOriginURL(base, resolved) {
+				return nil, nil, resp.StatusCode, fmt.Errorf("cross-origin MCP redirect refused: %s", resolved.Redacted())
+			}
+			currentURL = resolved.String()
 			continue
 		}
 		respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4_000_000))

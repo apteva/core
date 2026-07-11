@@ -1,3 +1,3 @@
 module github.com/apteva/core/mcps/onboarding
 
-go 1.21
+go 1.26.5

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,19 +12,19 @@ import (
 func newTestThinkerFull() *Thinker {
 	bus := NewEventBus()
 	t := &Thinker{
-		apiKey:    "test",
-		provider:  NewFireworksProvider("test"),
-		messages:  []Message{{Role: "system", Content: "test"}},
-		bus:       bus,
-		sub:       bus.Subscribe("main", 100),
-		pause:     make(chan bool),
-		quit:      make(chan struct{}),
-		rate:      RateSlow,
-		agentRate: RateSlow,
-		memory:    &MemoryStore{path: "/dev/null"},
-		config:    &Config{Directive: "test"},
-		apiLog:    &[]APIEvent{},
-		apiMu:     &sync.RWMutex{},
+		apiKey:      "test",
+		provider:    NewFireworksProvider("test"),
+		messages:    []Message{{Role: "system", Content: "test"}},
+		bus:         bus,
+		sub:         bus.Subscribe("main", 100),
+		pause:       make(chan bool),
+		quit:        make(chan struct{}),
+		rate:        RateSlow,
+		agentRate:   RateSlow,
+		memory:      &MemoryStore{path: "/dev/null"},
+		config:      &Config{Directive: "test"},
+		apiLog:      &[]APIEvent{},
+		apiMu:       &sync.RWMutex{},
 		apiNotify:   make(chan struct{}, 1),
 		threadID:    "main",
 		telemetry:   &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})},
@@ -52,7 +53,6 @@ func drainEventTextsWait(t *testing.T, th *Thinker, want int, timeout time.Durat
 	}
 	return acc
 }
-
 
 func TestExternalEventDetection(t *testing.T) {
 	tests := []struct {
@@ -142,7 +142,11 @@ func TestSubThread_HasBasePrompt(t *testing.T) {
 	thread := thinker.threads.threads["worker"]
 	thinker.threads.mu.RUnlock()
 
-	sysPrompt := thread.Thinker.messages[0].Content
+	context := thread.Thinker.contextSnapshot()
+	if len(context.Messages) == 0 {
+		t.Fatal("missing context snapshot")
+	}
+	sysPrompt := context.Messages[0].Content
 
 	// Should have base thread prompt
 	if !strings.Contains(sysPrompt, "SUB-THREAD") {
@@ -286,7 +290,7 @@ func TestSubThread_KillAll(t *testing.T) {
 }
 
 func TestConfig_PersistentThreads(t *testing.T) {
-	cfg := &Config{path: "/dev/null"}
+	cfg := &Config{path: filepath.Join(t.TempDir(), "config.json")}
 
 	cfg.SaveThread(PersistentThread{ID: "worker-a", Directive: "do stuff", Tools: []string{"web"}})
 	cfg.SaveThread(PersistentThread{ID: "worker-b", Directive: "research", Tools: []string{"web"}})
@@ -322,7 +326,6 @@ func TestConfig_PersistentThreads(t *testing.T) {
 		t.Error("expected 0 after clear")
 	}
 }
-
 
 func TestAPIEvents_Ordering(t *testing.T) {
 	thinker := newTestThinkerFull()

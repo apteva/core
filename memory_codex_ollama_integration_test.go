@@ -74,9 +74,10 @@ func TestIntegration_OllamaEmbeddingMemoryStoreSmoke(t *testing.T) {
 }
 
 // TestIntegration_CodexOllamaUnconsciousMemorySmoke proves the full agent
-// memory path with Codex as the LLM and Ollama as the embedding backend:
-// review_history -> Codex decides memory_remember -> MemoryStore writes a
-// 1024-dim Ollama vector -> later recall can retrieve it.
+// memory path with Codex as the LLM and Ollama as the embedding backend. It
+// enables Config.Unconscious and relies on NewThinker's production auto-spawn
+// and StartAll path: review_history -> Codex decides memory_remember ->
+// MemoryStore writes a vector -> later recall can retrieve it.
 //
 // Run:
 //
@@ -88,9 +89,9 @@ func TestIntegration_CodexOllamaUnconsciousMemorySmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex + Ollama memory smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
-		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set and ~/.codex/auth.json has no access token")
 	}
 
 	dim := configureOllamaEmbeddingTestEnv(t)
@@ -99,6 +100,7 @@ func TestIntegration_CodexOllamaUnconsciousMemorySmoke(t *testing.T) {
 
 	cfg := NewConfig()
 	cfg.Directive = "Test parent. Do not act; the unconscious thread is responsible for memory consolidation."
+	cfg.Unconscious = true
 	cfg.Save()
 
 	provider := NewOpenAICodexProvider(token)
@@ -124,25 +126,12 @@ func TestIntegration_CodexOllamaUnconsciousMemorySmoke(t *testing.T) {
 		t.Fatalf("memory backend dim = %d, want %d", parent.memory.backend.Dim, dim)
 	}
 
-	tools := []string{
-		"review_history", "memory_search", "memory_list",
-		"memory_remember", "memory_supersede", "memory_drop",
-		"skill_write", "pace",
+	parent.threads.mu.RLock()
+	autoSpawned := parent.threads.threads["unconscious"]
+	parent.threads.mu.RUnlock()
+	if autoSpawned == nil || !autoSpawned.Thinker.systemThread {
+		t.Fatal("Config.Unconscious did not auto-spawn the system thread")
 	}
-	if err := parent.threads.SpawnWithOpts(
-		"unconscious",
-		unconsciousDirectiveV2,
-		tools,
-		SpawnOpts{ParentID: "main", Depth: 0, System: true},
-	); err != nil {
-		t.Fatalf("spawn unconscious: %v", err)
-	}
-
-	parent.bus.Publish(Event{
-		Type: EventInbox,
-		To:   "unconscious",
-		Text: "[wake] new history available — consolidate memory now",
-	})
 
 	waitForMemory(t, parent.memory, 8*time.Minute, func(rec MemoryRecord) bool {
 		return len(rec.Embedding) == dim && strings.Contains(strings.ToLower(rec.Content), "ultramarine")

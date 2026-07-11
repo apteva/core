@@ -151,6 +151,24 @@ func TestMCPHTTP_FollowsRedirectAndParsesSSE(t *testing.T) {
 	}
 }
 
+func TestMCPHTTPServerRejectsCrossOriginRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	defer target.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	if _, err := connectMCPHTTP("redirect-test", source.URL); err == nil || !strings.Contains(err.Error(), "cross-origin") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestMCPToolMetaWakeOnResultRegistered(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {

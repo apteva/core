@@ -11,21 +11,30 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 // OpenAINativeProvider uses the OpenAI Responses API for web_search,
 // code_interpreter, and other OpenAI-specific features.
 // For OpenAI-compatible endpoints (Fireworks, Ollama, etc.), use OpenAICompatProvider.
 type OpenAINativeProvider struct {
-	name            string
-	apiKey          string
-	responsesURL    string
-	forceStoreFalse bool
-	runtimeTokenURL string
-	serverAPIKey    string
-	models          map[ModelTier]string
-	builtinTools    []string
-	reasoning       ReasoningSettings
+	name              string
+	apiKey            string
+	responsesURL      string
+	forceStoreFalse   bool
+	runtimeTokenURL   string
+	serverAPIKey      string
+	accountID         string
+	models            map[ModelTier]string
+	modelCapabilities map[string]ModelCapabilities
+	builtinTools      []string
+	reasoning         ReasoningSettings
+	tokenMu           sync.RWMutex
+	refreshMu         sync.Mutex
+	lastTokenRefresh  time.Time
+	cacheStateMu      sync.Mutex
+	cacheState        *openAIPromptCacheState
 }
 
 func NewOpenAINativeProvider(apiKey string) LLMProvider {
@@ -55,6 +64,7 @@ func NewOpenAICodexProvider(accessToken string) LLMProvider {
 		forceStoreFalse: true,
 		runtimeTokenURL: runtimeTokenURL,
 		serverAPIKey:    os.Getenv("APTEVA_API_KEY"),
+		accountID:       strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCOUNT_ID")),
 		models: map[ModelTier]string{
 			ModelLarge:  "gpt-5.5",
 			ModelMedium: "gpt-5.5",
@@ -94,27 +104,78 @@ func (p *OpenAINativeProvider) SetBuiltinTools(tools []string) {
 }
 
 func (p *OpenAINativeProvider) WithBuiltins(builtins []string) LLMProvider {
-	clone := *p
+	clone := p.clone()
 	clone.builtinTools = builtins
-	return &clone
+	return clone
 }
 
 func (p *OpenAINativeProvider) WithReasoning(settings ReasoningSettings) LLMProvider {
-	clone := *p
+	clone := p.clone()
 	clone.reasoning = settings
-	return &clone
+	return clone
+}
+
+func (p *OpenAINativeProvider) clone() *OpenAINativeProvider {
+	cacheState := p.promptCacheState()
+	p.tokenMu.RLock()
+	apiKey := p.apiKey
+	lastRefresh := p.lastTokenRefresh
+	accountID := p.accountID
+	p.tokenMu.RUnlock()
+	return &OpenAINativeProvider{
+		name: p.name, apiKey: apiKey, responsesURL: p.responsesURL,
+		forceStoreFalse: p.forceStoreFalse, runtimeTokenURL: p.runtimeTokenURL,
+		serverAPIKey: p.serverAPIKey, accountID: accountID, models: p.models,
+		modelCapabilities: cloneModelCapabilitiesMap(p.modelCapabilities),
+		builtinTools:      append([]string(nil), p.builtinTools...), reasoning: p.reasoning,
+		lastTokenRefresh: lastRefresh, cacheState: cacheState,
+	}
+}
+
+func (p *OpenAINativeProvider) promptCacheState() *openAIPromptCacheState {
+	p.cacheStateMu.Lock()
+	defer p.cacheStateMu.Unlock()
+	if p.cacheState == nil {
+		p.cacheState = &openAIPromptCacheState{}
+	}
+	return p.cacheState
+}
+
+func (p *OpenAINativeProvider) token() string {
+	p.tokenMu.RLock()
+	defer p.tokenMu.RUnlock()
+	return p.apiKey
+}
+
+func (p *OpenAINativeProvider) account() string {
+	p.tokenMu.RLock()
+	defer p.tokenMu.RUnlock()
+	return p.accountID
 }
 
 func (p *OpenAINativeProvider) requestReasoning(model string) *oaiReasoning {
 	level := normalizeReasoningLevel(p.reasoning.Level)
+	summariesSupported := true
+	if caps, ok := p.modelCapabilities[model]; ok && caps.SupportsReasoningSummaries != nil {
+		summariesSupported = *caps.SupportsReasoningSummaries
+	}
 	if p.Name() == "openai-codex" && level == ReasoningAuto {
-		return &oaiReasoning{Summary: "auto"}
+		if summariesSupported {
+			return &oaiReasoning{Summary: "auto"}
+		}
+		return nil
 	}
 	if level == ReasoningAuto {
 		return nil
 	}
-	out := &oaiReasoning{Effort: openAIReasoningEffort(level, p.Name(), model)}
-	if level != ReasoningNone {
+	effort := openAIReasoningEffort(level, p.Name(), model)
+	if caps, ok := p.modelCapabilities[model]; ok {
+		effort = reasoningEffortForCapabilities(caps, effort)
+	} else {
+		effort = modelReasoningEffort(model, effort)
+	}
+	out := &oaiReasoning{Effort: effort}
+	if level != ReasoningNone && summariesSupported {
 		out.Summary = "auto"
 	}
 	return out
@@ -161,6 +222,7 @@ type oaiResponsesRequest struct {
 	Reasoning            *oaiReasoning  `json:"reasoning,omitempty"`
 	PromptCacheKey       string         `json:"prompt_cache_key,omitempty"`
 	PromptCacheRetention string         `json:"prompt_cache_retention,omitempty"`
+	ParallelToolCalls    *bool          `json:"parallel_tool_calls,omitempty"`
 }
 
 type oaiReasoning struct {
@@ -257,6 +319,10 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		Stream: true,
 	}
 	reqBody.Reasoning = p.requestReasoning(model)
+	if caps, ok := p.modelCapabilities[model]; ok && caps.SupportsParallelToolCalls != nil {
+		value := *caps.SupportsParallelToolCalls
+		reqBody.ParallelToolCalls = &value
+	}
 	if p.forceStoreFalse {
 		store := false
 		reqBody.Store = &store
@@ -267,6 +333,10 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		stablePrefix = p.instructionsFromMessages(messages)
 	}
 	cacheHints := openAIPromptCacheHintsFor(p.Name(), model, stablePrefix, apiTools)
+	cacheState := p.promptCacheState()
+	if !cacheState.enabled() {
+		cacheHints = openAIPromptCacheHints{}
+	}
 	reqBody.PromptCacheKey = cacheHints.Key
 	reqBody.PromptCacheRetention = cacheHints.Retention
 
@@ -293,7 +363,10 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		req.Header.Set("Authorization", "Bearer "+p.token())
+		if accountID := p.account(); p.Name() == "openai-codex" && accountID != "" {
+			req.Header.Set("ChatGPT-Account-ID", accountID)
+		}
 		return llmHTTPClient.Do(req)
 	}
 
@@ -313,6 +386,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if cacheHints.Key != "" && openAICacheHintsUnsupported(resp.StatusCode, string(respBody)) {
+			cacheState.disable()
 			reqBody.PromptCacheKey = ""
 			reqBody.PromptCacheRetention = ""
 			retryBody, err := json.Marshal(reqBody)
@@ -332,8 +406,11 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 				}
 			}
 			if resp.StatusCode == http.StatusOK {
-				defer resp.Body.Close()
-				return p.streamResponse(resp.Body, onChunk, onThinking, onToolChunk)
+				idleBody := newIdleReader(resp.Body, streamIdleTimeout(), func() {
+					logMsg("OPENAI-NATIVE", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
+				})
+				defer idleBody.Close()
+				return p.streamResponse(idleBody, onChunk, onThinking, onToolChunk)
 			}
 			respBody, _ = io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
@@ -342,8 +419,11 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		return ChatResponse{}, fmt.Errorf("OpenAI Responses API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	defer resp.Body.Close()
-	return p.streamResponse(resp.Body, onChunk, onThinking, onToolChunk)
+	idleBody := newIdleReader(resp.Body, streamIdleTimeout(), func() {
+		logMsg("OPENAI-NATIVE", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
+	})
+	defer idleBody.Close()
+	return p.streamResponse(idleBody, onChunk, onThinking, onToolChunk)
 }
 
 func (p *OpenAINativeProvider) buildAPITools(_ string, tools []NativeTool) []any {
@@ -362,6 +442,18 @@ func (p *OpenAINativeProvider) buildAPITools(_ string, tools []NativeTool) []any
 func (p *OpenAINativeProvider) refreshRuntimeToken(ctx context.Context, force bool) error {
 	if p.runtimeTokenURL == "" || p.serverAPIKey == "" {
 		return nil
+	}
+	before := p.token()
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
+	if force {
+		p.tokenMu.RLock()
+		changed := p.apiKey != before
+		recent := !p.lastTokenRefresh.IsZero() && time.Since(p.lastTokenRefresh) < time.Second
+		p.tokenMu.RUnlock()
+		if changed || recent {
+			return nil
+		}
 	}
 	url := p.runtimeTokenURL
 	if force {
@@ -382,6 +474,7 @@ func (p *OpenAINativeProvider) refreshRuntimeToken(ctx context.Context, force bo
 	}
 	var payload struct {
 		AccessToken string `json:"access_token"`
+		AccountID   string `json:"account_id"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
 		return err
@@ -389,7 +482,13 @@ func (p *OpenAINativeProvider) refreshRuntimeToken(ctx context.Context, force bo
 	if strings.TrimSpace(payload.AccessToken) == "" {
 		return fmt.Errorf("runtime token refresh returned empty access_token")
 	}
+	p.tokenMu.Lock()
 	p.apiKey = payload.AccessToken
+	if strings.TrimSpace(payload.AccountID) != "" {
+		p.accountID = strings.TrimSpace(payload.AccountID)
+	}
+	p.lastTokenRefresh = time.Now()
+	p.tokenMu.Unlock()
 	return nil
 }
 
@@ -714,7 +813,8 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 						InputTokens  int `json:"input_tokens"`
 						OutputTokens int `json:"output_tokens"`
 						InputDetails struct {
-							CachedTokens int `json:"cached_tokens"`
+							CachedTokens     int `json:"cached_tokens"`
+							CacheWriteTokens int `json:"cache_write_tokens"`
 						} `json:"input_tokens_details"`
 					} `json:"usage"`
 				} `json:"response"`
@@ -723,7 +823,34 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			usage.PromptTokens = completed.Response.Usage.InputTokens
 			usage.CompletionTokens = completed.Response.Usage.OutputTokens
 			usage.CachedTokens = completed.Response.Usage.InputDetails.CachedTokens
+			usage.CacheWriteTokens = completed.Response.Usage.InputDetails.CacheWriteTokens
+
+		case "response.failed", "response.incomplete", "error":
+			var failed struct {
+				Error *struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error,omitempty"`
+				Response struct {
+					Error *struct {
+						Code    string `json:"code"`
+						Message string `json:"message"`
+					} `json:"error,omitempty"`
+					IncompleteDetails json.RawMessage `json:"incomplete_details,omitempty"`
+				} `json:"response,omitempty"`
+			}
+			_ = json.Unmarshal([]byte(data), &failed)
+			if failed.Error != nil {
+				return ChatResponse{}, fmt.Errorf("OpenAI stream %s (%s): %s", event.Type, failed.Error.Code, failed.Error.Message)
+			}
+			if failed.Response.Error != nil {
+				return ChatResponse{}, fmt.Errorf("OpenAI stream %s (%s): %s", event.Type, failed.Response.Error.Code, failed.Response.Error.Message)
+			}
+			return ChatResponse{}, fmt.Errorf("OpenAI stream %s: %s", event.Type, strings.TrimSpace(string(failed.Response.IncompleteDetails)))
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return ChatResponse{}, fmt.Errorf("OpenAI stream read error: %w", err)
 	}
 
 	response := full.String()

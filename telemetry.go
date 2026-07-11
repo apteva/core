@@ -29,6 +29,9 @@ type Telemetry struct {
 	log              []TelemetryEvent // stored events (forwarded to server)
 	liveLog          []TelemetryEvent // all events including live-only (for SSE)
 	notify           chan struct{}
+	notifyMu         sync.Mutex
+	notifySubs       map[uint64]chan struct{}
+	notifySeq        uint64
 	forwardCh        chan TelemetryEvent // serialized queue for live event forwarding
 	serverURL        string              // server URL (e.g. "http://localhost:5280")
 	telemetryURL     string              // full URL for batched stored events
@@ -37,6 +40,7 @@ type Telemetry struct {
 	instanceID       int64
 	seq              int64
 	quit             chan struct{}
+	stopOnce         sync.Once
 
 	// dropCount tracks live-forward events dropped because forwardCh was
 	// full. We still drop (blocking Emit from the thinker hot path would
@@ -50,8 +54,9 @@ func NewTelemetry() *Telemetry {
 		notify: make(chan struct{}, 1),
 		// 5000-slot buffer (was 500) to absorb bursts during heavy tool
 		// activity like transcription runs without dropping events.
-		forwardCh: make(chan TelemetryEvent, 5000),
-		quit:      make(chan struct{}),
+		forwardCh:  make(chan TelemetryEvent, 5000),
+		notifySubs: make(map[uint64]chan struct{}),
+		quit:       make(chan struct{}),
 	}
 
 	// Read agent ID from env (set by server when spawning).
@@ -93,7 +98,11 @@ func NewTelemetry() *Telemetry {
 }
 
 func (t *Telemetry) Stop() {
-	close(t.quit)
+	t.stopOnce.Do(func() {
+		if t.quit != nil {
+			close(t.quit)
+		}
+	})
 }
 
 // generateID returns a monotonically-increasing unique event id.
@@ -149,6 +158,14 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 	case t.notify <- struct{}{}:
 	default:
 	}
+	t.notifyMu.Lock()
+	for _, ch := range t.notifySubs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	t.notifyMu.Unlock()
 
 	// Forward ALL events to server for broadcast (live display on dashboard/console)
 	if t.telemetryLiveURL != "" {
@@ -174,21 +191,69 @@ func (t *Telemetry) DroppedLiveEvents() int64 {
 	return atomic.LoadInt64(&t.dropCount)
 }
 
-// liveForwardLoop drains the forwardCh sequentially — one HTTP POST at a time.
-// This guarantees chunks arrive at the server in the correct order.
+// Subscribe returns a per-listener wake channel. A shared channel is not a
+// broadcast primitive: with multiple SSE clients, one notification used to
+// wake only one of them.
+func (t *Telemetry) Subscribe() (<-chan struct{}, func()) {
+	t.notifyMu.Lock()
+	t.notifySeq++
+	id := t.notifySeq
+	ch := make(chan struct{}, 1)
+	if t.notifySubs == nil {
+		t.notifySubs = make(map[uint64]chan struct{})
+	}
+	t.notifySubs[id] = ch
+	t.notifyMu.Unlock()
+	return ch, func() {
+		t.notifyMu.Lock()
+		delete(t.notifySubs, id)
+		t.notifyMu.Unlock()
+	}
+}
+
+// liveForwardLoop preserves order while coalescing token/chunk bursts into a
+// single POST. This removes the previous one-HTTP-request-per-token overhead.
 func (t *Telemetry) liveForwardLoop() {
+	const maxBatch = 100
+	const flushDelay = 25 * time.Millisecond
 	for {
 		select {
 		case ev := <-t.forwardCh:
-			t.forwardLive(ev)
+			batch := []TelemetryEvent{ev}
+			timer := time.NewTimer(flushDelay)
+		collect:
+			for len(batch) < maxBatch {
+				select {
+				case next := <-t.forwardCh:
+					batch = append(batch, next)
+				case <-timer.C:
+					break collect
+				case <-t.quit:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					t.forwardLive(batch)
+					return
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			t.forwardLive(batch)
 		case <-t.quit:
 			return
 		}
 	}
 }
 
-func (t *Telemetry) forwardLive(ev TelemetryEvent) {
-	body, err := json.Marshal([]TelemetryEvent{ev})
+func (t *Telemetry) forwardLive(events []TelemetryEvent) {
+	body, err := json.Marshal(events)
 	if err != nil {
 		return
 	}
@@ -206,10 +271,13 @@ func (t *Telemetry) forwardLive(ev TelemetryEvent) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		logMsg("TELEMETRY", fmt.Sprintf("forwardLive: POST error for %s: %v", ev.Type, err))
+		logMsg("TELEMETRY", fmt.Sprintf("forwardLive: POST error for %d events: %v", len(events), err))
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logMsg("TELEMETRY", fmt.Sprintf("forwardLive: HTTP %d for %d events", resp.StatusCode, len(events)))
+	}
 }
 
 // Events returns all events (including live-only) since the given index. Used by SSE.
@@ -367,22 +435,25 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 // --- Convenience emitters with typed data ---
 
 type LLMDoneData struct {
-	Model        string `json:"model"`
-	Reasoning    string `json:"reasoning,omitempty"`
-	TokensIn     int    `json:"tokens_in"`
-	TokensCached int    `json:"tokens_cached"`
-	TokensOut    int    `json:"tokens_out"`
-	DurationMs   int64  `json:"duration_ms"`
+	Model            string `json:"model"`
+	Reasoning        string `json:"reasoning,omitempty"`
+	TokensIn         int    `json:"tokens_in"`
+	TokensCached     int    `json:"tokens_cached"`
+	CacheWriteTokens int    `json:"cache_write_tokens,omitempty"`
+	TokensOut        int    `json:"tokens_out"`
+	DurationMs       int64  `json:"duration_ms"`
 	// cost_usd is no longer populated by core — pricing lives in the
 	// server, which enriches llm.done events with a canonical
 	// cost_usd on ingest. Removing the field from the Go type keeps
 	// core free of pricing data, but the wire format is still the
 	// same map-of-strings consumed by dashboards and persisted by
 	// the server.
-	Iteration    int    `json:"iteration"`
-	Rate         string `json:"rate"`
-	ContextMsgs  int    `json:"context_msgs"`
-	ContextChars int    `json:"context_chars"`
+	Iteration           int    `json:"iteration"`
+	Rate                string `json:"rate"`
+	ContextMsgs         int    `json:"context_msgs"`
+	ContextChars        int    `json:"context_chars"`
+	RequestContextMsgs  int    `json:"request_context_msgs,omitempty"`
+	RequestContextChars int    `json:"request_context_chars,omitempty"`
 	// MaxContextTokens is the model's advertised input-context window
 	// (in tokens). Comes from a static lookup keyed on the model id —
 	// see ModelContextWindow. 0 when the model isn't in the table; UI
@@ -471,6 +542,9 @@ type DirectiveChangeData struct {
 func ModelContextWindow(modelID string) int {
 	if modelID == "" {
 		return 0
+	}
+	if caps, ok := capabilitiesForModel(modelID); ok && caps.ContextWindow > 0 {
+		return caps.ContextWindow
 	}
 	// Order longest-prefix first to win over shorter substrings.
 	table := []struct {

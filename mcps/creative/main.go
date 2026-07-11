@@ -80,7 +80,7 @@ func simulatePost(channel, topic, style string) string {
 	case "twitter":
 		return fmt.Sprintf("🚀 %s\n\nThread below 👇 #AI #agents #automation", topic)
 	case "instagram":
-		return fmt.Sprintf("✨ %s ✨\n\nBuilding the future of AI automation, one agent at a time.\n\n#AIagents #automation #tech #buildinpublic", topic)
+		return fmt.Sprintf("✨ %s ✨\n\nFreshly crafted at Bean & Brew.\n\n#coffee #latteart #beanandbrew", topic)
 	case "linkedin":
 		return fmt.Sprintf("%s\n\nI've been working on this for the past few months and the results have been incredible. Here's what I learned and why it matters for the industry.\n\n#AI #agents #entrepreneurship #buildinpublic", topic)
 	default:
@@ -156,8 +156,8 @@ func main() {
 		case "initialize":
 			respond(id, map[string]any{
 				"protocolVersion": "2024-11-05",
-				"capabilities":   map[string]any{"tools": map[string]any{}},
-				"serverInfo":     map[string]string{"name": "creative", "version": "1.0.0"},
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]string{"name": "creative", "version": "1.0.0"},
 			})
 		case "tools/list":
 			respond(id, map[string]any{

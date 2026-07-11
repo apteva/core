@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
+
+const maxRealtimeAudioFrameBytes = 1 << 20
 
 // realtimeAudioBridge holds the in-memory mapping between a
 // single-use audio token (handed out at realtime-spawn time) and
@@ -38,9 +41,9 @@ type audioBridgeRegistration struct {
 }
 
 var (
-	audioBridgeMu     sync.Mutex
-	audioBridgeByTok  = map[string]*audioBridgeRegistration{}
-	audioBridgeTTL    = 5 * time.Minute
+	audioBridgeMu    sync.Mutex
+	audioBridgeByTok = map[string]*audioBridgeRegistration{}
+	audioBridgeTTL   = 5 * time.Minute
 )
 
 // generateAudioToken returns a 32-hex-char random token. Cryptographic
@@ -86,6 +89,16 @@ func unregisterAudioBridge(threadID string) {
 	}
 }
 
+func renameAudioBridgeThread(oldID, newID string) {
+	audioBridgeMu.Lock()
+	defer audioBridgeMu.Unlock()
+	for _, reg := range audioBridgeByTok {
+		if reg.threadID == oldID {
+			reg.threadID = newID
+		}
+	}
+}
+
 // claimAudioBridge atomically pops a registration by token. Returns
 // the channels (and thread id) or an error. Single-use: the second
 // caller for the same token gets ErrAudioTokenUnknown.
@@ -98,6 +111,20 @@ func claimAudioBridge(token string) (*audioBridgeRegistration, error) {
 	}
 	delete(audioBridgeByTok, token)
 	if time.Since(reg.created) > audioBridgeTTL {
+		return nil, errAudioTokenExpired
+	}
+	return reg, nil
+}
+
+func peekAudioBridge(token string) (*audioBridgeRegistration, error) {
+	audioBridgeMu.Lock()
+	defer audioBridgeMu.Unlock()
+	reg, ok := audioBridgeByTok[token]
+	if !ok {
+		return nil, errAudioTokenUnknown
+	}
+	if time.Since(reg.created) > audioBridgeTTL {
+		delete(audioBridgeByTok, token)
 		return nil, errAudioTokenExpired
 	}
 	return reg, nil
@@ -124,7 +151,7 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "thread and token query params required", http.StatusBadRequest)
 		return
 	}
-	reg, err := claimAudioBridge(token)
+	reg, err := peekAudioBridge(token)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -139,6 +166,11 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		logMsg("REALTIME-AUDIO", fmt.Sprintf("upgrade failed for thread=%s: %v", thread, err))
 		return
 	}
+	reg, err = claimAudioBridge(token)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
 	defer conn.Close()
 	logMsg("REALTIME-AUDIO", fmt.Sprintf("bridge connected for thread=%s", thread))
 
@@ -150,13 +182,32 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 
 	go func() {
 		defer cancel()
+		reader := wsutil.Reader{
+			Source:         conn,
+			State:          ws.StateServerSide,
+			CheckUTF8:      true,
+			MaxFrameSize:   maxRealtimeAudioFrameBytes,
+			OnIntermediate: wsutil.ControlFrameHandler(conn, ws.StateServerSide),
+		}
 		for {
-			data, op, err := wsutil.ReadClientData(conn)
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+			header, err := reader.NextFrame()
 			if err != nil {
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("read end for thread=%s: %v", thread, err))
 				return
 			}
-			if op != ws.OpBinary || len(data) == 0 {
+			if header.OpCode.IsControl() {
+				if err := wsutil.ControlFrameHandler(conn, ws.StateServerSide)(header, &reader); err != nil {
+					return
+				}
+				continue
+			}
+			data, err := io.ReadAll(io.LimitReader(&reader, maxRealtimeAudioFrameBytes+1))
+			if err != nil || len(data) > maxRealtimeAudioFrameBytes {
+				logMsg("REALTIME-AUDIO", fmt.Sprintf("oversized/invalid frame for thread=%s: bytes=%d err=%v", thread, len(data), err))
+				return
+			}
+			if header.OpCode != ws.OpBinary || len(data) == 0 {
 				continue
 			}
 			select {
@@ -179,6 +230,7 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 			if !ok {
 				return
 			}
+			_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 			if err := wsutil.WriteServerBinary(conn, pcm); err != nil {
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
 				return

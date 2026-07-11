@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -66,6 +67,9 @@ type Message struct {
 	Parts       []ContentPart    `json:"parts,omitempty"`        // multimodal content
 	ToolCalls   []NativeToolCall `json:"tool_calls,omitempty"`   // assistant messages: structured tool calls
 	ToolResults []ToolResult     `json:"tool_results,omitempty"` // user messages: results for prior tool calls
+	// RequestContext marks transient retrieval context. It is carried only in
+	// the prepared provider request and is never written to session history.
+	RequestContext bool `json:"-"`
 	// Reasoning is the model's chain-of-thought from the turn that
 	// produced this message. We replay it back to the provider on
 	// subsequent turns because Moonshot (Kimi K2.6 via OpenCode Go)
@@ -108,7 +112,8 @@ type StreamChoice struct {
 }
 
 type PromptTokensDetails struct {
-	CachedTokens int `json:"cached_tokens"`
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
 }
 
 type Usage struct {
@@ -139,6 +144,10 @@ func Run() {
 	installSignalLogger()
 
 	cfg := NewConfig()
+	if err := cfg.LoadError(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid core config: %v\n", err)
+		return
+	}
 
 	provider, err := selectProvider(cfg)
 	if err != nil {
@@ -181,7 +190,19 @@ func Run() {
 	// apteva-server's reverse proxy. Operators wanting external core
 	// access should reach it through the server's /instances/<id>/*
 	// proxy, which has its own auth layer.
-	go startAPI(thinker, "127.0.0.1:"+apiPort)
+	apiAddr := "127.0.0.1:" + apiPort
+	apiListener, err := net.Listen("tcp", apiAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "core API listen failed on %s: %v\n", apiAddr, err)
+		thinker.Stop()
+		return
+	}
+	go func() {
+		if err := serveAPI(thinker, apiListener); err != nil && !strings.Contains(err.Error(), "closed network connection") {
+			logMsg("CRASH", fmt.Sprintf("core API stopped: %v", err))
+			thinker.Stop()
+		}
+	}()
 
 	// Check for --headless flag or NO_TUI env var
 	headless := os.Getenv("NO_TUI") != ""

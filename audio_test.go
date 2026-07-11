@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -12,9 +14,10 @@ import (
 // Set RUN_AUDIO_TEST=1 and provide a provider API key + audio URL.
 //
 // Usage:
-//   GOOGLE_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioInput -timeout 60s
-//   ANTHROPIC_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioInput -timeout 60s
-//   FIREWORKS_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioInput -timeout 60s
+//
+//	GOOGLE_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioInput -timeout 60s
+//	ANTHROPIC_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioInput -timeout 60s
+//	FIREWORKS_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioInput -timeout 60s
 func TestAudioInput(t *testing.T) {
 	if os.Getenv("RUN_AUDIO_TEST") == "" {
 		t.Skip("set RUN_AUDIO_TEST=1 to run")
@@ -77,6 +80,20 @@ func TestAudioInput(t *testing.T) {
 	}
 }
 
+func TestRealtimeAudioFailedUpgradeDoesNotConsumeToken(t *testing.T) {
+	audioIn := make(chan []byte, 1)
+	audioOut := make(chan []byte, 1)
+	token := registerAudioBridge("voice-test", audioIn, audioOut)
+	defer unregisterAudioBridge("voice-test")
+
+	req := httptest.NewRequest(http.MethodGet, "/realtime/audio?thread=voice-test&token="+token, nil)
+	rec := httptest.NewRecorder()
+	(&APIServer{}).realtimeAudioHandler(rec, req)
+	if _, err := claimAudioBridge(token); err != nil {
+		t.Fatalf("failed websocket upgrade consumed token: %v", err)
+	}
+}
+
 // TestMediaInSend tests that parseMediaURLs correctly classifies audio and image URLs.
 func TestMediaInSend(t *testing.T) {
 	tests := []struct {
@@ -108,7 +125,8 @@ func TestMediaInSend(t *testing.T) {
 // the thinker and gets a response from the LLM about the audio content.
 //
 // Usage:
-//   GOOGLE_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioViaParts -timeout 60s
+//
+//	GOOGLE_API_KEY=... AUDIO_URL=https://example.com/audio.mp3 RUN_AUDIO_TEST=1 go test -v -run TestAudioViaParts -timeout 60s
 func TestAudioViaParts(t *testing.T) {
 	if os.Getenv("RUN_AUDIO_TEST") == "" {
 		t.Skip("set RUN_AUDIO_TEST=1 to run")
@@ -131,7 +149,7 @@ func TestAudioViaParts(t *testing.T) {
 	}
 
 	thinker := NewThinker("", provider, cfg)
-	thinker.session = nil // no session history — fresh start
+	thinker.session = nil                   // no session history — fresh start
 	thinker.messages = thinker.messages[:1] // keep only system prompt
 	thinker.registry = NewToolRegistry("")
 	thinker.handleTools = mainToolHandler(thinker)
