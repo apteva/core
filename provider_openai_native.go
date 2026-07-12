@@ -223,6 +223,7 @@ type oaiResponsesRequest struct {
 	PromptCacheKey       string         `json:"prompt_cache_key,omitempty"`
 	PromptCacheRetention string         `json:"prompt_cache_retention,omitempty"`
 	ParallelToolCalls    *bool          `json:"parallel_tool_calls,omitempty"`
+	Include              []string       `json:"include,omitempty"`
 }
 
 type oaiReasoning struct {
@@ -232,17 +233,29 @@ type oaiReasoning struct {
 
 // oaiInputItem is a polymorphic input item for the Responses API.
 type oaiInputItem struct {
-	Type    string `json:"type"`              // "message", "function_call", "function_call_output"
-	ID      string `json:"id,omitempty"`      // for replaying Responses output items
-	Status  string `json:"status,omitempty"`  // for replaying Responses output items
-	Role    string `json:"role,omitempty"`    // for type=message
-	Content any    `json:"content,omitempty"` // string or []oaiContentBlock
-	Name    string `json:"name,omitempty"`    // for type=function_call
+	Raw     json.RawMessage `json:"-"`                 // exact Responses output item replay
+	Type    string          `json:"type"`              // "message", "function_call", "function_call_output"
+	ID      string          `json:"id,omitempty"`      // for replaying Responses output items
+	Status  string          `json:"status,omitempty"`  // for replaying Responses output items
+	Role    string          `json:"role,omitempty"`    // for type=message
+	Content any             `json:"content,omitempty"` // string or []oaiContentBlock
+	Name    string          `json:"name,omitempty"`    // for type=function_call
 
 	// function_call fields
 	CallID    string `json:"call_id,omitempty"`
 	Output    any    `json:"output,omitempty"`
 	Arguments string `json:"arguments,omitempty"` // for type=function_call (JSON string)
+}
+
+func (i oaiInputItem) MarshalJSON() ([]byte, error) {
+	if len(i.Raw) > 0 {
+		if !json.Valid(i.Raw) {
+			return nil, fmt.Errorf("invalid raw Responses input item")
+		}
+		return i.Raw, nil
+	}
+	type wireItem oaiInputItem
+	return json.Marshal(wireItem(i))
 }
 
 type oaiContentBlock struct {
@@ -289,7 +302,10 @@ type oaiOutputItem struct {
 		Type string `json:"type"`
 		Text string `json:"text,omitempty"`
 	} `json:"summary,omitempty"`
+	EncryptedContent string `json:"encrypted_content,omitempty"`
 }
+
+const openAIResponsesStateProvider = "openai-responses"
 
 func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	if p.Name() == "openai-codex" {
@@ -327,6 +343,10 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		store := false
 		reqBody.Store = &store
 		reqBody.Instructions = p.instructionsFromMessages(messages)
+		// Stateless Responses calls must carry opaque reasoning forward
+		// themselves. Request it on every Codex call so completed output
+		// items can be replayed exactly with later function outputs.
+		reqBody.Include = []string{"reasoning.encrypted_content"}
 	}
 	stablePrefix := reqBody.Instructions
 	if stablePrefix == "" {
@@ -526,6 +546,27 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			continue
 		}
 
+		// Responses output items are valid subsequent input items. Prefer
+		// the exact provider payload (reasoning, message, function calls,
+		// IDs and status) over the lossy legacy reconstruction below.
+		if m.ProviderState != nil &&
+			m.ProviderState.Provider == openAIResponsesStateProvider &&
+			len(m.ProviderState.Items) > 0 {
+			valid := true
+			for _, raw := range m.ProviderState.Items {
+				if len(raw) == 0 || !json.Valid(raw) {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				for _, raw := range m.ProviderState.Items {
+					items = append(items, oaiInputItem{Raw: append(json.RawMessage(nil), raw...)})
+				}
+				continue
+			}
+		}
+
 		// Tool results
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
@@ -611,6 +652,7 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 	var fullReasoning strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
+	var providerItems []json.RawMessage
 
 	// Track pending items
 	type pendingFunc struct {
@@ -735,6 +777,9 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 		case "response.output_item.done":
 			var item oaiOutputItem
 			json.Unmarshal(event.Item, &item)
+			if len(event.Item) > 0 && json.Valid(event.Item) {
+				providerItems = append(providerItems, append(json.RawMessage(nil), event.Item...))
+			}
 
 			switch item.Type {
 			case "function_call":
@@ -774,9 +819,11 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 						}
 					}
 					toolCalls = append(toolCalls, NativeToolCall{
-						ID:   pf.id,
-						Name: pf.name,
-						Args: args,
+						ID:           pf.id,
+						OutputItemID: item.ID,
+						Status:       item.Status,
+						Name:         pf.name,
+						Args:         args,
 					})
 					delete(pendingFuncs, item.ID)
 				}
@@ -855,7 +902,20 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 
 	response := full.String()
 	logMsg("OPENAI-NATIVE", fmt.Sprintf("done tokens_in=%d tokens_out=%d tools=%d len=%d", usage.PromptTokens, usage.CompletionTokens, len(toolCalls), len(response)))
-	return ChatResponse{Text: response, ToolCalls: toolCalls, Reasoning: fullReasoning.String(), Usage: usage}, nil
+	var providerState *ProviderResponseState
+	if len(providerItems) > 0 {
+		providerState = &ProviderResponseState{
+			Provider: openAIResponsesStateProvider,
+			Items:    providerItems,
+		}
+	}
+	return ChatResponse{
+		Text:          response,
+		ToolCalls:     toolCalls,
+		Reasoning:     fullReasoning.String(),
+		ProviderState: providerState,
+		Usage:         usage,
+	}, nil
 }
 
 func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {

@@ -62,11 +62,12 @@ type AudioURL struct {
 }
 
 type Message struct {
-	Role        string           `json:"role"`
-	Content     string           `json:"content"`
-	Parts       []ContentPart    `json:"parts,omitempty"`        // multimodal content
-	ToolCalls   []NativeToolCall `json:"tool_calls,omitempty"`   // assistant messages: structured tool calls
-	ToolResults []ToolResult     `json:"tool_results,omitempty"` // user messages: results for prior tool calls
+	Role          string                 `json:"role"`
+	Content       string                 `json:"content"`
+	Parts         []ContentPart          `json:"parts,omitempty"`          // multimodal content
+	ToolCalls     []NativeToolCall       `json:"tool_calls,omitempty"`     // assistant messages: structured tool calls
+	ToolResults   []ToolResult           `json:"tool_results,omitempty"`   // user messages: results for prior tool calls
+	ProviderState *ProviderResponseState `json:"provider_state,omitempty"` // opaque state for exact provider replay
 	// RequestContext marks transient retrieval context. It is carried only in
 	// the prepared provider request and is never written to session history.
 	RequestContext bool `json:"-"`

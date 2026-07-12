@@ -133,8 +133,15 @@ func TestThreadManager_SystemThreadsAreOperationalButNotAgentVisible(t *testing.
 	if err := thinker.threads.SpawnWithOpts("worker", "Handle operator work", nil, SpawnOpts{DeferRun: true}); err != nil {
 		t.Fatalf("spawn worker: %v", err)
 	}
+	workerEvents := thinker.drainEventTexts()
+	if len(workerEvents) != 1 || !strings.Contains(workerEvents[0], "[thread:worker] started") {
+		t.Fatalf("agent-visible worker startup = %v", workerEvents)
+	}
 	if err := thinker.threads.SpawnWithOpts("unconscious", "Consolidate memories", nil, SpawnOpts{System: true, DeferRun: true}); err != nil {
 		t.Fatalf("spawn unconscious: %v", err)
+	}
+	if systemEvents := thinker.drainEventTexts(); len(systemEvents) != 0 {
+		t.Fatalf("system thread leaked into parent inbox: %v", systemEvents)
 	}
 
 	all := thinker.threads.List()

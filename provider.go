@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,16 @@ import (
 	"sync"
 	"time"
 )
+
+// ProviderResponseState carries opaque, provider-specific response items that
+// must be replayed on a later request. The generic thinking loop deliberately
+// does not inspect Items. For example, stateless OpenAI Responses calls need
+// the original reasoning/function-call output items (including encrypted
+// reasoning) returned before a function_call_output.
+type ProviderResponseState struct {
+	Provider string            `json:"provider"`
+	Items    []json.RawMessage `json:"items,omitempty"`
+}
 
 // llmHTTPClient is a shared HTTP client for all LLM provider calls.
 // It uses a response header timeout to catch dead provider requests but no
@@ -160,7 +171,9 @@ type NativeTool struct {
 
 // NativeToolCall is a structured tool call returned by the provider.
 type NativeToolCall struct {
-	ID               string            `json:"id"` // provider-assigned ID for matching results
+	ID               string            `json:"id"`                       // provider call ID for matching results
+	OutputItemID     string            `json:"output_item_id,omitempty"` // Responses output item ID (fc_...), distinct from call ID
+	Status           string            `json:"status,omitempty"`         // Responses output item status for exact replay/debugging
 	Name             string            `json:"name"`
 	Args             map[string]string `json:"args"`
 	ThoughtSignature string            `json:"thought_signature,omitempty"` // Gemini: encrypted reasoning state
@@ -190,10 +203,11 @@ type ServerToolResult struct {
 
 // ChatResponse is the structured return from Chat().
 type ChatResponse struct {
-	Text          string             // streamed text content
-	Reasoning     string             // accumulated chain-of-thought (Fireworks reasoning_content / OpenRouter reasoning); empty when the provider didn't emit any
-	ToolCalls     []NativeToolCall   // structured tool calls WE need to execute
-	ServerResults []ServerToolResult // tools the PROVIDER already executed
+	Text          string                 // streamed text content
+	Reasoning     string                 // accumulated chain-of-thought (Fireworks reasoning_content / OpenRouter reasoning); empty when the provider didn't emit any
+	ToolCalls     []NativeToolCall       // structured tool calls WE need to execute
+	ServerResults []ServerToolResult     // tools the PROVIDER already executed
+	ProviderState *ProviderResponseState // opaque provider output items needed for stateless continuation
 	Usage         TokenUsage
 }
 

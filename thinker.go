@@ -2203,7 +2203,13 @@ func (t *Thinker) Run() {
 			continue
 		}
 		emptyLLMResponses = 0
-		assistantMsg := Message{Role: "assistant", Content: reply, ToolCalls: chatResp.ToolCalls, Reasoning: chatResp.Reasoning}
+		assistantMsg := Message{
+			Role:          "assistant",
+			Content:       reply,
+			ToolCalls:     chatResp.ToolCalls,
+			Reasoning:     chatResp.Reasoning,
+			ProviderState: chatResp.ProviderState,
+		}
 		t.messages = append(t.messages, assistantMsg)
 
 		// Persist to session history

@@ -61,6 +61,32 @@ func TestSanitize_OrphanToolUse_NoResult_Dropped(t *testing.T) {
 	}
 }
 
+func TestSanitize_OrphanToolUse_DropsProviderState(t *testing.T) {
+	in := []Message{{
+		Role:      "assistant",
+		Content:   "working",
+		ToolCalls: []NativeToolCall{{ID: "orphan", Name: "lookup"}},
+		ProviderState: &ProviderResponseState{
+			Provider: openAIResponsesStateProvider,
+			Items: []json.RawMessage{
+				json.RawMessage(`{"id":"rs_123","type":"reasoning","encrypted_content":"opaque"}`),
+				json.RawMessage(`{"id":"fc_123","type":"function_call","call_id":"orphan","name":"lookup","arguments":"{}"}`),
+			},
+		},
+	}}
+
+	out := sanitizeToolPairs(in)
+	if len(out) != 1 {
+		t.Fatalf("expected assistant message to remain, got %d", len(out))
+	}
+	if len(out[0].ToolCalls) != 0 {
+		t.Fatalf("ToolCalls = %#v", out[0].ToolCalls)
+	}
+	if out[0].ProviderState != nil {
+		t.Fatalf("ProviderState survived changed calls: %#v", out[0].ProviderState)
+	}
+}
+
 // Symmetric regression. Before the fix the assistant tool_use was
 // kept when its only matching ToolResult had an image — but if that
 // image-bearing result was itself dropped (which it now is), there
@@ -455,6 +481,42 @@ func TestSessionLoadAfterUsesMonotonicCursor(t *testing.T) {
 	}
 	if len(second) != 1 || second[0].Sequence != 3 || next != 3 {
 		t.Fatalf("second history page = %#v, cursor=%d", second, next)
+	}
+}
+
+func TestSessionPersistsProviderResponseState(t *testing.T) {
+	dir := t.TempDir()
+	session := NewSession(dir, "provider-state")
+	reasoning := json.RawMessage(`{"id":"rs_123","type":"reasoning","encrypted_content":"opaque-state"}`)
+	functionCall := json.RawMessage(`{"id":"fc_123","type":"function_call","status":"completed","call_id":"call_123","name":"lookup","arguments":"{}"}`)
+	want := Message{
+		Role:      "assistant",
+		ToolCalls: []NativeToolCall{{ID: "call_123", OutputItemID: "fc_123", Status: "completed", Name: "lookup"}},
+		ProviderState: &ProviderResponseState{
+			Provider: openAIResponsesStateProvider,
+			Items:    []json.RawMessage{reasoning, functionCall},
+		},
+	}
+	if err := session.AppendMessage(want, 7, TokenUsage{}); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call_123", Content: "ok"}}}, 8, TokenUsage{}); err != nil {
+		t.Fatalf("AppendMessage result: %v", err)
+	}
+
+	loaded, _ := NewSession(dir, "provider-state").LoadTail(10)
+	if len(loaded) != 2 {
+		t.Fatalf("loaded len = %d, want 2", len(loaded))
+	}
+	got := loaded[0]
+	if got.ProviderState == nil || got.ProviderState.Provider != openAIResponsesStateProvider {
+		t.Fatalf("ProviderState = %#v", got.ProviderState)
+	}
+	if len(got.ProviderState.Items) != 2 || !jsonEqual(got.ProviderState.Items[0], reasoning) || !jsonEqual(got.ProviderState.Items[1], functionCall) {
+		t.Fatalf("provider items = %#v", got.ProviderState.Items)
+	}
+	if len(got.ToolCalls) != 1 || got.ToolCalls[0].OutputItemID != "fc_123" || got.ToolCalls[0].Status != "completed" {
+		t.Fatalf("ToolCalls = %#v", got.ToolCalls)
 	}
 }
 

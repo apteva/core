@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -148,6 +149,10 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 	}
 	if body["instructions"] != "stable system" {
 		t.Fatalf("instructions = %v", body["instructions"])
+	}
+	include, _ := body["include"].([]any)
+	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v, want encrypted reasoning", body["include"])
 	}
 }
 
@@ -333,6 +338,106 @@ func TestOpenAINativeBuildInput_FunctionImageOutputs(t *testing.T) {
 	}
 }
 
+func TestOpenAINativeBuildInput_ReplaysProviderItemsBeforeToolResults(t *testing.T) {
+	reasoning := json.RawMessage(`{"id":"rs_123","type":"reasoning","summary":[{"type":"summary_text","text":"**Checking state**"}],"encrypted_content":"opaque-state"}`)
+	message := json.RawMessage(`{"id":"msg_123","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"I’ll check."}]}`)
+	functionCall := json.RawMessage(`{"id":"fc_123","type":"function_call","status":"completed","call_id":"call_123","name":"lookup","arguments":"{\"query\":\"x\"}"}`)
+	messages := []Message{
+		{
+			Role:      "assistant",
+			Content:   "I’ll check.",
+			ToolCalls: []NativeToolCall{{ID: "call_123", OutputItemID: "fc_123", Name: "lookup", Args: map[string]string{"query": "x"}}},
+			ProviderState: &ProviderResponseState{
+				Provider: openAIResponsesStateProvider,
+				Items:    []json.RawMessage{reasoning, message, functionCall},
+			},
+		},
+		{Role: "user", ToolResults: []ToolResult{{CallID: "call_123", Content: `{"ok":true}`}}},
+	}
+
+	items := (&OpenAINativeProvider{}).buildInput(messages)
+	if len(items) != 4 {
+		t.Fatalf("items len = %d, want 4", len(items))
+	}
+	for i, want := range []json.RawMessage{reasoning, message, functionCall} {
+		got, err := json.Marshal(items[i])
+		if err != nil {
+			t.Fatalf("marshal replay item %d: %v", i, err)
+		}
+		if !jsonEqual(got, want) {
+			t.Fatalf("replay item %d = %s, want %s", i, got, want)
+		}
+	}
+	if items[3].Type != "function_call_output" || items[3].CallID != "call_123" || items[3].Output != `{"ok":true}` {
+		t.Fatalf("tool result = %#v", items[3])
+	}
+}
+
+func TestOpenAINativeBuildInput_ReplaysParallelCallsInOriginalOrder(t *testing.T) {
+	rawItems := []json.RawMessage{
+		json.RawMessage(`{"id":"rs_parallel","type":"reasoning","encrypted_content":"opaque-parallel"}`),
+		json.RawMessage(`{"id":"fc_a","type":"function_call","status":"completed","call_id":"call_a","name":"first","arguments":"{}"}`),
+		json.RawMessage(`{"id":"fc_b","type":"function_call","status":"completed","call_id":"call_b","name":"second","arguments":"{}"}`),
+	}
+	messages := []Message{
+		{
+			Role:      "assistant",
+			ToolCalls: []NativeToolCall{{ID: "call_a", Name: "first"}, {ID: "call_b", Name: "second"}},
+			ProviderState: &ProviderResponseState{
+				Provider: openAIResponsesStateProvider,
+				Items:    rawItems,
+			},
+		},
+		{Role: "user", ToolResults: []ToolResult{{CallID: "call_a", Content: "a"}, {CallID: "call_b", Content: "b"}}},
+	}
+
+	items := (&OpenAINativeProvider{}).buildInput(messages)
+	if len(items) != 5 {
+		t.Fatalf("items len = %d, want 5", len(items))
+	}
+	for i, wantID := range []string{"rs_parallel", "fc_a", "fc_b"} {
+		var got map[string]any
+		raw, _ := json.Marshal(items[i])
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("decode item %d: %v", i, err)
+		}
+		if got["id"] != wantID {
+			t.Fatalf("item %d id = %v, want %s", i, got["id"], wantID)
+		}
+	}
+	if items[3].CallID != "call_a" || items[4].CallID != "call_b" {
+		t.Fatalf("result order = %q, %q", items[3].CallID, items[4].CallID)
+	}
+}
+
+func TestOpenAINativeBuildInput_InvalidProviderStateFallsBackToLegacyReplay(t *testing.T) {
+	messages := []Message{{
+		Role:      "assistant",
+		Content:   "working",
+		ToolCalls: []NativeToolCall{{ID: "call_legacy", Name: "lookup", Args: map[string]string{"query": "x"}}},
+		ProviderState: &ProviderResponseState{
+			Provider: openAIResponsesStateProvider,
+			Items:    []json.RawMessage{json.RawMessage(`{"type":"reasoning"}`), json.RawMessage(`not-json`)},
+		},
+	}}
+
+	items := (&OpenAINativeProvider{}).buildInput(messages)
+	if len(items) != 2 {
+		t.Fatalf("items len = %d, want legacy message + call", len(items))
+	}
+	if items[0].Type != "message" || items[0].Content != "working" {
+		t.Fatalf("legacy message = %#v", items[0])
+	}
+	if items[1].Type != "function_call" || items[1].CallID != "call_legacy" {
+		t.Fatalf("legacy call = %#v", items[1])
+	}
+}
+
+func jsonEqual(a, b []byte) bool {
+	var av, bv any
+	return json.Unmarshal(a, &av) == nil && json.Unmarshal(b, &bv) == nil && reflect.DeepEqual(av, bv)
+}
+
 func TestOpenAINativeStreamResponse_ReasoningSummary(t *testing.T) {
 	stream := strings.NewReader(strings.Join([]string{
 		`data: {"type":"response.reasoning_summary_text.delta","delta":"checking "}`,
@@ -361,6 +466,48 @@ func TestOpenAINativeStreamResponse_ReasoningSummary(t *testing.T) {
 	}
 	if resp.Usage.PromptTokens != 3 || resp.Usage.CompletionTokens != 2 || resp.Usage.CachedTokens != 1 {
 		t.Fatalf("Usage = %+v", resp.Usage)
+	}
+}
+
+func TestOpenAINativeStreamResponse_CapturesReasoningAndOutputItems(t *testing.T) {
+	stream := strings.NewReader(strings.Join([]string{
+		`data: {"type":"response.output_item.done","item":{"id":"rs_123","type":"reasoning","summary":[{"type":"summary_text","text":"**Checking state**"}],"encrypted_content":"opaque-state"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"msg_123","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"I’ll check."}]}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_123","type":"function_call","call_id":"call_123","name":"lookup"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_123","type":"function_call","status":"completed","call_id":"call_123","name":"lookup","arguments":"{\"query\":\"x\"}"}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n"))
+
+	resp, err := (&OpenAINativeProvider{}).streamResponse(stream, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("streamResponse: %v", err)
+	}
+	if resp.Reasoning != "**Checking state**" {
+		t.Fatalf("Reasoning = %q", resp.Reasoning)
+	}
+	if resp.ProviderState == nil || resp.ProviderState.Provider != openAIResponsesStateProvider {
+		t.Fatalf("ProviderState = %#v", resp.ProviderState)
+	}
+	if len(resp.ProviderState.Items) != 3 {
+		t.Fatalf("provider items = %d, want 3", len(resp.ProviderState.Items))
+	}
+	var captured []map[string]any
+	for i, raw := range resp.ProviderState.Items {
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			t.Fatalf("provider item %d: %v", i, err)
+		}
+		captured = append(captured, item)
+	}
+	if captured[0]["id"] != "rs_123" || captured[0]["encrypted_content"] != "opaque-state" {
+		t.Fatalf("reasoning item = %#v", captured[0])
+	}
+	if captured[1]["id"] != "msg_123" || captured[2]["id"] != "fc_123" {
+		t.Fatalf("item order = %#v", captured)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_123" || resp.ToolCalls[0].OutputItemID != "fc_123" || resp.ToolCalls[0].Status != "completed" {
+		t.Fatalf("ToolCalls = %#v", resp.ToolCalls)
 	}
 }
 

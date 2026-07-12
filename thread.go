@@ -681,7 +681,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	tm.parent.bus.Publish(Event{Type: EventThreadStart, From: id, Text: fmt.Sprintf("Thread %q spawned (provider: %s, role: %s, depth: %d)", id, provName, role, depth)})
 	toolList := toolSetToSlice(thread.Tools)
-	tm.parent.Inject(fmt.Sprintf("[thread:%s] started (provider: %s, role: %s, tools: %s)", id, provName, role, strings.Join(toolList, ", ")))
+	// System threads are runtime implementation details. Keep their lifecycle
+	// on the observer bus/API/telemetry paths, but never inject their identity
+	// or privileged tool list into the parent model's conversation. Agent-facing
+	// operations reject System targets, so advertising one here creates an
+	// impossible delegation target that the model will reasonably try to use.
+	if !opts.System {
+		tm.parent.Inject(fmt.Sprintf("[thread:%s] started (provider: %s, role: %s, tools: %s)", id, provName, role, strings.Join(toolList, ", ")))
+	}
 	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
 
 	// Telemetry: thread.spawn

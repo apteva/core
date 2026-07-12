@@ -159,6 +159,59 @@ func TestSessionLoadTailFiltersLegacyDynamicMessages(t *testing.T) {
 	}
 }
 
+func TestSessionLoadTailFiltersLegacySystemThreadStartup(t *testing.T) {
+	dir := t.TempDir()
+	session := NewSession(dir, "main")
+	startup := "[2026-07-12 11:26] Events:\n• [thread:unconscious] started (provider: openai-codex, role: worker, tools: memory_search, pace)\n"
+	combined := "[2026-07-12 11:27] Events:\n• [thread:unconscious] started (provider: openai-codex, role: worker, tools: memory_search, pace)\n• [console] Keep this request\n"
+	if err := session.Append(SessionEntry{Role: "user", Content: startup}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Append(SessionEntry{Role: "user", Content: combined}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Append(SessionEntry{Role: "assistant", Content: "done"}); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, _ := session.LoadTail(10)
+	if len(messages) != 2 {
+		t.Fatalf("loaded %d messages, want combined event + assistant: %+v", len(messages), messages)
+	}
+	if strings.Contains(messages[0].Content, "unconscious") || strings.Contains(messages[0].Content, "memory_search") {
+		t.Fatalf("legacy system startup leaked through: %q", messages[0].Content)
+	}
+	if !strings.Contains(messages[0].Content, "Keep this request") {
+		t.Fatalf("real event was removed with system startup: %q", messages[0].Content)
+	}
+}
+
+func TestSessionLoadTailFiltersLegacySystemThreadControlAttempt(t *testing.T) {
+	dir := t.TempDir()
+	session := NewSession(dir, "main")
+	if err := session.Append(SessionEntry{
+		Role:      "assistant",
+		Content:   "I’ll delegate to the memory worker.",
+		ToolCalls: []NativeToolCall{{ID: "call-system", Name: "send", Args: map[string]string{"id": "unconscious", "message": "search"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Append(SessionEntry{
+		Role:        "user",
+		ToolResults: []ToolResult{{CallID: "call-system", Content: `error: thread "unconscious" is platform-managed`}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Append(SessionEntry{Role: "user", Content: "real request"}); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, _ := session.LoadTail(10)
+	if len(messages) != 1 || messages[0].Content != "real request" {
+		t.Fatalf("system control attempt survived reload: %+v", messages)
+	}
+}
+
 type retrievalCaptureProvider struct {
 	mu       sync.Mutex
 	requests [][]Message

@@ -28,19 +28,20 @@ type SessionEntry struct {
 	// durable history safe for consumers that need to observe a running thread:
 	// unlike the in-memory context window, this cursor does not move when old
 	// messages are trimmed from the model prompt.
-	Sequence    int64            `json:"seq,omitempty"`
-	Timestamp   time.Time        `json:"ts"`
-	Role        string           `json:"role"` // "system", "user", "assistant", "tool_result", "_compacted"
-	Content     string           `json:"content"`
-	Parts       []ContentPart    `json:"parts,omitempty"`
-	ToolCalls   []NativeToolCall `json:"tool_calls,omitempty"`
-	ToolResults []ToolResult     `json:"tool_results,omitempty"`
-	Reasoning   string           `json:"reasoning,omitempty"`
-	Summary     string           `json:"summary,omitempty"`        // for _compacted entries
-	OrigCount   int              `json:"original_count,omitempty"` // how many messages were compacted
-	TokensIn    int              `json:"tokens_in,omitempty"`
-	TokensOut   int              `json:"tokens_out,omitempty"`
-	Iteration   int              `json:"iteration,omitempty"`
+	Sequence      int64                  `json:"seq,omitempty"`
+	Timestamp     time.Time              `json:"ts"`
+	Role          string                 `json:"role"` // "system", "user", "assistant", "tool_result", "_compacted"
+	Content       string                 `json:"content"`
+	Parts         []ContentPart          `json:"parts,omitempty"`
+	ToolCalls     []NativeToolCall       `json:"tool_calls,omitempty"`
+	ToolResults   []ToolResult           `json:"tool_results,omitempty"`
+	Reasoning     string                 `json:"reasoning,omitempty"`
+	ProviderState *ProviderResponseState `json:"provider_state,omitempty"`
+	Summary       string                 `json:"summary,omitempty"`        // for _compacted entries
+	OrigCount     int                    `json:"original_count,omitempty"` // how many messages were compacted
+	TokensIn      int                    `json:"tokens_in,omitempty"`
+	TokensOut     int                    `json:"tokens_out,omitempty"`
+	Iteration     int                    `json:"iteration,omitempty"`
 }
 
 // Session manages persistent JSONL history for one thread.
@@ -120,16 +121,17 @@ func (s *Session) Append(entry SessionEntry) error {
 // AppendMessage is a convenience to append a Message as a SessionEntry.
 func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) error {
 	entry := SessionEntry{
-		Timestamp:   time.Now(),
-		Role:        msg.Role,
-		Content:     msg.Content,
-		Parts:       msg.Parts,
-		ToolCalls:   msg.ToolCalls,
-		ToolResults: msg.ToolResults,
-		Reasoning:   msg.Reasoning,
-		TokensIn:    usage.PromptTokens,
-		TokensOut:   usage.CompletionTokens,
-		Iteration:   iteration,
+		Timestamp:     time.Now(),
+		Role:          msg.Role,
+		Content:       msg.Content,
+		Parts:         msg.Parts,
+		ToolCalls:     msg.ToolCalls,
+		ToolResults:   msg.ToolResults,
+		Reasoning:     msg.Reasoning,
+		ProviderState: msg.ProviderState,
+		TokensIn:      usage.PromptTokens,
+		TokensOut:     usage.CompletionTokens,
+		Iteration:     iteration,
 	}
 	return s.Append(entry)
 }
@@ -181,12 +183,13 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 	// Convert to Messages
 	for _, e := range real {
 		msg := Message{
-			Role:        e.Role,
-			Content:     e.Content,
-			Parts:       e.Parts,
-			ToolCalls:   e.ToolCalls,
-			ToolResults: e.ToolResults,
-			Reasoning:   e.Reasoning,
+			Role:          e.Role,
+			Content:       e.Content,
+			Parts:         e.Parts,
+			ToolCalls:     e.ToolCalls,
+			ToolResults:   e.ToolResults,
+			Reasoning:     e.Reasoning,
+			ProviderState: e.ProviderState,
 		}
 		// Normalize role: "tool_result" → "user" with ToolResults
 		if e.Role == "tool_result" {
@@ -311,6 +314,10 @@ func sanitizeToolPairs(messages []Message, pendingIDs ...map[string]bool) []Mess
 			if len(valid) != len(m.ToolCalls) {
 				removed += len(m.ToolCalls) - len(valid)
 				m.ToolCalls = valid
+				// ProviderState is an atomic copy of the original Responses
+				// output. Once calls are removed, replaying it would resurrect
+				// the orphaned calls; fall back to reconstruction instead.
+				m.ProviderState = nil
 			}
 		}
 
@@ -520,7 +527,12 @@ func buildCompactionParts(entries []SessionEntry, keepRecent int) (combined stri
 func sanitizeLegacyDynamicEntries(entries []SessionEntry) []SessionEntry {
 	cleaned := make([]SessionEntry, 0, len(entries))
 	for _, entry := range entries {
-		content, synthetic := stripLegacyDynamicContext(entry.Content)
+		if legacyEntryTargetsSystemThread(entry) {
+			continue
+		}
+		content, systemSynthetic := stripLegacySystemThreadEvents(entry.Content)
+		content, dynamicSynthetic := stripLegacyDynamicContext(content)
+		synthetic := systemSynthetic || dynamicSynthetic
 		if !synthetic {
 			cleaned = append(cleaned, entry)
 			continue
@@ -546,6 +558,43 @@ func sanitizeLegacyDynamicEntries(entries []SessionEntry) []SessionEntry {
 		cleaned = append(cleaned, entry)
 	}
 	return cleaned
+}
+
+func legacyEntryTargetsSystemThread(entry SessionEntry) bool {
+	for _, call := range entry.ToolCalls {
+		if call.Args["id"] == "unconscious" {
+			return true
+		}
+	}
+	return false
+}
+
+// stripLegacySystemThreadEvents removes unconscious-thread startup notices
+// written by cores that predate the System spawn visibility guard. Those
+// notices disclosed a platform-managed target and its privileged tools to the
+// main model. Keep other events from the same batch intact.
+func stripLegacySystemThreadEvents(content string) (string, bool) {
+	if !strings.Contains(content, "[thread:unconscious] started") {
+		return content, false
+	}
+	lines := strings.Split(content, "\n")
+	kept := make([]string, 0, len(lines))
+	removed := false
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "• [thread:unconscious] started") {
+			removed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !removed {
+		return content, false
+	}
+	result := strings.TrimSpace(strings.Join(kept, "\n"))
+	if strings.HasSuffix(result, "Events:") {
+		result = ""
+	}
+	return result, true
 }
 
 // Delete removes the history file.
