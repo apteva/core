@@ -252,6 +252,7 @@ func TestModelContextWindow(t *testing.T) {
 		// OpenCode Go uses dotted ids; bare "kimi-k2" must NOT
 		// shadow the dotted entries (was the bug).
 		{"kimi-k2.6", 256_000},
+		{"glm-5.2", 128_000},
 		{"kimi-k2.5", 256_000},
 		{"minimax-m2.7", 196_608},
 		{"minimax-m2.5", 196_608},

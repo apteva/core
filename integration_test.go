@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -42,11 +43,20 @@ func drainEvents(thinker *Thinker) func() int {
 	}
 }
 
+func newIsolatedIntegrationThinker(t *testing.T, tp testProvider) *Thinker {
+	t.Helper()
+	cfg := &Config{
+		path: filepath.Join(t.TempDir(), "config.json"),
+		Mode: ModeAutonomous,
+	}
+	return NewThinker(tp.APIKey, tp.Provider, cfg)
+}
+
 func TestIntegration_Think(t *testing.T) {
 	t.Parallel()
 	tp := getTestProvider(t)
 
-	thinker := NewThinker(tp.APIKey, tp.Provider)
+	thinker := newIsolatedIntegrationThinker(t, tp)
 	thinker.messages = append(thinker.messages, Message{
 		Role:    "user",
 		Content: "Reply with exactly one word: hello",
@@ -74,7 +84,7 @@ func TestIntegration_ThinkWithToolCall(t *testing.T) {
 	t.Parallel()
 	tp := getTestProvider(t)
 
-	thinker := NewThinker(tp.APIKey, tp.Provider)
+	thinker := newIsolatedIntegrationThinker(t, tp)
 	thinker.messages = append(thinker.messages, Message{
 		Role:    "user",
 		Content: `Reply with exactly this text and nothing else: [[reply message="test"]]`,
@@ -431,4 +441,3 @@ func TestIntegration_NativeToolCallNestedArrayArgs(t *testing.T) {
 	}
 	t.Logf("text: %q", text)
 }
-

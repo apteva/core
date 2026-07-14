@@ -1,6 +1,7 @@
 package core
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,8 +26,12 @@ func TestIntegration_MultiThreadCoordination(t *testing.T) {
 Each thread has tools="done". After spawning all 3, set pace to sleep and wait for their results.
 When all 3 threads report done, say "ALL TASKS COMPLETE" in your thought.`
 
-	thinker := NewThinker(apiKey, tp.Provider)
-	thinker.config = &Config{Directive: directive}
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: directive,
+		Mode:      ModeAutonomous,
+	}
+	thinker := NewThinker(apiKey, tp.Provider, cfg)
 	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, nil, nil)}
 
 	// Set up event filter and tool handler (same as normal startup)

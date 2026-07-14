@@ -26,7 +26,11 @@ func TestCodexLargeToolResultPreservedSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runLargeToolResultPreservedSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runLargeToolResultPreservedSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	const sentinel = "FULL_RESULT_SENTINEL_9F4C2A"
 	fullResult := "BEGIN-CATALOG\n" +
 		strings.Repeat("catalog item before sentinel\n", 320) +
@@ -36,7 +40,6 @@ func TestCodexLargeToolResultPreservedSmoke(t *testing.T) {
 		t.Fatalf("test setup failed: sentinel offset=%d, want past old cap boundary", strings.Index(fullResult, sentinel))
 	}
 
-	provider := NewOpenAICodexProvider(token)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	resp, err := provider.Chat(ctx, []Message{
@@ -69,7 +72,11 @@ func TestCodexSemanticCompactionSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runSemanticCompactionSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runSemanticCompactionSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	const oldIdentifier = "CONSULTING_LEAD_ALPHA_77"
 	const sentinel = "FULL_RESULT_SENTINEL_2B85D1"
 	fullResult := "BEGIN-CATALOG\n" +
@@ -77,7 +84,6 @@ func TestCodexSemanticCompactionSmoke(t *testing.T) {
 		sentinel + "\n" +
 		strings.Repeat("retained item after sentinel\n", 80)
 
-	provider := NewOpenAICodexProvider(token)
 	messages := []Message{{Role: "system", Content: "You are a lead-management agent."}}
 	for i := 0; i < contextPressureKeepRecent+8; i++ {
 		content := "Older work log: reviewed consulting leads and maintained outreach state."

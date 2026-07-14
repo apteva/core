@@ -251,6 +251,82 @@ func TestMainEvolveKicksNextTurn(t *testing.T) {
 	}
 }
 
+func TestMainEvolveIdenticalEditIsNoOp(t *testing.T) {
+	events := []APIEvent{}
+	directive := "# Schedule\n- cadence: weekly"
+	thinker := &Thinker{
+		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive},
+		directive: directive,
+		messages:  []Message{{Role: "system", Content: "stable prompt"}},
+		registry:  NewToolRegistry("test"),
+		threadID:  "main",
+		apiLog:    &events,
+		apiMu:     &sync.RWMutex{},
+		apiNotify: make(chan struct{}, 1),
+		telemetry: NewTelemetry(),
+	}
+	defer thinker.telemetry.Stop()
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace",
+			"section":   "Schedule",
+			"content":   "- cadence: weekly",
+		},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+
+	if thinker.kickNextTurn {
+		t.Fatal("identical evolve should not kick another turn")
+	}
+	if thinker.messages[0].Content != "stable prompt" {
+		t.Fatal("identical evolve rebuilt the system prompt")
+	}
+	if len(results) != 1 || results[0].Content != "directive already current" {
+		t.Fatalf("results = %+v", results)
+	}
+	telemetryEvents, _ := thinker.telemetry.StoredEvents(0)
+	for _, event := range telemetryEvents {
+		if event.Type == "directive.evolved" {
+			t.Fatalf("identical evolve emitted directive.evolved: %+v", event)
+		}
+	}
+}
+
+func TestWorkerEvolveIdenticalEditIsNoOp(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	directive := "# Schedule\n- cadence: weekly"
+	if err := thinker.threads.SpawnWithOpts("worker", directive, nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	worker := thinker.threads.threads["worker"]
+	originalPrompt := worker.Thinker.messages[0].Content
+
+	_, _, results := threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace",
+			"section":   "Schedule",
+			"content":   "- cadence: weekly",
+		},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+
+	if worker.Thinker.kickNextTurn {
+		t.Fatal("identical worker evolve should not kick another turn")
+	}
+	if worker.Thinker.messages[0].Content != originalPrompt {
+		t.Fatal("identical worker evolve rebuilt the system prompt")
+	}
+	if len(results) != 1 || results[0].Content != "directive already current" {
+		t.Fatalf("results = %+v", results)
+	}
+}
+
 func TestMainEvolveRejectsFullReplaceForMarkdown(t *testing.T) {
 	events := []APIEvent{}
 	directive := "# Role\nOld role\n# Goals\n- Ship"

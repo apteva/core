@@ -2,12 +2,128 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestCodexRecurringInstructionUsesMainWakeLoop is an opt-in behavioral smoke
+// against the real Codex provider. It sends the same kind of durable owner
+// message that regressed in production and observes the model-selected tools.
+//
+//	RUN_CODEX_RECURRING_EVOLVE_SMOKE=1 OPENAI_CODEX_ACCESS_TOKEN=... go test -run TestCodexRecurringInstructionUsesMainWakeLoop -timeout 5m .
+func TestCodexRecurringInstructionUsesMainWakeLoop(t *testing.T) {
+	if os.Getenv("RUN_CODEX_RECURRING_EVOLVE_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_RECURRING_EVOLVE_SMOKE=1 to run the recurring evolve smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex recurring evolve smoke in short mode")
+	}
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+	}
+	runRecurringInstructionUsesMainWakeLoop(t, NewOpenAICodexProvider(token))
+}
+
+func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+	cfg := &Config{
+		path: filepath.Join(t.TempDir(), "config.json"),
+		Directive: strings.Join([]string{
+			"# Role",
+			"You manage affiliate performance for the operator.",
+			"",
+			"# Goals",
+			"- Answer affiliate analytics requests accurately.",
+		}, "\n"),
+		Mode: ModeAutonomous,
+	}
+	thinker := NewThinker("", provider, cfg)
+	defer thinker.Stop()
+	started := time.Now()
+	go thinker.Run()
+	thinker.InjectConsole(strings.Join([]string{
+		"From now on, every week send me an affiliate-performance report.",
+		"The report must include evolution, conversions, conversion rate, revenue, commissions, network breakdown, notable changes, and recommended next steps.",
+		"Persist this durable responsibility with a concrete UTC cadence anchor and next-due value, then use your own automatic main-loop wake-up to check it.",
+		"Do not create a thread merely to wait and do not look for an external scheduler merely to wake yourself.",
+	}, "\n"))
+
+	deadline := time.Now().Add(4 * time.Minute)
+	seenEvolve := false
+	seenPace := false
+	seenPaceResult := false
+	seenEventIDs := map[string]bool{}
+	var paceArgs map[string]string
+	for time.Now().Before(deadline) {
+		events, _ := thinker.telemetry.StoredEvents(0)
+		for _, event := range events {
+			if event.ThreadID != "main" || event.Time.Before(started) {
+				continue
+			}
+			if seenEventIDs[event.ID] {
+				continue
+			}
+			seenEventIDs[event.ID] = true
+			switch event.Type {
+			case "tool.call":
+				var data ToolCallData
+				if json.Unmarshal(event.Data, &data) != nil {
+					continue
+				}
+				switch data.Name {
+				case "spawn":
+					t.Fatalf("recurring instruction spawned a timer worker: args=%v", data.Args)
+				case "search_tools":
+					query := strings.ToLower(data.Args["query"])
+					if strings.Contains(query, "schedul") || strings.Contains(query, "cron") || strings.Contains(query, "recurr") {
+						t.Fatalf("recurring instruction searched for a scheduler: args=%v", data.Args)
+					}
+				case "evolve":
+					if seenEvolve {
+						t.Fatalf("same recurring instruction called evolve more than once: args=%v", data.Args)
+					}
+					seenEvolve = true
+				case "pace":
+					seenPace = true
+					paceArgs = data.Args
+				}
+			case "tool.result":
+				var data ToolResultData
+				if json.Unmarshal(event.Data, &data) == nil && data.Name == "pace" {
+					if !data.Success || strings.HasPrefix(data.Result, "error:") {
+						t.Fatalf("pace failed: %+v", data)
+					}
+					seenPaceResult = true
+				}
+			}
+		}
+
+		if seenEvolve && seenPace && seenPaceResult {
+			sleep := paceArgs["sleep"]
+			duration, ok := parseSleepDuration(sleep)
+			if !ok || duration <= 0 || duration > maxSleep {
+				t.Fatalf("model selected invalid main-loop sleep %q", sleep)
+			}
+			directive := cfg.GetDirective()
+			lower := strings.ToLower(directive)
+			for _, want := range []string{"weekly", "anchor", "next"} {
+				if !strings.Contains(lower, want) {
+					t.Fatalf("evolved directive missing %q schedule state:\n%s", want, directive)
+				}
+			}
+			t.Logf("recurring instruction evolved on main with pace(%q):\n%s", sleep, directive)
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("timed out: evolve=%v pace=%v pace_result=%v directive=\n%s", seenEvolve, seenPace, seenPaceResult, cfg.GetDirective())
+}
 
 // TestCodexDirectiveEditSmoke is a release-gate smoke for the real Codex
 // provider. It verifies that the live model can use the new Markdown patch
@@ -25,7 +141,11 @@ func TestCodexDirectiveEditSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runDirectiveEditSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runDirectiveEditSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Chdir(t.TempDir())
 	cfg := &Config{
 		path: filepath.Join(t.TempDir(), "config.json"),
@@ -41,7 +161,6 @@ func TestCodexDirectiveEditSmoke(t *testing.T) {
 		}, "\n"),
 		Mode: ModeAutonomous,
 	}
-	provider := NewOpenAICodexProvider(token)
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 
@@ -84,14 +203,17 @@ func TestCodexEmptyDirectiveSectionInitSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runEmptyDirectiveSectionInitSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runEmptyDirectiveSectionInitSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Chdir(t.TempDir())
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "",
 		Mode:      ModeAutonomous,
 	}
-	provider := NewOpenAICodexProvider(token)
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 
@@ -134,14 +256,17 @@ func TestCodexRedundantDirectiveHeadingSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runRedundantDirectiveHeadingSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runRedundantDirectiveHeadingSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Chdir(t.TempDir())
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nMaintain this directive.\n\n# Goals\n- Keep the directive structured.",
 		Mode:      ModeAutonomous,
 	}
-	provider := NewOpenAICodexProvider(token)
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 
@@ -190,7 +315,11 @@ func TestCodexPersistentIntentAutoEvolveSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runPersistentIntentAutoEvolveSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runPersistentIntentAutoEvolveSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Chdir(t.TempDir())
 	cfg := &Config{
 		path: filepath.Join(t.TempDir(), "config.json"),
@@ -206,7 +335,6 @@ func TestCodexPersistentIntentAutoEvolveSmoke(t *testing.T) {
 		}, "\n"),
 		Mode: ModeAutonomous,
 	}
-	provider := NewOpenAICodexProvider(token)
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 
@@ -249,14 +377,17 @@ func TestCodexSubthreadPersistentIntentAutoEvolveSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runSubthreadPersistentIntentAutoEvolveSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runSubthreadPersistentIntentAutoEvolveSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Chdir(t.TempDir())
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate workers.",
 		Mode:      ModeAutonomous,
 	}
-	provider := NewOpenAICodexProvider(token)
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 
@@ -301,12 +432,16 @@ func TestCodexPersistentIntentBoundariesSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runPersistentIntentBoundariesSmoke(t, NewOpenAICodexProvider(token))
+}
 
-	provider := NewOpenAICodexProvider(token)
+func runPersistentIntentBoundariesSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
+	providerName := provider.Name()
 	pool := &ProviderPool{
-		providers: map[string]LLMProvider{"openai-codex": provider},
-		order:     []string{"openai-codex"},
-		default_:  "openai-codex",
+		providers: map[string]LLMProvider{providerName: provider},
+		order:     []string{providerName},
+		default_:  providerName,
 	}
 	registry := NewToolRegistry("")
 	prompt := buildSystemPrompt("# Role\nReview inbound work.\n\n# Goals\n- Keep reports accurate.", ModeAutonomous, registry, "", nil, nil, pool, nil)
@@ -356,7 +491,11 @@ func TestCodexMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
+	runMarkdownDirectiveRejectsFullReplaceSmoke(t, NewOpenAICodexProvider(token))
+}
 
+func runMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Chdir(t.TempDir())
 	original := strings.Join([]string{
 		"# Role",
@@ -370,7 +509,6 @@ func TestCodexMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T) {
 		Directive: original,
 		Mode:      ModeAutonomous,
 	}
-	provider := NewOpenAICodexProvider(token)
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 

@@ -147,7 +147,7 @@ func registerSystemTools(registry *ToolRegistry, memory *MemoryStore) {
 		Name:        "memory_remember",
 		Description: "Append a new memory. content is the statement to remember. tags are free-form labels (you choose what dimensions matter — common ones: identity, preference, decision, person, project, procedure). weight (0.0–1.0) is your confidence + importance estimate.",
 		Syntax:      `[[memory_remember content="Marco prefers terse replies for known topics, verbose for new ones" tags="preference,communication-style" weight="0.85"]]`,
-		Rules:       "ALWAYS memory_search first — don't remember a duplicate. If a similar memory exists with stale wording, use memory_supersede instead. Weight high (0.8–0.95) for user-stated facts, medium (0.5–0.75) for inferred patterns, low (0.2–0.4) for uncertain hunches you'll let decay if not confirmed.",
+		Rules:       "Use memory_search before writing when a duplicate or conflict is plausible. Fresh explicit user statements may be remembered directly. If a similar memory exists with stale wording, use memory_supersede instead. Weight high (0.8–0.95) for user-stated facts, medium (0.5–0.75) for inferred patterns, low (0.2–0.4) for uncertain hunches you'll let decay if not confirmed.",
 		Core:        true,
 		SystemOnly:  true,
 		Handler: func(args map[string]string) ToolResponse {

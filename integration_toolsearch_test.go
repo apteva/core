@@ -205,6 +205,11 @@ guess tool names. After the tool returns, call pace to sleep.`
 
 	thinker := newScenarioThinker(t, os.Getenv("FIREWORKS_API_KEY"), directive, mcpCfg, providers)
 	defer thinker.Stop()
+	// This case isolates explicit search_tools. Keep the directive in the
+	// already-built system prompt so the model sees the task, but remove it
+	// from BM25's preload query; otherwise the intentional preload path can
+	// surface the exact tool before the model has a chance to search for it.
+	thinker.directive = ""
 
 	// Sanity: the mock tool is indexed but hidden from main's tool list
 	// until search_tools activates it.

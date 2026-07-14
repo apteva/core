@@ -73,6 +73,36 @@ func TestApplyDirectiveEditSectionPayloadDefaultsToAppend(t *testing.T) {
 	}
 }
 
+func TestApplyDirectiveEditIdenticalSectionReplaceIsStable(t *testing.T) {
+	current := "# Goals\n- Ship\n\n# Schedule\n- cadence: weekly"
+	got, _, err := applyDirectiveEdit(current, map[string]string{
+		"edit_mode": "section_replace",
+		"section":   "Schedule",
+		"content":   "- cadence: weekly",
+	})
+	if err != nil {
+		t.Fatalf("applyDirectiveEdit: %v", err)
+	}
+	if got != current {
+		t.Fatalf("identical edit changed directive:\ngot:\n%s\nwant:\n%s", got, current)
+	}
+}
+
+func TestApplyDirectiveEditRemoveFinalLineRemovesEmptySection(t *testing.T) {
+	current := "# Goals\n- Ship\n\n# Affiliate Reporting\n- cadence: weekly"
+	got, _, err := applyDirectiveEdit(current, map[string]string{
+		"edit_mode": "section_remove_line",
+		"section":   "Affiliate Reporting",
+		"match":     "cadence: weekly",
+	})
+	if err != nil {
+		t.Fatalf("applyDirectiveEdit: %v", err)
+	}
+	if got != "# Goals\n- Ship" {
+		t.Fatalf("empty section was not removed: %q", got)
+	}
+}
+
 func TestApplyDirectiveEditBatchSectionPayloadDefaultsToAppend(t *testing.T) {
 	got, summary, err := applyDirectiveEdit("", map[string]string{
 		"edits": `[

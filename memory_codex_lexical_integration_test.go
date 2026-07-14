@@ -72,7 +72,11 @@ func TestIntegration_CodexUsesLexicalMemoryWithoutEmbeddings(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set and ~/.codex/auth.json has no access token")
 	}
+	runUsesLexicalMemoryWithoutEmbeddings(t, NewOpenAICodexProvider(token))
+}
 
+func runUsesLexicalMemoryWithoutEmbeddings(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Setenv("FIREWORKS_API_KEY", "")
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("OLLAMA_HOST", "")
@@ -113,7 +117,6 @@ func TestIntegration_CodexUsesLexicalMemoryWithoutEmbeddings(t *testing.T) {
 		t.Fatalf("dynamic context did not contain sentinel memory:\n%s", dynCtx)
 	}
 
-	provider := NewOpenAICodexProvider(token)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	resp, err := provider.Chat(ctx, []Message{
@@ -152,7 +155,11 @@ func TestIntegration_CodexUsesEphemeralMemoryAcrossTurns(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set and no valid local Codex token")
 	}
+	runUsesEphemeralMemoryAcrossTurns(t, NewOpenAICodexProvider(token))
+}
 
+func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Setenv("FIREWORKS_API_KEY", "")
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("OLLAMA_HOST", "")
@@ -169,7 +176,7 @@ func TestIntegration_CodexUsesEphemeralMemoryAcrossTurns(t *testing.T) {
 		}, "\n"),
 		Mode: ModeAutonomous,
 	}
-	thinker := NewThinker("", NewOpenAICodexProvider(token), cfg)
+	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 	relevantID, err := thinker.memory.Remember(
 		"For operation heliotrope-echo-731, the escalation channel is cobalt-desk-904.",
@@ -252,7 +259,7 @@ func TestIntegration_CodexUsesEphemeralMemoryAcrossTurns(t *testing.T) {
 	if recalls < 3 {
 		t.Fatalf("relevant memory recalled %d times, want at least 3", recalls)
 	}
-	t.Logf("live Codex used one relevant memory across three ephemeral turns")
+	t.Logf("live provider used one relevant memory across three ephemeral turns")
 }
 
 // TestIntegration_CodexAutoSpawnedUnconsciousCreatesLexicalMemory is the live
@@ -274,7 +281,11 @@ func TestIntegration_CodexAutoSpawnedUnconsciousCreatesLexicalMemory(t *testing.
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set and ~/.codex/auth.json has no access token")
 	}
+	runAutoSpawnedUnconsciousCreatesLexicalMemory(t, NewOpenAICodexProvider(token))
+}
 
+func runAutoSpawnedUnconsciousCreatesLexicalMemory(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Setenv("FIREWORKS_API_KEY", "")
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("OLLAMA_HOST", "")
@@ -288,7 +299,7 @@ func TestIntegration_CodexAutoSpawnedUnconsciousCreatesLexicalMemory(t *testing.
 		t.Fatal(err)
 	}
 
-	parent := NewThinker("", NewOpenAICodexProvider(token), cfg)
+	parent := NewThinker("", provider, cfg)
 	defer parent.Stop()
 	parent.threads.mu.RLock()
 	autoSpawned := parent.threads.threads["unconscious"]
@@ -308,7 +319,7 @@ func TestIntegration_CodexAutoSpawnedUnconsciousCreatesLexicalMemory(t *testing.
 	if !memoryResultsContain(results, "ultramarine") {
 		t.Fatalf("lexical recall missed Codex-created memory; results=%v", memoryContents(results))
 	}
-	t.Logf("Codex-created memories: %v", memoryContents(parent.memory.Active()))
+	t.Logf("provider-created memories: %v", memoryContents(parent.memory.Active()))
 }
 
 // TestIntegration_CodexUnconsciousHistoryGrowthCreatesPersistentMemory is the
@@ -332,7 +343,11 @@ func TestIntegration_CodexUnconsciousHistoryGrowthCreatesPersistentMemory(t *tes
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set and no valid local Codex token")
 	}
+	runUnconsciousHistoryGrowthCreatesPersistentMemory(t, NewOpenAICodexProvider(token))
+}
 
+func runUnconsciousHistoryGrowthCreatesPersistentMemory(t *testing.T, provider LLMProvider) {
+	t.Helper()
 	t.Setenv("FIREWORKS_API_KEY", "")
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("OLLAMA_HOST", "")
@@ -344,9 +359,9 @@ func TestIntegration_CodexUnconsciousHistoryGrowthCreatesPersistentMemory(t *tes
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
-	provider := &codexUnconsciousRouteProvider{codex: NewOpenAICodexProvider(token)}
+	routedProvider := &codexUnconsciousRouteProvider{codex: provider}
 	startedAt := time.Now()
-	parent := NewThinker("", provider, cfg)
+	parent := NewThinker("", routedProvider, cfg)
 	stopped := false
 	t.Cleanup(func() {
 		if !stopped {
@@ -365,8 +380,10 @@ func TestIntegration_CodexUnconsciousHistoryGrowthCreatesPersistentMemory(t *tes
 	go parent.Run()
 	const sentinel = "viridian-threshold-946"
 	padding := strings.Repeat("Non-memory transport padding used only to cross the safety threshold. ", 550)
-	parent.InjectConsole("User explicitly said: remember that the durable deployment threshold token is " + sentinel + ". " + padding)
-	parent.InjectConsole("User confirmed that future threshold deployment checks must use " + sentinel + ". " + padding)
+	parent.InjectConsole(padding)
+	parent.InjectConsole(padding)
+	parent.InjectConsole("User explicitly said: remember that the durable deployment threshold token is " + sentinel + ".")
+	parent.InjectConsole("User confirmed that future threshold deployment checks must use " + sentinel + ".")
 	waitForHistoryGrowth(t, baseline+unconsciousByteThreshold, 15*time.Second)
 
 	thresholdAt := time.Now()
@@ -378,14 +395,14 @@ func TestIntegration_CodexUnconsciousHistoryGrowthCreatesPersistentMemory(t *tes
 	}()
 	ticks <- thresholdAt
 
-	waitForMemory(t, parent.memory, 7*time.Minute, func(record MemoryRecord) bool {
+	waitForToolCall(t, parent.telemetry, "unconscious", "review_history", thresholdAt, time.Minute)
+	waitForToolCall(t, parent.telemetry, "unconscious", "memory_remember", thresholdAt, 6*time.Minute)
+	waitForMemory(t, parent.memory, time.Minute, func(record MemoryRecord) bool {
 		return len(record.Embedding) == 0 && strings.Contains(strings.ToLower(record.Content), sentinel)
 	})
 	if parent.memory.Count() <= memoriesBefore {
 		t.Fatalf("memory count did not increase: before=%d after=%d", memoriesBefore, parent.memory.Count())
 	}
-	waitForToolCall(t, parent.telemetry, "unconscious", "review_history", thresholdAt, time.Minute)
-	waitForToolCall(t, parent.telemetry, "unconscious", "memory_remember", thresholdAt, time.Minute)
 
 	parent.threads.KillAll()
 	parent.Stop()

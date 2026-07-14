@@ -26,17 +26,13 @@ func (s *ephemeralTurnContextState) reset() {
 }
 
 func renderEphemeralTurnContext(dynamicContext, now string, idle bool) string {
-	content := strings.TrimSpace(dynamicContext)
-	if content != "" {
-		content = ephemeralContextHeader + "\n" + content
+	content := ephemeralContextHeader + "\n[CURRENT TIME]\nUTC: " + now
+	if dynamic := strings.TrimSpace(dynamicContext); dynamic != "" {
+		content += "\n\n" + dynamic
 	}
 	if idle {
 		idleText := fmt.Sprintf("[%s] (no new events; continue standing work or wait)", now)
-		if content != "" {
-			content += "\n\n" + idleText
-		} else {
-			content = idleText
-		}
+		content += "\n\n" + idleText
 	}
 	return content
 }

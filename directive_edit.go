@@ -255,12 +255,24 @@ func markdownSectionReplaceLine(current, section, match, content string) (string
 
 func markdownSectionRemoveLine(current, section, match string) (string, error) {
 	lines := directiveLines(current)
-	_, bodyStart, bodyEnd, ok := findMarkdownSection(lines, section)
+	header, bodyStart, bodyEnd, ok := findMarkdownSection(lines, section)
 	if !ok {
 		return "", fmt.Errorf("section %q not found", section)
 	}
 	for i := bodyStart; i < bodyEnd; i++ {
 		if strings.Contains(lines[i], match) {
+			hasRemainingContent := false
+			for j := bodyStart; j < bodyEnd; j++ {
+				if j != i && strings.TrimSpace(lines[j]) != "" {
+					hasRemainingContent = true
+					break
+				}
+			}
+			if !hasRemainingContent {
+				out := append([]string{}, lines[:header]...)
+				out = append(out, lines[bodyEnd:]...)
+				return strings.Trim(strings.Join(out, "\n"), "\n"), nil
+			}
 			out := append([]string{}, lines[:i]...)
 			out = append(out, lines[i+1:]...)
 			return strings.Join(out, "\n"), nil

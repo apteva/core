@@ -10,6 +10,15 @@ import (
 	"github.com/joho/godotenv"
 )
 
+func TestOpenCodeGoDefaultsToGLM52(t *testing.T) {
+	models := NewOpenCodeGoProvider("test-key").Models()
+	for _, tier := range []ModelTier{ModelLarge, ModelMedium, ModelSmall} {
+		if got := models[tier]; got != "glm-5.2" {
+			t.Errorf("tier %q model = %q, want glm-5.2", tier, got)
+		}
+	}
+}
+
 // TestIntegration_OpenCodeGo_NativeToolCalls verifies the regression we
 // hit on instances #108/#109: kimi-k2.6 served via opencode.ai/zen/go
 // must accept the OpenAI-format `tools` array and return real
@@ -107,6 +116,7 @@ func TestIntegration_OpenCodeGo_NativeToolCalls(t *testing.T) {
 func TestIntegration_OpenCodeGo_MultiTurnToolCall(t *testing.T) {
 	apiKey := getOpenCodeGoKey(t)
 	prov := NewOpenCodeGoProvider(apiKey)
+	const model = "kimi-k2.6"
 
 	tools := []NativeTool{{
 		Name:        "calc",
@@ -125,7 +135,7 @@ func TestIntegration_OpenCodeGo_MultiTurnToolCall(t *testing.T) {
 		{Role: "system", Content: "You are an agent. Use the calc tool when the user asks for arithmetic."},
 		{Role: "user", Content: "What's 17 * 23?"},
 	}
-	resp1, err := prov.Chat(context.Background(), turn1, prov.Models()[ModelLarge], tools, nil, nil, nil)
+	resp1, err := prov.Chat(context.Background(), turn1, model, tools, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("turn1 Chat error: %v", err)
 	}
@@ -157,7 +167,7 @@ func TestIntegration_OpenCodeGo_MultiTurnToolCall(t *testing.T) {
 		},
 		{Role: "user", Content: "Thanks. Now what's 391 + 9?"},
 	}
-	resp2, err := prov.Chat(context.Background(), turn2, prov.Models()[ModelLarge], tools, nil, nil, nil)
+	resp2, err := prov.Chat(context.Background(), turn2, model, tools, nil, nil, nil)
 	if err != nil {
 		// This is the failure mode we're pinning. If we ever see
 		// HTTP 400 here, the assistant-content omission has come back.

@@ -57,6 +57,23 @@ func TestAppendEphemeralTurnContextPreservesDurablePrefix(t *testing.T) {
 	}
 }
 
+func TestEphemeralTurnContextAlwaysIncludesCurrentUTC(t *testing.T) {
+	content := renderEphemeralTurnContext("", "2026-07-13T12:03:00Z", false)
+	for _, want := range []string{ephemeralContextHeader, "[CURRENT TIME]", "UTC: 2026-07-13T12:03:00Z"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("context missing %q: %q", want, content)
+		}
+	}
+
+	state := ephemeralTurnContextState{}
+	base := []Message{{Role: "system", Content: "stable"}}
+	first := state.prepare(base, "", "2026-07-13T12:03:00Z", true, true)
+	second := state.prepare(base, "", "2026-07-14T12:03:00Z", true, true)
+	if first[1].Content == second[1].Content || !strings.Contains(second[1].Content, "2026-07-14T12:03:00Z") {
+		t.Fatalf("timer wake reused stale time: first=%q second=%q", first[1].Content, second[1].Content)
+	}
+}
+
 func TestEphemeralTurnContextStatePreservesAppendOnlyPrefix(t *testing.T) {
 	state := ephemeralTurnContextState{}
 	durable := []Message{{Role: "system", Content: "stable"}, {Role: "user", Content: "task"}}
@@ -283,8 +300,6 @@ func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
 	if len(requests) < 4 {
 		t.Fatalf("captured %d requests", len(requests))
 	}
-	contextIndex := -1
-	var contextContent string
 	for i, request := range requests[:4] {
 		markers := 0
 		foundIndex := -1
@@ -300,17 +315,8 @@ func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
 		if foundIndex < 0 || !strings.HasPrefix(request[foundIndex].Content, ephemeralContextHeader) {
 			t.Fatalf("request %d is missing marked ephemeral context: %+v", i+1, request)
 		}
-		if i == 0 {
-			contextIndex = foundIndex
-			contextContent = request[foundIndex].Content
-		} else {
-			if foundIndex != contextIndex || request[foundIndex].Content != contextContent {
-				t.Fatalf("request %d moved or changed transient context", i+1)
-			}
-			previous := requests[i-1]
-			if len(request) < len(previous) || !reflect.DeepEqual(previous, request[:len(previous)]) {
-				t.Fatalf("request %d is not an append-only extension of request %d", i+1, i)
-			}
+		if !strings.Contains(request[foundIndex].Content, "[CURRENT TIME]\nUTC: ") {
+			t.Fatalf("request %d lacks current time: %q", i+1, request[foundIndex].Content)
 		}
 	}
 	history, err := os.ReadFile(filepath.Join("history", "main.jsonl"))

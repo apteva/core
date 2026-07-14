@@ -568,12 +568,10 @@ func NewFireworksProvider(apiKey string) LLMProvider {
 // table reports the same so the dashboard's per-call $ figure stays
 // blank rather than misleadingly nonzero.
 //
-// Defaults: kimi-k2.6 across all three tiers. With a flat-rate plan
-// the per-iteration cost incentive that justified Qwen on small/medium
-// for token-priced providers doesn't apply, so we let the agent run
-// the strongest model end-to-end. Users who want to stretch the
-// monthly cap with cheaper tiers can override per-instance in the
-// dashboard provider settings.
+// Defaults: glm-5.2 across all three tiers. With a flat-rate plan the
+// per-iteration cost incentive for choosing weaker small/medium models does
+// not apply, so the agent uses the same capable model end-to-end. Users can
+// still override individual tiers in the dashboard provider settings.
 func NewOpenCodeGoProvider(apiKey string) LLMProvider {
 	return &OpenAICompatProvider{
 		name:       "opencode-go",
@@ -581,9 +579,9 @@ func NewOpenCodeGoProvider(apiKey string) LLMProvider {
 		url:        "https://opencode.ai/zen/go/v1/chat/completions",
 		authHeader: "Bearer",
 		models: map[ModelTier]string{
-			ModelLarge:  "kimi-k2.6",
-			ModelMedium: "kimi-k2.6",
-			ModelSmall:  "kimi-k2.6",
+			ModelLarge:  "glm-5.2",
+			ModelMedium: "glm-5.2",
+			ModelSmall:  "glm-5.2",
 		},
 		inputCost:  0,
 		cachedCost: 0,

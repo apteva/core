@@ -598,6 +598,7 @@ func ModelContextWindow(modelID string) int {
 		{"qwen3.6-plus", 128_000},
 		{"qwen3.5-plus", 128_000},
 		// GLM-5.x (Zhipu) — published 128K context window.
+		{"glm-5.2", 128_000},
 		{"glm-5.1", 128_000},
 		{"glm-5", 128_000},
 		// MiMo V2 / V2.5 — published 256K context.
