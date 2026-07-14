@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -50,8 +51,6 @@ func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider)
 	thinker.InjectConsole(strings.Join([]string{
 		"From now on, every week send me an affiliate-performance report.",
 		"The report must include evolution, conversions, conversion rate, revenue, commissions, network breakdown, notable changes, and recommended next steps.",
-		"Persist this durable responsibility with a concrete UTC cadence anchor and next-due value, then use your own automatic main-loop wake-up to check it.",
-		"Do not create a thread merely to wait and do not look for an external scheduler merely to wake yourself.",
 	}, "\n"))
 
 	deadline := time.Now().Add(4 * time.Minute)
@@ -112,17 +111,67 @@ func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider)
 			}
 			directive := cfg.GetDirective()
 			lower := strings.ToLower(directive)
-			for _, want := range []string{"weekly", "anchor", "next"} {
+			for _, want := range []string{"affiliate", "report"} {
 				if !strings.Contains(lower, want) {
-					t.Fatalf("evolved directive missing %q schedule state:\n%s", want, directive)
+					t.Fatalf("evolved directive missing %q recurring policy:\n%s", want, directive)
 				}
 			}
+			if !strings.Contains(lower, "weekly") && !strings.Contains(lower, "every week") {
+				t.Fatalf("evolved directive missing weekly cadence:\n%s", directive)
+			}
+			for _, forbidden := range []string{"next-due", "next due", "last-completed", "last completed", "timestamp"} {
+				if strings.Contains(lower, forbidden) {
+					t.Fatalf("evolved directive used execution state %q as policy:\n%s", forbidden, directive)
+				}
+			}
+			for _, forbidden := range []struct {
+				label   string
+				pattern *regexp.Regexp
+			}{
+				{"next/first … due state", regexp.MustCompile(`(?i)\b(?:next|first)\b[^\n]{0,50}\bdue\b`)},
+				{"last-run marker", regexp.MustCompile(`(?i)\blast[- ]?(?:sent|run|completed)\b`)},
+				{"concrete ISO date", regexp.MustCompile(`\b20\d{2}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?Z?)?\b`)},
+			} {
+				if forbidden.pattern.MatchString(directive) {
+					t.Fatalf("evolved directive used %s as policy:\n%s", forbidden.label, directive)
+				}
+			}
+			runRecurringCompletionDoesNotEvolveSmoke(t, provider, directive)
 			t.Logf("recurring instruction evolved on main with pace(%q):\n%s", sleep, directive)
 			return
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
 	t.Fatalf("timed out: evolve=%v pace=%v pace_result=%v directive=\n%s", seenEvolve, seenPace, seenPaceResult, cfg.GetDirective())
+}
+
+func runRecurringCompletionDoesNotEvolveSmoke(t *testing.T, provider LLMProvider, directive string) {
+	t.Helper()
+	providerName := provider.Name()
+	pool := &ProviderPool{
+		providers: map[string]LLMProvider{providerName: provider},
+		order:     []string{providerName},
+		default_:  providerName,
+	}
+	registry := NewToolRegistry("")
+	prompt := buildSystemPrompt(directive, ModeAutonomous, registry, "", nil, nil, pool, nil)
+	messages := appendEphemeralTurnContext([]Message{
+		{Role: "system", Content: prompt},
+		{Role: "user", Content: "[from:report-worker] The weekly affiliate-performance report was delivered successfully for this run."},
+	}, "", time.Now().UTC().Format(time.RFC3339), false)
+	tools := registry.NativeTools(map[string]bool{"evolve": true, "pace": true}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	response, err := provider.Chat(ctx, messages, provider.Models()[ModelLarge], tools, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("completion-state chat: %v", err)
+	}
+	for _, call := range response.ToolCalls {
+		if call.Name == "evolve" {
+			t.Fatalf("successful recurring run triggered directive bookkeeping: args=%v text=%q", call.Args, response.Text)
+		}
+	}
 }
 
 // TestCodexDirectiveEditSmoke is a release-gate smoke for the real Codex

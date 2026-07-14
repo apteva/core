@@ -56,6 +56,30 @@ func TestOpenCodeGoKimiCode27RecurringInstructionUsesMainWakeLoop(t *testing.T) 
 	runRecurringInstructionUsesMainWakeLoop(t, provider)
 }
 
+// TestOpenCodeGoMiniMaxM3RecurringInstructionUsesMainWakeLoop runs the same
+// behavioral gate with OpenCode Go's MiniMax M3 model.
+//
+//	RUN_OPENCODE_GO_MINIMAX_M3_SMOKE=1 go test -v -run TestOpenCodeGoMiniMaxM3RecurringInstructionUsesMainWakeLoop -timeout 5m .
+func TestOpenCodeGoMiniMaxM3RecurringInstructionUsesMainWakeLoop(t *testing.T) {
+	if os.Getenv("RUN_OPENCODE_GO_MINIMAX_M3_SMOKE") == "" {
+		t.Skip("set RUN_OPENCODE_GO_MINIMAX_M3_SMOKE=1 to run the MiniMax M3 recurring evolve smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping MiniMax M3 recurring evolve smoke in short mode")
+	}
+	loadIntegrationEnv()
+	key := strings.TrimSpace(os.Getenv("OPENCODE_GO_API_KEY"))
+	if key == "" {
+		t.Skip("OPENCODE_GO_API_KEY not set")
+	}
+
+	provider := NewOpenCodeGoProvider(key)
+	for _, tier := range []ModelTier{ModelLarge, ModelMedium, ModelSmall} {
+		provider.Models()[tier] = "minimax-m3"
+	}
+	runRecurringInstructionUsesMainWakeLoop(t, provider)
+}
+
 // TestOpenCodeGoDirectiveBehaviorSuite runs every provider-neutral directive
 // behavior smoke through OpenCode Go's default GLM 5.2 model.
 func TestOpenCodeGoDirectiveBehaviorSuite(t *testing.T) {
@@ -71,7 +95,35 @@ func TestOpenCodeGoDirectiveBehaviorSuite(t *testing.T) {
 		t.Skip("OPENCODE_GO_API_KEY not set")
 	}
 	newProvider := func() LLMProvider { return NewOpenCodeGoProvider(key) }
+	runProviderDirectiveBehaviorSuite(t, newProvider)
+}
 
+// TestOpenCodeGoMiniMaxM3DirectiveBehaviorSuite runs the complete
+// provider-neutral directive behavior suite through MiniMax M3.
+func TestOpenCodeGoMiniMaxM3DirectiveBehaviorSuite(t *testing.T) {
+	if os.Getenv("RUN_OPENCODE_GO_MINIMAX_M3_SUITE") == "" {
+		t.Skip("set RUN_OPENCODE_GO_MINIMAX_M3_SUITE=1 to run the MiniMax M3 directive behavior suite")
+	}
+	if testing.Short() {
+		t.Skip("skipping MiniMax M3 directive behavior suite in short mode")
+	}
+	loadIntegrationEnv()
+	key := strings.TrimSpace(os.Getenv("OPENCODE_GO_API_KEY"))
+	if key == "" {
+		t.Skip("OPENCODE_GO_API_KEY not set")
+	}
+	newProvider := func() LLMProvider {
+		provider := NewOpenCodeGoProvider(key)
+		for _, tier := range []ModelTier{ModelLarge, ModelMedium, ModelSmall} {
+			provider.Models()[tier] = "minimax-m3"
+		}
+		return provider
+	}
+	runProviderDirectiveBehaviorSuite(t, newProvider)
+}
+
+func runProviderDirectiveBehaviorSuite(t *testing.T, newProvider func() LLMProvider) {
+	t.Helper()
 	t.Run("structured edit", func(t *testing.T) { runDirectiveEditSmoke(t, newProvider()) })
 	t.Run("empty directive initialization", func(t *testing.T) { runEmptyDirectiveSectionInitSmoke(t, newProvider()) })
 	t.Run("redundant heading recovery", func(t *testing.T) { runRedundantDirectiveHeadingSmoke(t, newProvider()) })
