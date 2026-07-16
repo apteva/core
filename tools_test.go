@@ -1,12 +1,86 @@
 package core
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+func TestExecuteToolKeepsFullResultButBoundsTelemetry(t *testing.T) {
+	payload := "a" + strings.Repeat("é", 700) + "SENSITIVE_FULL_RESULT_TAIL"
+	image := []byte("image-bytes")
+	registry := NewToolRegistry("")
+	completed := make(chan struct{})
+	registry.Register(&ToolDef{
+		Name: "large_result",
+		Handler: func(map[string]string) ToolResponse {
+			defer close(completed)
+			return ToolResponse{Text: payload, Image: image}
+		},
+	})
+	bus := NewEventBus()
+	telemetry := NewTelemetry()
+	thinker := &Thinker{
+		bus: bus, sub: bus.Subscribe("main", 100), registry: registry,
+		quit: make(chan struct{}), telemetry: telemetry, threadID: "main",
+	}
+	executeTool(thinker, toolCall{Name: "large_result", NativeID: "call-large", Args: map[string]string{}})
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("tool did not complete")
+	}
+
+	var fullResult *ToolResult
+	deadline := time.Now().Add(time.Second)
+	for fullResult == nil && time.Now().Before(deadline) {
+		select {
+		case event := <-thinker.sub.C:
+			if event.ToolResult != nil {
+				fullResult = event.ToolResult
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if fullResult == nil || fullResult.Content != payload || string(fullResult.Image) != string(image) {
+		t.Fatalf("agent context did not retain full result: %+v", fullResult)
+	}
+
+	var data ToolResultData
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		events, _ := telemetry.StoredEvents(0)
+		for _, event := range events {
+			if event.Type == "tool.result" {
+				if err := json.Unmarshal(event.Data, &data); err != nil {
+					t.Fatal(err)
+				}
+				goto found
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("tool.result telemetry was not emitted")
+
+found:
+	wantBytes := len(payload) + len(image)
+	if data.ResultOriginalBytes != wantBytes || data.ResultContextBytes != wantBytes || data.ResultImageBytes != len(image) {
+		t.Fatalf("size metadata=%+v, want original/context=%d image=%d", data, wantBytes, len(image))
+	}
+	if !data.ResultTruncated || data.ResultPreviewBytes != len(data.Result) || len(data.Result) > toolResultTelemetryPreviewBytes+3 {
+		t.Fatalf("preview metadata=%+v", data)
+	}
+	if !utf8.ValidString(data.Result) {
+		t.Fatal("telemetry preview is not valid UTF-8")
+	}
+	if strings.Contains(data.Result, "SENSITIVE_FULL_RESULT_TAIL") {
+		t.Fatal("telemetry retained the sensitive result tail")
+	}
+}
 
 func TestExecuteToolBoundsParallelism(t *testing.T) {
 	registry := NewToolRegistry("test")

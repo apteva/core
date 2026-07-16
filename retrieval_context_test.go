@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -69,8 +70,12 @@ func TestEphemeralTurnContextAlwaysIncludesCurrentUTC(t *testing.T) {
 	base := []Message{{Role: "system", Content: "stable"}}
 	first := state.prepare(base, "", "2026-07-13T12:03:00Z", true, true)
 	second := state.prepare(base, "", "2026-07-14T12:03:00Z", true, true)
-	if first[1].Content == second[1].Content || !strings.Contains(second[1].Content, "2026-07-14T12:03:00Z") {
-		t.Fatalf("timer wake reused stale time: first=%q second=%q", first[1].Content, second[1].Content)
+	if len(second) != len(first)+1 || !reflect.DeepEqual(first, second[:len(first)]) {
+		t.Fatalf("timer wake rewrote the previous request: first=%+v second=%+v", first, second)
+	}
+	latest := second[len(second)-1].Content
+	if first[1].Content == latest || !strings.Contains(latest, "2026-07-14T12:03:00Z") {
+		t.Fatalf("timer wake reused stale time: first=%q latest=%q", first[1].Content, latest)
 	}
 }
 
@@ -97,6 +102,25 @@ func TestEphemeralTurnContextStatePreservesAppendOnlyPrefix(t *testing.T) {
 	secondInput := (&OpenAINativeProvider{}).buildInput(second)
 	if len(secondInput) < len(firstInput) || !reflect.DeepEqual(firstInput, secondInput[:len(firstInput)]) {
 		t.Fatalf("native Responses input lost append-only prefix:\nfirst=%+v\nsecond=%+v", firstInput, secondInput)
+	}
+}
+
+func TestEphemeralTurnContextNewSemanticTurnAppendsSnapshot(t *testing.T) {
+	state := ephemeralTurnContextState{}
+	durable := []Message{{Role: "system", Content: "stable"}, {Role: "user", Content: "first task"}}
+	first := state.prepare(durable, "[ACTIVE THREADS]\n- worker-a", "2026-07-10T14:00:00Z", false, true)
+
+	durable = append(durable,
+		Message{Role: "assistant", Content: "first answer"},
+		Message{Role: "user", Content: "second task"},
+	)
+	second := state.prepare(durable, "[ACTIVE THREADS]\n- worker-b", "2026-07-10T14:05:00Z", false, true)
+	if len(second) <= len(first) || !reflect.DeepEqual(first, second[:len(first)]) {
+		t.Fatalf("new semantic turn rewrote the prior request:\nfirst=%+v\nsecond=%+v", first, second)
+	}
+	latest := second[len(second)-1]
+	if !latest.RequestContext || !strings.Contains(latest.Content, "worker-b") || !strings.Contains(latest.Content, "14:05:00Z") {
+		t.Fatalf("latest context snapshot = %+v", latest)
 	}
 }
 
@@ -305,18 +329,21 @@ func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
 		foundIndex := -1
 		for j, message := range request {
 			markers += strings.Count(message.Content, "[memories — surfaced")
-			if message.RequestContext {
+			if message.RequestContext && strings.HasPrefix(message.Content, ephemeralContextHeader) {
 				foundIndex = j
 			}
 		}
-		if markers != 1 {
-			t.Fatalf("request %d has %d memory blocks, want exactly 1", i+1, markers)
+		if markers != i+1 {
+			t.Fatalf("request %d has %d memory snapshots, want %d append-only snapshots", i+1, markers, i+1)
 		}
 		if foundIndex < 0 || !strings.HasPrefix(request[foundIndex].Content, ephemeralContextHeader) {
 			t.Fatalf("request %d is missing marked ephemeral context: %+v", i+1, request)
 		}
 		if !strings.Contains(request[foundIndex].Content, "[CURRENT TIME]\nUTC: ") {
 			t.Fatalf("request %d lacks current time: %q", i+1, request[foundIndex].Content)
+		}
+		if i > 0 && !reflect.DeepEqual(requests[i-1], request[:len(requests[i-1])]) {
+			t.Fatalf("request %d rewrote the prior provider prefix:\nprevious=%+v\ncurrent=%+v", i+1, requests[i-1], request)
 		}
 	}
 	history, err := os.ReadFile(filepath.Join("history", "main.jsonl"))
@@ -328,13 +355,26 @@ func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
 	}
 	events, _ := thinker.telemetry.StoredEvents(0)
 	foundRecall := false
+	foundCacheDiagnostics := false
 	for _, event := range events {
 		if event.Type == "memory.recall" && strings.Contains(string(event.Data), `"ephemeral":true`) {
 			foundRecall = true
-			break
+		}
+		if event.Type == "llm.done" {
+			var data LLMDoneData
+			if json.Unmarshal(event.Data, &data) == nil &&
+				data.PromptCacheStablePrefixHash != "" &&
+				data.PromptCacheRequestHash != "" &&
+				data.PromptCacheIdentityHash != "" &&
+				data.PromptCacheCommonPrefixBytes > 0 {
+				foundCacheDiagnostics = true
+			}
 		}
 	}
 	if !foundRecall {
 		t.Fatal("missing ephemeral memory.recall telemetry")
+	}
+	if !foundCacheDiagnostics {
+		t.Fatal("missing append-only prompt-cache diagnostics on llm.done telemetry")
 	}
 }

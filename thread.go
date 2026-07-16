@@ -508,32 +508,34 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		messages: []Message{
 			{Role: "system", Content: threadSystemPrompt},
 		},
-		bus:               tm.parent.bus,
-		sub:               sub,
-		pause:             make(chan bool),
-		quit:              make(chan struct{}),
-		rate:              RateReactive,
-		agentRate:         RateNormal,
-		agentSleep:        10 * time.Second,
-		model:             initialModel,
-		agentModel:        initialModel,
-		agentReasoning:    initialReasoning,
-		maxHistory:        historyLimit,
-		memory:            tm.parent.memory,
-		session:           NewSession(".", id),
-		threadID:          id,
-		apiLog:            tm.parent.apiLog,
-		apiMu:             tm.parent.apiMu,
-		apiNotify:         tm.parent.apiNotify,
-		registry:          threadRegistry,
-		toolAllowlist:     threadAllowlist,
-		config:            tm.parent.config,
-		mcpServers:        threadMCPServers,
-		toolIndex:         tm.parent.toolIndex,
-		activeTools:       preloadActive,
-		directive:         directive,
-		systemThread:      isSystem,
-		unconsciousSafety: tm.parent.unconsciousSafety,
+		bus:                    tm.parent.bus,
+		sub:                    sub,
+		pause:                  make(chan bool),
+		quit:                   make(chan struct{}),
+		rate:                   RateReactive,
+		agentRate:              RateNormal,
+		agentSleep:             10 * time.Second,
+		model:                  initialModel,
+		agentModel:             initialModel,
+		agentReasoning:         initialReasoning,
+		maxHistory:             historyLimit,
+		promptCacheResetReason: "startup",
+		memory:                 tm.parent.memory,
+		session:                NewSession(".", id),
+		toolResultAge:          map[string]int{},
+		threadID:               id,
+		apiLog:                 tm.parent.apiLog,
+		apiMu:                  tm.parent.apiMu,
+		apiNotify:              tm.parent.apiNotify,
+		registry:               threadRegistry,
+		toolAllowlist:          threadAllowlist,
+		config:                 tm.parent.config,
+		mcpServers:             threadMCPServers,
+		toolIndex:              tm.parent.toolIndex,
+		activeTools:            preloadActive,
+		directive:              directive,
+		systemThread:           isSystem,
+		unconsciousSafety:      tm.parent.unconsciousSafety,
 		rebuildPrompt: func(_ string) string {
 			cd := ""
 			if threadRegistry != nil {
@@ -607,6 +609,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			thinker.messages[0].Content += contextBlock
 		}
 		thinker.messages = append(thinker.messages, saved...)
+		thinker.markLoadedToolResultsHistorical(saved)
 		logMsg("THREAD", fmt.Sprintf("%s loaded %d messages from history (%d compacted summaries)", id, len(saved), len(summaries)))
 	}
 	thinker.publishRuntimeStatus()
@@ -749,18 +752,18 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 		var doneMsg *string
 		var doneCallID string
 
-		addResult := func(callID, content string) {
+		addResult := func(callID, toolName, content string) {
 			if callID != "" {
-				results = append(results, ToolResult{CallID: callID, Content: content})
+				results = append(results, ToolResult{CallID: callID, ToolName: toolName, Content: content})
 			}
 		}
 		// Emit tool.result telemetry for inline tools
 		emitResult := func(call toolCall, content string) {
-			addResult(call.NativeID, content)
+			addResult(call.NativeID, call.Name, content)
 			if t.telemetry != nil {
-				t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-					ID: call.NativeID, Name: call.Name, Success: true, Result: content,
-				})
+				t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+					call.NativeID, call.Name, 0, true, content, content, 0,
+				))
 			}
 		}
 
@@ -1043,7 +1046,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 		}
 
 		if doneMsg != nil {
-			addResult(doneCallID, "stopping")
+			addResult(doneCallID, "done", "stopping")
 			logMsg("THREAD", fmt.Sprintf("%s calling done, msg=%q", thread.ID, *doneMsg))
 			thread.doneForever = true // mark for permanent cleanup (deletes session)
 			if *doneMsg != "" {

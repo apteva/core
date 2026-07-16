@@ -128,10 +128,12 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 		responsesURL:    srv.URL,
 		forceStoreFalse: true,
 	}
-	resp, err := p.Chat(context.Background(),
+	scope := openAIPromptCacheScope{Identity: "agent:10/thread:main", Epoch: 7}
+	tools := []NativeTool{{Name: "app_tool", Description: "tool", Parameters: map[string]any{"type": "object"}}}
+	resp, err := p.Chat(withOpenAIPromptCacheScope(context.Background(), scope),
 		[]Message{{Role: "system", Content: "stable system"}, {Role: "user", Content: "hello"}},
 		"gpt-5.5",
-		[]NativeTool{{Name: "app_tool", Description: "tool", Parameters: map[string]any{"type": "object"}}},
+		tools,
 		nil, nil, nil,
 	)
 	if err != nil {
@@ -144,8 +146,12 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 		t.Fatalf("Codex request sent unsupported prompt_cache_retention: %#v", body)
 	}
 	key, _ := body["prompt_cache_key"].(string)
-	if !strings.HasPrefix(key, "apteva-v1-") {
+	if !strings.HasPrefix(key, "apteva-v2-") {
 		t.Fatalf("prompt_cache_key = %q", key)
+	}
+	wantKey := openAIPromptCacheHintsForScope("openai-codex", "gpt-5.5", "stable system", p.buildAPITools("gpt-5.5", tools), scope).Key
+	if key != wantKey {
+		t.Fatalf("prompt_cache_key = %q, want scoped key %q", key, wantKey)
 	}
 	if body["instructions"] != "stable system" {
 		t.Fatalf("instructions = %v", body["instructions"])

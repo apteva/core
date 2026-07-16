@@ -93,10 +93,11 @@ func executeTool(t *Thinker, call toolCall) {
 				logMsg("TOOL", fmt.Sprintf("PANIC %s: %v", call.Name, r))
 				t.Inject(fmt.Sprintf("[tool:%s] error: panic: %v", call.Name, r))
 				if t.telemetry != nil {
-					t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-						ID: call.NativeID, Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
-						Success: false, Result: fmt.Sprintf("panic: %v", r),
-					})
+					result := fmt.Sprintf("panic: %v", r)
+					t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+						call.NativeID, call.Name, time.Since(start).Milliseconds(), false,
+						result, result, 0,
+					))
 				}
 			}
 		}()
@@ -125,15 +126,11 @@ func executeTool(t *Thinker, call toolCall) {
 
 		// Telemetry: tool.result
 		if t.telemetry != nil {
-			resultSummary := resp.Text
-			if len(resultSummary) > 1000 {
-				resultSummary = resultSummary[:1000] + "..."
-			}
-			t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-				ID: call.NativeID, Name: call.Name, DurationMs: time.Since(start).Milliseconds(),
-				Success: !resp.IsError && !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown"),
-				Result:  resultSummary,
-			})
+			success := !resp.IsError && !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown")
+			t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+				call.NativeID, call.Name, time.Since(start).Milliseconds(), success,
+				resp.Text, resp.Text, len(resp.Image),
+			))
 		}
 
 		// Emit visual chunk for TUI
@@ -149,10 +146,11 @@ func executeTool(t *Thinker, call toolCall) {
 		// still queued for history pairing, but do not wake the model.
 		resultText := resp.Text
 		toolResult := ToolResult{
-			CallID:  call.NativeID,
-			Content: resultText,
-			Image:   resp.Image,
-			IsError: resp.IsError,
+			CallID:   call.NativeID,
+			ToolName: call.Name,
+			Content:  resultText,
+			Image:    resp.Image,
+			IsError:  resp.IsError,
 		}
 
 		// Late-result routing. If the iter-boundary barrier already

@@ -32,7 +32,8 @@ func TestMainPromptKeepsRecurringWorkOnMainLoop(t *testing.T) {
 		"capped at 24h",
 		"Main owns recurring responsibilities",
 		"never create a scheduler or a thread merely to wait",
-		"Spawn a one-shot worker only when due execution is heavy",
+		"Keep bounded work on the current thread",
+		"Output length alone is not a reason to spawn",
 		"Decide what is due from current time plus execution history",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -48,6 +49,40 @@ func TestMainPromptKeepsRecurringWorkOnMainLoop(t *testing.T) {
 	for _, forbidden := range []string{"next-due", "next due", "last-completed", "last completed"} {
 		if strings.Contains(strings.ToLower(prompt), forbidden) {
 			t.Fatalf("main prompt still recommends directive execution state %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{">1KB", "article body", "heavy output"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("main prompt still contains output-specific delegation rule %q", forbidden)
+		}
+	}
+}
+
+func TestDelegationToolDescriptionsKeepBoundedWorkOnCurrentThread(t *testing.T) {
+	registry := NewToolRegistry("test")
+	spawn := registry.Get("spawn")
+	if spawn == nil {
+		t.Fatal("spawn tool missing")
+	}
+	for _, want := range []string{
+		"independent or ongoing work",
+		"separate ownership",
+		"do not spawn when the current thread can complete the work directly",
+	} {
+		if !strings.Contains(spawn.Description, want) {
+			t.Fatalf("spawn description missing %q: %s", want, spawn.Description)
+		}
+	}
+	done := registry.Get("done")
+	if done == nil {
+		t.Fatal("done tool missing")
+	}
+	for _, want := range []string{
+		"one-shot worker should call done",
+		"Persistent or conversational threads should remain active",
+	} {
+		if !strings.Contains(done.Rules, want) {
+			t.Fatalf("done rules missing %q: %s", want, done.Rules)
 		}
 	}
 }
@@ -108,7 +143,10 @@ func TestEvolveToolPromotesDurableIntentAndRejectsContentInstructions(t *testing
 		recurringDirectiveContract,
 		"even when the source does not mention evolve",
 		"tool results",
-		"Patch the smallest relevant section once",
+		"Make exactly one evolve call per authoritative instruction",
+		"use edits to apply them atomically",
+		"Patch the smallest relevant sections",
+		"Pass section names without Markdown # prefixes",
 	} {
 		if !strings.Contains(description, want) {
 			t.Fatalf("evolve description missing %q", want)

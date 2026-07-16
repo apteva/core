@@ -29,6 +29,32 @@ type OpenAICompatProvider struct {
 	cacheOff   bool
 }
 
+// openAICompatRequestOptions carries provider-specific additions through the
+// shared Chat Completions transport. Keeping these options request-scoped lets
+// thin wrappers such as XAIProvider reuse all message, tool-call, streaming,
+// and usage parsing without teaching every compatible provider about xAI.
+type openAICompatRequestOptions struct {
+	Fields  map[string]any
+	Headers map[string]string
+}
+
+type openAICompatRequestOptionsContextKey struct{}
+
+func withOpenAICompatRequestOptions(ctx context.Context, options openAICompatRequestOptions) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAICompatRequestOptionsContextKey{}, options)
+}
+
+func openAICompatRequestOptionsFromContext(ctx context.Context) openAICompatRequestOptions {
+	if ctx == nil {
+		return openAICompatRequestOptions{}
+	}
+	options, _ := ctx.Value(openAICompatRequestOptionsContextKey{}).(openAICompatRequestOptions)
+	return options
+}
+
 func (p *OpenAICompatProvider) promptCacheHintsEnabled() bool {
 	p.cacheMu.RLock()
 	defer p.cacheMu.RUnlock()
@@ -241,6 +267,7 @@ func toOpenAIMessages(messages []Message) []any {
 }
 
 func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+	requestOptions := openAICompatRequestOptionsFromContext(ctx)
 	// Build request
 	openAIMessages := toOpenAIMessages(messages)
 	reqMap := map[string]any{
@@ -265,7 +292,10 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		}
 		reqMap["tools"] = defs
 	}
-	if hints := openAIPromptCacheHintsFor(p.name, model, openAIPromptCacheStablePrefix(openAIMessages), reqMap["tools"]); hints.Key != "" && p.promptCacheHintsEnabled() {
+	for key, value := range requestOptions.Fields {
+		reqMap[key] = value
+	}
+	if hints := openAIPromptCacheHintsForScope(p.name, model, openAIPromptCacheStablePrefix(openAIMessages), reqMap["tools"], openAIPromptCacheScopeFromContext(ctx)); hints.Key != "" && p.promptCacheHintsEnabled() {
 		reqMap["prompt_cache_key"] = hints.Key
 		reqMap["prompt_cache_retention"] = hints.Retention
 	}
@@ -295,6 +325,11 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		req.Header.Set("Content-Type", "application/json")
 		if p.apiKey != "" && p.authHeader != "" {
 			req.Header.Set("Authorization", p.authHeader+" "+p.apiKey)
+		}
+		for key, value := range requestOptions.Headers {
+			if strings.TrimSpace(key) != "" {
+				req.Header.Set(key, value)
+			}
 		}
 		return llmHTTPClient.Do(req)
 	}

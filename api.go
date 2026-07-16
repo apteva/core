@@ -19,6 +19,51 @@ type APIServer struct {
 	apiKey    string // if set, all endpoints except /health require auth
 }
 
+type contextResetResult struct {
+	Status         string `json:"status"`
+	ID             string `json:"id"`
+	BeforeCount    int    `json:"before_count"`
+	AfterCount     int    `json:"after_count"`
+	RemovedCount   int    `json:"removed_count"`
+	BeforeChars    int    `json:"before_chars"`
+	AfterChars     int    `json:"after_chars"`
+	RemovedChars   int    `json:"removed_chars"`
+	ThreadsRemoved int    `json:"threads_removed,omitempty"`
+	MemoryRemoved  int    `json:"memory_removed,omitempty"`
+}
+
+// resetThinkerContext clears every request-context layer, not only the visible
+// messages slice. The old reset path left ephemeral retrieval snapshots and
+// prompt-cache identity behind, so a nominally clean context could still be
+// assembled with state from before the reset.
+func resetThinkerContext(t *Thinker) (contextResetResult, error) {
+	result := contextResetResult{Status: "reset", ID: t.threadID}
+	result.BeforeCount = len(t.messages)
+	result.BeforeChars = contextChars(t.messages)
+
+	if t.session != nil {
+		if err := t.session.Reset(); err != nil {
+			return result, fmt.Errorf("remove conversation journal: %w", err)
+		}
+	}
+	if len(t.messages) > 1 {
+		t.messages = t.messages[:1]
+	}
+	t.requestContext.reset()
+	t.resetPromptCache("manual_context_reset")
+	t.toolResultMu.Lock()
+	t.toolResultAge = map[string]int{}
+	t.toolResultMu.Unlock()
+	t.publishRuntimeStatus()
+	t.publishContextStatus()
+
+	result.AfterCount = len(t.messages)
+	result.AfterChars = contextChars(t.messages)
+	result.RemovedCount = max(0, result.BeforeCount-result.AfterCount)
+	result.RemovedChars = max(0, result.BeforeChars-result.AfterChars)
+	return result, nil
+}
+
 // apiAuth wraps a handler with API key authentication.
 func (a *APIServer) apiAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -305,22 +350,13 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "thread not found", http.StatusNotFound)
 			return
 		}
-		// Drop persisted history (session.jsonl) and rebuild an empty
-		// session so subsequent iterations append to a clean file.
-		if t.session != nil {
-			t.session.Delete()
-			t.session = NewSession(".", id)
+		result, err := resetThinkerContext(t)
+		if err != nil {
+			http.Error(w, "reset thread context: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
-		// Reset the in-memory message slice to just the system prompt.
-		// Iteration counter is preserved — the thread keeps its identity,
-		// it just forgets what it was talking about.
-		if len(t.messages) > 0 {
-			t.messages = t.messages[:1]
-		}
-		t.publishRuntimeStatus()
-		t.publishContextStatus()
-		logMsg("API", fmt.Sprintf("reset thread %s: history wiped, messages=[system]", id))
-		writeJSON(w, map[string]any{"status": "reset", "id": id, "count": len(t.messages)})
+		logMsg("API", fmt.Sprintf("reset thread %s: messages %d→%d, chars %d→%d", id, result.BeforeCount, result.AfterCount, result.BeforeChars, result.AfterChars))
+		writeJSON(w, result)
 		return
 	}
 
@@ -783,6 +819,9 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				"connected": liveNames[cfg.Name],
 				"no_spawn":  cfg.NoSpawn,
 			}
+			if cfg.ToolLoading != nil {
+				entry["tool_loading"] = cfg.ToolLoading
+			}
 			if cfg.Transport != "" {
 				entry["transport"] = cfg.Transport
 			}
@@ -884,6 +923,12 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			a.thinker.publishContextStatus()
 		}
 		if body.MCPServers != nil {
+			for _, cfg := range body.MCPServers {
+				if err := validateMCPToolLoading(cfg); err != nil {
+					http.Error(w, "invalid MCP tool loading policy: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+			}
 			if err := a.reconcileMCP(body.MCPServers); err != nil {
 				http.Error(w, "persist MCP configuration: "+err.Error(), http.StatusInternalServerError)
 				return
@@ -914,9 +959,12 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			a.thinker.publishRuntimeStatus()
 			a.thinker.publishContextStatus()
 		}
+		var resetResult *contextResetResult
 		if body.Reset != nil {
 			logMsg("API", fmt.Sprintf("PUT /config reset: history=%v memory=%v threads=%v", body.Reset.History, body.Reset.Memory, body.Reset.Threads))
+			result := contextResetResult{Status: "reset", ID: "main"}
 			if body.Reset.Threads {
+				result.ThreadsRemoved = a.thinker.threads.Count()
 				if err := a.thinker.config.ClearThreads(); err != nil {
 					http.Error(w, "persist thread reset: "+err.Error(), http.StatusInternalServerError)
 					return
@@ -924,29 +972,44 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				a.thinker.threads.KillAll()
 			}
 			if body.Reset.History {
-				if a.thinker.session != nil {
-					a.thinker.session.Delete()
-					a.thinker.session = NewSession(".", "main")
+				// Agent-wide history reset includes every persisted sub-thread
+				// journal and archived tool result. Recreate the private directory
+				// before the live main Session is reused below.
+				if err := os.RemoveAll(historyDir); err != nil {
+					http.Error(w, "remove agent history: "+err.Error(), http.StatusInternalServerError)
+					return
 				}
-				// Clear thread histories
-				os.RemoveAll("history")
-				os.MkdirAll("history", 0755)
+				if err := os.MkdirAll(historyDir, 0700); err != nil {
+					http.Error(w, "recreate agent history: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+				contextResult, err := resetThinkerContext(a.thinker)
+				if err != nil {
+					http.Error(w, "reset agent context: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+				result.BeforeCount = contextResult.BeforeCount
+				result.AfterCount = contextResult.AfterCount
+				result.RemovedCount = contextResult.RemovedCount
+				result.BeforeChars = contextResult.BeforeChars
+				result.AfterChars = contextResult.AfterChars
+				result.RemovedChars = contextResult.RemovedChars
 			}
 			if body.Reset.Memory && a.thinker.memory != nil {
+				result.MemoryRemoved = a.thinker.memory.Count()
 				os.Remove(a.thinker.memory.path)
 				a.thinker.memory.mu.Lock()
 				a.thinker.memory.records = nil
 				a.thinker.memory.byID = map[string]int{}
 				a.thinker.memory.mu.Unlock()
 			}
-			// Reset message context to just system prompt
-			if body.Reset.History {
-				a.thinker.messages = a.thinker.messages[:1]
-				a.thinker.publishRuntimeStatus()
-				a.thinker.publishContextStatus()
-			}
+			resetResult = &result
 		}
-		writeJSON(w, map[string]string{"status": "updated"})
+		response := map[string]any{"status": "updated"}
+		if resetResult != nil {
+			response["reset"] = resetResult
+		}
+		writeJSON(w, response)
 	default:
 		http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 	}
@@ -964,6 +1027,11 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 // demand) is gone — see the proposal note in mcp.go's MCPServerConfig
 // comment.
 func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
+	for _, cfg := range desired {
+		if err := validateMCPToolLoading(cfg); err != nil {
+			return err
+		}
+	}
 
 	names := make([]string, len(desired))
 	for i, c := range desired {
@@ -972,9 +1040,9 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
 	logMsg("API", fmt.Sprintf("reconcileMCP: %d desired servers (system entries preserved): %v", len(desired), names))
 	t := a.thinker
 
-	// Current config map lets us detect when the URL/command/args/transport
-	// or no_spawn changed between reconciles — any change forces a
-	// detach-then-reattach.
+	// Current config map lets us distinguish connection changes from prompt
+	// visibility changes. Loading/no_spawn policy can be updated in place;
+	// URL/command/transport changes still require reconnect for ordinary MCPs.
 	currentCfg := make(map[string]MCPServerConfig)
 	if t.config != nil {
 		for _, c := range t.config.GetMCPServers() {
@@ -990,15 +1058,10 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
 
 	// For each server name currently known to exist, decide whether it
 	// stays as-is, gets removed, or gets replaced (close + reconnect).
-	// Replacement happens when the desired config differs from the
-	// current one in any connection-level field. NoSpawn is included
-	// because it gates sub-thread search visibility — flipping it
-	// shouldn't require a process restart.
-	changed := func(old, new MCPServerConfig) bool {
+	// Replacement happens only for connection-level changes. Policy metadata
+	// is mirrored into ToolIndex without disturbing the live transport.
+	connectionChanged := func(old, new MCPServerConfig) bool {
 		if old.URL != new.URL || old.Command != new.Command || old.Transport != new.Transport {
-			return true
-		}
-		if old.NoSpawn != new.NoSpawn {
 			return true
 		}
 		if len(old.Args) != len(new.Args) {
@@ -1019,6 +1082,35 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
 		}
 		return false
 	}
+	visibilityChanged := func(old, new MCPServerConfig) bool {
+		return old.NoSpawn != new.NoSpawn || !toolLoadingEqual(old, new)
+	}
+	toolLoadingChanged := false
+	updateVisibility := func(current MCPServerConfig, hasCurrent bool, desiredCfg MCPServerConfig) error {
+		if hasCurrent && !visibilityChanged(current, desiredCfg) {
+			return nil
+		}
+		if err := t.config.SaveMCPServer(desiredCfg); err != nil {
+			return err
+		}
+		if t.toolIndex != nil {
+			t.toolIndex.UpdatePolicy(desiredCfg.Name, desiredCfg.NoSpawn, desiredCfg.ToolLoading)
+		}
+		if !toolLoadingEqual(current, desiredCfg) {
+			toolLoadingChanged = true
+			if t.telemetry != nil {
+				mode := ToolLoadAuto
+				if desiredCfg.ToolLoading != nil {
+					mode = normalizeToolLoadMode(desiredCfg.ToolLoading.Default)
+				}
+				t.telemetry.Emit("mcp.tool_loading_changed", "api", map[string]any{
+					"name":         desiredCfg.Name,
+					"default_mode": mode,
+				})
+			}
+		}
+		return nil
+	}
 
 	// Disconnect servers that are either absent from desired or whose
 	// config changed. System entries are never touched — they're not
@@ -1034,6 +1126,16 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
 			// config updates may round-trip them with slightly different
 			// connection details; reconnecting them can deadlock the
 			// management request they are serving.
+			if err := updateVisibility(current, hasCurrent, desiredCfg); err != nil {
+				return err
+			}
+			// Preserve the server's existing connection-level round-trip
+			// behavior, but persist fresh host metadata such as its URL.
+			if !hasCurrent || connectionChanged(current, desiredCfg) {
+				if err := t.config.SaveMCPServer(desiredCfg); err != nil {
+					return err
+				}
+			}
 			kept = append(kept, srv)
 			continue
 		}
@@ -1043,10 +1145,16 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
 			// round-trip those live entries back in `desired`; do not close
 			// the very MCP connection currently serving the request just
 			// because there is no persisted baseline to compare against.
+			if err := updateVisibility(current, false, desiredCfg); err != nil {
+				return err
+			}
 			kept = append(kept, srv)
 			continue
 		}
-		if stillWant && !changed(current, desiredCfg) {
+		if stillWant && !connectionChanged(current, desiredCfg) {
+			if err := updateVisibility(current, true, desiredCfg); err != nil {
+				return err
+			}
 			kept = append(kept, srv)
 			continue
 		}
@@ -1108,6 +1216,12 @@ func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
 	}
 	// Refresh the prompt catalog snapshot — tool counts may have moved.
 	t.mcpCatalog = computeMCPCatalog(t.toolIndex)
+	if toolLoadingChanged {
+		// This deliberately changes the stable tools prefix once. Give the
+		// provider cache a new epoch with an actionable reset reason instead
+		// of reporting the later hash mismatch as unexplained churn.
+		t.resetPromptCache("tool_loading_policy_changed")
+	}
 	return nil
 }
 

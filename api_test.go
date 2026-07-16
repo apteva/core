@@ -89,6 +89,64 @@ func TestAPI_Status(t *testing.T) {
 	}
 }
 
+func TestAPI_ResetThreadReportsCleanupResultAndClearsTransientContext(t *testing.T) {
+	api, thinker := newTestAPI()
+	thinker.session = NewSession(t.TempDir(), "main")
+	thinker.messages = []Message{
+		{Role: "system", Content: "system prompt"},
+		{Role: "user", Content: "old request"},
+		{Role: "assistant", Content: "old answer"},
+	}
+	for _, message := range thinker.messages[1:] {
+		if err := thinker.session.AppendMessage(message, 1, TokenUsage{}); err != nil {
+			t.Fatalf("append fixture message: %v", err)
+		}
+	}
+	thinker.requestContext = ephemeralTurnContextState{
+		snapshots: []ephemeralTurnContextSnapshot{{
+			anchor:  1,
+			message: Message{Role: "user", Content: "stale request context", RequestContext: true},
+		}},
+		signature: "stale",
+		active:    true,
+	}
+	thinker.publishRuntimeStatus()
+	thinker.publishContextStatus()
+
+	req := httptest.NewRequest(http.MethodPost, "/threads/main/reset", nil)
+	w := httptest.NewRecorder()
+	api.threadAction(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var result contextResetResult
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode reset result: %v", err)
+	}
+	if result.Status != "reset" || result.ID != "main" {
+		t.Fatalf("unexpected reset identity: %+v", result)
+	}
+	if result.BeforeCount != 3 || result.AfterCount != 1 || result.RemovedCount != 2 {
+		t.Fatalf("unexpected reset counts: %+v", result)
+	}
+	if result.RemovedChars <= 0 || result.AfterChars != contextChars([]Message{{Role: "system", Content: "system prompt"}}) {
+		t.Fatalf("unexpected reset chars: %+v", result)
+	}
+	if thinker.session.Count() != 0 {
+		t.Fatalf("session count = %d, want 0", thinker.session.Count())
+	}
+	if len(thinker.messages) != 1 || thinker.messages[0].Role != "system" {
+		t.Fatalf("messages were not reset: %#v", thinker.messages)
+	}
+	if thinker.requestContext.active || len(thinker.requestContext.snapshots) != 0 {
+		t.Fatalf("transient request context survived reset: %#v", thinker.requestContext)
+	}
+	if snapshot := thinker.contextSnapshot(); len(snapshot.Messages) != 1 {
+		t.Fatalf("published context has %d messages, want 1", len(snapshot.Messages))
+	}
+}
+
 type fakeLiveMCP struct {
 	name   string
 	closed bool
@@ -156,6 +214,45 @@ func TestReconcileMCPKeepsLiveNoSpawnServerWhenConfigDiffers(t *testing.T) {
 	}
 	if len(thinker.mcpServers) != 1 || thinker.mcpServers[0].GetName() != "apteva-server" {
 		t.Fatalf("expected live no_spawn MCP to remain attached, got %#v", thinker.mcpServers)
+	}
+}
+
+func TestReconcileMCPUpdatesToolLoadingWithoutReconnect(t *testing.T) {
+	api, thinker := newTestAPI()
+	thinker.registry = NewToolRegistry("")
+	thinker.toolIndex = NewToolIndex()
+	thinker.config = &Config{}
+	oldCfg := MCPServerConfig{
+		Name:      "channels",
+		URL:       "http://127.0.0.1:7777",
+		Transport: "http",
+		NoSpawn:   true,
+	}
+	if err := thinker.config.SaveMCPServer(oldCfg); err != nil {
+		t.Fatal(err)
+	}
+	thinker.toolIndex.Add("channels", []mcpToolDef{{Name: "send", Description: "Send a visible message"}}, true)
+	live := &fakeLiveMCP{name: "channels"}
+	thinker.mcpServers = []MCPConn{live}
+
+	newCfg := oldCfg
+	newCfg.ToolLoading = &MCPToolLoadingConfig{Default: ToolLoadAlways}
+	if err := api.reconcileMCP([]MCPServerConfig{newCfg}); err != nil {
+		t.Fatal(err)
+	}
+	if live.closed {
+		t.Fatal("tool loading policy update reconnected the live Channels MCP")
+	}
+	entry, ok := thinker.toolIndex.Get("channels_send")
+	if !ok || entry.LoadMode != ToolLoadAlways {
+		t.Fatalf("updated index entry = %#v, %v", entry, ok)
+	}
+	persisted := thinker.config.GetMCPServers()
+	if len(persisted) != 1 || persisted[0].ToolLoading == nil || persisted[0].ToolLoading.Default != ToolLoadAlways {
+		t.Fatalf("persisted MCP policy = %#v", persisted)
+	}
+	if thinker.promptCacheEpoch != 1 || thinker.promptCacheResetReason != "tool_loading_policy_changed" {
+		t.Fatalf("prompt cache state = epoch %d reason %q", thinker.promptCacheEpoch, thinker.promptCacheResetReason)
 	}
 }
 
@@ -435,6 +532,43 @@ func TestAPI_Config_Get(t *testing.T) {
 	}
 	if body["mode"] != "autonomous" {
 		t.Errorf("expected default mode 'autonomous', got %v", body["mode"])
+	}
+}
+
+func TestAPIConfigToolLoadingRoundTripAndValidation(t *testing.T) {
+	api, thinker := newTestAPI()
+	thinker.config.MCPServers = []MCPServerConfig{{
+		Name:      "channels",
+		URL:       "http://127.0.0.1:7777",
+		Transport: "http",
+		NoSpawn:   true,
+		ToolLoading: &MCPToolLoadingConfig{
+			Default: ToolLoadAlways,
+		},
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "/config", nil)
+	w := httptest.NewRecorder()
+	api.config(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		MCPServers []MCPServerConfig `json:"mcp_servers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.MCPServers) != 1 || body.MCPServers[0].ToolLoading == nil || body.MCPServers[0].ToolLoading.Default != ToolLoadAlways {
+		t.Fatalf("GET dropped tool_loading: %#v", body.MCPServers)
+	}
+
+	badPayload := []byte(`{"mcp_servers":[{"name":"bad","url":"http://example.test","tool_loading":{"default":"sometimes"}}]}`)
+	req = httptest.NewRequest(http.MethodPut, "/config", bytes.NewReader(badPayload))
+	w = httptest.NewRecorder()
+	api.config(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid policy status = %d, want 400: %s", w.Code, w.Body.String())
 	}
 }
 

@@ -130,6 +130,7 @@ func decodeImageDataURL(url string) ([]byte, bool) {
 }
 
 const evictedScreenshotPlaceholder = "[previous screenshot replaced — see latest for current screen state]"
+const computerScreenshotTailHeader = "[CURRENT COMPUTER SCREENSHOT — ephemeral uncached request tail]"
 
 func toolNamesByCallID(messages []Message) map[string]string {
 	names := make(map[string]string)
@@ -173,6 +174,100 @@ func evictStaleComputerScreenshots(messages []Message, keep int) int {
 		}
 	}
 	return removed
+}
+
+// prepareComputerScreenshotTail returns a provider-only projection. Computer
+// pixels are removed from their historical function outputs without changing
+// the durable messages, then the newest frame is attached as a regular user
+// image at the request tail. A changing frame can therefore invalidate only
+// the volatile suffix instead of rewriting an earlier cached prefix.
+func prepareComputerScreenshotTail(messages []Message) []Message {
+	names := toolNamesByCallID(messages)
+	latestCallID := ""
+	var latestImage []byte
+	for i := len(messages) - 1; i >= 0 && latestImage == nil; i-- {
+		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
+			result := messages[i].ToolResults[j]
+			if len(result.Image) == 0 || !isComputerToolName(names[result.CallID]) {
+				continue
+			}
+			latestCallID = result.CallID
+			latestImage = append([]byte(nil), result.Image...)
+			break
+		}
+	}
+	if len(latestImage) == 0 {
+		return messages
+	}
+
+	projected := cloneMessages(messages)
+	for i := range projected {
+		for j := range projected[i].ToolResults {
+			result := &projected[i].ToolResults[j]
+			if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
+				result.Image = nil
+			}
+		}
+	}
+
+	mimeType := "image/png"
+	if _, format, err := image.DecodeConfig(bytes.NewReader(latestImage)); err == nil {
+		switch strings.ToLower(format) {
+		case "jpeg", "jpg":
+			mimeType = "image/jpeg"
+		case "gif":
+			mimeType = "image/gif"
+		case "png":
+			mimeType = "image/png"
+		}
+	}
+	imageURL := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(latestImage)
+	projected = append(projected, Message{
+		Role:           "user",
+		RequestContext: true,
+		Parts: []ContentPart{
+			{Type: "text", Text: fmt.Sprintf("%s\nSource computer tool call: %s", computerScreenshotTailHeader, latestCallID)},
+			{Type: "image_url", ImageURL: &ImageURL{URL: imageURL, Detail: "original"}},
+		},
+	})
+	return projected
+}
+
+// checkpointHistoryWindow trims history in occasional blocks instead of
+// deleting one oldest message on nearly every turn. maxHistory remains the
+// steady-state target: main/lead threads trigger above 120 and return to 80;
+// workers trigger above 24 and return to 16. The caller owns the intentional
+// cache-epoch reset caused by a successful checkpoint.
+func checkpointHistoryWindow(messages []Message, maxHistory int) ([]Message, int) {
+	if len(messages) <= 1 || maxHistory <= 0 {
+		return messages, 0
+	}
+	margin := maxHistory / 5
+	if margin < 4 {
+		margin = 4
+	}
+	upper := maxHistory + margin
+	target := maxHistory - margin
+	if target < 1 {
+		target = 1
+	}
+	if len(messages)-1 <= upper {
+		return messages, 0
+	}
+
+	start := len(messages) - target
+	for start > 1 && len(messages[start].ToolResults) > 0 {
+		start--
+	}
+	next := make([]Message, 0, 1+len(messages)-start)
+	next = append(next, messages[0])
+	next = append(next, messages[start:]...)
+	next = append(next[:1], sanitizeToolPairs(next[1:])...)
+	dropped := len(messages) - len(next)
+	if dropped <= 0 {
+		return messages, 0
+	}
+	return next, dropped
 }
 
 // messageForSession removes transient computer pixels from the durable copy.
@@ -331,6 +426,10 @@ func (t *Thinker) semanticCompactContext(reason string) (semanticCompactionResul
 
 	prompt := buildSemanticCompactionPrompt(reason, old)
 	ctx, cancel := context.WithTimeout(context.Background(), semanticCompactionTimeout)
+	ctx = withOpenAIPromptCacheScope(ctx, openAIPromptCacheScope{
+		Identity: t.promptCacheIdentity() + "/context-compaction",
+		Epoch:    t.promptCacheEpoch,
+	})
 	done := make(chan struct{})
 	go func() {
 		select {

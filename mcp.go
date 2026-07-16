@@ -46,6 +46,104 @@ type mcpToolsListResult struct {
 	Tools []mcpToolDef `json:"tools"`
 }
 
+// ToolLoadMode controls when an MCP tool schema is included in model
+// requests. The policy is provider-neutral: core resolves it before handing
+// the selected tool list to Codex, Anthropic, OpenCode Go, or any other
+// native-tool provider.
+type ToolLoadMode string
+
+const (
+	ToolLoadAuto     ToolLoadMode = "auto"
+	ToolLoadAlways   ToolLoadMode = "always"
+	ToolLoadDeferred ToolLoadMode = "deferred"
+)
+
+// MCPToolLoadingConfig sets a server-wide default plus optional overrides for
+// individual tools. Tool override keys are the raw names returned by the MCP
+// server (for example "send"), not core's qualified name ("channels_send").
+// A nil config is equivalent to {"default":"auto"} for backward
+// compatibility with every existing mcp_servers entry.
+type MCPToolLoadingConfig struct {
+	Default ToolLoadMode            `json:"default,omitempty"`
+	Tools   map[string]ToolLoadMode `json:"tools,omitempty"`
+}
+
+func normalizeToolLoadMode(mode ToolLoadMode) ToolLoadMode {
+	switch mode {
+	case ToolLoadAlways, ToolLoadDeferred:
+		return mode
+	case "", ToolLoadAuto:
+		return ToolLoadAuto
+	default:
+		// Config validation rejects unknown values. Falling back here keeps
+		// runtime selection safe if a config is assembled programmatically.
+		return ToolLoadAuto
+	}
+}
+
+func validToolLoadMode(mode ToolLoadMode) bool {
+	switch mode {
+	case "", ToolLoadAuto, ToolLoadAlways, ToolLoadDeferred:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c MCPServerConfig) toolLoadMode(tool string) ToolLoadMode {
+	if c.ToolLoading == nil {
+		return ToolLoadAuto
+	}
+	mode := normalizeToolLoadMode(c.ToolLoading.Default)
+	if override, ok := c.ToolLoading.Tools[tool]; ok {
+		mode = normalizeToolLoadMode(override)
+	}
+	return mode
+}
+
+func validateMCPToolLoading(cfg MCPServerConfig) error {
+	if cfg.ToolLoading == nil {
+		return nil
+	}
+	if !validToolLoadMode(cfg.ToolLoading.Default) {
+		return fmt.Errorf("MCP server %q has invalid tool_loading.default %q (want auto, always, or deferred)", cfg.Name, cfg.ToolLoading.Default)
+	}
+	for name, mode := range cfg.ToolLoading.Tools {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("MCP server %q has an empty tool_loading.tools key", cfg.Name)
+		}
+		if !validToolLoadMode(mode) {
+			return fmt.Errorf("MCP server %q tool %q has invalid loading mode %q (want auto, always, or deferred)", cfg.Name, name, mode)
+		}
+	}
+	return nil
+}
+
+// toolLoadingEqual compares effective policy, so an omitted config and an
+// explicit {"default":"auto"} do not cause a needless cache reset.
+func toolLoadingEqual(a, b MCPServerConfig) bool {
+	if a.toolLoadMode("") != b.toolLoadMode("") {
+		return false
+	}
+	keys := map[string]struct{}{}
+	if a.ToolLoading != nil {
+		for name := range a.ToolLoading.Tools {
+			keys[name] = struct{}{}
+		}
+	}
+	if b.ToolLoading != nil {
+		for name := range b.ToolLoading.Tools {
+			keys[name] = struct{}{}
+		}
+	}
+	for name := range keys {
+		if a.toolLoadMode(name) != b.toolLoadMode(name) {
+			return false
+		}
+	}
+	return true
+}
+
 type mcpCallResult struct {
 	Content []struct {
 		Type string `json:"type"`
@@ -71,6 +169,11 @@ type MCPServerConfig struct {
 	Env       map[string]string `json:"env,omitempty"`       // stdio transport
 	Transport string            `json:"transport,omitempty"` // "stdio" (default) or "http"
 	URL       string            `json:"url,omitempty"`       // http transport
+	// ToolLoading controls prompt-schema availability independently from
+	// connection and authorization. Always-loaded tools are present on every
+	// authorized model request; deferred tools require search/preload; auto
+	// preserves the global eager/discovery threshold behavior.
+	ToolLoading *MCPToolLoadingConfig `json:"tool_loading,omitempty"`
 	// NoSpawn, when true, hides this server's tools from sub-thread
 	// search_tools results and refuses sub-thread spawn(mcps=[...])
 	// attachments. Used for infrastructure-level servers the host
@@ -525,7 +628,7 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 		// so the index's "this tool exists" claim is always consistent
 		// with what the registry can actually dispatch.
 		if index != nil {
-			index.Add(cfg.Name, tools, cfg.NoSpawn)
+			index.Add(cfg.Name, tools, cfg.NoSpawn, cfg.ToolLoading)
 		}
 
 		servers = append(servers, srv)

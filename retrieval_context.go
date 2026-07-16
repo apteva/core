@@ -6,18 +6,23 @@ import (
 	"strings"
 )
 
-const ephemeralContextHeader = "[REQUEST CONTEXT — ephemeral; not conversation history or current user input]"
+const ephemeralContextHeader = "[REQUEST CONTEXT SNAPSHOT — ephemeral; not durable conversation history or current user input; later snapshots supersede earlier ones]"
 
 var legacyEventHeaderRE = regexp.MustCompile(`(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] Events:\s*$`)
 
-// ephemeralTurnContextState keeps request-only context at a stable position
-// for the lifetime of one semantic turn. Tool calls and their results then
-// append after the same context, preserving the exact provider prefix without
-// leaking retrieval context into durable history.
+type ephemeralTurnContextSnapshot struct {
+	anchor  int
+	message Message
+}
+
+// ephemeralTurnContextState keeps every request-only turn snapshot at the
+// position where the provider first saw it. A later semantic turn appends a
+// new snapshot instead of removing or repositioning the old one. This makes
+// normal provider requests append-only while keeping retrieval context out of
+// durable conversation history and the session journal.
 type ephemeralTurnContextState struct {
-	anchor    int
+	snapshots []ephemeralTurnContextSnapshot
 	signature string
-	message   Message
 	active    bool
 }
 
@@ -49,17 +54,33 @@ func (s *ephemeralTurnContextState) prepare(messages []Message, dynamicContext, 
 	}
 
 	signature := ephemeralTurnContextSignature(dynamicContext, idle)
-	if forceNew || !s.active || s.signature != signature || s.anchor < 0 || s.anchor > len(messages) {
-		s.anchor = len(messages)
+	for _, snapshot := range s.snapshots {
+		if snapshot.anchor < 0 || snapshot.anchor > len(messages) {
+			s.reset()
+			forceNew = true
+			break
+		}
+	}
+	if forceNew || !s.active || s.signature != signature {
+		s.snapshots = append(s.snapshots, ephemeralTurnContextSnapshot{
+			anchor:  len(messages),
+			message: Message{Role: "user", Content: content, RequestContext: true},
+		})
 		s.signature = signature
-		s.message = Message{Role: "user", Content: content, RequestContext: true}
 		s.active = true
 	}
 
-	request := make([]Message, 0, len(messages)+1)
-	request = append(request, messages[:s.anchor]...)
-	request = append(request, s.message)
-	request = append(request, messages[s.anchor:]...)
+	request := make([]Message, 0, len(messages)+len(s.snapshots))
+	for i := 0; i <= len(messages); i++ {
+		for _, snapshot := range s.snapshots {
+			if snapshot.anchor == i {
+				request = append(request, snapshot.message)
+			}
+		}
+		if i < len(messages) {
+			request = append(request, messages[i])
+		}
+	}
 	return request
 }
 

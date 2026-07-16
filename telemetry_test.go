@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -42,6 +43,45 @@ func TestTelemetryLiveForwardBatchesBurstIntoOneRequest(t *testing.T) {
 	case extra := <-requests:
 		t.Fatalf("burst produced an extra request with %d events", len(extra))
 	case <-time.After(75 * time.Millisecond):
+	}
+}
+
+func TestTelemetryLiveForwardRetriesBatchWithoutReordering(t *testing.T) {
+	requests := make(chan []TelemetryEvent, 4)
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var events []TelemetryEvent
+		if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+			t.Errorf("decode live batch: %v", err)
+		}
+		requests <- events
+		if attempts.Add(1) == 1 {
+			http.Error(w, "restart", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	tel := &Telemetry{
+		forwardCh:        make(chan TelemetryEvent, 100),
+		quit:             make(chan struct{}),
+		telemetryLiveURL: server.URL,
+	}
+	tel.forwardCh <- TelemetryEvent{ID: "first", Type: "llm.start"}
+	tel.forwardCh <- TelemetryEvent{ID: "second", Type: "llm.chunk"}
+	go tel.liveForwardLoop()
+	defer close(tel.quit)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case events := <-requests:
+			if len(events) != 2 || events[0].ID != "first" || events[1].ID != "second" {
+				t.Fatalf("attempt %d reordered batch: %+v", i+1, events)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for attempt %d", i+1)
+		}
 	}
 }
 

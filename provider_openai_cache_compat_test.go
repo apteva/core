@@ -44,7 +44,7 @@ func TestOpenAICompatChat_SendsPromptCacheHintsOnlyForOpenAI(t *testing.T) {
 	if body["prompt_cache_retention"] != "24h" {
 		t.Fatalf("prompt_cache_retention = %v, want 24h", body["prompt_cache_retention"])
 	}
-	if key, _ := body["prompt_cache_key"].(string); !strings.HasPrefix(key, "apteva-v1-") {
+	if key, _ := body["prompt_cache_key"].(string); !strings.HasPrefix(key, "apteva-v2-") {
 		t.Fatalf("prompt_cache_key = %q", key)
 	}
 

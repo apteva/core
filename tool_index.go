@@ -31,9 +31,11 @@ type ToolIndex struct {
 // IndexEntry is one tool's worth of searchable metadata.
 type IndexEntry struct {
 	Server      string
+	LocalName   string // raw MCP name (for example "send")
 	Name        string // fully-qualified (e.g. "storage_files_upload")
 	Description string
 	NoSpawn     bool // sub-threads cannot see this tool in search
+	LoadMode    ToolLoadMode
 	// tokens is the lowercased, deduplicated set of search terms
 	// (name segments + description words). Precomputed at Add() time.
 	tokens map[string]int
@@ -46,7 +48,7 @@ func NewToolIndex() *ToolIndex {
 
 // Add registers a server's tools. Replaces any prior entries for the
 // same server name so reconnect or hot-reload semantics work cleanly.
-func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool) {
+func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loading ...*MCPToolLoadingConfig) {
 	if ix == nil {
 		return
 	}
@@ -60,16 +62,42 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool) {
 		}
 	}
 	ix.entries = filtered
+	cfg := MCPServerConfig{Name: server}
+	if len(loading) > 0 {
+		cfg.ToolLoading = loading[0]
+	}
 	for _, t := range tools {
 		full := server + "_" + t.Name
 		e := IndexEntry{
 			Server:      server,
+			LocalName:   t.Name,
 			Name:        full,
 			Description: t.Description,
 			NoSpawn:     noSpawn,
+			LoadMode:    cfg.toolLoadMode(t.Name),
 			tokens:      indexTokens(full + " " + t.Description),
 		}
 		ix.entries = append(ix.entries, e)
+	}
+}
+
+// UpdatePolicy changes only prompt visibility metadata. MCP connections and
+// registered handlers remain untouched, which is required for host-owned
+// no_spawn servers such as Channels that cannot safely reconnect while their
+// management request is in flight.
+func (ix *ToolIndex) UpdatePolicy(server string, noSpawn bool, loading *MCPToolLoadingConfig) {
+	if ix == nil {
+		return
+	}
+	cfg := MCPServerConfig{Name: server, ToolLoading: loading}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	for i := range ix.entries {
+		if ix.entries[i].Server != server {
+			continue
+		}
+		ix.entries[i].NoSpawn = noSpawn
+		ix.entries[i].LoadMode = cfg.toolLoadMode(ix.entries[i].LocalName)
 	}
 }
 
@@ -141,6 +169,24 @@ func (ix *ToolIndex) ToolCountByServer() map[string]int {
 	return out
 }
 
+// ToolPolicyCountsByServer returns per-server counts keyed by normalized load
+// mode. It feeds the prompt's compact catalog without exposing index internals.
+func (ix *ToolIndex) ToolPolicyCountsByServer() map[string]map[ToolLoadMode]int {
+	if ix == nil {
+		return nil
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	out := map[string]map[ToolLoadMode]int{}
+	for _, e := range ix.entries {
+		if out[e.Server] == nil {
+			out[e.Server] = map[ToolLoadMode]int{}
+		}
+		out[e.Server][normalizeToolLoadMode(e.LoadMode)]++
+	}
+	return out
+}
+
 // computeMCPCatalog projects the index into the legacy
 // MCPServerInfo shape consumed by buildSystemPrompt. Kept as a free
 // function so the prompt builder doesn't need to learn about the
@@ -150,11 +196,81 @@ func computeMCPCatalog(ix *ToolIndex) []MCPServerInfo {
 		return nil
 	}
 	counts := ix.ToolCountByServer()
+	policyCounts := ix.ToolPolicyCountsByServer()
 	out := make([]MCPServerInfo, 0, len(counts))
 	for _, name := range ix.Servers() {
-		out = append(out, MCPServerInfo{Name: name, ToolCount: counts[name]})
+		out = append(out, MCPServerInfo{
+			Name:          name,
+			ToolCount:     counts[name],
+			AlwaysCount:   policyCounts[name][ToolLoadAlways],
+			AutoCount:     policyCounts[name][ToolLoadAuto],
+			DeferredCount: policyCounts[name][ToolLoadDeferred],
+		})
 	}
 	return out
+}
+
+// BaselineNames returns schemas that are visible without activation for the
+// current global mode. Explicit policy wins over the global threshold:
+// always is always present, deferred always requires activation, and auto
+// follows eagerMode. no_spawn remains an authorization boundary.
+func (ix *ToolIndex) BaselineNames(eagerMode, allowNoSpawn bool) []string {
+	if ix == nil {
+		return nil
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	out := make([]string, 0, len(ix.entries))
+	for _, e := range ix.entries {
+		if !allowNoSpawn && e.NoSpawn {
+			continue
+		}
+		mode := normalizeToolLoadMode(e.LoadMode)
+		if mode == ToolLoadAlways || (mode == ToolLoadAuto && eagerMode) {
+			out = append(out, e.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AlwaysCount reports pinned schemas in the caller's authorized scope.
+func (ix *ToolIndex) AlwaysCount(allowNoSpawn bool) int {
+	if ix == nil {
+		return 0
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	n := 0
+	for _, e := range ix.entries {
+		if (!allowNoSpawn && e.NoSpawn) || normalizeToolLoadMode(e.LoadMode) != ToolLoadAlways {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// DeferredCount reports schemas excluded from the baseline in the current
+// global mode. It includes explicit deferred tools plus auto tools while the
+// process is in discovery mode.
+func (ix *ToolIndex) DeferredCount(eagerMode, allowNoSpawn bool) int {
+	if ix == nil {
+		return 0
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	n := 0
+	for _, e := range ix.entries {
+		if !allowNoSpawn && e.NoSpawn {
+			continue
+		}
+		mode := normalizeToolLoadMode(e.LoadMode)
+		if mode == ToolLoadDeferred || (mode == ToolLoadAuto && !eagerMode) {
+			n++
+		}
+	}
+	return n
 }
 
 // AllNames returns every indexed tool's fully-qualified name. Backs
@@ -175,6 +291,7 @@ func (ix *ToolIndex) AllNames(allowNoSpawn bool) []string {
 		}
 		out = append(out, e.Name)
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -231,6 +348,12 @@ func (ix *ToolIndex) Search(query string, k int, allowNoSpawn bool) []IndexEntry
 	var hits []scored
 	for _, e := range ix.entries {
 		if !allowNoSpawn && e.NoSpawn {
+			continue
+		}
+		// Always-loaded schemas are already callable. Returning them from
+		// search would waste an activation slot and encourage a needless
+		// extra model round-trip.
+		if normalizeToolLoadMode(e.LoadMode) == ToolLoadAlways {
 			continue
 		}
 		s := scoreEntry(terms, e)

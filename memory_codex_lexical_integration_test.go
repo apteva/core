@@ -378,12 +378,12 @@ func runUnconsciousHistoryGrowthCreatesPersistentMemory(t *testing.T, provider L
 	memoriesBefore := parent.memory.Count()
 
 	go parent.Run()
-	const sentinel = "viridian-threshold-946"
-	padding := strings.Repeat("Non-memory transport padding used only to cross the safety threshold. ", 550)
+	const sentinel = "viridian green"
+	padding := strings.Repeat("Routine build output from the current deployment review completed successfully. ", 550)
 	parent.InjectConsole(padding)
 	parent.InjectConsole(padding)
-	parent.InjectConsole("User explicitly said: remember that the durable deployment threshold token is " + sentinel + ".")
-	parent.InjectConsole("User confirmed that future threshold deployment checks must use " + sentinel + ".")
+	parent.InjectConsole("Please remember my lasting preference: deployment dashboards should use " + sentinel + " for status accents.")
+	parent.InjectConsole("For future deployment dashboard work, keep " + sentinel + " as my preferred status accent color.")
 	waitForHistoryGrowth(t, baseline+unconsciousByteThreshold, 15*time.Second)
 
 	thresholdAt := time.Now()
@@ -417,7 +417,7 @@ func runUnconsciousHistoryGrowthCreatesPersistentMemory(t *testing.T, provider L
 		t.Fatal("Codex threshold memory was not persisted")
 	}
 	reloaded := NewMemoryStore("")
-	results := reloaded.Recall("What token is used for durable deployment threshold checks?", 5)
+	results := reloaded.Recall("Which status accent color does the user prefer for deployment dashboards?", 5)
 	if !memoryResultsContain(results, sentinel) {
 		t.Fatalf("restarted memory store could not recall %s: %v", sentinel, memoryContents(results))
 	}

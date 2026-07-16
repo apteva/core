@@ -221,7 +221,7 @@ func TestShouldRecoverFromEmptyResponseAfterRepeatedEmptyUnknownUsage(t *testing
 	}
 }
 
-func TestSessionForceCompactPreservesRecentOversizedToolResult(t *testing.T) {
+func TestSessionForceCompactArchivesRecentOversizedToolResult(t *testing.T) {
 	session := NewSession(t.TempDir(), "main")
 	for i := 0; i < contextPressureKeepRecent+5; i++ {
 		session.Append(SessionEntry{Role: "user", Content: "message"})
@@ -251,9 +251,16 @@ func TestSessionForceCompactPreservesRecentOversizedToolResult(t *testing.T) {
 	if len(last.ToolResults) != 1 {
 		t.Fatalf("expected retained tool result, got %+v", last.ToolResults)
 	}
-	if last.ToolResults[0].Content != large {
-		t.Fatalf("tool result changed: len=%d want=%d contains_sentinel=%v",
-			len(last.ToolResults[0].Content), len(large), strings.Contains(last.ToolResults[0].Content, "FULL_RESULT_SENTINEL"))
+	stored := last.ToolResults[0]
+	if stored.Content != "" || stored.SHA256 == "" || stored.ArchiveRef == "" || stored.OriginalBytes != len(large) {
+		t.Fatalf("tool result was not reduced to durable archive metadata: %+v", stored)
+	}
+	object, err := session.archive.Read(stored.ArchiveRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if object.Content != large || !strings.Contains(object.Content, "FULL_RESULT_SENTINEL") {
+		t.Fatal("full result was not retained in the immutable archive")
 	}
 }
 

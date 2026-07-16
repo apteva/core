@@ -181,10 +181,17 @@ type NativeToolCall struct {
 
 // ToolResult is sent back to the provider after executing a tool.
 type ToolResult struct {
-	CallID  string `json:"call_id"`
-	Content string `json:"content"`         // text result
-	Image   []byte `json:"image,omitempty"` // optional image (screenshot etc.)
-	IsError bool   `json:"is_error,omitempty"`
+	CallID             string `json:"call_id"`
+	ToolName           string `json:"tool_name,omitempty"`
+	Content            string `json:"content"`         // full text for first consumption; bounded archive preview thereafter
+	Image              []byte `json:"image,omitempty"` // optional image (screenshot etc.)
+	IsError            bool   `json:"is_error,omitempty"`
+	OriginalChars      int    `json:"original_chars,omitempty"`
+	OriginalBytes      int    `json:"original_bytes,omitempty"`
+	OriginalImageBytes int    `json:"original_image_bytes,omitempty"`
+	SHA256             string `json:"sha256,omitempty"`
+	ArchiveRef         string `json:"archive_ref,omitempty"`
+	ContentIsPreview   bool   `json:"content_is_preview,omitempty"`
 }
 
 // BuiltinTool defines a provider-side tool (executed by the LLM provider, not by us).
@@ -311,6 +318,10 @@ func createProviderByName(name string) LLMProvider {
 		if key := os.Getenv("GOOGLE_API_KEY"); key != "" {
 			return NewGoogleProvider(key)
 		}
+	case "xai":
+		if key := os.Getenv("XAI_API_KEY"); key != "" {
+			return NewXAIProvider(key)
+		}
 	case "ollama":
 		// Require explicit OLLAMA_HOST. Previously we silently defaulted
 		// to http://localhost:11434, which meant every install with no
@@ -373,6 +384,16 @@ func applyModelOverrides(provider LLMProvider, models map[string]string) {
 		}
 		if small != "" {
 			p.models[ModelSmall] = small
+		}
+	case *XAIProvider:
+		if large != "" {
+			p.compat.models[ModelLarge] = large
+		}
+		if medium != "" {
+			p.compat.models[ModelMedium] = medium
+		}
+		if small != "" {
+			p.compat.models[ModelSmall] = small
 		}
 	case *OpenAINativeProvider:
 		if large != "" {
@@ -619,7 +640,7 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 	// requires OLLAMA_HOST set explicitly and only returns non-nil
 	// when the user has it running.
 	if len(pool.providers) == 0 {
-		for _, name := range []string{"opencode-go", "fireworks", "anthropic", "google", "openai", "venice", "nvidia", "ollama"} {
+		for _, name := range []string{"opencode-go", "fireworks", "anthropic", "google", "openai", "xai", "venice", "nvidia", "ollama"} {
 			if p := createProviderByName(name); p != nil {
 				pool.providers[name] = p
 				pool.order = append(pool.order, name)
@@ -628,7 +649,7 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 	}
 
 	if len(pool.providers) == 0 {
-		return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, or OLLAMA_HOST")
+		return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, or OLLAMA_HOST")
 	}
 
 	// Default = first with Default flag, or first in order
@@ -682,6 +703,9 @@ func availableProviders() []LLMProvider {
 	}
 	if key := os.Getenv("GOOGLE_API_KEY"); key != "" {
 		providers = append(providers, NewGoogleProvider(key))
+	}
+	if key := os.Getenv("XAI_API_KEY"); key != "" {
+		providers = append(providers, NewXAIProvider(key))
 	}
 	if host := os.Getenv("OLLAMA_HOST"); host != "" {
 		providers = append(providers, NewOllamaProvider(host))

@@ -352,7 +352,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	if stablePrefix == "" {
 		stablePrefix = p.instructionsFromMessages(messages)
 	}
-	cacheHints := openAIPromptCacheHintsFor(p.Name(), model, stablePrefix, apiTools)
+	cacheHints := openAIPromptCacheHintsForScope(p.Name(), model, stablePrefix, apiTools, openAIPromptCacheScopeFromContext(ctx))
 	cacheState := p.promptCacheState()
 	if !cacheState.enabled() {
 		cacheHints = openAIPromptCacheHints{}

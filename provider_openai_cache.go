@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,28 @@ const defaultOpenAIPromptCacheRetention = "24h"
 type openAIPromptCacheHints struct {
 	Key       string
 	Retention string
+}
+
+type openAIPromptCacheScope struct {
+	Identity string
+	Epoch    uint64
+}
+
+type openAIPromptCacheScopeContextKey struct{}
+
+func withOpenAIPromptCacheScope(ctx context.Context, scope openAIPromptCacheScope) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAIPromptCacheScopeContextKey{}, scope)
+}
+
+func openAIPromptCacheScopeFromContext(ctx context.Context) openAIPromptCacheScope {
+	if ctx == nil {
+		return openAIPromptCacheScope{}
+	}
+	scope, _ := ctx.Value(openAIPromptCacheScopeContextKey{}).(openAIPromptCacheScope)
+	return scope
 }
 
 type openAIPromptCacheState struct {
@@ -41,6 +64,10 @@ func (s *openAIPromptCacheState) disable() {
 }
 
 func openAIPromptCacheHintsFor(providerName, model, stablePrefix string, tools any) openAIPromptCacheHints {
+	return openAIPromptCacheHintsForScope(providerName, model, stablePrefix, tools, openAIPromptCacheScope{})
+}
+
+func openAIPromptCacheHintsForScope(providerName, model, stablePrefix string, tools any, scope openAIPromptCacheScope) openAIPromptCacheHints {
 	if !openAIPromptCacheEnabled(providerName) {
 		return openAIPromptCacheHints{}
 	}
@@ -56,10 +83,14 @@ func openAIPromptCacheHintsFor(providerName, model, stablePrefix string, tools a
 	}
 
 	h := sha256.New()
-	h.Write([]byte("apteva-openai-cache-v1\n"))
+	h.Write([]byte("apteva-openai-cache-v2\n"))
 	h.Write([]byte(providerName))
 	h.Write([]byte{'\n'})
 	h.Write([]byte(model))
+	h.Write([]byte{'\n'})
+	h.Write([]byte(scope.Identity))
+	h.Write([]byte{'\n'})
+	h.Write([]byte(strconv.FormatUint(scope.Epoch, 10)))
 	h.Write([]byte{'\n'})
 	h.Write([]byte(stablePrefix))
 	h.Write([]byte{'\n'})
@@ -70,7 +101,7 @@ func openAIPromptCacheHintsFor(providerName, model, stablePrefix string, tools a
 	}
 	sum := h.Sum(nil)
 	return openAIPromptCacheHints{
-		Key:       "apteva-v1-" + hex.EncodeToString(sum[:16]),
+		Key:       "apteva-v2-" + hex.EncodeToString(sum[:16]),
 		Retention: retention,
 	}
 }

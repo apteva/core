@@ -98,6 +98,21 @@ func TestOpenCodeGoDirectiveBehaviorSuite(t *testing.T) {
 	runProviderDirectiveBehaviorSuite(t, newProvider)
 }
 
+func TestOpenCodeGoBoundedOneOffStaysOnMainSmoke(t *testing.T) {
+	if os.Getenv("RUN_OPENCODE_GO_DIRECTIVE_SUITE") == "" {
+		t.Skip("set RUN_OPENCODE_GO_DIRECTIVE_SUITE=1 to run the GLM bounded-work smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping GLM bounded-work smoke in short mode")
+	}
+	loadIntegrationEnv()
+	key := strings.TrimSpace(os.Getenv("OPENCODE_GO_API_KEY"))
+	if key == "" {
+		t.Skip("OPENCODE_GO_API_KEY not set")
+	}
+	runBoundedOneOffStaysOnMainSmoke(t, NewOpenCodeGoProvider(key))
+}
+
 // TestOpenCodeGoMiniMaxM3DirectiveBehaviorSuite runs the complete
 // provider-neutral directive behavior suite through MiniMax M3.
 func TestOpenCodeGoMiniMaxM3DirectiveBehaviorSuite(t *testing.T) {

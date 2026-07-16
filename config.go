@@ -53,7 +53,7 @@ type ModelCapabilities struct {
 }
 
 type ProviderConfig struct {
-	Name              string                       `json:"name"`                         // "google", "openai", "anthropic", "fireworks", "ollama", "openai-realtime"
+	Name              string                       `json:"name"`                         // "google", "openai", "anthropic", "fireworks", "xai", "ollama", "openai-realtime"
 	Default           bool                         `json:"default,omitempty"`            // true = default provider (first match wins)
 	Models            map[string]string            `json:"models,omitempty"`             // "large" → model ID, "medium" → ..., "small" → ...
 	ModelCapabilities map[string]ModelCapabilities `json:"model_capabilities,omitempty"` // selected model metadata keyed by model ID
@@ -105,6 +105,11 @@ func (c *Config) load() error {
 		c.Provider.Default = true
 		c.Providers = []ProviderConfig{*c.Provider}
 		c.Provider = nil
+	}
+	for _, server := range c.MCPServers {
+		if err := validateMCPToolLoading(server); err != nil {
+			return err
+		}
 	}
 	return nil
 }

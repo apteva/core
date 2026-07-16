@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // TelemetryEvent is the unified event format — matches server schema.
@@ -245,21 +246,56 @@ func (t *Telemetry) liveForwardLoop() {
 				default:
 				}
 			}
-			t.forwardLive(batch)
+			t.forwardLiveWithRetry(batch)
 		case <-t.quit:
 			return
 		}
 	}
 }
 
-func (t *Telemetry) forwardLive(events []TelemetryEvent) {
+// forwardLiveWithRetry keeps ownership of a batch until the server accepts it.
+// That preserves event order across a short server restart: newer events stay
+// queued in forwardCh while the current batch retries. The queue remains
+// bounded so telemetry can never block the thinker hot path indefinitely.
+func (t *Telemetry) forwardLiveWithRetry(events []TelemetryEvent) {
+	const (
+		baseDelay = 100 * time.Millisecond
+		maxDelay  = 5 * time.Second
+	)
+	delay := baseDelay
+	for {
+		if t.forwardLive(events) {
+			return
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+			if delay < maxDelay {
+				delay *= 2
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+			}
+		case <-t.quit:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
+}
+
+func (t *Telemetry) forwardLive(events []TelemetryEvent) bool {
 	body, err := json.Marshal(events)
 	if err != nil {
-		return
+		return true // deterministic failure: retrying cannot repair this batch
 	}
 	req, err := http.NewRequest("POST", t.telemetryLiveURL, bytes.NewReader(body))
 	if err != nil {
-		return
+		return true
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if t.instanceSecret != "" {
@@ -272,12 +308,14 @@ func (t *Telemetry) forwardLive(events []TelemetryEvent) {
 	resp, err := client.Do(req)
 	if err != nil {
 		logMsg("TELEMETRY", fmt.Sprintf("forwardLive: POST error for %d events: %v", len(events), err))
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		logMsg("TELEMETRY", fmt.Sprintf("forwardLive: HTTP %d for %d events", resp.StatusCode, len(events)))
+		return false
 	}
+	return true
 }
 
 // Events returns all events (including live-only) since the given index. Used by SSE.
@@ -460,13 +498,21 @@ type LLMDoneData struct {
 	// (in tokens). Comes from a static lookup keyed on the model id —
 	// see ModelContextWindow. 0 when the model isn't in the table; UI
 	// should treat 0 as "unknown" and skip percentage rendering.
-	MaxContextTokens int    `json:"max_context_tokens,omitempty"`
-	MemoryCount      int    `json:"memory_count"`
-	ThreadCount      int    `json:"thread_count"`
-	Message          string `json:"message,omitempty"`
-	NativeToolCount  int    `json:"native_tool_count,omitempty"`
-	ActiveMCPCount   int    `json:"active_mcp_count,omitempty"`
-	ToolMode         string `json:"tool_mode,omitempty"`
+	MaxContextTokens             int    `json:"max_context_tokens,omitempty"`
+	MemoryCount                  int    `json:"memory_count"`
+	ThreadCount                  int    `json:"thread_count"`
+	Message                      string `json:"message,omitempty"`
+	NativeToolCount              int    `json:"native_tool_count,omitempty"`
+	ActiveMCPCount               int    `json:"active_mcp_count,omitempty"`
+	AlwaysMCPCount               int    `json:"always_mcp_count,omitempty"`
+	DeferredMCPCount             int    `json:"deferred_mcp_count,omitempty"`
+	ToolMode                     string `json:"tool_mode,omitempty"`
+	PromptCacheEpoch             uint64 `json:"prompt_cache_epoch"`
+	PromptCacheResetReason       string `json:"prompt_cache_reset_reason,omitempty"`
+	PromptCacheIdentityHash      string `json:"prompt_cache_identity_hash,omitempty"`
+	PromptCacheStablePrefixHash  string `json:"prompt_cache_stable_prefix_hash,omitempty"`
+	PromptCacheRequestHash       string `json:"prompt_cache_request_hash,omitempty"`
+	PromptCacheCommonPrefixBytes int    `json:"prompt_cache_common_prefix_bytes,omitempty"`
 }
 
 type LLMChunkData struct {
@@ -516,11 +562,46 @@ type ToolCallData struct {
 }
 
 type ToolResultData struct {
-	ID         string `json:"id,omitempty"`
-	Name       string `json:"name"`
-	DurationMs int64  `json:"duration_ms"`
-	Success    bool   `json:"success"`
-	Result     string `json:"result,omitempty"`
+	ID                  string `json:"id,omitempty"`
+	Name                string `json:"name"`
+	DurationMs          int64  `json:"duration_ms"`
+	Success             bool   `json:"success"`
+	Result              string `json:"result,omitempty"`
+	ResultOriginalBytes int    `json:"result_original_bytes"`
+	ResultContextBytes  int    `json:"result_context_bytes"`
+	ResultPreviewBytes  int    `json:"result_preview_bytes"`
+	ResultImageBytes    int    `json:"result_image_bytes,omitempty"`
+	ResultTruncated     bool   `json:"result_truncated"`
+}
+
+const toolResultTelemetryPreviewBytes = 1000
+
+// newToolResultData records payload sizes without copying the complete result
+// into server telemetry. ContextBytes describes the raw text+image bytes made
+// available to the next model turn; it can differ from the tool's original
+// output when core wraps or transforms a result.
+func newToolResultData(id, name string, durationMs int64, success bool, originalText, contextText string, imageBytes int) ToolResultData {
+	preview := contextText
+	truncated := len(preview) > toolResultTelemetryPreviewBytes
+	if truncated {
+		end := toolResultTelemetryPreviewBytes
+		for end > 0 && !utf8.ValidString(preview[:end]) {
+			end--
+		}
+		preview = preview[:end] + "..."
+	}
+	return ToolResultData{
+		ID:                  id,
+		Name:                name,
+		DurationMs:          durationMs,
+		Success:             success,
+		Result:              preview,
+		ResultOriginalBytes: len(originalText) + imageBytes,
+		ResultContextBytes:  len(contextText) + imageBytes,
+		ResultPreviewBytes:  len(preview),
+		ResultImageBytes:    imageBytes,
+		ResultTruncated:     truncated,
+	}
 }
 
 type DirectiveChangeData struct {
@@ -633,6 +714,15 @@ func ModelContextWindow(modelID string) int {
 		{"venice-uncensored", 32_000},
 		{"grok-41-fast", 1_000_000},
 		{"grok-4-20", 2_000_000},
+		// --- xAI direct API ---
+		// Live catalog capabilities from /v1/language-models take
+		// precedence; these keep telemetry useful during catalog outages.
+		{"grok-4.5", 500_000},
+		{"grok-4.3", 1_000_000},
+		{"grok-build-0.1", 256_000},
+		{"grok-4.20-0309-reasoning", 1_000_000},
+		{"grok-4.20-0309-non-reasoning", 1_000_000},
+		{"grok-4.20-multi-agent-0309", 1_000_000},
 		{"hermes-3-llama-3.1-405b", 128_000},
 
 		// --- OpenAI ---

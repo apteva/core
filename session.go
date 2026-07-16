@@ -49,6 +49,8 @@ type Session struct {
 	mu        sync.Mutex
 	compactMu sync.Mutex
 	path      string
+	threadID  string
+	archive   *ToolResultArchive
 	count     int // approximate line count
 	nextSeq   int64
 }
@@ -60,7 +62,11 @@ func NewSession(baseDir, threadID string) *Session {
 	_ = os.Chmod(dir, 0700)
 	path := safeSessionPath(dir, threadID)
 
-	s := &Session{path: path}
+	s := &Session{
+		path:     path,
+		threadID: threadID,
+		archive:  NewToolResultArchive(baseDir, threadID),
+	}
 
 	// Count existing lines
 	if f, err := os.Open(path); err == nil {
@@ -91,6 +97,12 @@ func safeSessionPath(dir, threadID string) string {
 
 // Append writes one entry to the history file.
 func (s *Session) Append(entry SessionEntry) error {
+	var err error
+	entry, err = s.prepareEntryForDurability(entry)
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -116,6 +128,121 @@ func (s *Session) Append(entry SessionEntry) error {
 	}
 	s.count++
 	return nil
+}
+
+// ArchiveToolResults stores each payload before it enters the in-memory
+// conversation. The returned live message keeps the full payload through the
+// short retention window; persistence stores only internal archive metadata.
+func (s *Session) ArchiveToolResults(msg Message) (Message, error) {
+	if s == nil || len(msg.ToolResults) == 0 {
+		return msg, nil
+	}
+	archived := msg
+	archived.ToolResults = append([]ToolResult(nil), msg.ToolResults...)
+	for i := range archived.ToolResults {
+		if !shouldArchiveToolResult(archived.ToolResults[i]) {
+			continue
+		}
+		result, err := s.archive.Archive(archived.ToolResults[i])
+		if err != nil {
+			return msg, err
+		}
+		archived.ToolResults[i] = result
+	}
+	return archived, nil
+}
+
+func (s *Session) prepareEntryForDurability(entry SessionEntry) (SessionEntry, error) {
+	if s == nil || len(entry.ToolResults) == 0 {
+		return entry, nil
+	}
+	entry.ToolResults = append([]ToolResult(nil), entry.ToolResults...)
+	for i := range entry.ToolResults {
+		if !shouldArchiveToolResult(entry.ToolResults[i]) {
+			continue
+		}
+		result, err := s.archive.Archive(entry.ToolResults[i])
+		if err != nil {
+			return SessionEntry{}, err
+		}
+		entry.ToolResults[i] = metadataOnlyArchivedToolResult(result)
+	}
+	return entry, nil
+}
+
+// projectEntriesForModelLoad migrates legacy full-payload entries into the
+// archive and always returns bounded projections. If an archive write fails,
+// the in-memory fallback is still bounded and contains no image bytes.
+func (s *Session) projectEntriesForModelLoad(entries []SessionEntry) []SessionEntry {
+	projected := make([]SessionEntry, len(entries))
+	for i, entry := range entries {
+		projected[i] = entry
+		if len(entry.ToolResults) == 0 {
+			continue
+		}
+		projected[i].ToolResults = append([]ToolResult(nil), entry.ToolResults...)
+		for j, original := range entry.ToolResults {
+			if !shouldArchiveToolResult(original) {
+				continue
+			}
+			archived := original
+			var err error
+			if isToolResultSHA256(original.SHA256) {
+				var object archivedToolResultObject
+				ref := original.ArchiveRef
+				if ref == "" {
+					ref = original.SHA256
+				}
+				object, err = s.archive.Read(ref)
+				if err == nil {
+					archived.Content = object.Content
+					archived.Image = append([]byte(nil), object.Image...)
+					archived.IsError = object.IsError
+					archived.OriginalChars = object.OriginalChars
+					archived.OriginalBytes = object.OriginalBytes
+					archived.OriginalImageBytes = object.OriginalImageBytes
+					archived.ContentIsPreview = false
+				}
+			} else {
+				archived, err = s.archive.Archive(original)
+			}
+			if err != nil {
+				archived = original
+				archived.Image = nil
+				archived.Content = deterministicToolResultExcerpt(original.Content, historicalToolResultPerResultChars)
+				archived.ContentIsPreview = true
+			}
+			projected[i].ToolResults[j] = projectArchivedToolResult(archived, historicalToolResultPerResultChars)
+		}
+	}
+	return projected
+}
+
+func (s *Session) archiveEntriesForDurability(entries []SessionEntry) ([]SessionEntry, bool, error) {
+	archivedEntries := make([]SessionEntry, len(entries))
+	changed := false
+	for i, entry := range entries {
+		archivedEntries[i] = entry
+		if len(entry.ToolResults) == 0 {
+			continue
+		}
+		archivedEntries[i].ToolResults = append([]ToolResult(nil), entry.ToolResults...)
+		for j, original := range entry.ToolResults {
+			if !shouldArchiveToolResult(original) {
+				continue
+			}
+			if isToolResultSHA256(original.SHA256) && original.Content == "" && len(original.Image) == 0 && original.ContentIsPreview {
+				continue
+			}
+			archived, err := s.archive.Archive(original)
+			if err != nil {
+				return nil, false, fmt.Errorf("archive legacy tool result %q: %w", original.CallID, err)
+			}
+			archivedEntries[i].ToolResults[j] = metadataOnlyArchivedToolResult(archived)
+			changed = true
+		}
+	}
+	return archivedEntries, changed, nil
 }
 
 // AppendMessage is a convenience to append a Message as a SessionEntry.
@@ -149,15 +276,31 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 	defer f.Close()
 
 	var entries []SessionEntry
+	migrationSafe := true
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), maxSessionEntryBytes)
 	for scanner.Scan() {
 		var entry SessionEntry
 		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
 			entries = append(entries, entry)
+		} else {
+			migrationSafe = false
 		}
 	}
+	if scanner.Err() != nil {
+		migrationSafe = false
+	}
 	entries = sanitizeLegacyDynamicEntries(entries)
+	durableEntries, migrated, archiveErr := s.archiveEntriesForDurability(entries)
+	if archiveErr == nil {
+		entries = durableEntries
+		if migrated && migrationSafe {
+			if err := s.rewriteEntriesLocked(entries); err == nil {
+				s.count = len(entries)
+			}
+		}
+	}
+	entries = s.projectEntriesForModelLoad(entries)
 
 	// Collect compacted summaries
 	for _, e := range entries {
@@ -237,7 +380,11 @@ func (s *Session) LoadAfter(after int64, limit int) (entries []SessionEntry, nex
 		if entry.Sequence <= after {
 			continue
 		}
-		entries = append(entries, entry)
+		archived, _, archiveErr := s.archiveEntriesForDurability([]SessionEntry{entry})
+		if archiveErr != nil {
+			return nil, nextCursor, archiveErr
+		}
+		entries = append(entries, archived[0])
 		if entry.Sequence > nextCursor {
 			nextCursor = entry.Sequence
 		}
@@ -361,6 +508,11 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 	}
 
 	entries = sanitizeLegacyDynamicEntries(entries)
+	entries, _, err = s.archiveEntriesForDurability(entries)
+	if err != nil {
+		s.mu.Unlock()
+		return
+	}
 	if !force && len(entries) <= compactThreshold {
 		s.count = len(entries)
 		s.mu.Unlock()
@@ -372,7 +524,8 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		return
 	}
 
-	combined, realCount, _ := buildCompactionParts(entries, keepRecent)
+	compactionEntries := s.projectEntriesForModelLoad(entries)
+	combined, realCount, _ := buildCompactionParts(compactionEntries, keepRecent)
 	compactPrefix := len(entries) - keepRecent
 	if compactPrefix < 0 {
 		compactPrefix = 0
@@ -402,6 +555,10 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		return
 	}
 	entries = sanitizeLegacyDynamicEntries(entries)
+	entries, _, err = s.archiveEntriesForDurability(entries)
+	if err != nil {
+		return
+	}
 	if !force && len(entries) <= compactThreshold {
 		s.count = len(entries)
 		return
@@ -414,7 +571,6 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		return
 	}
 	recent := append([]SessionEntry(nil), entries[compactPrefix:]...)
-	stripComputerImagesFromSessionEntries(recent)
 	if summaryText == "" {
 		summaryText = fmt.Sprintf("Compacted %d messages.", realCount)
 	}
@@ -430,25 +586,6 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 	newEntries := append([]SessionEntry{compactedEntry}, recent...)
 	if s.rewriteEntriesLocked(newEntries) == nil {
 		s.count = len(newEntries)
-	}
-}
-
-func stripComputerImagesFromSessionEntries(entries []SessionEntry) {
-	names := make(map[string]string)
-	for _, entry := range entries {
-		for _, call := range entry.ToolCalls {
-			if call.ID != "" {
-				names[call.ID] = call.Name
-			}
-		}
-	}
-	for i := range entries {
-		for j := range entries[i].ToolResults {
-			result := &entries[i].ToolResults[j]
-			if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
-				result.Image = nil
-			}
-		}
 	}
 }
 
@@ -604,6 +741,24 @@ func (s *Session) Delete() {
 	os.Remove(s.path)
 }
 
+// Reset removes the durable conversation journal while keeping the Session
+// object usable. Reusing the same object matters for live thinkers: replacing
+// the pointer during a reset can race an in-flight append and resurrect the
+// deleted history through the old Session instance.
+func (s *Session) Reset() error {
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	s.count = 0
+	s.nextSeq = 0
+	return nil
+}
+
 // Rename moves the on-disk history file when a thread's id changes.
 // Best-effort: a missing source file (the thread had no entries yet)
 // is treated as success so the caller can rename the in-memory record
@@ -622,6 +777,12 @@ func (s *Session) Rename(newThreadID string) error {
 		}
 	}
 	s.path = newPath
+	if s.archive != nil {
+		if err := s.archive.RenameThread(newThreadID); err != nil {
+			return err
+		}
+	}
+	s.threadID = newThreadID
 	return nil
 }
 

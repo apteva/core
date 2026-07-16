@@ -41,9 +41,9 @@ const activeToolsCap = 40
 
 // toolSearchMode resolves APTEVA_TOOL_SEARCH: "auto" (default) | "on"
 // | "off". "on" forces the discovery model (search + preload); "off"
-// forces eager (every attached tool, every turn); "auto" decides by
-// the size of the attached surface. Mirrors Anthropic's own
-// ENABLE_TOOL_SEARCH knob.
+// makes auto-policy tools eager; "auto" decides by the size of the
+// attached surface. Explicit always/deferred policy still wins over this
+// process-wide default. Mirrors Anthropic's own ENABLE_TOOL_SEARCH knob.
 func toolSearchMode() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APTEVA_TOOL_SEARCH"))) {
 	case "on":
@@ -236,6 +236,51 @@ func countActiveMCPTools(active map[string]bool) int {
 		}
 	}
 	return n
+}
+
+// prepareNativeTools resolves the provider-neutral MCP loading policy into
+// the exact schema list for one model request. Always-loaded tools are merged
+// transiently, never inserted into activeTools, so search activation remains
+// LRU-bounded while pinned schemas cannot be evicted.
+func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
+	if t == nil || t.registry == nil {
+		return nil
+	}
+	eager := t.useEagerTools()
+	if eager {
+		t.lastToolMode = "eager"
+	} else {
+		t.lastToolMode = "discovery"
+		preloadK := 5
+		if providerName == "openai-codex" {
+			preloadK = 3
+		}
+		t.applyPreload(preloadK, t.lastInboundForPreload)
+		t.evictActiveToolsLRU(activeToolsCap)
+	}
+
+	allowNoSpawn := t.threadID == "main"
+	active := t.activeTools
+	baseline := t.toolIndex.BaselineNames(eager, allowNoSpawn)
+	if len(baseline) > 0 {
+		merged := make(map[string]bool, len(t.activeTools)+len(baseline))
+		for name, enabled := range t.activeTools {
+			if enabled {
+				merged[name] = true
+			}
+		}
+		for _, name := range baseline {
+			merged[name] = true
+		}
+		active = merged
+	}
+
+	tools := t.registry.NativeTools(t.toolAllowlist, active, t.systemThread)
+	t.lastNativeToolCount = len(tools)
+	t.lastActiveMCPCount = countActiveMCPTools(active)
+	t.lastAlwaysMCPCount = t.toolIndex.AlwaysCount(allowNoSpawn)
+	t.lastDeferredMCPCount = t.toolIndex.DeferredCount(eager, allowNoSpawn)
+	return tools
 }
 
 // evictActiveToolsLRU bounds the sticky active-tool set. Sticky preload

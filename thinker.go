@@ -22,8 +22,11 @@ const (
 // MCPServerInfo is a lightweight catalog entry for an MCP server.
 // Main uses this to show available servers in its prompt without registering all tools.
 type MCPServerInfo struct {
-	Name      string
-	ToolCount int
+	Name          string
+	ToolCount     int
+	AlwaysCount   int
+	AutoCount     int
+	DeferredCount int
 }
 
 type ModelTier int
@@ -231,14 +234,14 @@ TIME, STATE, AND RECURRENCE:
 DELEGATION:
 - Before spawning, check [ACTIVE THREADS]: if an existing thread has matching tools and directive, send(id="...") to it instead. Spawn only when no existing thread fits, or when you need parallelism over independent inputs.
 - For batches of independent repeated work, especially tool-heavy or waiting/polling work, prefer using main as a coordinator and spawning focused workers; keep simple or sequential work on main.
-- One-shot workers should own one clear unit of work, use the smallest required tool set, and send/done a concise result back.
+- One-shot workers should own one clear unit of work, use the smallest required tool set, report the result to their parent, then call done. Persistent workers remain active.
 - tools= lists which tools the worker can use. ALWAYS include EVERY tool the worker needs to carry out its directive; do not use empty tools for a worker that needs specific visible tools. A missing tool = worker reports failure and can't act. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
-- Spawn for heavy output, not inline tool args. If a single tool call would carry >1KB of model-generated content (article body, multi-section report, generated code), instead spawn(id="...", directive="<focused write task — what to produce, where to store it, what to return>", tools="<storage/etc.>") and continue with other work. The sub-thread streams the content in its own context; you read its [thread:id done] notification when it finishes. Inlining large content in tool args blocks this loop while the model streams it.
+- Keep bounded work on the current thread. Spawn only when separate ownership, parallelism, long-running execution, or context isolation materially helps. Output length alone is not a reason to spawn.
 - directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
   GOOD: directive="Check for new support tickets periodically. Report findings to main."
 - provider= (optional) picks a specific LLM; omit to inherit. Use a stronger provider for complex tasks, a cheaper one for coordination. See [AVAILABLE PROVIDERS].
-- Never short-sleep to check on a worker; replies wake you. Spawn a one-shot worker only when due execution is heavy or benefits from independent parallel work.
+- Never short-sleep to check on a worker; replies wake you. Do not create a one-shot worker merely to offload work the current thread can complete directly.
 
 TOOL CALLS:
 - Every tool takes a "_reason" string for the operator UI. Write a clear capitalized activity phrase, maximum 6 words, usually ending in "-ing", naming the action and object so it is understandable without the tool name (e.g. "Searching for customer row", "Sending Pushover notification"). Do not use a generic tool name as the reason.`
@@ -306,21 +309,44 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 	// actually send in `tools`).
 	if len(mcpCatalog) > 0 {
 		totalTools := 0
+		hasExplicitPolicy := false
 		for _, info := range mcpCatalog {
 			totalTools += info.ToolCount
+			if info.AlwaysCount > 0 || info.DeferredCount > 0 {
+				hasExplicitPolicy = true
+			}
 		}
 		prompt += "\n\n[AVAILABLE MCP SERVERS]\n"
-		if poolUsesEagerTools(pool, totalTools) {
+		eager := poolUsesEagerTools(pool, totalTools)
+		if eager && !hasExplicitPolicy {
 			// Eager: every tool's schema is in `tools` already — telling
 			// the model to search_tools first would cost a wasted round-
 			// trip per request.
 			prompt += "These servers are attached and ALL their tools are already in your tool list — call them directly.\n\n"
+		} else if eager {
+			prompt += "Always and automatic MCP tools are already in your tool list. Explicitly deferred tools require search_tools. Never search for a tool that is already visible.\n\n"
 		} else {
-			prompt += "These servers are attached. Their tools are NOT in your tool list by default — search_tools(query=\"...\") loads the ones you need, on demand. Repeat uses stay loaded.\n"
+			prompt += "Always-loaded MCP tools are already in your tool list. Automatic and deferred tools require search_tools unless preloaded for the current task. Never search for a tool that is already visible. Repeat uses stay loaded.\n"
 			prompt += "When spawning a worker that should boot hot with a server's full surface: spawn(id=\"ops\", directive=\"Manage inventory\", mcps=\"store\", tools=\"\")\n\n"
 		}
 		for _, info := range mcpCatalog {
-			prompt += fmt.Sprintf("- %s (%d tools)\n", info.Name, info.ToolCount)
+			autoCount := info.AutoCount
+			if counted := info.AlwaysCount + info.AutoCount + info.DeferredCount; counted < info.ToolCount {
+				// Hand-built test/legacy catalog entries only populated
+				// ToolCount. Treat the unclassified remainder as auto.
+				autoCount += info.ToolCount - counted
+			}
+			parts := make([]string, 0, 3)
+			if info.AlwaysCount > 0 {
+				parts = append(parts, fmt.Sprintf("%d always", info.AlwaysCount))
+			}
+			if autoCount > 0 {
+				parts = append(parts, fmt.Sprintf("%d automatic", autoCount))
+			}
+			if info.DeferredCount > 0 {
+				parts = append(parts, fmt.Sprintf("%d deferred", info.DeferredCount))
+			}
+			prompt += fmt.Sprintf("- %s (%d tools: %s)\n", info.Name, info.ToolCount, strings.Join(parts, ", "))
 		}
 	}
 
@@ -345,7 +371,7 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		prompt += `You act carefully. Read-only tools (screenshot, list, query, read_file, web search, memory_scan) are free — use them at will.
 
 Before any STATE-CHANGING tool (exec, write, delete, deploy, restart, purchase, send-as-user, browser actions on logged-in sites):
-- Send one concise channels_respond explaining action + target + why (one sentence each).
+- Send one concise channels_send explaining action + target + why (one sentence each).
 - Wait for the user's next message before executing. Don't chain tool calls.
 - If unsure whether an action is state-changing, ask. Asking is cheap; undoing is expensive.
 
@@ -353,7 +379,7 @@ When the user corrects or pushes back, stop and adjust immediately — don't arg
 	case ModeLearn:
 		prompt += `You are learning the user's preferences. Soft gate — nothing blocks you at runtime. The quality of this mode depends on YOU actually pausing and asking.
 
-DEFAULT: BEFORE ANY ACTION YOU HAVEN'T TAKEN BEFORE THIS SESSION, send ONE short channels_respond:
+DEFAULT: BEFORE ANY ACTION YOU HAVEN'T TAKEN BEFORE THIS SESSION, send ONE short channels_send:
   "About to <verb> <target>. Reason: <one sentence>. OK?"
 Then wait for the user's answer before proceeding.
 
@@ -373,7 +399,7 @@ When the user pushes back ("no", "don't", "stop", "I didn't want that"), stop an
 - Assess risk honestly. If genuinely unsure, ask.
 - When the user corrects or pushes back, stop and adjust immediately — don't argue.
 
-ACT, DON'T NARRATE. You have no live audience between thoughts — every tool result comes back as structured input, not as something a human is watching scroll by. Skip the "let me think about this, I'll take a screenshot to see what's there, then I'll consider the options before..." prose. Take the next tool call. The tool's output is your feedback; react to it on the next iteration. Reserve natural-language output for channels_respond (actually talking to the user). Thoughts that produce only prose and no tool call waste a round-trip.`
+ACT, DON'T NARRATE. You have no live audience between thoughts — every tool result comes back as structured input, not as something a human is watching scroll by. Skip the "let me think about this, I'll take a screenshot to see what's there, then I'll consider the options before..." prose. Take the next tool call. The tool's output is your feedback; react to it on the next iteration. Reserve natural-language output for channels_send (actually talking to the user). Thoughts that produce only prose and no tool call waste a round-trip.`
 	}
 
 	if pool != nil && pool.DefaultName() == "openai-codex" {
@@ -586,12 +612,29 @@ type Thinker struct {
 	agentReasoning ReasoningLevel
 	memory         *MemoryStore
 	session        *Session
+	toolResultMu   sync.Mutex
+	// Successful provider calls age tool results. Large results are projected
+	// to bounded previews only after a short full-content retention window.
+	toolResultAge  map[string]int
 	requestContext ephemeralTurnContextState
 	threads        *ThreadManager
 	config         *Config
 	registry       *ToolRegistry
 
 	maxHistory int // max messages in context window (varies by role)
+
+	// Prompt-cache state is per agent thread. The epoch changes only when
+	// core intentionally rewrites an earlier provider prefix (compaction,
+	// checkpointing, sanitization, directive changes, or tool-schema changes).
+	promptCacheEpoch             uint64
+	promptCacheResetReason       string
+	promptCacheStableHash        string
+	promptCacheRequestEpoch      uint64
+	promptCacheRequestReason     string
+	promptCacheRequestStableHash string
+	promptCacheRequestHash       string
+	promptCacheCommonPrefixBytes int
+	promptCachePreviousRequest   []byte
 
 	// directive is this thread's mission text — main's directive for
 	// the main thinker, the spawn directive for a sub-thread. Fed into
@@ -673,9 +716,11 @@ type Thinker struct {
 	mcpCatalog   []MCPServerInfo
 	pendingTools sync.Map // tool call IDs with pending async results
 
-	lastNativeToolCount int
-	lastActiveMCPCount  int
-	lastToolMode        string
+	lastNativeToolCount  int
+	lastActiveMCPCount   int
+	lastAlwaysMCPCount   int
+	lastDeferredMCPCount int
+	lastToolMode         string
 
 	silentToolMu      sync.Mutex
 	silentToolResults []ToolResult
@@ -862,26 +907,28 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		messages: []Message{
 			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil, nil)},
 		},
-		config:         config,
-		bus:            bus,
-		sub:            bus.Subscribe("main", 100),
-		pause:          make(chan bool, 1),
-		quit:           make(chan struct{}),
-		rate:           RateSlow,
-		agentRate:      RateSlow,
-		agentSleep:     30 * time.Second,
-		agentReasoning: ReasoningAuto,
-		memory:         NewMemoryStore(apiKey),
-		session:        NewSession(".", "main"),
-		apiLog:         &[]APIEvent{},
-		apiMu:          &sync.RWMutex{},
-		apiNotify:      make(chan struct{}, 1),
-		threadID:       "main",
-		maxHistory:     maxHistoryMain,
-		telemetry:      NewTelemetry(),
-		execution:      NewExecutionController(config.GetExecutionControl()),
-		checkpoints:    NewExecutionCheckpointStore(),
-		blobs:          NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
+		config:                 config,
+		bus:                    bus,
+		sub:                    bus.Subscribe("main", 100),
+		pause:                  make(chan bool, 1),
+		quit:                   make(chan struct{}),
+		rate:                   RateSlow,
+		agentRate:              RateSlow,
+		agentSleep:             30 * time.Second,
+		agentReasoning:         ReasoningAuto,
+		memory:                 NewMemoryStore(apiKey),
+		session:                NewSession(".", "main"),
+		toolResultAge:          map[string]int{},
+		apiLog:                 &[]APIEvent{},
+		apiMu:                  &sync.RWMutex{},
+		apiNotify:              make(chan struct{}, 1),
+		threadID:               "main",
+		maxHistory:             maxHistoryMain,
+		promptCacheResetReason: "startup",
+		telemetry:              NewTelemetry(),
+		execution:              NewExecutionController(config.GetExecutionControl()),
+		checkpoints:            NewExecutionCheckpointStore(),
+		blobs:                  NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
 	}
 	if config.Unconscious {
 		t.unconsciousSafety = newUnconsciousSafetyState(time.Now(), fileSize("history/main.jsonl"))
@@ -935,6 +982,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		}
 		// Append saved messages after system prompt
 		t.messages = append(t.messages, saved...)
+		t.markLoadedToolResultsHistorical(saved)
 		logMsg("SESSION", fmt.Sprintf("loaded %d messages from history (%d compacted summaries)", len(saved), len(summaries)))
 	}
 	// Respawn persistent threads from config, sorted by depth (parents before children).
@@ -1127,13 +1175,21 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 	}
 
 	t.messages = cloneMessages(cp.messages)
-	t.requestContext.reset()
+	t.resetPromptCache("execution_checkpoint_restored")
 	if len(t.messages) == 0 {
 		t.messages = []Message{{Role: "system", Content: ""}}
 	}
 	if t.rebuildPrompt != nil {
 		t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
 	}
+	for i := range t.messages {
+		if len(t.messages[i].ToolResults) > 0 {
+			t.messages[i] = t.archiveToolResultMessage(t.messages[i])
+		}
+	}
+	// A process/session restore must never replay full historical payloads.
+	// The immutable objects remain in the internal audit archive.
+	t.markLoadedToolResultsHistorical(t.messages)
 	t.activeTools = copyBoolMap(cp.activeTools)
 	t.activeToolAge = copyIntMap(cp.activeToolAge)
 	t.rate = cp.rate
@@ -1323,12 +1379,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			// Helper to add inline tool result + emit telemetry
 			addResult := func(content string) {
 				if call.NativeID != "" {
-					results = append(results, ToolResult{CallID: call.NativeID, Content: content})
+					results = append(results, ToolResult{CallID: call.NativeID, ToolName: call.Name, Content: content})
 				}
 				if t.telemetry != nil {
-					t.telemetry.Emit("tool.result", t.threadID, ToolResultData{
-						ID: call.NativeID, Name: call.Name, Success: true, Result: content,
-					})
+					t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+						call.NativeID, call.Name, 0, true, content, content, 0,
+					))
 				}
 			}
 
@@ -1587,7 +1643,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						} else {
 							t.directive = d
 							t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
-							t.requestContext.reset()
+							t.resetPromptCache("directive_evolved")
 							t.kickNextTurn = true
 							t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 							if t.telemetry != nil {
@@ -1705,7 +1761,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					// server's tools are discoverable via search_tools
 					// and per-turn preload, same as startup-connected MCPs.
 					if t.toolIndex != nil {
-						t.toolIndex.Add(name, tools, cfg.NoSpawn)
+						t.toolIndex.Add(name, tools, cfg.NoSpawn, cfg.ToolLoading)
 						t.mcpCatalog = computeMCPCatalog(t.toolIndex)
 					}
 					addResult(fmt.Sprintf("connected to %s: %d tools", name, len(tools)))
@@ -1949,10 +2005,10 @@ func (t *Thinker) Run() {
 
 		// If we have tool results, add them as a proper tool_result message first
 		if len(toolResults) > 0 {
-			trMsg := Message{Role: "user", ToolResults: toolResults}
+			trMsg := t.archiveToolResultMessage(Message{Role: "user", ToolResults: toolResults})
 			t.messages = append(t.messages, trMsg)
 			if t.session != nil {
-				t.session.AppendMessage(messageForSession(t.messages, trMsg), t.iteration, TokenUsage{})
+				t.session.AppendMessage(trMsg, t.iteration, TokenUsage{})
 			}
 		}
 
@@ -1998,9 +2054,6 @@ func (t *Thinker) Run() {
 		}
 
 		t.sanitizeConversationMessages()
-		// A computer result's newest screenshot is useful for the next action;
-		// older frames are stale and must not drive context-pressure decisions.
-		evictStaleComputerScreenshots(t.messages, 1)
 
 		// Recall uses the current event, otherwise the latest durable task,
 		// otherwise the standing directive. It never queries generated assistant
@@ -2030,6 +2083,7 @@ func (t *Thinker) Run() {
 			!hadEvents && len(toolResults) == 0,
 			hasExternalEvent || (!hadEvents && len(toolResults) == 0),
 		)
+		requestMessages = t.prepareToolResultRequest(requestMessages)
 		if t.telemetry != nil && memoryCandidates > 0 {
 			matches := make([]map[string]any, 0, len(recallMatches))
 			for _, match := range recallMatches {
@@ -2067,7 +2121,6 @@ func (t *Thinker) Run() {
 
 		if shouldCompactBeforeLLM(t.modelID(), requestMessages) {
 			t.compactForContextPressure("pre_llm", TokenUsage{}, emptyLLMResponses)
-			t.requestContext.reset()
 			requestMessages = t.requestContext.prepare(
 				t.messages,
 				dynCtx,
@@ -2075,6 +2128,7 @@ func (t *Thinker) Run() {
 				!hadEvents && len(toolResults) == 0,
 				true,
 			)
+			requestMessages = t.prepareToolResultRequest(requestMessages)
 		}
 
 		start := time.Now()
@@ -2091,6 +2145,7 @@ func (t *Thinker) Run() {
 		if err != nil {
 			return
 		}
+		t.markToolResultsConsumed(requestMessages)
 		var llmSummary string
 		if len(chatResp.ToolCalls) > 0 {
 			var names []string
@@ -2249,44 +2304,27 @@ func (t *Thinker) Run() {
 		// Inject results for inline-handled tools (pace, spawn, kill, etc.)
 		// so providers like Anthropic see matching tool_result for every tool_use
 		if len(inlineResults) > 0 {
-			t.messages = append(t.messages, Message{Role: "user", ToolResults: inlineResults})
+			inlineMessage := t.archiveToolResultMessage(Message{Role: "user", ToolResults: inlineResults})
+			t.messages = append(t.messages, inlineMessage)
 			if t.session != nil {
-				t.session.AppendMessage(Message{Role: "user", ToolResults: inlineResults}, t.iteration, TokenUsage{})
+				t.session.AppendMessage(inlineMessage, t.iteration, TokenUsage{})
 			}
 		}
 
-		// Sliding window — keep tool_use/tool_result pairs together
+		// Checkpoint history in blocks instead of deleting one oldest message
+		// every turn near the limit. The resulting prefix rewrite is explicit,
+		// infrequent, and receives a new prompt-cache epoch.
 		maxHist := t.maxHistory
 		if maxHist <= 0 {
 			maxHist = maxHistoryMain // fallback
 		}
-		if len(t.messages) > maxHist+1 {
-			start := len(t.messages) - maxHist
-			// Don't start on a tool_result message (orphaned result)
-			for start > 1 && len(t.messages[start].ToolResults) > 0 {
-				start--
-			}
-			t.messages = append(t.messages[:1], t.messages[start:]...)
-			t.requestContext.reset()
-			// Sanitize any remaining orphaned tool_results after trimming
-			// (no pending IDs needed here — this runs during the same iteration)
-		}
-
-		// Evict old non-computer images — computer screenshots are already
-		// reduced to the latest frame before context-pressure evaluation.
-		imageCount := 0
-		maxImages := 3
-		for i := len(t.messages) - 1; i >= 1; i-- {
-			for j := range t.messages[i].ToolResults {
-				if t.messages[i].ToolResults[j].Image != nil {
-					imageCount++
-					if imageCount > maxImages {
-						// Replace old screenshot with text placeholder
-						t.messages[i].ToolResults[j].Image = nil
-						t.messages[i].ToolResults[j].Content = evictedScreenshotPlaceholder
-					}
-				}
-			}
+		if checkpointed, dropped := checkpointHistoryWindow(t.messages, maxHist); dropped > 0 {
+			t.messages = checkpointed
+			t.advancePromptCacheEpoch("history_checkpoint", true, map[string]any{
+				"dropped_messages":  dropped,
+				"retained_messages": len(t.messages),
+				"history_target":    maxHist,
+			})
 		}
 
 		t.compactSessionIfNeeded()
@@ -2347,21 +2385,29 @@ func (t *Thinker) Run() {
 				// cost_usd intentionally omitted — server enriches with
 				// canonical pricing at ingest so we're not double-booking
 				// the model→cost knowledge in core.
-				Iteration:           t.iteration,
-				Rate:                formatSleep(sleepDur),
-				ContextMsgs:         len(t.messages),
-				ContextChars:        ctxChars,
-				ContextTokensEst:    estimatedContextTokens(t.messages),
-				RequestContextMsgs:  len(requestMessages),
-				RequestContextChars: contextChars(requestMessages),
-				RequestTokensEst:    estimatedContextTokens(requestMessages),
-				MaxContextTokens:    ModelContextWindow(model),
-				MemoryCount:         t.memory.Count(),
-				ThreadCount:         threadCount,
-				Message:             thoughtLog,
-				NativeToolCount:     t.lastNativeToolCount,
-				ActiveMCPCount:      t.lastActiveMCPCount,
-				ToolMode:            t.lastToolMode,
+				Iteration:                    t.iteration,
+				Rate:                         formatSleep(sleepDur),
+				ContextMsgs:                  len(t.messages),
+				ContextChars:                 ctxChars,
+				ContextTokensEst:             estimatedContextTokens(t.messages),
+				RequestContextMsgs:           len(requestMessages),
+				RequestContextChars:          contextChars(requestMessages),
+				RequestTokensEst:             estimatedContextTokens(requestMessages),
+				MaxContextTokens:             ModelContextWindow(model),
+				MemoryCount:                  t.memory.Count(),
+				ThreadCount:                  threadCount,
+				Message:                      thoughtLog,
+				NativeToolCount:              t.lastNativeToolCount,
+				ActiveMCPCount:               t.lastActiveMCPCount,
+				AlwaysMCPCount:               t.lastAlwaysMCPCount,
+				DeferredMCPCount:             t.lastDeferredMCPCount,
+				ToolMode:                     t.lastToolMode,
+				PromptCacheEpoch:             t.promptCacheRequestEpoch,
+				PromptCacheResetReason:       t.promptCacheRequestReason,
+				PromptCacheIdentityHash:      promptCacheShortHash([]byte(t.promptCacheIdentity())),
+				PromptCacheStablePrefixHash:  t.promptCacheRequestStableHash,
+				PromptCacheRequestHash:       t.promptCacheRequestHash,
+				PromptCacheCommonPrefixBytes: t.promptCacheCommonPrefixBytes,
 			})
 		}
 		if t.threadID == "unconscious" && t.unconsciousSafety != nil {
@@ -2423,7 +2469,12 @@ func (t *Thinker) think() (ChatResponse, error) {
 
 func (t *Thinker) thinkWithProvider(ctx context.Context, provider LLMProvider) (ChatResponse, error) {
 	t.sanitizeConversationMessages()
-	return t.thinkWithProviderMessages(ctx, provider, t.messages)
+	messages := t.prepareToolResultRequest(t.messages)
+	response, err := t.thinkWithProviderMessages(ctx, provider, messages)
+	if err == nil {
+		t.markToolResultsConsumed(messages)
+	}
+	return response, err
 }
 
 func (t *Thinker) sanitizeConversationMessages() {
@@ -2440,7 +2491,7 @@ func (t *Thinker) sanitizeConversationMessages() {
 	})
 	t.messages = append(t.messages[:1], sanitizeToolPairs(t.messages[1:], pending)...)
 	if len(t.messages) != before {
-		t.requestContext.reset()
+		t.resetPromptCache("tool_pair_sanitized")
 	}
 }
 
@@ -2460,49 +2511,17 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 
 	// Build native tools from registry if provider supports it.
 	//
-	// Two modes (resolved per-turn by useEagerTools — see toolSearchMode):
-	//   - eager: every attached tool, every turn. The list is stable
-	//     turn-to-turn, so the `tools` prompt prefix caches well — the
-	//     right call for a small surface where the search round-trip
-	//     would cost more than it saves.
-	//   - discovery: applyPreload STICKILY activates the BM25 top matches for
-	//     this turn's directive+context; search_tools adds more on
-	//     demand. The active set grows then stabilises (then caches),
-	//     bounded by evictActiveToolsLRU.
+	// Tool loading is resolved in core before every provider call. Explicit
+	// always/deferred policy wins; auto tools follow the global eager-vs-
+	// discovery threshold. This keeps behavior identical across providers.
 	var nativeTools []NativeTool
 	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
-		active := t.activeTools
-		if t.useEagerTools() {
-			t.lastToolMode = "eager"
-			all := t.toolIndex.AllNames(t.threadID == "main")
-			if len(all) > 0 {
-				// Transient merge — eager's "everything" set is already
-				// stable, no need to pollute the sticky activeTools.
-				merged := make(map[string]bool, len(t.activeTools)+len(all))
-				for k := range t.activeTools {
-					merged[k] = true
-				}
-				for _, n := range all {
-					merged[n] = true
-				}
-				active = merged
-			}
-		} else {
-			t.lastToolMode = "discovery"
-			preloadK := 5
-			if provider.Name() == "openai-codex" {
-				preloadK = 3
-			}
-			t.applyPreload(preloadK, t.lastInboundForPreload)
-			t.evictActiveToolsLRU(activeToolsCap)
-			active = t.activeTools
-		}
-		nativeTools = t.registry.NativeTools(t.toolAllowlist, active, t.systemThread)
-		t.lastNativeToolCount = len(nativeTools)
-		t.lastActiveMCPCount = countActiveMCPTools(active)
+		nativeTools = t.prepareNativeTools(provider.Name())
 	} else {
 		t.lastNativeToolCount = 0
 		t.lastActiveMCPCount = 0
+		t.lastAlwaysMCPCount = 0
+		t.lastDeferredMCPCount = 0
 		t.lastToolMode = ""
 	}
 
@@ -2544,6 +2563,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	// is now cancellable in principle, just nothing is wired to cancel it.
 	modelID := modelIDForProvider(provider, t.model)
 	chatProvider := providerWithReasoning(provider, t.agentReasoning)
+	ctx = t.preparePromptCacheContext(ctx, messages, nativeTools)
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
 	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat exit model=%s dur=%s tool_calls=%d err=%v",
 		t.threadID, t.modelID(), time.Since(callStart).Round(time.Millisecond), len(resp.ToolCalls), err))
@@ -2807,8 +2827,9 @@ func (t *Thinker) injectPlaceholdersForPending(toolResults *[]ToolResult) {
 		}
 		toolName, _ := v.(string)
 		*toolResults = append(*toolResults, ToolResult{
-			CallID:  id,
-			Content: "⏳ In progress — this tool is still running from an earlier iteration. A [late-result] message will be delivered as soon as it completes. DO NOT call this tool again with the same arguments.",
+			CallID:   id,
+			ToolName: toolName,
+			Content:  "⏳ In progress — this tool is still running from an earlier iteration. A [late-result] message will be delivered as soon as it completes. DO NOT call this tool again with the same arguments.",
 		})
 		t.placeholdersSent.Store(id, placeholderInfo{
 			iteration:    t.iteration,
@@ -2888,7 +2909,7 @@ func (t *Thinker) ReloadDirectiveQuiet() {
 	directive := t.config.GetDirective()
 	t.directive = directive
 	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
-	t.requestContext.reset()
+	t.resetPromptCache("directive_reloaded")
 	t.publishContextStatus()
 }
 
@@ -2999,6 +3020,10 @@ func (t *Thinker) summarizePersistentSession(text string) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), semanticCompactionTimeout)
 	defer cancel()
+	ctx = withOpenAIPromptCacheScope(ctx, openAIPromptCacheScope{
+		Identity: t.promptCacheIdentity() + "/session-compaction",
+		Epoch:    t.promptCacheEpoch,
+	})
 	resp, err := t.provider.Chat(ctx, prompt, model, nil, nil, nil, nil)
 	if err != nil {
 		return "", err
@@ -3102,7 +3127,12 @@ func (t *Thinker) compactForContextPressure(reason string, usage TokenUsage, emp
 	afterTokensEst := estimatedContextTokens(t.messages)
 	reduced := afterChars < beforeChars
 	if reduced {
-		t.requestContext.reset()
+		t.advancePromptCacheEpoch("context_compaction_"+reason, true, map[string]any{
+			"before_messages": beforeMsgs,
+			"after_messages":  len(t.messages),
+			"before_chars":    beforeChars,
+			"after_chars":     afterChars,
+		})
 	}
 	if t.telemetry != nil {
 		t.telemetry.Emit("llm.compaction_done", t.threadID, map[string]any{

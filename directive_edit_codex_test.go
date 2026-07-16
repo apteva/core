@@ -30,6 +30,79 @@ func TestCodexRecurringInstructionUsesMainWakeLoop(t *testing.T) {
 	runRecurringInstructionUsesMainWakeLoop(t, NewOpenAICodexProvider(token))
 }
 
+// TestCodexBoundedOneOffStaysOnMainSmoke verifies that a bounded task is
+// completed directly even when spawn is available to the model.
+func TestCodexBoundedOneOffStaysOnMainSmoke(t *testing.T) {
+	if os.Getenv("RUN_CODEX_DIRECTIVE_EDIT_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_DIRECTIVE_EDIT_SMOKE=1 to run the Codex bounded-work smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex bounded-work smoke in short mode")
+	}
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+	}
+	runBoundedOneOffStaysOnMainSmoke(t, NewOpenAICodexProvider(token))
+}
+
+func runBoundedOneOffStaysOnMainSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
+	registry := NewToolRegistry("")
+	providerName := provider.Name()
+	pool := &ProviderPool{
+		providers: map[string]LLMProvider{providerName: provider},
+		order:     []string{providerName},
+		default_:  providerName,
+	}
+	prompt := buildSystemPrompt(strings.Join([]string{
+		"# Role",
+		"You complete operator requests accurately.",
+		"",
+		"# Goals",
+		"- Produce clear, concise work.",
+	}, "\n"), ModeAutonomous, registry, "", nil, nil, pool, nil)
+	messages := appendEphemeralTurnContext([]Message{
+		{Role: "system", Content: prompt},
+		{Role: "user", Content: "[console] Complete this bounded one-off request directly: draft a concise customer update from these facts: the migration finished, validation passed, and no action is required. Deliver it with deliver_result."},
+	}, "", time.Now().UTC().Format(time.RFC3339), false)
+	tools := append(registry.NativeTools(nil, nil), NativeTool{
+		Name:        "deliver_result",
+		Description: "Deliver the completed result to the operator on the current thread.",
+		Parameters: map[string]any{
+			"type":     "object",
+			"required": []string{"text"},
+			"properties": map[string]any{
+				"text": map[string]any{"type": "string", "description": "The completed result."},
+			},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	response, err := provider.Chat(ctx, messages, provider.Models()[ModelLarge], tools, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("bounded-work chat: %v", err)
+	}
+	delivered := false
+	for _, call := range response.ToolCalls {
+		switch call.Name {
+		case "spawn":
+			t.Fatalf("bounded one-off request was delegated: args=%v", call.Args)
+		case "evolve":
+			t.Fatalf("bounded one-off request was stored as directive policy: args=%v", call.Args)
+		case "deliver_result":
+			if strings.TrimSpace(call.Args["text"]) == "" {
+				t.Fatalf("deliver_result had empty text: args=%v", call.Args)
+			}
+			delivered = true
+		}
+	}
+	if !delivered {
+		t.Fatalf("bounded one-off request was not delivered directly: text=%q calls=%v", response.Text, response.ToolCalls)
+	}
+}
+
 func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider) {
 	t.Helper()
 	t.Chdir(t.TempDir())
@@ -118,6 +191,9 @@ func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider)
 			}
 			if !strings.Contains(lower, "weekly") && !strings.Contains(lower, "every week") {
 				t.Fatalf("evolved directive missing weekly cadence:\n%s", directive)
+			}
+			if regexp.MustCompile(`(?m)^#{1,6}\s+#{1,6}\s+`).MatchString(directive) {
+				t.Fatalf("evolved directive contains a malformed nested heading:\n%s", directive)
 			}
 			for _, forbidden := range []string{"next-due", "next due", "last-completed", "last completed", "timestamp"} {
 				if strings.Contains(lower, forbidden) {
