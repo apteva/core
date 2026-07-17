@@ -79,7 +79,19 @@ func (s *recursiveImprovementState) publish(args map[string]string) ToolResponse
 		}
 	}
 	if !afterEvolution && preEvolution >= len(recursiveImprovementViews) {
-		return ToolResponse{Text: "error: experiment budget exhausted", IsError: true}
+		// Native providers may return evolve and the dependent validation
+		// publish in one tool batch. evolve is handled inline while publish
+		// runs asynchronously, so briefly allow that directive update to win
+		// the race. With no concurrent evolution, the original budget error
+		// remains unchanged.
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for !afterEvolution && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+			afterEvolution = s.cfg.GetDirective() != s.initial
+		}
+		if !afterEvolution {
+			return ToolResponse{Text: "error: experiment budget exhausted", IsError: true}
+		}
 	}
 	if afterEvolution && postEvolution >= 1 {
 		return ToolResponse{Text: "error: validation budget exhausted", IsError: true}
@@ -248,6 +260,7 @@ func runRecursiveSelfImprovementSmoke(t *testing.T, provider LLMProvider) {
 	seenEvents := map[string]bool{}
 	evolveCalls := 0
 	evolved := false
+	pacedAfterValidation := false
 	for time.Now().Before(deadline) {
 		events, _ := thinker.telemetry.StoredEvents(0)
 		for _, event := range events {
@@ -271,6 +284,9 @@ func runRecursiveSelfImprovementSmoke(t *testing.T, provider LLMProvider) {
 				t.Fatalf("bounded sequential learning loop spawned a thread: args=%v", call.Args)
 			case "evolve":
 				evolveCalls++
+				if evolveCalls > 1 {
+					t.Fatalf("agent entered an evolve loop: calls=%d args=%v directive=\n%s", evolveCalls, call.Args, cfg.GetDirective())
+				}
 				posts := state.snapshot()
 				measured := 0
 				for _, post := range posts {
@@ -290,6 +306,7 @@ func runRecursiveSelfImprovementSmoke(t *testing.T, provider LLMProvider) {
 				if !validated {
 					t.Fatalf("agent paced before evolving and validating its learned strategy: args=%v posts=%+v directive=\n%s", call.Args, posts, cfg.GetDirective())
 				}
+				pacedAfterValidation = true
 			}
 		}
 
@@ -298,7 +315,7 @@ func runRecursiveSelfImprovementSmoke(t *testing.T, provider LLMProvider) {
 		for _, post := range posts {
 			validated = validated || (post.AfterEvolution && post.Measured)
 		}
-		if evolved && validated {
+		if evolved && validated && pacedAfterValidation {
 			assertRecursiveSelfImprovement(t, posts, evolveCalls, cfg.GetDirective())
 			t.Logf("provider=%s learned strategy after %d posts:\n%s", provider.Name(), len(posts), cfg.GetDirective())
 			return
