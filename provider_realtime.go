@@ -2,7 +2,7 @@ package core
 
 import (
 	"context"
-	"errors"
+	"strings"
 )
 
 // RealtimeProvider is the parallel of LLMProvider for bidirectional,
@@ -18,25 +18,49 @@ import (
 // streaming-session models are fundamentally different shapes —
 // fusing them would either lossy-shim realtime into Chat() or force
 // every text provider to implement methods it has no notion of.
-// Common metadata (Name, Models, CostPer1M) lives on both for
+// Common metadata (Name and Models) lives on both for
 // uniformity at registration time.
 type RealtimeProvider interface {
 	Name() string
 	Models() map[ModelTier]string
-	// CostPer1M returns (input_text, cached_text, output_text, audio)
-	// pricing per 1M tokens / characters. Audio is a separate rate
-	// because realtime APIs bill audio in/out very differently from text.
-	CostPer1M() (in, cached, out, audio float64)
+	// Pricing returns the model-specific text and audio rates. Realtime
+	// providers report input/output audio separately, and cached audio has
+	// its own rate, so the ordinary three-number LLM price tuple is not
+	// expressive enough here.
+	Pricing(model string) RealtimePricing
 
 	// DefaultVoice returns the provider's preferred voice when the
 	// caller doesn't specify one. Empty string is acceptable for
 	// providers that pick a voice server-side.
 	DefaultVoice() string
 
+	// DefaultTranscriptionModel returns the provider-native streaming
+	// transcription model to request for input captions. Providers that
+	// do not support a separate transcription model may return empty.
+	DefaultTranscriptionModel() string
+
 	// Open establishes a session. ctx propagates to the underlying
 	// connection; cancelling ctx closes the session cleanly. The
 	// returned session is bound to ctx for its lifetime.
 	Open(ctx context.Context, opts RealtimeSessionOpts) (RealtimeSession, error)
+}
+
+// configurableRealtimeProvider is an optional registration-time extension.
+// It keeps provider model/voice overrides out of ProviderPool type switches,
+// so adding another realtime adapter does not change thread orchestration.
+type configurableRealtimeProvider interface {
+	applyRealtimeConfig(ProviderConfig)
+}
+
+func applyRealtimeModelAndVoiceConfig(models map[ModelTier]string, voice *string, config ProviderConfig) {
+	for tierName, model := range config.Models {
+		if tier, ok := modelNames[strings.ToLower(strings.TrimSpace(tierName))]; ok && strings.TrimSpace(model) != "" {
+			models[tier] = strings.TrimSpace(model)
+		}
+	}
+	if voice != nil && strings.TrimSpace(config.RealtimeVoice) != "" {
+		*voice = strings.TrimSpace(config.RealtimeVoice)
+	}
 }
 
 // AudioFormat names a wire encoding for realtime audio. Providers map
@@ -45,9 +69,9 @@ type RealtimeProvider interface {
 type AudioFormat string
 
 const (
-	AudioPCM16     AudioFormat = "pcm16"
-	AudioG711ULaw  AudioFormat = "g711_ulaw"
-	AudioG711ALaw  AudioFormat = "g711_alaw"
+	AudioPCM16    AudioFormat = "pcm16"
+	AudioG711ULaw AudioFormat = "g711_ulaw"
+	AudioG711ALaw AudioFormat = "g711_alaw"
 )
 
 // RealtimeSessionOpts is the connect-time configuration for a
@@ -55,13 +79,56 @@ const (
 // updated via UpdateInstructions / similar — opts itself is consumed
 // only at Open.
 type RealtimeSessionOpts struct {
-	Model        string       // provider-specific model id
-	Voice        string       // empty = provider default
-	Instructions string       // the thread's directive
-	Tools        []NativeTool // tool schemas to expose to the model
-	AudioInFmt   AudioFormat
-	AudioOutFmt  AudioFormat
-	Temperature  float64 // 0 = provider default
+	Model              string       // provider-specific model id
+	Voice              string       // empty = provider default
+	Instructions       string       // complete thread system prompt
+	Tools              []NativeTool // tool schemas to expose to the model
+	AudioInFmt         AudioFormat
+	AudioOutFmt        AudioFormat
+	AudioInRate        int    // Hz; 0 = provider default
+	AudioOutRate       int    // Hz; 0 = provider default
+	Reasoning          string // provider-supported reasoning effort; empty/auto = default
+	SafetyIdentifier   string // stable privacy-preserving end-user/session identifier
+	TranscribeInput    bool
+	TranscriptionModel string // empty = provider default
+}
+
+// RealtimePricing supports dollars per one million tokens plus optional
+// duration/message rates. Providers leave unsupported dimensions at zero.
+type RealtimePricing struct {
+	TextInput        float64
+	TextCachedInput  float64
+	TextOutput       float64
+	AudioInput       float64
+	AudioCachedInput float64
+	AudioOutput      float64
+
+	// Some realtime vendors bill connection media by duration and text
+	// conversation items by count rather than by tokens. These optional
+	// dimensions coexist with token pricing so provider adapters do not
+	// leak billing rules into the generic thread runtime.
+	AudioInputPerMinute  float64
+	AudioOutputPerMinute float64
+	TextInputPerMessage  float64
+}
+
+// RealtimeUsage is the detailed token accounting carried by a completed
+// realtime response. Keeping text and audio separate is necessary for
+// correct cost calculation and cache telemetry.
+type RealtimeUsage struct {
+	TotalTokens       int
+	InputTokens       int
+	OutputTokens      int
+	TextInputTokens   int
+	TextCachedTokens  int
+	TextOutputTokens  int
+	AudioInputTokens  int
+	AudioCachedTokens int
+	AudioOutputTokens int
+
+	AudioInputSeconds  float64
+	AudioOutputSeconds float64
+	TextInputMessages  int
 }
 
 // RealtimeSession is the live, bidirectional handle to a single
@@ -79,20 +146,32 @@ type RealtimeSession interface {
 	// into the call (e.g. "[from:main] caller is VIP, be warm").
 	SendText(role, text string) error
 
-	// SendToolResult delivers the result of a tool call back to the
-	// model. callID matches the id from the corresponding
-	// RealtimeToolCallEvent.
+	// SendToolResult delivers one tool result without starting the next model
+	// response. This separation lets the generic thinker submit every result
+	// from a parallel tool batch before requesting one continuation.
 	SendToolResult(callID, result string, isError bool) error
 
-	// UpdateInstructions replaces the session's system instructions
-	// in place (provider-side session.update). The conversation
-	// history is preserved; only the directive shifts.
-	UpdateInstructions(directive string) error
+	// RequestResponse asks the provider to continue after text or tool items
+	// have been added to its conversation.
+	RequestResponse() error
+
+	// UpdateConfiguration replaces mutable instructions and tools while
+	// preserving the provider-side conversation.
+	UpdateConfiguration(instructions string, tools []NativeTool) error
+
+	// RestoreConversation appends bounded transcript history without
+	// triggering a response. It is used after a provider-enforced session
+	// renewal so the worker can continue rather than becoming a blank agent.
+	RestoreConversation(messages []Message) error
 
 	// Interrupt cancels the model's current utterance. Used when new
 	// user audio arrives during model speech, or when main sends a
 	// course-correction the worker decides to act on immediately.
 	Interrupt() error
+
+	// Truncate removes the unplayed suffix of an assistant audio item after
+	// client-managed WebSocket playback is interrupted.
+	Truncate(itemID string, audioEndMS int) error
 
 	// Events returns the unified event stream from the session:
 	// audio out, transcript fragments, tool calls, lifecycle events,
@@ -109,13 +188,15 @@ type RealtimeSession interface {
 type RealtimeEventType string
 
 const (
-	RealtimeEventAudioOut          RealtimeEventType = "audio_out"           // PCM chunk
-	RealtimeEventTranscriptInput   RealtimeEventType = "transcript_input"    // user said
-	RealtimeEventTranscriptOutput  RealtimeEventType = "transcript_output"   // model said
-	RealtimeEventToolCall          RealtimeEventType = "tool_call"
-	RealtimeEventResponseDone      RealtimeEventType = "response_done"
-	RealtimeEventSessionEnded      RealtimeEventType = "session_ended"
-	RealtimeEventError             RealtimeEventType = "error"
+	RealtimeEventAudioOut         RealtimeEventType = "audio_out"         // PCM chunk
+	RealtimeEventTranscriptInput  RealtimeEventType = "transcript_input"  // user said
+	RealtimeEventTranscriptOutput RealtimeEventType = "transcript_output" // model said
+	RealtimeEventToolCall         RealtimeEventType = "tool_call"
+	RealtimeEventResponseDone     RealtimeEventType = "response_done"
+	RealtimeEventSpeechStarted    RealtimeEventType = "speech_started"
+	RealtimeEventRateLimits       RealtimeEventType = "rate_limits"
+	RealtimeEventSessionEnded     RealtimeEventType = "session_ended"
+	RealtimeEventError            RealtimeEventType = "error"
 )
 
 // RealtimeEvent is a single event from a session. Only the fields
@@ -135,13 +216,15 @@ type RealtimeEvent struct {
 	ToolName   string
 	ToolArgs   string // raw JSON string
 
+	// Response/audio item metadata. ItemID + AudioEndMS let the caller
+	// truncate unplayed audio correctly on barge-in.
+	ResponseID   string
+	ItemID       string
+	AudioStartMS int
+	AudioEndMS   int
+	Usage        RealtimeUsage
+	DroppedAudio uint64
+
 	// Error (RealtimeEventError)
 	Err error
 }
-
-// ErrRealtimeNotImplemented is returned by stub realtime providers
-// that have been registered but whose Open() implementation hasn't
-// landed yet. Callers should propagate this as a normal spawn
-// error — the gate in the spawn handler turns it into a tool result
-// the LLM can read.
-var ErrRealtimeNotImplemented = errors.New("realtime provider not implemented yet")

@@ -1005,29 +1005,31 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		}
 		if parentID == "" || parentID == "main" {
 			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-				ParentID:  "main",
-				Depth:     pt.Depth,
-				DeferRun:  true,
-				MCPNames:  pt.MCPNames,
-				Model:     pt.Model,
-				Reasoning: ptReasoning,
-				Realtime:  pt.Realtime,
-				Voice:     pt.Voice,
-				System:    pt.System,
+				ProviderName: pt.Provider,
+				ParentID:     "main",
+				Depth:        pt.Depth,
+				DeferRun:     true,
+				MCPNames:     pt.MCPNames,
+				Model:        pt.Model,
+				Reasoning:    ptReasoning,
+				Realtime:     pt.Realtime,
+				Voice:        pt.Voice,
+				System:       pt.System,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
 			if mgr != nil {
 				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-					ParentID:  parentID,
-					Depth:     pt.Depth,
-					DeferRun:  true,
-					MCPNames:  pt.MCPNames,
-					Model:     pt.Model,
-					Reasoning: ptReasoning,
-					Realtime:  pt.Realtime,
-					Voice:     pt.Voice,
-					System:    pt.System,
+					ProviderName: pt.Provider,
+					ParentID:     parentID,
+					Depth:        pt.Depth,
+					DeferRun:     true,
+					MCPNames:     pt.MCPNames,
+					Model:        pt.Model,
+					Reasoning:    ptReasoning,
+					Realtime:     pt.Realtime,
+					Voice:        pt.Voice,
+					System:       pt.System,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -1494,7 +1496,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						addResult(fmt.Sprintf("error: %v", err))
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
-						if err := t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Model: modelName, Reasoning: reasoning.String(), Realtime: realtime, Voice: voice}); err != nil {
+						if err := t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Provider: providerName, Model: modelName, Reasoning: reasoning.String(), Realtime: realtime, Voice: voice}); err != nil {
 							t.threads.Kill(id)
 							addResult(fmt.Sprintf("error: persist spawned thread: %v", err))
 							toolNames = append(toolNames, call.Raw)

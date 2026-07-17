@@ -114,6 +114,8 @@ type ThreadInfo struct {
 	Model        ModelTier
 	Reasoning    ReasoningLevel
 	Provider     string // active provider name
+	Realtime     bool
+	Voice        string
 	Started      time.Time
 	ContextMsgs  int
 	ContextChars int
@@ -132,12 +134,27 @@ type Thread struct {
 	MCPNames     []string // MCP server names this thread connected to
 	Thinker      *Thinker
 	Realtime     *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
-	Parent       *Thinker
-	Children     *ThreadManager // non-nil if this thread can spawn (depth < MaxSpawnDepth)
-	Tools        map[string]bool
-	Started      time.Time
-	initialParts []ContentPart // media to inject before first Run()
-	doneForever  bool          // true if thread called done (permanent termination)
+	IsRealtime   bool
+	Voice        string
+	ProviderName string
+	Ephemeral    bool
+	audioIn      chan []byte
+	audioOut     chan []byte
+	audioControl chan string
+	// BridgeDisconnectTTL is set only for caller-owned realtime sessions
+	// (the dashboard currently uses it). A zero value preserves the existing
+	// sidecar/telephony behaviour: losing the audio bridge does not kill the
+	// realtime worker.
+	BridgeDisconnectTTL time.Duration
+	bridgeCleanupTimer  *time.Timer
+	initialMessage      string
+	initialMessageSent  bool
+	Parent              *Thinker
+	Children            *ThreadManager // non-nil if this thread can spawn (depth < MaxSpawnDepth)
+	Tools               map[string]bool
+	Started             time.Time
+	initialParts        []ContentPart // media to inject before first Run()
+	doneForever         bool          // true if thread called done (permanent termination)
 }
 
 type ThreadManager struct {
@@ -174,6 +191,7 @@ type SpawnOpts struct {
 	BuiltinTools []string // provider builtin overrides (nil = inherit, empty = none)
 	DeferRun     bool     // if true, don't start Run() — call StartAll() later
 	System       bool     // true for platform-owned system threads such as unconscious
+	Ephemeral    bool     // temporary caller-owned thread; cleanup also removes session history
 	// Paused: if true, the thread spawns in paused state. Run() loop
 	// blocks at the top of its first iteration until either an inbox
 	// event arrives (an explicit `send` from the leader) OR the
@@ -207,11 +225,20 @@ type SpawnOpts struct {
 	// these and forwards to session.SendAudio. nil = no inbound audio
 	// (text-only realtime — useful for tests). Ignored when
 	// Realtime is false.
-	AudioIn <-chan []byte
+	AudioIn chan []byte
 	// AudioOut: PCM audio chunks the realtime thread writes when the
 	// model speaks. Caller plays/streams them. nil = audio output
 	// silently dropped. Ignored when Realtime is false.
-	AudioOut chan<- []byte
+	AudioOut chan []byte
+	// AudioControl carries low-volume playback controls such as "interrupt"
+	// to the WebSocket bridge so telephony clients can clear queued audio.
+	AudioControl chan string
+	// BridgeDisconnectTTL asks core to stop this realtime thread if its audio
+	// bridge remains disconnected for the duration. Zero disables cleanup.
+	BridgeDisconnectTTL time.Duration
+	// InitialMessage is sent to the realtime provider after the first audio
+	// bridge connects, then immediately requests a response.
+	InitialMessage string
 }
 
 // SpawnWithMedia creates a thread and injects media parts before it starts thinking.
@@ -375,17 +402,26 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	threadSystemPrompt := basePrompt + threadDirectivePersistencePrompt + coreDocs + modeBlock + "\n\n[DIRECTIVE]\n" + directive
 
 	thread := &Thread{
-		ID:           id,
-		Name:         persistedName,
-		System:       isSystem,
-		ParentID:     parentID,
-		Depth:        depth,
-		Directive:    directive,
-		MCPNames:     opts.MCPNames,
-		Parent:       tm.parent,
-		Tools:        toolSet,
-		Started:      time.Now(),
-		initialParts: opts.MediaParts,
+		ID:                  id,
+		Name:                persistedName,
+		System:              isSystem,
+		ParentID:            parentID,
+		Depth:               depth,
+		Directive:           directive,
+		MCPNames:            opts.MCPNames,
+		IsRealtime:          opts.Realtime,
+		Voice:               opts.Voice,
+		ProviderName:        opts.ProviderName,
+		Ephemeral:           opts.Ephemeral,
+		audioIn:             opts.AudioIn,
+		audioOut:            opts.AudioOut,
+		audioControl:        opts.AudioControl,
+		BridgeDisconnectTTL: opts.BridgeDisconnectTTL,
+		initialMessage:      strings.TrimSpace(opts.InitialMessage),
+		Parent:              tm.parent,
+		Tools:               toolSet,
+		Started:             time.Now(),
+		initialParts:        opts.MediaParts,
 	}
 
 	// Create a Thinker — same struct as main, shares the bus and provider pool
@@ -615,6 +651,15 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	thinker.publishRuntimeStatus()
 	thinker.publishContextStatus()
 
+	// Deferred realtime threads still need a realtime runtime object so
+	// StartAll starts the correct loop after persisted threads are assembled.
+	if opts.Realtime && realtimeProvider != nil && opts.DeferRun {
+		thread.Realtime = newRealtimeThinker(
+			context.Background(), thinker, realtimeProvider, opts.Voice,
+			opts.AudioIn, opts.AudioOut, opts.AudioControl,
+		)
+	}
+
 	tm.threads[id] = thread
 
 	// Inject initial messages before starting so first thought picks them up
@@ -653,10 +698,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				context.Background(),
 				thinker,
 				realtimeProvider,
-				directive,
 				opts.Voice,
 				opts.AudioIn,
 				opts.AudioOut,
+				opts.AudioControl,
 			)
 			if err != nil {
 				logMsg("REALTIME", fmt.Sprintf("[%s] open failed: %v", id, err))
@@ -703,10 +748,101 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			ParentID:  parentID,
 			Directive: directive,
 			Tools:     tools,
+			MCP:       append([]string(nil), thread.MCPNames...),
+			Realtime:  thread.IsRealtime,
+			Voice:     thread.Voice,
+			Provider:  thread.ProviderName,
 		})
 	}
 
 	return nil
+}
+
+// findManagedThread locates a thread and the manager that owns it. Realtime
+// dashboard threads are direct children today, but recursion keeps token
+// renewal and bridge cleanup correct for future nested realtime workers.
+func (tm *ThreadManager) findManagedThread(id string) (*ThreadManager, *Thread) {
+	tm.mu.RLock()
+	if thread := tm.threads[id]; thread != nil {
+		tm.mu.RUnlock()
+		return tm, thread
+	}
+	children := make([]*ThreadManager, 0, len(tm.threads))
+	for _, thread := range tm.threads {
+		if thread.Children != nil {
+			children = append(children, thread.Children)
+		}
+	}
+	tm.mu.RUnlock()
+	for _, child := range children {
+		if owner, thread := child.findManagedThread(id); thread != nil {
+			return owner, thread
+		}
+	}
+	return nil, nil
+}
+
+// RenewRealtimeAudioToken reattaches a caller to the existing realtime
+// provider session. Only the bridge capability rotates; model state,
+// transcript, MCP connections, and tool state remain untouched.
+func (tm *ThreadManager) RenewRealtimeAudioToken(id string) (string, error) {
+	owner, thread := tm.findManagedThread(id)
+	if thread == nil || owner == nil || !thread.IsRealtime || thread.audioIn == nil || thread.audioOut == nil {
+		return "", fmt.Errorf("realtime thread %q not found", id)
+	}
+	owner.mu.Lock()
+	if thread.bridgeCleanupTimer != nil {
+		thread.bridgeCleanupTimer.Stop()
+		thread.bridgeCleanupTimer = nil
+	}
+	owner.mu.Unlock()
+	return renewAudioBridge(id, thread.audioIn, thread.audioOut, thread.audioControl), nil
+}
+
+func (tm *ThreadManager) realtimeBridgeConnected(id string) {
+	owner, thread := tm.findManagedThread(id)
+	if thread == nil || owner == nil {
+		return
+	}
+	owner.mu.Lock()
+	if thread.bridgeCleanupTimer != nil {
+		thread.bridgeCleanupTimer.Stop()
+		thread.bridgeCleanupTimer = nil
+	}
+	message := ""
+	realtime := thread.Realtime
+	if realtime != nil && !thread.initialMessageSent && thread.initialMessage != "" {
+		thread.initialMessageSent = true
+		message = thread.initialMessage
+	}
+	owner.mu.Unlock()
+	if message != "" {
+		if err := realtime.requestTextResponse(message); err != nil {
+			logMsg("REALTIME-AUDIO", fmt.Sprintf("initial response for thread=%s: %v", id, err))
+			owner.mu.Lock()
+			if current := owner.threads[id]; current == thread {
+				thread.initialMessageSent = false
+			}
+			owner.mu.Unlock()
+		}
+	}
+}
+
+func (tm *ThreadManager) realtimeBridgeDisconnected(id string) {
+	owner, thread := tm.findManagedThread(id)
+	if thread == nil || owner == nil || thread.BridgeDisconnectTTL <= 0 {
+		return
+	}
+	owner.mu.Lock()
+	if thread.bridgeCleanupTimer != nil {
+		thread.bridgeCleanupTimer.Stop()
+	}
+	ttl := thread.BridgeDisconnectTTL
+	thread.bridgeCleanupTimer = time.AfterFunc(ttl, func() {
+		logMsg("REALTIME-AUDIO", fmt.Sprintf("bridge grace expired for thread=%s; stopping", id))
+		owner.Kill(id)
+	})
+	owner.mu.Unlock()
 }
 
 // resolveSend resolves aliases and routes an agent-originated message. System
@@ -901,7 +1037,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						persistErr := t.config.SaveThread(PersistentThread{
 							ID: sid, ParentID: thread.ID, Depth: thread.Depth + 1,
 							Directive: directive, Tools: spawnTools, MCPNames: mcpNames,
-							Model: modelName, Reasoning: reasoning.String(),
+							Provider: providerName, Model: modelName, Reasoning: reasoning.String(),
 						})
 						if persistErr != nil {
 							thread.Children.Kill(sid)
@@ -1012,19 +1148,22 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					} else if d == thread.Directive {
 						emitResult(call, "directive already current")
 					} else {
-						persistErr := tm.parent.config.SaveThread(PersistentThread{
-							ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
-							System:    thread.System,
-							Directive: d, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
-							Model: t.agentModel.String(), Reasoning: t.agentReasoning.String(),
-						})
+						persisted := persistentThreadState(thread)
+						persisted.Directive = d
+						persistErr := tm.parent.config.SaveThread(persisted)
 						if persistErr != nil {
 							emitResult(call, fmt.Sprintf("error: persist directive: %v", persistErr))
 						} else {
+							if thread.Realtime != nil {
+								thread.Realtime.transcriptMu.Lock()
+							}
 							thread.Directive = d
 							t.directive = d
 							if t.rebuildPrompt != nil {
 								t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
+							}
+							if thread.Realtime != nil {
+								thread.Realtime.transcriptMu.Unlock()
 							}
 							t.kickNextTurn = true
 							t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
@@ -1152,6 +1291,10 @@ func (tm *ThreadManager) List() []ThreadInfo {
 	var infos []ThreadInfo
 	for _, t := range tm.threads {
 		status := t.Thinker.status()
+		providerName := status.Provider
+		if t.IsRealtime && t.ProviderName != "" {
+			providerName = t.ProviderName
+		}
 		subCount := 0
 		if t.Children != nil {
 			subCount = t.Children.Count()
@@ -1169,7 +1312,9 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Rate:         status.Rate,
 			Model:        status.Model,
 			Reasoning:    status.Reasoning,
-			Provider:     status.Provider,
+			Provider:     providerName,
+			Realtime:     t.IsRealtime,
+			Voice:        t.Voice,
 			Started:      t.Started,
 			ContextMsgs:  status.ContextMsgs,
 			ContextChars: status.ContextChars,
@@ -1219,11 +1364,29 @@ func (tm *ThreadManager) StartAll() {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	for _, thread := range tm.threads {
-		go thread.Thinker.Run()
+		if thread.Realtime != nil {
+			go thread.Realtime.Run()
+		} else {
+			go thread.Thinker.Run()
+		}
 		if thread.Children != nil {
 			thread.Children.StartAll()
 		}
 	}
+}
+
+func persistentThreadState(thread *Thread) PersistentThread {
+	state := PersistentThread{
+		ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
+		System: thread.System, Directive: thread.Directive,
+		Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
+		Provider: thread.ProviderName, Realtime: thread.IsRealtime, Voice: thread.Voice,
+	}
+	if thread.Thinker != nil {
+		state.Model = thread.Thinker.agentModel.String()
+		state.Reasoning = thread.Thinker.agentReasoning.String()
+	}
+	return state
 }
 
 // Update changes a thread's directive and/or tools. Rebuilds the system prompt immediately.
@@ -1258,14 +1421,15 @@ func (tm *ThreadManager) Update(id, name, directive string, tools []string) erro
 		nextTools = toolSet
 	}
 
-	if err := tm.parent.config.SaveThread(PersistentThread{
-		ID: id, Name: nextName, ParentID: thread.ParentID, Depth: thread.Depth,
-		System:    thread.System,
-		Directive: nextDirective, Tools: toolSetToSlice(nextTools), MCPNames: thread.MCPNames,
-	}); err != nil {
+	persisted := persistentThreadState(thread)
+	persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
+	if err := tm.parent.config.SaveThread(persisted); err != nil {
 		return fmt.Errorf("persist thread update: %w", err)
 	}
 
+	if thread.Realtime != nil {
+		thread.Realtime.transcriptMu.Lock()
+	}
 	thread.Name = nextName
 	thread.Directive = nextDirective
 	thread.Tools = nextTools
@@ -1274,6 +1438,10 @@ func (tm *ThreadManager) Update(id, name, directive string, tools []string) erro
 		thread.Thinker.messages[0] = Message{Role: "system", Content: thread.Thinker.rebuildPrompt("")}
 	}
 	thread.Thinker.publishContextStatus()
+	if thread.Realtime != nil {
+		thread.Realtime.transcriptMu.Unlock()
+		thread.Realtime.refreshConfiguration()
+	}
 
 	// Telemetry: name-only changes fire thread.renamed (id stays the
 	// same on both sides) so the dashboard can update its label without
@@ -1332,11 +1500,18 @@ func (tm *ThreadManager) Rename(oldID, newID string) error {
 	thread.ID = newID
 	if thread.Thinker != nil {
 		thread.Thinker.threadID = newID
+		if thread.Realtime != nil {
+			thread.Realtime.transcriptMu.Lock()
+			thread.Realtime.opts.SafetyIdentifier = realtimeSafetyIdentifier(newID)
+		}
 		if thread.Thinker.rebuildPrompt != nil && len(thread.Thinker.messages) > 0 {
 			thread.Thinker.messages[0] = Message{Role: "system", Content: thread.Thinker.rebuildPrompt("")}
 		}
 		thread.Thinker.publishRuntimeStatus()
 		thread.Thinker.publishContextStatus()
+		if thread.Realtime != nil {
+			thread.Realtime.transcriptMu.Unlock()
+		}
 	}
 	tm.threads[newID] = thread
 
@@ -1352,11 +1527,8 @@ func (tm *ThreadManager) Rename(oldID, newID string) error {
 	renameAudioBridgeThread(oldID, newID)
 
 	// Persist the identity change with one atomic config write.
-	if err := tm.parent.config.RenameThread(oldID, PersistentThread{
-		ID: newID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
-		System:    thread.System,
-		Directive: thread.Directive, Tools: toolSetToSlice(thread.Tools), MCPNames: thread.MCPNames,
-	}); err != nil {
+	persisted := persistentThreadState(thread)
+	if err := tm.parent.config.RenameThread(oldID, persisted); err != nil {
 		// Reverse the live routing/session rename so persistence failure is
 		// visible as a failed operation, not split-brain state.
 		tm.mu.Lock()
@@ -1414,8 +1586,13 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	logMsg("THREAD", fmt.Sprintf("%s cleanupThread start", id))
 	tm.mu.Lock()
 	thread := tm.threads[id]
+	if thread != nil && thread.bridgeCleanupTimer != nil {
+		thread.bridgeCleanupTimer.Stop()
+		thread.bridgeCleanupTimer = nil
+	}
 	delete(tm.threads, id)
 	tm.mu.Unlock()
+	unregisterAudioBridge(id)
 
 	// Cascade: kill all children first
 	if thread != nil && thread.Children != nil {
@@ -1434,7 +1611,7 @@ func (tm *ThreadManager) cleanupThread(id string) {
 
 	// Only delete session history if thread called done (permanent termination).
 	// For kills/restarts, keep the session so the thread can restore context on respawn.
-	if thread != nil && thread.doneForever && thread.Thinker.session != nil {
+	if thread != nil && (thread.doneForever || thread.Ephemeral) && thread.Thinker.session != nil {
 		thread.Thinker.session.Delete()
 	}
 

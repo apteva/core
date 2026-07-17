@@ -83,7 +83,7 @@ func TestAudioInput(t *testing.T) {
 func TestRealtimeAudioFailedUpgradeDoesNotConsumeToken(t *testing.T) {
 	audioIn := make(chan []byte, 1)
 	audioOut := make(chan []byte, 1)
-	token := registerAudioBridge("voice-test", audioIn, audioOut)
+	token := registerAudioBridge("voice-test", audioIn, audioOut, make(chan string, 1))
 	defer unregisterAudioBridge("voice-test")
 
 	req := httptest.NewRequest(http.MethodGet, "/realtime/audio?thread=voice-test&token="+token, nil)
@@ -91,6 +91,28 @@ func TestRealtimeAudioFailedUpgradeDoesNotConsumeToken(t *testing.T) {
 	(&APIServer{}).realtimeAudioHandler(rec, req)
 	if _, err := claimAudioBridge(token); err != nil {
 		t.Fatalf("failed websocket upgrade consumed token: %v", err)
+	}
+}
+
+func TestRealtimeAudioTokenRenewalInvalidatesPreviousCapability(t *testing.T) {
+	audioIn := make(chan []byte, 1)
+	audioOut := make(chan []byte, 1)
+	control := make(chan string, 1)
+	first := registerAudioBridge("voice-renew", audioIn, audioOut, control)
+	defer unregisterAudioBridge("voice-renew")
+	second := renewAudioBridge("voice-renew", audioIn, audioOut, control)
+	if first == second {
+		t.Fatal("renewal reused the previous audio capability")
+	}
+	if _, err := claimAudioBridge(first); err == nil {
+		t.Fatal("previous audio capability remained valid after renewal")
+	}
+	reg, err := claimAudioBridge(second)
+	if err != nil {
+		t.Fatalf("renewed audio capability was rejected: %v", err)
+	}
+	if reg.threadID != "voice-renew" || reg.audioIn != audioIn || reg.audioOut != audioOut {
+		t.Fatalf("renewed registration changed bridge identity: %#v", reg)
 	}
 }
 

@@ -195,6 +195,9 @@ type threadJSON struct {
 	Model     string   `json:"model"`
 	Reasoning string   `json:"reasoning,omitempty"`
 	Age       string   `json:"age"`
+	Realtime  bool     `json:"realtime,omitempty"`
+	Voice     string   `json:"voice,omitempty"`
+	Provider  string   `json:"provider,omitempty"`
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
@@ -237,6 +240,9 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 				Model:     t.Model.String(),
 				Reasoning: t.Reasoning.String(),
 				Age:       formatAge(time.Since(t.Started)),
+				Realtime:  t.Realtime,
+				Voice:     t.Voice,
+				Provider:  t.Provider,
 			})
 			// Recurse into children
 			if t.SubThreads > 0 {
@@ -360,6 +366,27 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if sub == "audio-token" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if id == "main" {
+			http.Error(w, "main is not a realtime thread", http.StatusBadRequest)
+			return
+		}
+		token, err := a.thinker.threads.RenewRealtimeAudioToken(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"status": "renewed", "id": id, "audio_token": token,
+			"format": map[string]any{"encoding": "pcm16", "sample_rate": 24000, "channels": 1},
+		})
+		return
+	}
+
 	if sub != "" {
 		http.Error(w, fmt.Sprintf("unknown sub-path %q", sub), http.StatusNotFound)
 		return
@@ -449,15 +476,18 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	var body struct {
-		Directive       string   `json:"directive"`
-		DirectiveSuffix string   `json:"directive_suffix"`
-		Tools           []string `json:"tools"`
-		MCP             []string `json:"mcp"`
-		Realtime        bool     `json:"realtime,omitempty"`
-		Voice           string   `json:"voice,omitempty"`
-		ProviderName    string   `json:"provider,omitempty"`
-		Model           string   `json:"model,omitempty"`
-		Reasoning       string   `json:"reasoning,omitempty"`
+		Directive                  string   `json:"directive"`
+		DirectiveSuffix            string   `json:"directive_suffix"`
+		Tools                      []string `json:"tools"`
+		MCP                        []string `json:"mcp"`
+		Realtime                   bool     `json:"realtime,omitempty"`
+		Ephemeral                  bool     `json:"ephemeral,omitempty"`
+		Voice                      string   `json:"voice,omitempty"`
+		ProviderName               string   `json:"provider,omitempty"`
+		Model                      string   `json:"model,omitempty"`
+		Reasoning                  string   `json:"reasoning,omitempty"`
+		InitialMessage             string   `json:"initial_message,omitempty"`
+		BridgeDisconnectTTLSeconds int      `json:"bridge_disconnect_ttl_seconds,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -499,10 +529,19 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		MCPNames:      body.MCP,
 		BypassNoSpawn: true,
 		Realtime:      body.Realtime,
+		Ephemeral:     body.Ephemeral,
 		Voice:         body.Voice,
 		ProviderName:  body.ProviderName,
 		Model:         strings.ToLower(strings.TrimSpace(body.Model)),
 	}
+	if body.BridgeDisconnectTTLSeconds < 0 || body.BridgeDisconnectTTLSeconds > 3600 {
+		http.Error(w, "bridge_disconnect_ttl_seconds must be between 0 and 3600", http.StatusBadRequest)
+		return
+	}
+	if body.BridgeDisconnectTTLSeconds > 0 {
+		opts.BridgeDisconnectTTL = time.Duration(body.BridgeDisconnectTTLSeconds) * time.Second
+	}
+	opts.InitialMessage = strings.TrimSpace(body.InitialMessage)
 	if rawReasoning := strings.TrimSpace(body.Reasoning); rawReasoning != "" {
 		r, ok := parseReasoningLevel(rawReasoning)
 		if !ok {
@@ -532,9 +571,11 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		}
 		audioIn := make(chan []byte, 64)
 		audioOut := make(chan []byte, 64)
+		audioControl := make(chan string, 8)
 		opts.AudioIn = audioIn
 		opts.AudioOut = audioOut
-		audioToken = registerAudioBridge(id, audioIn, audioOut)
+		opts.AudioControl = audioControl
+		audioToken = registerAudioBridge(id, audioIn, audioOut, audioControl)
 	}
 
 	if err := a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts); err != nil {
@@ -558,6 +599,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	resp := map[string]any{"status": "created", "id": id}
 	if body.Realtime {
 		resp["audio_token"] = audioToken
+		resp["format"] = map[string]any{"encoding": "pcm16", "sample_rate": 24000, "channels": 1}
 	}
 	writeJSON(w, resp)
 }
@@ -842,17 +884,23 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			"mcp_servers":           mcpInfo,
 			"execution_control":     a.thinker.executionStatus(),
 			"execution_checkpoints": a.thinker.executionCheckpointMeta(),
+			"realtime_enabled":      a.thinker.config.RealtimeEnabledFlag(),
+			"realtime_voice":        a.thinker.config.GetRealtimeVoice(),
+			"realtime_voice_mcp":    a.thinker.config.GetRealtimeVoiceMCP(),
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive  string                  `json:"directive,omitempty"`
-			Mode       RunMode                 `json:"mode,omitempty"`
-			Provider   *ProviderConfig         `json:"provider,omitempty"`
-			Providers  []ProviderConfig        `json:"providers,omitempty"`
-			Computer   json.RawMessage         `json:"computer,omitempty"`
-			MCPServers []MCPServerConfig       `json:"mcp_servers,omitempty"`
-			Execution  *ExecutionControlConfig `json:"execution_control,omitempty"`
-			Reset      *struct {
+			Directive        string                  `json:"directive,omitempty"`
+			Mode             RunMode                 `json:"mode,omitempty"`
+			Provider         *ProviderConfig         `json:"provider,omitempty"`
+			Providers        []ProviderConfig        `json:"providers,omitempty"`
+			Computer         json.RawMessage         `json:"computer,omitempty"`
+			MCPServers       []MCPServerConfig       `json:"mcp_servers,omitempty"`
+			Execution        *ExecutionControlConfig `json:"execution_control,omitempty"`
+			RealtimeEnabled  *bool                   `json:"realtime_enabled,omitempty"`
+			RealtimeVoice    *string                 `json:"realtime_voice,omitempty"`
+			RealtimeVoiceMCP *[]string               `json:"realtime_voice_mcp,omitempty"`
+			Reset            *struct {
 				History bool `json:"history,omitempty"`
 				Memory  bool `json:"memory,omitempty"`
 				Threads bool `json:"threads,omitempty"`
@@ -894,8 +942,20 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 				a.thinker.telemetry.Emit("execution.mode_changed", "main", a.thinker.executionStatus())
 			}
 		}
+		if body.RealtimeVoiceMCP != nil {
+			if err := a.thinker.config.SetRealtimeVoiceMCP(*body.RealtimeVoiceMCP); err != nil {
+				http.Error(w, "persist realtime voice capabilities: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if body.RealtimeVoice != nil {
+			if err := a.thinker.config.SetRealtimeVoice(*body.RealtimeVoice); err != nil {
+				http.Error(w, "persist realtime voice: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
 		logMsg("API", fmt.Sprintf("PUT /config: providers=%d provider=%v", len(body.Providers), body.Provider != nil))
-		if len(body.Providers) > 0 || body.Provider != nil {
+		if len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil {
 			providers := a.thinker.config.GetProviders()
 			if len(body.Providers) > 0 {
 				providers = cloneProviderConfigs(body.Providers)
@@ -903,21 +963,36 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			if body.Provider != nil {
 				providers = mergeProviderConfig(providers, *body.Provider)
 			}
-			candidate := &Config{Providers: providers, RealtimeEnabled: a.thinker.config.RealtimeEnabledFlag()}
+			realtimeEnabled := a.thinker.config.RealtimeEnabledFlag()
+			if body.RealtimeEnabled != nil {
+				realtimeEnabled = *body.RealtimeEnabled
+			}
+			candidate := &Config{Providers: providers, RealtimeEnabled: realtimeEnabled}
 			pool, err := buildProviderPool(candidate)
 			if err != nil {
 				http.Error(w, "invalid provider configuration: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			if err := a.thinker.config.ReplaceProviders(providers); err != nil {
-				http.Error(w, "persist providers: "+err.Error(), http.StatusInternalServerError)
-				return
+			if len(body.Providers) > 0 || body.Provider != nil {
+				if err := a.thinker.config.ReplaceProviders(providers); err != nil {
+					http.Error(w, "persist providers: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+			if body.RealtimeEnabled != nil {
+				if err := a.thinker.config.SetRealtimeEnabled(realtimeEnabled); err != nil {
+					http.Error(w, "persist realtime setting: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
 			}
 			oldDefault := a.thinker.status().Provider
 			a.thinker.pool = pool
 			a.thinker.provider = pool.Default()
 			if a.thinker.provider != nil && a.thinker.provider.Name() != oldDefault && len(a.thinker.messages) > 0 {
 				a.thinker.messages = a.thinker.messages[:1]
+			}
+			if len(a.thinker.messages) > 0 && a.thinker.rebuildPrompt != nil {
+				a.thinker.messages[0] = Message{Role: "system", Content: a.thinker.rebuildPrompt("")}
 			}
 			a.thinker.publishRuntimeStatus()
 			a.thinker.publishContextStatus()

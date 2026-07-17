@@ -276,6 +276,14 @@ func createRealtimeProviderByName(name string) RealtimeProvider {
 		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 			return NewOpenAIRealtimeProvider(key)
 		}
+	case "xai-realtime":
+		if key := os.Getenv("XAI_API_KEY"); key != "" {
+			return NewXAIRealtimeProvider(key)
+		}
+	case "google-realtime":
+		if key := os.Getenv("GOOGLE_API_KEY"); key != "" {
+			return NewGoogleRealtimeProvider(key)
+		}
 	}
 	return nil
 }
@@ -285,7 +293,7 @@ func createRealtimeProviderByName(name string) RealtimeProvider {
 // buildProviderPool without trying both factories blindly.
 func isRealtimeProviderName(name string) bool {
 	switch name {
-	case "openai-realtime":
+	case "openai-realtime", "xai-realtime", "google-realtime":
 		return true
 	}
 	return false
@@ -591,6 +599,9 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 			if rp == nil {
 				continue
 			}
+			if configurable, ok := rp.(configurableRealtimeProvider); ok {
+				configurable.applyRealtimeConfig(pc)
+			}
 			pool.realtimeProviders[pc.Name] = rp
 			pool.realtimeOrder = append(pool.realtimeOrder, pc.Name)
 			if pc.Default {
@@ -728,18 +739,17 @@ func calculateCostForProvider(provider LLMProvider, usage TokenUsage) float64 {
 		float64(usage.CompletionTokens)*outputPer1M) / 1_000_000
 }
 
-// calculateCostForRealtimeProvider mirrors calculateCostForProvider
-// but uses the 4-arg pricing tuple (the audio rate is separate from
-// text I/O on realtime APIs). Returned value is in dollars assuming
-// the per-1M figures are dollar-denominated, same as the text path.
-func calculateCostForRealtimeProvider(provider RealtimeProvider, usage TokenUsage) float64 {
-	inputPer1M, cachedPer1M, outputPer1M, audioPer1M := provider.CostPer1M()
-	uncached := usage.PromptTokens - usage.CachedTokens
-	if uncached < 0 {
-		uncached = 0
-	}
-	return (float64(uncached)*inputPer1M +
-		float64(usage.CachedTokens)*cachedPer1M +
-		float64(usage.CompletionTokens)*outputPer1M +
-		float64(usage.AudioTokens)*audioPer1M) / 1_000_000
+func calculateCostForRealtimeProvider(provider RealtimeProvider, model string, usage RealtimeUsage) float64 {
+	pricing := provider.Pricing(model)
+	uncachedText := max(0, usage.TextInputTokens-usage.TextCachedTokens)
+	uncachedAudio := max(0, usage.AudioInputTokens-usage.AudioCachedTokens)
+	return (float64(uncachedText)*pricing.TextInput+
+		float64(usage.TextCachedTokens)*pricing.TextCachedInput+
+		float64(usage.TextOutputTokens)*pricing.TextOutput+
+		float64(uncachedAudio)*pricing.AudioInput+
+		float64(usage.AudioCachedTokens)*pricing.AudioCachedInput+
+		float64(usage.AudioOutputTokens)*pricing.AudioOutput)/1_000_000 +
+		usage.AudioInputSeconds/60*pricing.AudioInputPerMinute +
+		usage.AudioOutputSeconds/60*pricing.AudioOutputPerMinute +
+		float64(usage.TextInputMessages)*pricing.TextInputPerMessage
 }

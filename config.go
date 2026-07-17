@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -20,8 +22,9 @@ type PersistentThread struct {
 	MCPNames  []string `json:"mcp_names,omitempty"` // MCP servers to connect on respawn
 	Model     string   `json:"model,omitempty"`     // starting model tier: large, medium, small
 	Reasoning string   `json:"reasoning,omitempty"` // starting reasoning effort: auto, low, medium, high, ...
+	Provider  string   `json:"provider,omitempty"`  // provider selected for this thread
 	Realtime  bool     `json:"realtime,omitempty"`  // spawn as a realtime (voice/audio) thread
-	Voice     string   `json:"voice,omitempty"`     // realtime voice id (e.g. "alloy"); empty = provider default
+	Voice     string   `json:"voice,omitempty"`     // realtime voice id (e.g. "marin"); empty = provider default
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
@@ -53,12 +56,12 @@ type ModelCapabilities struct {
 }
 
 type ProviderConfig struct {
-	Name              string                       `json:"name"`                         // "google", "openai", "anthropic", "fireworks", "xai", "ollama", "openai-realtime"
+	Name              string                       `json:"name"`                         // "google", "openai", "anthropic", "fireworks", "xai", "ollama", or a "*-realtime" companion
 	Default           bool                         `json:"default,omitempty"`            // true = default provider (first match wins)
 	Models            map[string]string            `json:"models,omitempty"`             // "large" → model ID, "medium" → ..., "small" → ...
 	ModelCapabilities map[string]ModelCapabilities `json:"model_capabilities,omitempty"` // selected model metadata keyed by model ID
 	BuiltinTools      []string                     `json:"builtin_tools,omitempty"`      // e.g. ["code_execution"]
-	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "alloy")
+	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "marin")
 }
 
 type Config struct {
@@ -66,15 +69,20 @@ type Config struct {
 	saveMu          sync.Mutex
 	path            string
 	loadErr         error
-	Directive       string                 `json:"directive"`
-	Mode            RunMode                `json:"mode,omitempty"`
-	Unconscious     bool                   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
-	RealtimeEnabled bool                   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
-	Providers       []ProviderConfig       `json:"providers,omitempty"`        // multi-provider pool
-	Provider        *ProviderConfig        `json:"provider,omitempty"`         // legacy single-provider (auto-migrated to Providers on load)
-	Threads         []PersistentThread     `json:"threads,omitempty"`
-	MCPServers      []MCPServerConfig      `json:"mcp_servers,omitempty"`
-	Execution       ExecutionControlConfig `json:"execution_control,omitempty"`
+	Directive       string  `json:"directive"`
+	Mode            RunMode `json:"mode,omitempty"`
+	Unconscious     bool    `json:"unconscious,omitempty"`      // enable background memory consolidation thread
+	RealtimeEnabled bool    `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
+	RealtimeVoice   string  `json:"realtime_voice,omitempty"`   // dashboard/default realtime voice (provider validates at session open)
+	// RealtimeVoiceMCP is the operator-selected subset of attached MCP
+	// servers exposed to dashboard voice sessions. It is policy/config only;
+	// realtime execution still uses the normal thread registry and gates.
+	RealtimeVoiceMCP []string               `json:"realtime_voice_mcp,omitempty"`
+	Providers        []ProviderConfig       `json:"providers,omitempty"` // multi-provider pool
+	Provider         *ProviderConfig        `json:"provider,omitempty"`  // legacy single-provider (auto-migrated to Providers on load)
+	Threads          []PersistentThread     `json:"threads,omitempty"`
+	MCPServers       []MCPServerConfig      `json:"mcp_servers,omitempty"`
+	Execution        ExecutionControlConfig `json:"execution_control,omitempty"`
 }
 
 func NewConfig() *Config {
@@ -194,6 +202,51 @@ func (c *Config) RealtimeEnabledFlag() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.RealtimeEnabled
+}
+
+func (c *Config) SetRealtimeEnabled(enabled bool) error {
+	return c.update(func() { c.RealtimeEnabled = enabled })
+}
+
+func (c *Config) GetRealtimeVoice() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.RealtimeVoice
+}
+
+func (c *Config) SetRealtimeVoice(voice string) error {
+	voice = strings.TrimSpace(voice)
+	if len(voice) > 64 {
+		return fmt.Errorf("realtime voice is too long")
+	}
+	return c.update(func() { c.RealtimeVoice = voice })
+}
+
+func (c *Config) GetRealtimeVoiceMCP() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]string(nil), c.RealtimeVoiceMCP...)
+}
+
+func (c *Config) SetRealtimeVoiceMCP(names []string) error {
+	clean := make([]string, 0, len(names))
+	seen := map[string]bool{}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		clean = append(clean, name)
+	}
+	sort.Strings(clean)
+	return c.update(func() { c.RealtimeVoiceMCP = clean })
 }
 
 func (c *Config) SetDirective(d string) error {
@@ -322,7 +375,7 @@ func (c *Config) GetProviders() []ProviderConfig {
 	defer c.mu.RUnlock()
 	out := make([]ProviderConfig, len(c.Providers))
 	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: p.BuiltinTools}
+		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: p.BuiltinTools, RealtimeVoice: p.RealtimeVoice}
 		if p.Models != nil {
 			cp.Models = make(map[string]string)
 			for k, v := range p.Models {

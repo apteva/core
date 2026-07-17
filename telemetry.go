@@ -530,6 +530,10 @@ type ThreadSpawnData struct {
 	ParentID  string   `json:"parent_id"`
 	Directive string   `json:"directive"`
 	Tools     []string `json:"tools"`
+	MCP       []string `json:"mcp,omitempty"`
+	Realtime  bool     `json:"realtime,omitempty"`
+	Voice     string   `json:"voice,omitempty"`
+	Provider  string   `json:"provider,omitempty"`
 }
 
 type ThreadDoneData struct {

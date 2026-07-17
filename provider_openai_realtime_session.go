@@ -8,47 +8,96 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
 )
 
-// openaiRealtimeSession is a live WebSocket session against OpenAI's
-// Realtime API. One goroutine reads server frames and translates them
-// into RealtimeEvent on the events channel; one goroutine serializes
-// outbound messages from the outbox channel onto the wire. Public
-// methods enqueue into the outbox without blocking on I/O so callers
-// never stall the audio loop.
-type openaiRealtimeSession struct {
-	conn    net.Conn
-	events  chan RealtimeEvent
-	outbox  chan []byte
-	closeMu sync.Mutex
-	closed  bool
+const (
+	realtimeEventBuffer  = 256
+	realtimeOutboxBuffer = 256
+	realtimePingInterval = 30 * time.Second
+)
+
+type realtimeOutboundFrame struct {
+	op   ws.OpCode
+	data []byte
 }
 
-// openaiRealtimeEvent matches the wire envelope. Only fields we
-// inspect are tagged; everything else is preserved via raw passthrough
-// when we need it.
+// openaiRealtimeSession is the shared transport for providers implementing the
+// OpenAI-compatible realtime event protocol. Provider-specific session shapes
+// remain injected callbacks; the thread runtime only sees RealtimeSession.
+// The outbox is never closed: Close signals done and closes the connection,
+// eliminating the enqueue-vs-close send-on-closed-channel race.
+type openaiRealtimeSession struct {
+	conn   net.Conn
+	events chan RealtimeEvent
+	outbox chan realtimeOutboundFrame
+	done   chan struct{}
+
+	providerName             string
+	buildConfigurationUpdate func(string, []NativeTool) map[string]any
+	audioInBytes             atomic.Uint64
+	audioOutBytes            atomic.Uint64
+	textInputMessages        atomic.Uint64
+	audioInBytesPerSecond    float64
+	audioOutBytesPerSecond   float64
+	closeOnce                sync.Once
+	droppedAudio             atomic.Uint64
+}
+
+type openAICompatibleRealtimeConfig struct {
+	providerName             string
+	apiKey                   string
+	endpoint                 string
+	defaultVoice             string
+	safetyIdentifierHeader   string
+	buildSessionUpdate       func(RealtimeSessionOpts, string) ([]byte, error)
+	buildConfigurationUpdate func(string, []NativeTool) map[string]any
+}
+
+type openaiRealtimeUsage struct {
+	TotalTokens  int `json:"total_tokens"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	InputDetails struct {
+		TextTokens    int `json:"text_tokens"`
+		AudioTokens   int `json:"audio_tokens"`
+		CachedTokens  int `json:"cached_tokens"`
+		CachedDetails struct {
+			TextTokens  int `json:"text_tokens"`
+			AudioTokens int `json:"audio_tokens"`
+		} `json:"cached_tokens_details"`
+	} `json:"input_token_details"`
+	OutputDetails struct {
+		TextTokens  int `json:"text_tokens"`
+		AudioTokens int `json:"audio_tokens"`
+	} `json:"output_token_details"`
+}
+
 type openaiRealtimeEvent struct {
-	Type    string `json:"type"`
-	EventID string `json:"event_id,omitempty"`
+	Type         string `json:"type"`
+	EventID      string `json:"event_id,omitempty"`
+	ResponseID   string `json:"response_id,omitempty"`
+	ItemID       string `json:"item_id,omitempty"`
+	Delta        string `json:"delta,omitempty"`
+	Transcript   string `json:"transcript,omitempty"`
+	Text         string `json:"text,omitempty"`
+	CallID       string `json:"call_id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Arguments    string `json:"arguments,omitempty"`
+	AudioStartMS int    `json:"audio_start_ms,omitempty"`
 
-	// response.audio.delta
-	Delta string `json:"delta,omitempty"`
+	Response struct {
+		ID     string              `json:"id"`
+		Status string              `json:"status"`
+		Usage  openaiRealtimeUsage `json:"usage"`
+	} `json:"response,omitempty"`
 
-	// response.audio_transcript.delta / .done, response.text.delta / .done
-	Transcript string `json:"transcript,omitempty"`
-	Text       string `json:"text,omitempty"`
-
-	// response.function_call_arguments.* and conversation.item.*
-	CallID    string `json:"call_id,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
-
-	// error
 	Error struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
@@ -56,27 +105,42 @@ type openaiRealtimeEvent struct {
 	} `json:"error,omitempty"`
 }
 
-// Open dials OpenAI's realtime endpoint and returns a live session.
-// ctx governs the dial + handshake; the session inherits it for
-// in-flight reads. Caller is responsible for calling Close().
 func (p *OpenAIRealtimeProvider) openSession(ctx context.Context, opts RealtimeSessionOpts) (*openaiRealtimeSession, error) {
+	return openAICompatibleRealtimeSession(ctx, opts, openAICompatibleRealtimeConfig{
+		providerName: "openai-realtime", apiKey: p.apiKey, endpoint: p.endpoint,
+		defaultVoice: p.DefaultVoice(), safetyIdentifierHeader: "OpenAI-Safety-Identifier",
+		buildSessionUpdate: buildSessionUpdate,
+		buildConfigurationUpdate: func(instructions string, tools []NativeTool) map[string]any {
+			return map[string]any{
+				"type": "session.update",
+				"session": map[string]any{
+					"type": "realtime", "instructions": instructions, "tools": sessionTools(tools),
+				},
+			}
+		},
+	})
+}
+
+func openAICompatibleRealtimeSession(ctx context.Context, opts RealtimeSessionOpts, config openAICompatibleRealtimeConfig) (*openaiRealtimeSession, error) {
 	model := opts.Model
 	if model == "" {
-		model = p.models[ModelLarge]
+		return nil, fmt.Errorf("%s: realtime model is required", config.providerName)
 	}
-	endpoint := &url.URL{
-		Scheme:   "wss",
-		Host:     "api.openai.com",
-		Path:     "/v1/realtime",
-		RawQuery: "model=" + url.QueryEscape(model),
+	endpoint, err := url.Parse(config.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("realtime endpoint: %w", err)
 	}
+	query := endpoint.Query()
+	query.Set("model", model)
+	endpoint.RawQuery = query.Encode()
 
+	header := http.Header{"Authorization": []string{"Bearer " + config.apiKey}}
+	if opts.SafetyIdentifier != "" && config.safetyIdentifierHeader != "" {
+		header.Set(config.safetyIdentifierHeader, opts.SafetyIdentifier)
+	}
 	dialer := ws.Dialer{
 		Timeout: 10 * time.Second,
-		Header: ws.HandshakeHeaderHTTP(http.Header{
-			"Authorization": []string{"Bearer " + p.apiKey},
-			"OpenAI-Beta":   []string{"realtime=v1"},
-		}),
+		Header:  ws.HandshakeHeaderHTTP(header),
 	}
 	conn, _, _, err := dialer.Dial(ctx, endpoint.String())
 	if err != nil {
@@ -84,28 +148,79 @@ func (p *OpenAIRealtimeProvider) openSession(ctx context.Context, opts RealtimeS
 	}
 
 	s := &openaiRealtimeSession{
-		conn:   conn,
-		events: make(chan RealtimeEvent, 64),
-		outbox: make(chan []byte, 64),
+		conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer),
+		outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), done: make(chan struct{}),
+		providerName: config.providerName, buildConfigurationUpdate: config.buildConfigurationUpdate,
+		audioInBytesPerSecond:  audioBytesPerSecond(opts.AudioInFmt, opts.AudioInRate),
+		audioOutBytesPerSecond: audioBytesPerSecond(opts.AudioOutFmt, opts.AudioOutRate),
 	}
 
-	// Initial session.update — directive, voice, audio formats, tools.
-	sessUpdate, err := buildSessionUpdate(opts, p.DefaultVoice())
+	if config.buildSessionUpdate == nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%s: session update builder is required", config.providerName)
+	}
+	sessUpdate, err := config.buildSessionUpdate(opts, config.defaultVoice)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
-	// Non-blocking: outbox is buffered.
-	s.outbox <- sessUpdate
+	s.outbox <- realtimeOutboundFrame{op: ws.OpText, data: sessUpdate}
 
 	go s.readLoop()
 	go s.writeLoop()
-
+	go s.pingLoop()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = s.Close()
+		case <-s.done:
+		}
+	}()
 	return s, nil
 }
 
-// buildSessionUpdate marshals the initial session.update payload from
-// our generic opts.
+func sessionTools(tools []NativeTool) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, map[string]any{
+			"type": "function", "name": tool.Name,
+			"description": tool.Description, "parameters": tool.Parameters,
+		})
+	}
+	return out
+}
+
+func openAIAudioFormat(format AudioFormat, rate int) map[string]any {
+	if rate <= 0 {
+		rate = 24000
+	}
+	var config map[string]any
+	switch format {
+	case AudioG711ULaw:
+		config = map[string]any{"type": "audio/pcmu"}
+	case AudioG711ALaw:
+		config = map[string]any{"type": "audio/pcma"}
+	default:
+		config = map[string]any{"type": "audio/pcm", "rate": rate}
+	}
+	return config
+}
+
+func audioBytesPerSecond(format AudioFormat, rate int) float64 {
+	switch format {
+	case AudioG711ULaw, AudioG711ALaw:
+		if rate <= 0 {
+			rate = 8000
+		}
+		return float64(rate)
+	default:
+		if rate <= 0 {
+			rate = 24000
+		}
+		return float64(rate * 2) // signed 16-bit mono PCM
+	}
+}
+
 func buildSessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, error) {
 	voice := opts.Voice
 	if voice == "" {
@@ -120,242 +235,310 @@ func buildSessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, 
 		outFmt = AudioPCM16
 	}
 
-	type sessionTool struct {
-		Type        string         `json:"type"`
-		Name        string         `json:"name"`
-		Description string         `json:"description"`
-		Parameters  map[string]any `json:"parameters"`
-	}
-	tools := make([]sessionTool, 0, len(opts.Tools))
-	for _, t := range opts.Tools {
-		tools = append(tools, sessionTool{
-			Type:        "function",
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  t.Parameters,
-		})
-	}
-
-	payload := map[string]any{
-		"type": "session.update",
-		"session": map[string]any{
-			"instructions":       opts.Instructions,
-			"voice":              voice,
-			"input_audio_format": string(inFmt),
-			"output_audio_format": string(outFmt),
-			"modalities":         []string{"audio", "text"},
-			"tools":              tools,
+	input := map[string]any{
+		"format": openAIAudioFormat(inFmt, opts.AudioInRate),
+		"turn_detection": map[string]any{
+			"type": "server_vad", "create_response": true, "interrupt_response": true,
 		},
 	}
-	if opts.Temperature > 0 {
-		payload["session"].(map[string]any)["temperature"] = opts.Temperature
+	if opts.TranscribeInput {
+		model := opts.TranscriptionModel
+		if model == "" {
+			model = "gpt-4o-mini-transcribe"
+		}
+		input["transcription"] = map[string]any{"model": model}
 	}
-	return json.Marshal(payload)
+
+	session := map[string]any{
+		"type":              "realtime",
+		"model":             opts.Model,
+		"instructions":      opts.Instructions,
+		"output_modalities": []string{"audio"},
+		"audio": map[string]any{
+			"input": input,
+			"output": map[string]any{
+				"format": openAIAudioFormat(outFmt, opts.AudioOutRate),
+				"voice":  voice,
+			},
+		},
+		"tools":       sessionTools(opts.Tools),
+		"tool_choice": "auto",
+		"truncation":  map[string]any{"type": "retention_ratio", "retention_ratio": 0.8},
+	}
+	if effort := strings.TrimSpace(opts.Reasoning); effort != "" && effort != "auto" && effort != "none" {
+		session["reasoning"] = map[string]any{"effort": effort}
+	}
+	return json.Marshal(map[string]any{"type": "session.update", "session": session})
 }
 
-// readLoop pulls server frames, decodes them, and emits
-// RealtimeEvent. On a fatal error or close, it closes the events
-// channel and drops out. Only text frames are expected from OpenAI
-// realtime — audio comes back base64-encoded inside JSON events.
 func (s *openaiRealtimeSession) readLoop() {
 	defer close(s.events)
 	for {
 		data, op, err := wsutil.ReadServerData(s.conn)
 		if err != nil {
-			s.emit(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("ws read: %w", err)})
-			s.emit(RealtimeEvent{Type: RealtimeEventSessionEnded})
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("ws read: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.droppedAudio.Load()})
 			return
 		}
 		if op != ws.OpText {
-			// Realtime API doesn't use binary frames; ignore.
 			continue
 		}
-		var ev openaiRealtimeEvent
-		if err := json.Unmarshal(data, &ev); err != nil {
-			s.emit(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("decode event: %w", err)})
+		var event openaiRealtimeEvent
+		if err := json.Unmarshal(data, &event); err != nil {
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("decode event: %w", err)})
 			continue
 		}
-		s.translate(&ev)
+		s.translate(&event)
 	}
 }
 
-// translate converts the OpenAI wire event into our provider-neutral
-// RealtimeEvent and pushes it onto the events channel. Unknown event
-// types are silently dropped — the API emits many lifecycle events
-// (session.created, response.content_part.added, etc.) that consumers
-// don't need.
-func (s *openaiRealtimeSession) translate(ev *openaiRealtimeEvent) {
-	switch ev.Type {
-	case "response.audio.delta":
-		if ev.Delta != "" {
-			pcm, err := base64.StdEncoding.DecodeString(ev.Delta)
-			if err == nil {
-				s.emit(RealtimeEvent{Type: RealtimeEventAudioOut, Audio: pcm})
-			}
-		}
-	case "response.audio_transcript.delta":
-		s.emit(RealtimeEvent{
-			Type:       RealtimeEventTranscriptOutput,
-			Transcript: ev.Delta,
-			Final:      false,
-		})
-	case "response.audio_transcript.done":
-		s.emit(RealtimeEvent{
-			Type:       RealtimeEventTranscriptOutput,
-			Transcript: ev.Transcript,
-			Final:      true,
-		})
-	case "conversation.item.input_audio_transcription.completed":
-		s.emit(RealtimeEvent{
-			Type:       RealtimeEventTranscriptInput,
-			Transcript: ev.Transcript,
-			Final:      true,
-		})
-	case "response.function_call_arguments.done":
-		s.emit(RealtimeEvent{
-			Type:       RealtimeEventToolCall,
-			ToolCallID: ev.CallID,
-			ToolName:   ev.Name,
-			ToolArgs:   ev.Arguments,
-		})
-	case "response.done":
-		s.emit(RealtimeEvent{Type: RealtimeEventResponseDone})
-	case "error":
-		s.emit(RealtimeEvent{
-			Type: RealtimeEventError,
-			Err:  fmt.Errorf("openai realtime: %s/%s: %s", ev.Error.Type, ev.Error.Code, ev.Error.Message),
-		})
-	}
-}
-
-func (s *openaiRealtimeSession) emit(ev RealtimeEvent) {
-	select {
-	case s.events <- ev:
-	default:
-		// Drop on saturation rather than block the read loop. The
-		// alternative — blocking — would starve the WebSocket buffer
-		// and ultimately cause the server to close the connection.
-		// Consumers should size their loops to drain promptly.
-	}
-}
-
-// writeLoop drains the outbox and writes each message as a text
-// frame. Exits when outbox is closed (via Close()).
-func (s *openaiRealtimeSession) writeLoop() {
-	for msg := range s.outbox {
-		if err := wsutil.WriteClientText(s.conn, msg); err != nil {
-			// Once the connection is dead, the read loop will surface
-			// the error too; we just stop writing and let Close clean up.
+func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
+	base := RealtimeEvent{ResponseID: event.ResponseID, ItemID: event.ItemID}
+	switch event.Type {
+	case "response.output_audio.delta", "response.audio.delta":
+		pcm, err := base64.StdEncoding.DecodeString(event.Delta)
+		if err != nil {
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("decode output audio: %w", err)})
 			return
 		}
+		s.audioOutBytes.Add(uint64(len(pcm)))
+		base.Type, base.Audio = RealtimeEventAudioOut, pcm
+		s.emitAudio(base)
+	case "response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta":
+		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptOutput, event.Delta, false
+		s.emitAudio(base)
+	case "response.output_audio_transcript.done":
+		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptOutput, event.Transcript, true
+		s.emitControl(base)
+	case "response.output_text.done":
+		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptOutput, event.Text, true
+		s.emitControl(base)
+	case "conversation.item.input_audio_transcription.delta":
+		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptInput, event.Delta, false
+		s.emitAudio(base)
+	case "conversation.item.input_audio_transcription.updated":
+		transcript := event.Transcript
+		if transcript == "" {
+			transcript = event.Delta
+		}
+		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptInput, transcript, false
+		s.emitAudio(base)
+	case "conversation.item.input_audio_transcription.completed":
+		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptInput, event.Transcript, true
+		s.emitControl(base)
+	case "input_audio_buffer.speech_started":
+		base.Type, base.AudioStartMS = RealtimeEventSpeechStarted, event.AudioStartMS
+		s.emitControl(base)
+	case "response.function_call_arguments.done":
+		base.Type = RealtimeEventToolCall
+		base.ToolCallID, base.ToolName, base.ToolArgs = event.CallID, event.Name, event.Arguments
+		s.emitControl(base)
+	case "response.done":
+		usage := event.Response.Usage
+		base.Type, base.ResponseID = RealtimeEventResponseDone, event.Response.ID
+		base.Usage = RealtimeUsage{
+			TotalTokens: usage.TotalTokens, InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
+			TextInputTokens:   usage.InputDetails.TextTokens,
+			TextCachedTokens:  usage.InputDetails.CachedDetails.TextTokens,
+			TextOutputTokens:  usage.OutputDetails.TextTokens,
+			AudioInputTokens:  usage.InputDetails.AudioTokens,
+			AudioCachedTokens: usage.InputDetails.CachedDetails.AudioTokens,
+			AudioOutputTokens: usage.OutputDetails.AudioTokens,
+		}
+		if s.audioInBytesPerSecond > 0 {
+			base.Usage.AudioInputSeconds = float64(s.audioInBytes.Swap(0)) / s.audioInBytesPerSecond
+		}
+		if s.audioOutBytesPerSecond > 0 {
+			base.Usage.AudioOutputSeconds = float64(s.audioOutBytes.Swap(0)) / s.audioOutBytesPerSecond
+		}
+		base.Usage.TextInputMessages = int(s.textInputMessages.Swap(0))
+		s.emitControl(base)
+	case "rate_limits.updated":
+		base.Type = RealtimeEventRateLimits
+		s.emitControl(base)
+	case "error":
+		providerName := s.providerName
+		if providerName == "" {
+			providerName = "realtime"
+		}
+		s.emitControl(RealtimeEvent{Type: RealtimeEventError,
+			Err: fmt.Errorf("%s: %s/%s: %s", providerName, event.Error.Type, event.Error.Code, event.Error.Message)})
 	}
 }
 
-// enqueue serializes a message to JSON and pushes it onto the outbox.
-// Drops on saturation to keep the caller (audio loop, tool handler)
-// non-blocking. If the session has been closed, drops silently.
-func (s *openaiRealtimeSession) enqueue(payload map[string]any) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	s.closeMu.Lock()
-	if s.closed {
-		s.closeMu.Unlock()
-		return nil
-	}
-	s.closeMu.Unlock()
+// Audio and partial transcript deltas may be dropped under sustained
+// backpressure. Lifecycle, error, tool, final transcript, and usage events are
+// never silently discarded.
+func (s *openaiRealtimeSession) emitAudio(event RealtimeEvent) {
 	select {
-	case s.outbox <- data:
+	case s.events <- event:
+	default:
+		s.droppedAudio.Add(1)
+	}
+}
+
+func (s *openaiRealtimeSession) emitControl(event RealtimeEvent) {
+	select {
+	case s.events <- event:
+	case <-s.done:
+	}
+}
+
+func (s *openaiRealtimeSession) writeLoop() {
+	for {
+		select {
+		case <-s.done:
+			return
+		case frame := <-s.outbox:
+			if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
+				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("ws write: %w", err)})
+				_ = s.conn.Close()
+				return
+			}
+		}
+	}
+}
+
+func (s *openaiRealtimeSession) pingLoop() {
+	ticker := time.NewTicker(realtimePingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			_ = s.enqueueFrame(realtimeOutboundFrame{op: ws.OpPing})
+		}
+	}
+}
+
+func (s *openaiRealtimeSession) enqueueFrame(frame realtimeOutboundFrame) error {
+	select {
+	case <-s.done:
+		return fmt.Errorf("realtime session closed")
+	default:
+	}
+	select {
+	case s.outbox <- frame:
 		return nil
+	case <-s.done:
+		return fmt.Errorf("realtime session closed")
 	default:
 		return fmt.Errorf("realtime outbox full")
 	}
 }
 
-// SendAudio base64-encodes PCM and pushes an input_audio_buffer.append.
+func (s *openaiRealtimeSession) enqueue(payload map[string]any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return s.enqueueFrame(realtimeOutboundFrame{op: ws.OpText, data: data})
+}
+
 func (s *openaiRealtimeSession) SendAudio(pcm []byte) error {
 	if len(pcm) == 0 {
 		return nil
 	}
-	return s.enqueue(map[string]any{
-		"type":  "input_audio_buffer.append",
-		"audio": base64.StdEncoding.EncodeToString(pcm),
-	})
+	if err := s.enqueue(map[string]any{"type": "input_audio_buffer.append", "audio": base64.StdEncoding.EncodeToString(pcm)}); err != nil {
+		return err
+	}
+	s.audioInBytes.Add(uint64(len(pcm)))
+	return nil
 }
 
-// SendText injects a conversation.item.create with the given role.
-// Triggers a response.create afterwards so the model actually speaks
-// (without it, the message sits in history until the next user audio
-// turn completes).
+func (s *openaiRealtimeSession) appendText(role, text string, respond bool) error {
+	contentType := "input_text"
+	if role == "assistant" {
+		contentType = "output_text"
+	}
+	if err := s.enqueue(map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type": "message", "role": role,
+			"content": []map[string]any{{"type": contentType, "text": text}},
+		},
+	}); err != nil {
+		return err
+	}
+	s.textInputMessages.Add(1)
+	if respond {
+		return s.enqueue(map[string]any{"type": "response.create"})
+	}
+	return nil
+}
+
 func (s *openaiRealtimeSession) SendText(role, text string) error {
-	if err := s.enqueue(map[string]any{
-		"type": "conversation.item.create",
-		"item": map[string]any{
-			"type": "message",
-			"role": role,
-			"content": []map[string]any{
-				{"type": "input_text", "text": text},
-			},
-		},
-	}); err != nil {
-		return err
-	}
-	return s.enqueue(map[string]any{"type": "response.create"})
+	return s.appendText(role, text, true)
 }
 
-// SendToolResult delivers a function_call_output item back to the
-// model.
 func (s *openaiRealtimeSession) SendToolResult(callID, result string, isError bool) error {
-	output := result
 	if isError {
-		output = "ERROR: " + result
+		result = "ERROR: " + result
 	}
-	if err := s.enqueue(map[string]any{
-		"type": "conversation.item.create",
-		"item": map[string]any{
-			"type":    "function_call_output",
-			"call_id": callID,
-			"output":  output,
-		},
-	}); err != nil {
-		return err
-	}
-	return s.enqueue(map[string]any{"type": "response.create"})
-}
-
-// UpdateInstructions issues session.update with the new directive.
-// Other session fields (voice, audio format, tools) are left untouched
-// — OpenAI allows partial updates.
-func (s *openaiRealtimeSession) UpdateInstructions(directive string) error {
 	return s.enqueue(map[string]any{
-		"type": "session.update",
-		"session": map[string]any{
-			"instructions": directive,
-		},
+		"type": "conversation.item.create",
+		"item": map[string]any{"type": "function_call_output", "call_id": callID, "output": result},
 	})
 }
 
-// Interrupt cancels the model's current response. OpenAI's
-// response.cancel handles the case where audio is mid-flight cleanly.
+func (s *openaiRealtimeSession) RequestResponse() error {
+	return s.enqueue(map[string]any{"type": "response.create"})
+}
+
+func (s *openaiRealtimeSession) UpdateConfiguration(instructions string, tools []NativeTool) error {
+	if s.buildConfigurationUpdate == nil {
+		return fmt.Errorf("%s: configuration updates are not supported", s.providerName)
+	}
+	return s.enqueue(s.buildConfigurationUpdate(instructions, tools))
+}
+
+func (s *openaiRealtimeSession) RestoreConversation(messages []Message) error {
+	for _, message := range messages {
+		if strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		if message.Role != "user" && message.Role != "assistant" && message.Role != "system" {
+			continue
+		}
+		if err := s.appendText(message.Role, message.Content, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *openaiRealtimeSession) Interrupt() error {
 	return s.enqueue(map[string]any{"type": "response.cancel"})
 }
 
+func (s *openaiRealtimeSession) Truncate(itemID string, audioEndMS int) error {
+	if itemID == "" {
+		return fmt.Errorf("truncate requires item id")
+	}
+	if audioEndMS < 0 {
+		audioEndMS = 0
+	}
+	return s.enqueue(map[string]any{
+		"type": "conversation.item.truncate", "item_id": itemID,
+		"content_index": 0, "audio_end_ms": audioEndMS,
+	})
+}
+
 func (s *openaiRealtimeSession) Events() <-chan RealtimeEvent { return s.events }
 
-// Close terminates the session. Safe to call multiple times. Closes
-// the WS connection (which unblocks the read loop) and the outbox
-// (which unblocks the write loop). The events channel closes when
-// the read loop exits.
 func (s *openaiRealtimeSession) Close() error {
-	s.closeMu.Lock()
-	if s.closed {
-		s.closeMu.Unlock()
-		return nil
-	}
-	s.closed = true
-	close(s.outbox)
-	s.closeMu.Unlock()
-	return s.conn.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if s.conn != nil {
+			err = s.conn.Close()
+		}
+	})
+	return err
 }

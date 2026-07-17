@@ -2,317 +2,617 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
-// RealtimeThinker drives a thread whose conversation runs over a
-// RealtimeSession (bidirectional WebSocket) instead of discrete
-// request/response Chat() calls.
-//
-// It embeds *Thinker for shared state — registry, bus subscription,
-// pause/quit channels, memory, config, telemetry. The standard Run()
-// loop is replaced by an event-driven select that fans together:
-//   - session events from the model (audio out, transcript, tool calls)
-//   - inbound audio from the caller (mic / telephony)
-//   - bus inbox events (send from other threads, lifecycle)
-//   - pause / quit signals
-//
-// All Thinker mechanics that don't assume the iteration loop
-// (executeTool, pendingTools tracking, persistence, telemetry) are
-// reused unchanged.
+const (
+	realtimeReconnectMinDelay = time.Second
+	realtimeReconnectMaxDelay = 30 * time.Second
+	realtimeRestoreMessages   = 32
+	realtimePCMBytesPerSecond = 24000 * 2
+)
+
+// RealtimeThinker is the event-driven counterpart to Thinker. It deliberately
+// reuses Thinker's prompt, tool handler, execution gates, durable Session, bus,
+// and telemetry instead of maintaining a second, weaker agent runtime.
 type RealtimeThinker struct {
 	*Thinker
 
 	provider RealtimeProvider
-	session  RealtimeSession
 	voice    string
+	opts     RealtimeSessionOpts
 
-	audioIn  <-chan []byte
-	audioOut chan<- []byte
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	// transcript accumulates the final model utterances so the thread
-	// has a readable log (visible via t.messages or session file). Not
-	// resent to the model — the realtime API holds its own server-side
-	// conversation state.
+	sessionMu sync.RWMutex
+	rtSession RealtimeSession
+
+	audioIn      <-chan []byte
+	audioOut     chan<- []byte
+	audioControl chan<- string
+
 	transcriptMu sync.Mutex
+	outputMu     sync.Mutex
+	outputItemID string
+	outputBytes  int
+
+	toolBatchMu     sync.Mutex
+	toolBatches     map[string]*realtimeToolBatch
+	toolCallBatches map[string]string
 }
 
-// startRealtimeThinker builds a RealtimeThinker around an
-// already-constructed Thinker and opens the session. Returns the
-// RealtimeThinker ready to Run(); caller invokes Run() in a goroutine.
-// On open failure, the embedded Thinker is left intact (caller is
-// responsible for tearing it down) and the error is returned.
+type realtimeToolBatch struct {
+	session      RealtimeSession
+	pending      int
+	responseDone bool
+}
+
+func realtimeNativeTools(thinker *Thinker) []NativeTool {
+	var tools []NativeTool
+	if thinker.registry != nil {
+		tools = thinker.registry.NativeTools(thinker.toolAllowlist, thinker.activeTools, thinker.systemThread)
+	}
+	return append(tools, NativeTool{
+		Name:        "interrupt",
+		Description: "Cancel your own in-flight speech immediately when the remaining utterance is stale. Takes no arguments.",
+		Parameters: map[string]any{
+			"type": "object", "properties": map[string]any{},
+		},
+	})
+}
+
+func realtimeSafetyIdentifier(threadID string) string {
+	sum := sha256.Sum256([]byte("apteva-realtime:" + threadID))
+	return "apt_" + hex.EncodeToString(sum[:12])
+}
+
+func newRealtimeThinker(
+	ctx context.Context,
+	thinker *Thinker,
+	provider RealtimeProvider,
+	voice string,
+	audioIn <-chan []byte,
+	audioOut chan<- []byte,
+	audioControl chan<- string,
+) *RealtimeThinker {
+	if voice == "" {
+		voice = provider.DefaultVoice()
+	}
+	model := ""
+	if models := provider.Models(); models != nil {
+		model = models[thinker.agentModel]
+		if model == "" {
+			model = models[ModelLarge]
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	rt := &RealtimeThinker{
+		Thinker: thinker, provider: provider, voice: voice,
+		ctx: runCtx, cancel: cancel,
+		audioIn: audioIn, audioOut: audioOut, audioControl: audioControl,
+		toolBatches: map[string]*realtimeToolBatch{}, toolCallBatches: map[string]string{},
+	}
+	rt.opts = RealtimeSessionOpts{
+		Model:              model,
+		Voice:              voice,
+		Instructions:       rt.currentInstructions(),
+		Tools:              realtimeNativeTools(thinker),
+		AudioInFmt:         AudioPCM16,
+		AudioOutFmt:        AudioPCM16,
+		AudioInRate:        24000,
+		AudioOutRate:       24000,
+		Reasoning:          thinker.agentReasoning.String(),
+		SafetyIdentifier:   realtimeSafetyIdentifier(thinker.threadID),
+		TranscribeInput:    true,
+		TranscriptionModel: provider.DefaultTranscriptionModel(),
+	}
+	return rt
+}
+
+// startRealtimeThinker opens once before returning so a bad credential or
+// contract fails the spawn synchronously. Run renews the session thereafter.
 func startRealtimeThinker(
 	ctx context.Context,
 	thinker *Thinker,
 	provider RealtimeProvider,
-	directive string,
 	voice string,
 	audioIn <-chan []byte,
 	audioOut chan<- []byte,
+	audioControl chan<- string,
 ) (*RealtimeThinker, error) {
-	if voice == "" {
-		voice = provider.DefaultVoice()
-	}
-
-	// Native tool schemas — same registry the regular thinker uses.
-	var nativeTools []NativeTool
-	if thinker.registry != nil {
-		nativeTools = thinker.registry.NativeTools(thinker.toolAllowlist, thinker.activeTools, thinker.systemThread)
-	}
-	// interrupt is realtime-only and not in the shared registry. It
-	// acts on the session itself (cancels the in-flight model
-	// response) rather than running a goroutine, so the model needs
-	// to see it in the tools list but it bypasses executeTool. The
-	// special-case in dispatchToolCall handles invocation.
-	nativeTools = append(nativeTools, NativeTool{
-		Name:        "interrupt",
-		Description: "Cancel your own in-flight speech immediately. Use when new context arrives mid-utterance and the rest of what you were about to say would be wrong or stale. Takes no arguments.",
-		Parameters: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
-		},
-	})
-
-	model := ""
-	if m := provider.Models(); m != nil {
-		model = m[ModelLarge]
-	}
-
-	session, err := provider.Open(ctx, RealtimeSessionOpts{
-		Model:        model,
-		Voice:        voice,
-		Instructions: directive,
-		Tools:        nativeTools,
-		AudioInFmt:   AudioPCM16,
-		AudioOutFmt:  AudioPCM16,
-	})
-	if err != nil {
+	rt := newRealtimeThinker(ctx, thinker, provider, voice, audioIn, audioOut, audioControl)
+	if err := rt.openSession(false); err != nil {
+		rt.cancel()
 		return nil, fmt.Errorf("realtime open: %w", err)
 	}
-
-	return &RealtimeThinker{
-		Thinker:  thinker,
-		provider: provider,
-		session:  session,
-		voice:    voice,
-		audioIn:  audioIn,
-		audioOut: audioOut,
-	}, nil
+	return rt, nil
 }
 
-// Run is the event-driven counterpart to Thinker.Run. It blocks until
-// the session ends, the thread is killed, or the bus quits. Tool
-// calls fire as goroutines via the existing executeTool plumbing and
-// their results are delivered back via session.SendToolResult.
+func (rt *RealtimeThinker) currentInstructions() string {
+	rt.transcriptMu.Lock()
+	defer rt.transcriptMu.Unlock()
+	return rt.currentInstructionsLocked()
+}
+
+func (rt *RealtimeThinker) currentInstructionsLocked() string {
+	if len(rt.messages) > 0 && rt.messages[0].Role == "system" {
+		return rt.messages[0].Content
+	}
+	return rt.directive
+}
+
+func (rt *RealtimeThinker) configurationSnapshot() (string, []NativeTool) {
+	rt.transcriptMu.Lock()
+	defer rt.transcriptMu.Unlock()
+	return rt.currentInstructionsLocked(), realtimeNativeTools(rt.Thinker)
+}
+
+func (rt *RealtimeThinker) currentSession() RealtimeSession {
+	rt.sessionMu.RLock()
+	defer rt.sessionMu.RUnlock()
+	return rt.rtSession
+}
+
+func (rt *RealtimeThinker) replaceSession(next RealtimeSession) {
+	rt.sessionMu.Lock()
+	previous := rt.rtSession
+	rt.rtSession = next
+	rt.sessionMu.Unlock()
+	if previous != nil && previous != next {
+		rt.toolBatchMu.Lock()
+		rt.toolBatches = map[string]*realtimeToolBatch{}
+		rt.toolCallBatches = map[string]string{}
+		rt.toolBatchMu.Unlock()
+		_ = previous.Close()
+	}
+}
+
+func (rt *RealtimeThinker) beginToolCall(event RealtimeEvent, session RealtimeSession) {
+	batchID := event.ResponseID
+	rt.toolBatchMu.Lock()
+	batch := rt.toolBatches[batchID]
+	if batch == nil {
+		batch = &realtimeToolBatch{session: session}
+		rt.toolBatches[batchID] = batch
+	}
+	batch.pending++
+	rt.toolCallBatches[event.ToolCallID] = batchID
+	rt.toolBatchMu.Unlock()
+}
+
+func (rt *RealtimeThinker) completeToolCall(callID string) {
+	var continueSession RealtimeSession
+	rt.toolBatchMu.Lock()
+	batchID, exists := rt.toolCallBatches[callID]
+	if exists {
+		delete(rt.toolCallBatches, callID)
+		if batch := rt.toolBatches[batchID]; batch != nil {
+			if batch.pending > 0 {
+				batch.pending--
+			}
+			if batch.responseDone && batch.pending == 0 {
+				continueSession = batch.session
+				delete(rt.toolBatches, batchID)
+			}
+		}
+	}
+	rt.toolBatchMu.Unlock()
+	if continueSession != nil {
+		_ = continueSession.RequestResponse()
+	}
+}
+
+func (rt *RealtimeThinker) completeToolResponse(responseID string) {
+	var continueSession RealtimeSession
+	rt.toolBatchMu.Lock()
+	batchID := responseID
+	batch := rt.toolBatches[batchID]
+	if batch == nil && responseID != "" {
+		// Some compatible providers omit response_id on function-call events.
+		// There can be only one active provider response on a session, so bind
+		// an otherwise-unidentified batch when response.done arrives.
+		batchID, batch = "", rt.toolBatches[""]
+	}
+	if batch != nil {
+		batch.responseDone = true
+		if batch.pending == 0 {
+			continueSession = batch.session
+			delete(rt.toolBatches, batchID)
+		}
+	}
+	rt.toolBatchMu.Unlock()
+	if continueSession != nil {
+		_ = continueSession.RequestResponse()
+	}
+}
+
+func (rt *RealtimeThinker) submitToolResult(session RealtimeSession, callID, result string, isError bool) {
+	if err := session.SendToolResult(callID, result, isError); err != nil {
+		logMsg("REALTIME", fmt.Sprintf("[%s] send tool result %s: %v", rt.threadID, callID, err))
+		return
+	}
+	rt.completeToolCall(callID)
+}
+
+func (rt *RealtimeThinker) boundedTranscript() []Message {
+	rt.transcriptMu.Lock()
+	defer rt.transcriptMu.Unlock()
+	start := 1
+	if start > len(rt.messages) {
+		start = len(rt.messages)
+	}
+	eligible := make([]Message, 0, len(rt.messages)-start)
+	for _, msg := range rt.messages[start:] {
+		if (msg.Role == "user" || msg.Role == "assistant") && strings.TrimSpace(msg.Content) != "" {
+			eligible = append(eligible, Message{Role: msg.Role, Content: msg.Content})
+		}
+	}
+	if len(eligible) > realtimeRestoreMessages {
+		eligible = eligible[len(eligible)-realtimeRestoreMessages:]
+	}
+	return eligible
+}
+
+func (rt *RealtimeThinker) openSession(restore bool) error {
+	instructions, tools := rt.configurationSnapshot()
+	rt.transcriptMu.Lock()
+	rt.opts.Instructions, rt.opts.Tools = instructions, tools
+	opts := rt.opts
+	rt.transcriptMu.Unlock()
+	session, err := rt.provider.Open(rt.ctx, opts)
+	if err != nil {
+		return err
+	}
+	var history []Message
+	if restore {
+		history = rt.boundedTranscript()
+	}
+	// Called even for a new/empty session. Most providers treat this as a
+	// no-op; Gemini Live uses it to finish its initial history-seeding phase
+	// before accepting normal realtime input.
+	if err := session.RestoreConversation(history); err != nil {
+		_ = session.Close()
+		return fmt.Errorf("restore conversation: %w", err)
+	}
+	rt.replaceSession(session)
+	return nil
+}
+
+func (rt *RealtimeThinker) refreshConfiguration() {
+	session := rt.currentSession()
+	if session == nil {
+		return
+	}
+	instructions, tools := rt.configurationSnapshot()
+	if err := session.UpdateConfiguration(instructions, tools); err != nil {
+		logMsg("REALTIME", fmt.Sprintf("[%s] update configuration: %v", rt.threadID, err))
+	}
+}
+
+func (rt *RealtimeThinker) emit(eventType string, data map[string]any) {
+	if rt.telemetry != nil {
+		rt.telemetry.Emit(eventType, rt.threadID, data)
+	}
+}
+
+// Run survives normal provider-enforced session endings. Only explicit thread
+// stop/cancellation ends the worker and invokes the normal cleanup path.
 func (rt *RealtimeThinker) Run() {
 	defer func() {
-		if rt.session != nil {
-			_ = rt.session.Close()
-		}
+		rt.cancel()
+		rt.replaceSession(nil)
 		if rt.onStop != nil {
 			rt.onStop()
 		}
 	}()
 
-	logMsg("REALTIME", fmt.Sprintf("[%s] session up, voice=%s", rt.threadID, rt.voice))
-
-	// Wire executeTool's result publish path to this thread. The
-	// existing tools.go executeTool publishes a ToolResult event on
-	// the bus; we subscribe to our own thread's inbox to catch them
-	// (same pattern as the regular Thinker iteration uses).
-
+	logMsg("REALTIME", fmt.Sprintf("[%s] session up, model=%s voice=%s", rt.threadID, rt.opts.Model, rt.voice))
+	rt.emit("realtime.session_started", map[string]any{
+		"model": rt.opts.Model, "voice": rt.voice, "provider": rt.provider.Name(),
+	})
+	reconnectDelay := realtimeReconnectMinDelay
 	for {
-		var audioIn <-chan []byte = rt.audioIn // nil-safe — nil chan blocks forever
-		select {
-
-		case ev, ok := <-rt.session.Events():
-			if !ok {
-				logMsg("REALTIME", fmt.Sprintf("[%s] session closed", rt.threadID))
-				return
-			}
-			rt.handleSessionEvent(ev)
-
-		case audio, ok := <-audioIn:
-			if !ok {
-				rt.audioIn = nil // stop selecting on it
+		if rt.currentSession() == nil {
+			if err := rt.openSession(true); err != nil {
+				rt.emit("realtime.reconnect", map[string]any{"success": false, "error": err.Error(), "delay_ms": reconnectDelay.Milliseconds()})
+				select {
+				case <-rt.quit:
+					return
+				case <-rt.ctx.Done():
+					return
+				case <-time.After(reconnectDelay):
+				}
+				reconnectDelay = min(realtimeReconnectMaxDelay, reconnectDelay*2)
 				continue
 			}
-			if err := rt.session.SendAudio(audio); err != nil {
+			rt.emit("realtime.reconnect", map[string]any{"success": true})
+			reconnectDelay = realtimeReconnectMinDelay
+		}
+
+		session := rt.currentSession()
+		events := session.Events()
+		select {
+		case event, ok := <-events:
+			if !ok {
+				logMsg("REALTIME", fmt.Sprintf("[%s] provider session closed; renewing", rt.threadID))
+				rt.replaceSession(nil)
+				continue
+			}
+			rt.handleSessionEvent(event)
+
+		case audio, ok := <-rt.audioIn:
+			if !ok {
+				rt.audioIn = nil
+				continue
+			}
+			if rt.paused {
+				continue
+			}
+			if err := session.SendAudio(audio); err != nil {
 				logMsg("REALTIME", fmt.Sprintf("[%s] send audio: %v", rt.threadID, err))
 			}
 
-		case ev := <-rt.sub.C:
-			rt.handleBusEvent(ev)
+		case event := <-rt.sub.C:
+			rt.handleBusEvent(event)
 
 		case paused := <-rt.pause:
 			rt.paused = paused
 			if paused {
-				logMsg("REALTIME", fmt.Sprintf("[%s] paused (audio still received, model continues)", rt.threadID))
-			} else {
-				logMsg("REALTIME", fmt.Sprintf("[%s] resumed", rt.threadID))
+				_ = session.Interrupt()
 			}
+			rt.publishRuntimeStatus()
 
 		case <-rt.quit:
-			logMsg("REALTIME", fmt.Sprintf("[%s] quit", rt.threadID))
+			return
+		case <-rt.ctx.Done():
 			return
 		}
 	}
 }
 
-// handleSessionEvent routes one RealtimeEvent from the model.
-func (rt *RealtimeThinker) handleSessionEvent(ev RealtimeEvent) {
-	switch ev.Type {
+func (rt *RealtimeThinker) appendTranscript(role, transcript string) {
+	message := Message{Role: role, Content: transcript}
+	rt.transcriptMu.Lock()
+	rt.messages = append(rt.messages, message)
+	rt.publishContextStatus()
+	rt.transcriptMu.Unlock()
+	if rt.Thinker.session != nil {
+		_ = rt.Thinker.session.AppendMessage(message, rt.iteration, TokenUsage{})
+	}
+	rt.emit("realtime."+role, map[string]any{"text": transcript})
+}
+
+func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
+	switch event.Type {
 	case RealtimeEventAudioOut:
+		if rt.paused {
+			return
+		}
 		if rt.audioOut != nil {
 			select {
-			case rt.audioOut <- ev.Audio:
+			case rt.audioOut <- event.Audio:
+				rt.outputMu.Lock()
+				if event.ItemID != "" && event.ItemID != rt.outputItemID {
+					rt.outputItemID, rt.outputBytes = event.ItemID, 0
+				}
+				rt.outputBytes += len(event.Audio)
+				rt.outputMu.Unlock()
 			default:
-				// Caller's consumer is slow — dropping a chunk is
-				// preferable to stalling the session goroutine. In
-				// practice the caller's sink should always drain
-				// faster than the model produces.
+				rt.emit("realtime.audio_drop", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "consumer_backpressure"})
+			}
+		}
+
+	case RealtimeEventSpeechStarted:
+		rt.outputMu.Lock()
+		itemID := rt.outputItemID
+		playedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
+		rt.outputItemID, rt.outputBytes = "", 0
+		rt.outputMu.Unlock()
+		if session := rt.currentSession(); session != nil && itemID != "" {
+			_ = session.Truncate(itemID, playedMS)
+		}
+		if rt.audioControl != nil {
+			select {
+			case rt.audioControl <- "interrupt":
+			default:
+				rt.emit("realtime.control_drop", map[string]any{"control": "interrupt"})
 			}
 		}
 
 	case RealtimeEventTranscriptOutput:
-		if ev.Final && ev.Transcript != "" {
-			rt.transcriptMu.Lock()
-			rt.messages = append(rt.messages, Message{Role: "assistant", Content: ev.Transcript})
-			rt.transcriptMu.Unlock()
-			if rt.telemetry != nil {
-				rt.telemetry.EmitLive("realtime.assistant", rt.threadID, map[string]any{
-					"text": ev.Transcript,
-				})
-			}
+		if event.Final && strings.TrimSpace(event.Transcript) != "" {
+			rt.appendTranscript("assistant", event.Transcript)
 		}
 
 	case RealtimeEventTranscriptInput:
-		if ev.Final && ev.Transcript != "" {
-			rt.transcriptMu.Lock()
-			rt.messages = append(rt.messages, Message{Role: "user", Content: ev.Transcript})
-			rt.transcriptMu.Unlock()
-			if rt.telemetry != nil {
-				rt.telemetry.EmitLive("realtime.user", rt.threadID, map[string]any{
-					"text": ev.Transcript,
-				})
-			}
+		if event.Final && strings.TrimSpace(event.Transcript) != "" {
+			rt.appendTranscript("user", event.Transcript)
 		}
 
 	case RealtimeEventToolCall:
-		rt.dispatchToolCall(ev)
+		if rt.paused {
+			if session := rt.currentSession(); session != nil {
+				rt.beginToolCall(event, session)
+				rt.submitToolResult(session, event.ToolCallID, "thread is paused", true)
+			}
+			return
+		}
+		rt.dispatchToolCall(event)
 
 	case RealtimeEventResponseDone:
-		// Lifecycle marker — nothing to do; transcript .done events
-		// have already populated history.
+		rt.completeToolResponse(event.ResponseID)
+		cost := calculateCostForRealtimeProvider(rt.provider, rt.opts.Model, event.Usage)
+		rt.emit("realtime.usage", map[string]any{
+			"model": rt.opts.Model, "cost": cost,
+			"total_tokens":         event.Usage.TotalTokens,
+			"text_input_tokens":    event.Usage.TextInputTokens,
+			"text_cached_tokens":   event.Usage.TextCachedTokens,
+			"text_output_tokens":   event.Usage.TextOutputTokens,
+			"audio_input_tokens":   event.Usage.AudioInputTokens,
+			"audio_cached_tokens":  event.Usage.AudioCachedTokens,
+			"audio_output_tokens":  event.Usage.AudioOutputTokens,
+			"audio_input_seconds":  event.Usage.AudioInputSeconds,
+			"audio_output_seconds": event.Usage.AudioOutputSeconds,
+			"text_input_messages":  event.Usage.TextInputMessages,
+		})
 
 	case RealtimeEventError:
-		logMsg("REALTIME", fmt.Sprintf("[%s] session error: %v", rt.threadID, ev.Err))
+		logMsg("REALTIME", fmt.Sprintf("[%s] session error: %v", rt.threadID, event.Err))
+		rt.emit("realtime.error", map[string]any{"error": fmt.Sprint(event.Err)})
 
 	case RealtimeEventSessionEnded:
-		// Read loop will close Events() channel; Run() will exit on
-		// the next iteration via the !ok branch.
+		rt.emit("realtime.session_ended", map[string]any{"dropped_audio_events": event.DroppedAudio})
 	}
 }
 
-// dispatchToolCall dispatches a tool call from the model. Reuses the
-// standard executeTool path so realtime threads get the same panic
-// recovery, telemetry, and result routing as text threads. The
-// result is delivered to the session via handleBusEvent when
-// executeTool publishes the result event on the bus.
-func (rt *RealtimeThinker) dispatchToolCall(ev RealtimeEvent) {
-	logMsg("REALTIME", fmt.Sprintf("[%s] tool call %s id=%s args=%dB",
-		rt.threadID, ev.ToolName, ev.ToolCallID, len(ev.ToolArgs)))
-
-	// Special-case the realtime-only interrupt tool — it acts on the
-	// session directly, not through the registry.
-	if ev.ToolName == "interrupt" {
-		if err := rt.session.Interrupt(); err != nil {
-			_ = rt.session.SendToolResult(ev.ToolCallID, "interrupt failed: "+err.Error(), true)
+// dispatchToolCall uses the exact same handler and execution-control gates as
+// normal model turns. This is what makes core send/done/evolve/pace work and
+// keeps external tools subject to the same authorization and telemetry path.
+func (rt *RealtimeThinker) dispatchToolCall(event RealtimeEvent) {
+	session := rt.currentSession()
+	if session == nil {
+		return
+	}
+	rt.beginToolCall(event, session)
+	if event.ToolName == "interrupt" {
+		if err := session.Interrupt(); err != nil {
+			rt.submitToolResult(session, event.ToolCallID, "interrupt failed: "+err.Error(), true)
 			return
 		}
-		_ = rt.session.SendToolResult(ev.ToolCallID, "interrupted", false)
+		rt.submitToolResult(session, event.ToolCallID, "interrupted", false)
 		return
 	}
 
-	args := flattenJSONArgs(ev.ToolArgs)
 	call := toolCall{
-		Name:     ev.ToolName,
-		Args:     args,
-		Raw:      fmt.Sprintf("[[%s native_realtime]]", ev.ToolName),
-		NativeID: ev.ToolCallID,
+		Name: event.ToolName, Args: flattenJSONArgs(event.ToolArgs),
+		Raw: event.ToolName, NativeID: event.ToolCallID,
 	}
-	executeTool(rt.Thinker, call)
+	if rt.toolAllowlist != nil && !rt.toolAllowlist[call.Name] {
+		rt.submitToolResult(session, call.NativeID, "tool is not available to this thread", true)
+		return
+	}
+	if !rt.executionGate(ExecutionPhaseToolBefore, ExecutionGate{
+		Tool: call.Name, CallID: call.NativeID,
+		Summary: toolSummary(call.Name, call.Args), Args: call.Args,
+	}) {
+		return
+	}
+	callMessage := Message{Role: "assistant", ToolCalls: []NativeToolCall{{
+		ID: call.NativeID, Name: call.Name, Args: call.Args,
+	}}}
+	rt.transcriptMu.Lock()
+	rt.messages = append(rt.messages, callMessage)
+	rt.transcriptMu.Unlock()
+	if rt.Thinker.session != nil {
+		_ = rt.Thinker.session.AppendMessage(callMessage, rt.iteration, TokenUsage{})
+	}
+	if rt.handleTools == nil {
+		rt.submitToolResult(session, call.NativeID, "tool handler unavailable", true)
+		return
+	}
+	_, _, results := rt.handleTools(rt.Thinker, []toolCall{call}, nil)
+	if len(results) == 0 {
+		// External tools complete asynchronously and return through the bus.
+		if rt.registry != nil {
+			if def := rt.registry.Get(call.Name); def != nil && !def.Core {
+				return
+			}
+		}
+		rt.submitToolResult(session, call.NativeID, "tool is not available to this thread", true)
+		return
+	}
+
+	message := rt.archiveToolResultMessage(Message{Role: "user", ToolResults: results})
+	rt.transcriptMu.Lock()
+	rt.messages = append(rt.messages, message)
+	rt.publishContextStatus()
+	rt.transcriptMu.Unlock()
+	if rt.Thinker.session != nil {
+		_ = rt.Thinker.session.AppendMessage(message, rt.iteration, TokenUsage{})
+	}
+	for _, result := range results {
+		if !rt.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
+			Tool: call.Name, CallID: result.CallID,
+			Summary: call.Name + " result ready", Result: result.Content,
+		}) {
+			return
+		}
+		isError := result.IsError || strings.HasPrefix(strings.ToLower(strings.TrimSpace(result.Content)), "error:")
+		rt.submitToolResult(session, result.CallID, result.Content, isError)
+	}
+	rt.refreshConfiguration()
 }
 
-// flattenJSONArgs converts a JSON object string into map[string]string
-// the same way the text providers do (string values pass through,
-// non-strings are re-marshaled). Returns an empty map on parse error
-// so the dispatcher can surface "unknown args" rather than panic.
 func flattenJSONArgs(raw string) map[string]string {
 	args := map[string]string{}
 	if strings.TrimSpace(raw) == "" {
 		return args
 	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+	var object map[string]any
+	if err := json.Unmarshal([]byte(raw), &object); err != nil {
 		return args
 	}
-	for k, v := range obj {
-		switch tv := v.(type) {
-		case string:
-			args[k] = tv
-		default:
-			b, _ := json.Marshal(v)
-			args[k] = string(b)
+	for key, value := range object {
+		if text, ok := value.(string); ok {
+			args[key] = text
+			continue
 		}
+		encoded, _ := json.Marshal(value)
+		args[key] = string(encoded)
 	}
 	return args
 }
 
-// handleBusEvent processes one inbound bus event. There are two
-// kinds we care about:
-//   - tool results from executeTool goroutines (EventInbox with a
-//     non-nil ToolResult). These are forwarded to the session as
-//     function_call_output so the model sees its tool result.
-//   - text messages from other threads ("send" from main, or peer
-//     workers). These are injected as system notes so the model can
-//     react.
-//
-// The discriminator is ToolResult != nil — that's the same shape
-// executeTool produces today (tools.go ~line 164). Lifecycle events
-// (pause/quit) are handled separately in the main select.
-func (rt *RealtimeThinker) handleBusEvent(ev Event) {
-	if ev.Type != EventInbox {
+func (rt *RealtimeThinker) handleBusEvent(event Event) {
+	if event.Type != EventInbox {
 		return
 	}
-
-	// Tool result delivery path. executeTool publishes EventInbox
-	// with a populated ToolResult; forward it to the realtime session.
-	if ev.ToolResult != nil {
-		_ = rt.session.SendToolResult(
-			ev.ToolResult.CallID,
-			ev.ToolResult.Content,
-			ev.ToolResult.IsError,
-		)
+	session := rt.currentSession()
+	if session == nil {
 		return
 	}
-
-	// Inter-thread send. Inject as a system note so the model can
-	// react inside the conversation.
-	var note string
-	if ev.From != "" {
-		note = fmt.Sprintf("[from:%s] %s", ev.From, ev.Text)
-	} else {
-		note = ev.Text
+	if event.ToolResult != nil {
+		message := rt.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{*event.ToolResult}})
+		rt.transcriptMu.Lock()
+		rt.messages = append(rt.messages, message)
+		rt.publishContextStatus()
+		rt.transcriptMu.Unlock()
+		if rt.Thinker.session != nil {
+			_ = rt.Thinker.session.AppendMessage(message, rt.iteration, TokenUsage{})
+		}
+		rt.submitToolResult(session, event.ToolResult.CallID, event.ToolResult.Content, event.ToolResult.IsError)
+		return
+	}
+	note := event.Text
+	if event.From != "" {
+		note = fmt.Sprintf("[from:%s] %s", event.From, event.Text)
 	}
 	if strings.TrimSpace(note) == "" {
 		return
 	}
-	if err := rt.session.SendText("system", note); err != nil {
+	if err := session.SendText("user", note); err != nil {
 		logMsg("REALTIME", fmt.Sprintf("[%s] inject text: %v", rt.threadID, err))
 	}
+}
+
+func (rt *RealtimeThinker) requestTextResponse(message string) error {
+	session := rt.currentSession()
+	if session == nil {
+		return errors.New("realtime session unavailable")
+	}
+	if err := session.SendText("user", message); err != nil {
+		return err
+	}
+	return session.RequestResponse()
 }

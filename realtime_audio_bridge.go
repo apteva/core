@@ -37,14 +37,20 @@ type audioBridgeRegistration struct {
 	threadID string
 	audioIn  chan []byte // bridge writes here (caller → model)
 	audioOut chan []byte // bridge reads here (model → caller)
+	control  chan string // low-volume JSON/text playback controls
 	created  time.Time
 }
 
 var (
 	audioBridgeMu    sync.Mutex
 	audioBridgeByTok = map[string]*audioBridgeRegistration{}
+	audioBridgeLive  = map[string]*audioBridgeConnection{}
 	audioBridgeTTL   = 5 * time.Minute
 )
+
+type audioBridgeConnection struct {
+	cancel context.CancelFunc
+}
 
 // generateAudioToken returns a 32-hex-char random token. Cryptographic
 // randomness — single-use, but still worth not being guessable.
@@ -57,7 +63,7 @@ func generateAudioToken() string {
 // registerAudioBridge stashes the channels under a freshly-generated
 // token and returns the token. Sweeps any tokens older than TTL so
 // the map doesn't grow unbounded if callers never connect.
-func registerAudioBridge(threadID string, audioIn, audioOut chan []byte) string {
+func registerAudioBridge(threadID string, audioIn, audioOut chan []byte, control chan string) string {
 	audioBridgeMu.Lock()
 	defer audioBridgeMu.Unlock()
 	now := time.Now()
@@ -71,9 +77,19 @@ func registerAudioBridge(threadID string, audioIn, audioOut chan []byte) string 
 		threadID: threadID,
 		audioIn:  audioIn,
 		audioOut: audioOut,
+		control:  control,
 		created:  now,
 	}
 	return tok
+}
+
+// renewAudioBridge invalidates every unused token and any live bridge for the
+// thread, then mints a fresh single-use token over the same long-lived audio
+// channels. The realtime provider session and transcript stay intact while a
+// browser changes network or wakes from sleep.
+func renewAudioBridge(threadID string, audioIn, audioOut chan []byte, control chan string) string {
+	unregisterAudioBridge(threadID)
+	return registerAudioBridge(threadID, audioIn, audioOut, control)
 }
 
 // unregisterAudioBridge removes any registrations bound to threadID.
@@ -81,11 +97,16 @@ func registerAudioBridge(threadID string, audioIn, audioOut chan []byte) string 
 // thread is killed before a bridge connected.
 func unregisterAudioBridge(threadID string) {
 	audioBridgeMu.Lock()
-	defer audioBridgeMu.Unlock()
 	for tok, reg := range audioBridgeByTok {
 		if reg.threadID == threadID {
 			delete(audioBridgeByTok, tok)
 		}
+	}
+	live := audioBridgeLive[threadID]
+	delete(audioBridgeLive, threadID)
+	audioBridgeMu.Unlock()
+	if live != nil {
+		live.cancel()
 	}
 }
 
@@ -96,6 +117,10 @@ func renameAudioBridgeThread(oldID, newID string) {
 		if reg.threadID == oldID {
 			reg.threadID = newID
 		}
+	}
+	if live := audioBridgeLive[oldID]; live != nil {
+		delete(audioBridgeLive, oldID)
+		audioBridgeLive[newID] = live
 	}
 }
 
@@ -173,12 +198,39 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 	}
 	defer conn.Close()
 	logMsg("REALTIME-AUDIO", fmt.Sprintf("bridge connected for thread=%s", thread))
+	if a.thinker != nil && a.thinker.threads != nil {
+		a.thinker.threads.realtimeBridgeConnected(thread)
+	}
+	if a.thinker != nil && a.thinker.telemetry != nil {
+		a.thinker.telemetry.Emit("realtime.bridge_connected", thread, map[string]any{
+			"encoding": "pcm16", "sample_rate": 24000, "channels": 1,
+		})
+	}
 
 	// Run reader (WS → audioIn) and writer (audioOut → WS) in
 	// goroutines. Either side dying closes the WS, which unblocks the
 	// other.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	live := &audioBridgeConnection{cancel: cancel}
+	audioBridgeMu.Lock()
+	audioBridgeLive[thread] = live
+	audioBridgeMu.Unlock()
+	defer func() {
+		audioBridgeMu.Lock()
+		for id, connected := range audioBridgeLive {
+			if connected == live {
+				delete(audioBridgeLive, id)
+			}
+		}
+		audioBridgeMu.Unlock()
+		if a.thinker != nil && a.thinker.telemetry != nil {
+			a.thinker.telemetry.Emit("realtime.bridge_disconnected", thread, map[string]any{})
+		}
+		if a.thinker != nil && a.thinker.threads != nil {
+			a.thinker.threads.realtimeBridgeDisconnected(thread)
+		}
+	}()
 
 	go func() {
 		defer cancel()
@@ -218,6 +270,11 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 				// Thread's audio loop is slow — drop the frame
 				// rather than backpressure the network. Matches the
 				// realtime thread's own drop-on-saturation policy.
+				if a.thinker != nil && a.thinker.telemetry != nil {
+					a.thinker.telemetry.Emit("realtime.audio_drop", thread, map[string]any{
+						"direction": "input", "bytes": len(data), "reason": "thread_backpressure",
+					})
+				}
 			}
 		}
 	}()
@@ -233,6 +290,17 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 			_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 			if err := wsutil.WriteServerBinary(conn, pcm); err != nil {
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
+				return
+			}
+		case control, ok := <-reg.control:
+			if !ok {
+				reg.control = nil
+				continue
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+			payload := []byte(fmt.Sprintf(`{"type":%q}`, control))
+			if err := wsutil.WriteServerMessage(conn, ws.OpText, payload); err != nil {
+				logMsg("REALTIME-AUDIO", fmt.Sprintf("control write end for thread=%s: %v", thread, err))
 				return
 			}
 		}
