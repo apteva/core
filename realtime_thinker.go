@@ -43,6 +43,9 @@ type RealtimeThinker struct {
 	outputMu     sync.Mutex
 	outputItemID string
 	outputBytes  int
+	stateMu      sync.Mutex
+	state        string
+	statePhase   string
 
 	toolBatchMu     sync.Mutex
 	toolBatches     map[string]*realtimeToolBatch
@@ -103,6 +106,14 @@ func newRealtimeThinker(
 		audioIn: audioIn, audioOut: audioOut, audioControl: audioControl,
 		toolBatches: map[string]*realtimeToolBatch{}, toolCallBatches: map[string]string{},
 	}
+	reasoning := thinker.agentReasoning.String()
+	if reasoning == "" || reasoning == "auto" {
+		if defaults, ok := provider.(realtimeReasoningDefaultProvider); ok {
+			if preferred := strings.TrimSpace(defaults.DefaultRealtimeReasoning()); preferred != "" {
+				reasoning = preferred
+			}
+		}
+	}
 	rt.opts = RealtimeSessionOpts{
 		Model:              model,
 		Voice:              voice,
@@ -112,7 +123,7 @@ func newRealtimeThinker(
 		AudioOutFmt:        AudioPCM16,
 		AudioInRate:        24000,
 		AudioOutRate:       24000,
-		Reasoning:          thinker.agentReasoning.String(),
+		Reasoning:          reasoning,
 		SafetyIdentifier:   realtimeSafetyIdentifier(thinker.threadID),
 		TranscribeInput:    true,
 		TranscriptionModel: provider.DefaultTranscriptionModel(),
@@ -209,11 +220,12 @@ func (rt *RealtimeThinker) completeToolCall(callID string) {
 	}
 	rt.toolBatchMu.Unlock()
 	if continueSession != nil {
+		rt.setConversationState("thinking", RealtimeEvent{})
 		_ = continueSession.RequestResponse()
 	}
 }
 
-func (rt *RealtimeThinker) completeToolResponse(responseID string) {
+func (rt *RealtimeThinker) completeToolResponse(responseID string) bool {
 	var continueSession RealtimeSession
 	rt.toolBatchMu.Lock()
 	batchID := responseID
@@ -224,7 +236,8 @@ func (rt *RealtimeThinker) completeToolResponse(responseID string) {
 		// an otherwise-unidentified batch when response.done arrives.
 		batchID, batch = "", rt.toolBatches[""]
 	}
-	if batch != nil {
+	hadToolBatch := batch != nil
+	if hadToolBatch {
 		batch.responseDone = true
 		if batch.pending == 0 {
 			continueSession = batch.session
@@ -233,8 +246,10 @@ func (rt *RealtimeThinker) completeToolResponse(responseID string) {
 	}
 	rt.toolBatchMu.Unlock()
 	if continueSession != nil {
+		rt.setConversationState("thinking", RealtimeEvent{ResponseID: responseID})
 		_ = continueSession.RequestResponse()
 	}
+	return hadToolBatch
 }
 
 func (rt *RealtimeThinker) submitToolResult(session RealtimeSession, callID, result string, isError bool) {
@@ -306,6 +321,36 @@ func (rt *RealtimeThinker) emit(eventType string, data map[string]any) {
 	}
 }
 
+func (rt *RealtimeThinker) setConversationState(state string, event RealtimeEvent) {
+	state = strings.TrimSpace(state)
+	phase := strings.TrimSpace(event.Phase)
+	if state == "" {
+		return
+	}
+	rt.stateMu.Lock()
+	if rt.state == state && rt.statePhase == phase {
+		rt.stateMu.Unlock()
+		return
+	}
+	previous := rt.state
+	rt.state, rt.statePhase = state, phase
+	rt.stateMu.Unlock()
+	data := map[string]any{"state": state}
+	if previous != "" {
+		data["previous_state"] = previous
+	}
+	if event.ResponseID != "" {
+		data["response_id"] = event.ResponseID
+	}
+	if event.ItemID != "" {
+		data["item_id"] = event.ItemID
+	}
+	if phase != "" {
+		data["phase"] = phase
+	}
+	rt.emit("realtime.state", data)
+}
+
 // Run survives normal provider-enforced session endings. Only explicit thread
 // stop/cancellation ends the worker and invokes the normal cleanup path.
 func (rt *RealtimeThinker) Run() {
@@ -321,6 +366,7 @@ func (rt *RealtimeThinker) Run() {
 	rt.emit("realtime.session_started", map[string]any{
 		"model": rt.opts.Model, "voice": rt.voice, "provider": rt.provider.Name(),
 	})
+	rt.setConversationState("listening", RealtimeEvent{})
 	reconnectDelay := realtimeReconnectMinDelay
 	for {
 		if rt.currentSession() == nil {
@@ -399,6 +445,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		if rt.paused {
 			return
 		}
+		rt.setConversationState("speaking", event)
 		if rt.audioOut != nil {
 			select {
 			case rt.audioOut <- event.Audio:
@@ -414,6 +461,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 
 	case RealtimeEventSpeechStarted:
+		rt.setConversationState("listening", event)
 		rt.outputMu.Lock()
 		itemID := rt.outputItemID
 		playedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
@@ -438,7 +486,11 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 	case RealtimeEventTranscriptInput:
 		if event.Final && strings.TrimSpace(event.Transcript) != "" {
 			rt.appendTranscript("user", event.Transcript)
+			rt.setConversationState("thinking", event)
 		}
+
+	case RealtimeEventResponseStarted:
+		rt.setConversationState("thinking", event)
 
 	case RealtimeEventToolCall:
 		if rt.paused {
@@ -448,10 +500,13 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 			}
 			return
 		}
+		rt.setConversationState("working", event)
 		rt.dispatchToolCall(event)
 
 	case RealtimeEventResponseDone:
-		rt.completeToolResponse(event.ResponseID)
+		if !rt.completeToolResponse(event.ResponseID) {
+			rt.setConversationState("listening", event)
+		}
 		cost := calculateCostForRealtimeProvider(rt.provider, rt.opts.Model, event.Usage)
 		rt.emit("realtime.usage", map[string]any{
 			"model": rt.opts.Model, "cost": cost,
@@ -472,6 +527,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.emit("realtime.error", map[string]any{"error": fmt.Sprint(event.Err)})
 
 	case RealtimeEventSessionEnded:
+		rt.setConversationState("disconnected", event)
 		rt.emit("realtime.session_ended", map[string]any{"dropped_audio_events": event.DroppedAudio})
 	}
 }
@@ -601,6 +657,7 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	if strings.TrimSpace(note) == "" {
 		return
 	}
+	rt.setConversationState("thinking", RealtimeEvent{})
 	if err := session.SendText("user", note); err != nil {
 		logMsg("REALTIME", fmt.Sprintf("[%s] inject text: %v", rt.threadID, err))
 	}
@@ -611,6 +668,7 @@ func (rt *RealtimeThinker) requestTextResponse(message string) error {
 	if session == nil {
 		return errors.New("realtime session unavailable")
 	}
+	rt.setConversationState("thinking", RealtimeEvent{})
 	if err := session.SendText("user", message); err != nil {
 		return err
 	}

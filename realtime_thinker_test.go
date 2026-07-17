@@ -2,10 +2,37 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestRealtimePromptKeepsReasoningPrivateWithoutChangingNormalWorkers(t *testing.T) {
+	normal := formatThreadBasePrompt(false, false, "worker", "main coordinator")
+	if !strings.Contains(normal, "Think out loud") || strings.Contains(normal, "LIVE TURN-TAKING") {
+		t.Fatalf("normal worker prompt changed unexpectedly:\n%s", normal)
+	}
+
+	realtime := formatThreadBasePrompt(false, true, "voice", "main coordinator") + realtimeConversationPrompt
+	for _, forbidden := range []string{"Think out loud", "You MUST report results", "pace(sleep=\"5m\")"} {
+		if strings.Contains(realtime, forbidden) {
+			t.Fatalf("realtime prompt contains %q:\n%s", forbidden, realtime)
+		}
+	}
+	for _, required := range []string{
+		"Reason privately",
+		"Spoken output contains only words intended for the caller",
+		"at most one brief, natural sentence",
+		"After sending work to main, do not speak again",
+		"Do not use pace as a conversational wait mechanism",
+	} {
+		if !strings.Contains(realtime, required) {
+			t.Fatalf("realtime prompt missing %q:\n%s", required, realtime)
+		}
+	}
+}
 
 type fakeRealtimeToolResult struct {
 	callID  string
@@ -138,6 +165,23 @@ func TestRealtimeOpenUsesFullCorePromptAndSelectedProfile(t *testing.T) {
 	}
 }
 
+func TestOpenAIRealtimeUsesLowReasoningOnlyWhenProfileIsAuto(t *testing.T) {
+	thinker := newTestThinker()
+	thinker.agentReasoning = ReasoningAuto
+	rt := newRealtimeThinker(context.Background(), thinker, NewOpenAIRealtimeProvider("test"), "", nil, nil, nil)
+	defer rt.cancel()
+	if rt.opts.Reasoning != "low" {
+		t.Fatalf("auto reasoning = %q, want OpenAI realtime default low", rt.opts.Reasoning)
+	}
+
+	thinker.agentReasoning = ReasoningHigh
+	explicit := newRealtimeThinker(context.Background(), thinker, NewOpenAIRealtimeProvider("test"), "", nil, nil, nil)
+	defer explicit.cancel()
+	if explicit.opts.Reasoning != "high" {
+		t.Fatalf("explicit reasoning = %q, want high", explicit.opts.Reasoning)
+	}
+}
+
 func TestRealtimeCoreToolsUseNormalThreadHandlerAndRefreshPrompt(t *testing.T) {
 	t.Chdir(t.TempDir())
 	parent := newTestThinker()
@@ -168,6 +212,9 @@ func TestRealtimeCoreToolsUseNormalThreadHandlerAndRefreshPrompt(t *testing.T) {
 	}
 	if len(session.updates) != 1 || session.updates[0].Instructions != thread.Thinker.messages[0].Content {
 		t.Fatalf("updated prompt not pushed: %#v", session.updates)
+	}
+	if !strings.Contains(session.updates[0].Instructions, "[REALTIME CONVERSATION]") || strings.Contains(session.updates[0].Instructions, "Think out loud") {
+		t.Fatalf("realtime speech contract lost after evolve:\n%s", session.updates[0].Instructions)
 	}
 	session.mu.Unlock()
 
@@ -308,6 +355,42 @@ func TestRealtimeSpeechStartTruncatesAndClearsPlayback(t *testing.T) {
 	session.mu.Unlock()
 	if got := <-control; got != "interrupt" {
 		t.Fatalf("control = %q", got)
+	}
+}
+
+func TestRealtimeConversationStateTelemetrySeparatesThinkingAndSpeaking(t *testing.T) {
+	thinker := newTestThinker()
+	rt := newRealtimeThinker(context.Background(), thinker, &fakeRealtimeProvider{}, "", nil, nil, nil)
+	defer rt.cancel()
+
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseStarted, ResponseID: "response-1"})
+	rt.handleSessionEvent(RealtimeEvent{
+		Type: RealtimeEventAudioOut, ResponseID: "response-1", ItemID: "item-1", Phase: "commentary", Audio: []byte{1, 2},
+	})
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: "response-1"})
+
+	events, _ := thinker.telemetry.StoredEvents(0)
+	var states []string
+	var speakingPhase string
+	for _, event := range events {
+		if event.Type != "realtime.state" {
+			continue
+		}
+		var data map[string]any
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		state, _ := data["state"].(string)
+		states = append(states, state)
+		if state == "speaking" {
+			speakingPhase, _ = data["phase"].(string)
+		}
+	}
+	if got := strings.Join(states, ","); got != "thinking,speaking,listening" {
+		t.Fatalf("states = %q", got)
+	}
+	if speakingPhase != "commentary" {
+		t.Fatalf("speaking phase = %q", speakingPhase)
 	}
 }
 

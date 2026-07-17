@@ -112,6 +112,33 @@ func TestOpenAIRealtimeTranslatesGAEventsAndUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAIRealtimeCarriesResponseLifecycleAndAudioPhase(t *testing.T) {
+	session := newTranslationSession()
+	session.translate(&openaiRealtimeEvent{Type: "response.created", Response: struct {
+		ID     string                     `json:"id"`
+		Status string                     `json:"status"`
+		Usage  openaiRealtimeUsage        `json:"usage"`
+		Output []openaiRealtimeOutputItem `json:"output,omitempty"`
+	}{ID: "response-1"}})
+	started := <-session.events
+	if started.Type != RealtimeEventResponseStarted || started.ResponseID != "response-1" {
+		t.Fatalf("started event = %#v", started)
+	}
+
+	session.translate(&openaiRealtimeEvent{
+		Type: "response.output_item.added", ResponseID: "response-1",
+		Item: openaiRealtimeOutputItem{ID: "item-1", Type: "message", Phase: "commentary"},
+	})
+	session.translate(&openaiRealtimeEvent{
+		Type: "response.output_audio.delta", ResponseID: "response-1", ItemID: "item-1",
+		Delta: base64.StdEncoding.EncodeToString([]byte{4, 5, 6}),
+	})
+	audio := <-session.events
+	if audio.Type != RealtimeEventAudioOut || audio.Phase != "commentary" || audio.ResponseID != "response-1" {
+		t.Fatalf("phased audio event = %#v", audio)
+	}
+}
+
 func TestOpenAIRealtimeCloseAndEnqueueDoNotRaceOnClosedChannel(t *testing.T) {
 	session := newTranslationSession()
 	var wait sync.WaitGroup

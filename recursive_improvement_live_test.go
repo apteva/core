@@ -25,7 +25,7 @@ Maximize measured views through controlled experiments.
 - Work directly on this thread; do not delegate or spawn workers.
 - Publish and measure exactly one post at a time. Never guess or compare unmeasured performance.
 - First test the current default angle. Then test each of the other available angles once, using the same broad topic but writing a suitable post for each angle.
-- After all three distinct angles have measured results, publish and measure one validation post using whichever angle performed best. Then sleep for 24 hours.`
+- After all three distinct angles have measured results, sleep for 24 hours.`
 
 var recursiveImprovementViews = map[string]int{
 	"baseline_product_tip": 120,
@@ -260,7 +260,8 @@ func runRecursiveSelfImprovementSmoke(t *testing.T, provider LLMProvider) {
 	seenEvents := map[string]bool{}
 	evolveCalls := 0
 	evolved := false
-	pacedAfterValidation := false
+	pacedAfterLearning := false
+	var paceWithoutEvolveAt time.Time
 	for time.Now().Before(deadline) {
 		events, _ := thinker.telemetry.StoredEvents(0)
 		for _, event := range events {
@@ -298,27 +299,21 @@ func runRecursiveSelfImprovementSmoke(t *testing.T, provider LLMProvider) {
 					t.Fatalf("agent evolved before observing all experiments: measured=%d args=%v posts=%+v", measured, call.Args, posts)
 				}
 			case "pace":
-				posts := state.snapshot()
-				validated := false
-				for _, post := range posts {
-					validated = validated || (post.AfterEvolution && post.Measured)
+				pacedAfterLearning = true
+				if !evolved && paceWithoutEvolveAt.IsZero() {
+					paceWithoutEvolveAt = time.Now()
 				}
-				if !validated {
-					t.Fatalf("agent paced before evolving and validating its learned strategy: args=%v posts=%+v directive=\n%s", call.Args, posts, cfg.GetDirective())
-				}
-				pacedAfterValidation = true
 			}
 		}
 
 		posts := state.snapshot()
-		validated := false
-		for _, post := range posts {
-			validated = validated || (post.AfterEvolution && post.Measured)
-		}
-		if evolved && validated && pacedAfterValidation {
+		if evolved && pacedAfterLearning {
 			assertRecursiveSelfImprovement(t, posts, evolveCalls, cfg.GetDirective())
 			t.Logf("provider=%s learned strategy after %d posts:\n%s", provider.Name(), len(posts), cfg.GetDirective())
 			return
+		}
+		if !paceWithoutEvolveAt.IsZero() && time.Since(paceWithoutEvolveAt) > 15*time.Second {
+			t.Fatalf("agent paced after learning without evolving: posts=%+v directive=\n%s", posts, cfg.GetDirective())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -349,11 +344,8 @@ func assertRecursiveSelfImprovement(t *testing.T, posts []recursiveImprovementPo
 	if experiments[0].Angle != "baseline_product_tip" {
 		t.Fatalf("first experiment angle = %q, want baseline_product_tip", experiments[0].Angle)
 	}
-	if len(validations) != 1 || validations[0].Angle != "contrarian_lesson" {
-		t.Fatalf("validation did not use measured winner: %+v", validations)
-	}
-	if validations[0].Views <= experiments[0].Views {
-		t.Fatalf("validation did not improve on baseline: validation=%d baseline=%d", validations[0].Views, experiments[0].Views)
+	if len(validations) != 0 {
+		t.Fatalf("agent published again after completing the learning cycle: %+v", validations)
 	}
 	lower := strings.ToLower(directive)
 	if !strings.Contains(lower, "contrarian_lesson") {

@@ -48,6 +48,7 @@ type openaiRealtimeSession struct {
 	audioOutBytesPerSecond   float64
 	closeOnce                sync.Once
 	droppedAudio             atomic.Uint64
+	itemPhases               map[string]string
 }
 
 type openAICompatibleRealtimeConfig struct {
@@ -79,23 +80,32 @@ type openaiRealtimeUsage struct {
 	} `json:"output_token_details"`
 }
 
+type openaiRealtimeOutputItem struct {
+	ID    string `json:"id,omitempty"`
+	Type  string `json:"type,omitempty"`
+	Phase string `json:"phase,omitempty"`
+}
+
 type openaiRealtimeEvent struct {
-	Type         string `json:"type"`
-	EventID      string `json:"event_id,omitempty"`
-	ResponseID   string `json:"response_id,omitempty"`
-	ItemID       string `json:"item_id,omitempty"`
-	Delta        string `json:"delta,omitempty"`
-	Transcript   string `json:"transcript,omitempty"`
-	Text         string `json:"text,omitempty"`
-	CallID       string `json:"call_id,omitempty"`
-	Name         string `json:"name,omitempty"`
-	Arguments    string `json:"arguments,omitempty"`
-	AudioStartMS int    `json:"audio_start_ms,omitempty"`
+	Type         string                   `json:"type"`
+	EventID      string                   `json:"event_id,omitempty"`
+	ResponseID   string                   `json:"response_id,omitempty"`
+	ItemID       string                   `json:"item_id,omitempty"`
+	Delta        string                   `json:"delta,omitempty"`
+	Transcript   string                   `json:"transcript,omitempty"`
+	Text         string                   `json:"text,omitempty"`
+	CallID       string                   `json:"call_id,omitempty"`
+	Name         string                   `json:"name,omitempty"`
+	Arguments    string                   `json:"arguments,omitempty"`
+	Phase        string                   `json:"phase,omitempty"`
+	AudioStartMS int                      `json:"audio_start_ms,omitempty"`
+	Item         openaiRealtimeOutputItem `json:"item,omitempty"`
 
 	Response struct {
-		ID     string              `json:"id"`
-		Status string              `json:"status"`
-		Usage  openaiRealtimeUsage `json:"usage"`
+		ID     string                     `json:"id"`
+		Status string                     `json:"status"`
+		Usage  openaiRealtimeUsage        `json:"usage"`
+		Output []openaiRealtimeOutputItem `json:"output,omitempty"`
 	} `json:"response,omitempty"`
 
 	Error struct {
@@ -151,6 +161,7 @@ func openAICompatibleRealtimeSession(ctx context.Context, opts RealtimeSessionOp
 		conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer),
 		outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), done: make(chan struct{}),
 		providerName: config.providerName, buildConfigurationUpdate: config.buildConfigurationUpdate,
+		itemPhases:             make(map[string]string),
 		audioInBytesPerSecond:  audioBytesPerSecond(opts.AudioInFmt, opts.AudioInRate),
 		audioOutBytesPerSecond: audioBytesPerSecond(opts.AudioOutFmt, opts.AudioOutRate),
 	}
@@ -298,8 +309,40 @@ func (s *openaiRealtimeSession) readLoop() {
 }
 
 func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
-	base := RealtimeEvent{ResponseID: event.ResponseID, ItemID: event.ItemID}
+	base := RealtimeEvent{ResponseID: event.ResponseID, ItemID: event.ItemID, Phase: event.Phase}
+	if base.ItemID != "" && base.Phase == "" {
+		base.Phase = s.itemPhases[base.ItemID]
+	}
 	switch event.Type {
+	case "response.created":
+		base.Type = RealtimeEventResponseStarted
+		if event.Response.ID != "" {
+			base.ResponseID = event.Response.ID
+		}
+		s.emitControl(base)
+	case "response.output_item.added":
+		itemID := event.Item.ID
+		if itemID == "" {
+			itemID = event.ItemID
+		}
+		phase := strings.TrimSpace(event.Item.Phase)
+		if phase == "" {
+			phase = strings.TrimSpace(event.Phase)
+		}
+		if itemID != "" && phase != "" {
+			if s.itemPhases == nil {
+				s.itemPhases = make(map[string]string)
+			}
+			s.itemPhases[itemID] = phase
+		}
+	case "response.output_item.done":
+		itemID := event.Item.ID
+		if itemID == "" {
+			itemID = event.ItemID
+		}
+		if itemID != "" {
+			delete(s.itemPhases, itemID)
+		}
 	case "response.output_audio.delta", "response.audio.delta":
 		pcm, err := base64.StdEncoding.DecodeString(event.Delta)
 		if err != nil {
@@ -341,6 +384,11 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 	case "response.done":
 		usage := event.Response.Usage
 		base.Type, base.ResponseID = RealtimeEventResponseDone, event.Response.ID
+		for _, item := range event.Response.Output {
+			if item.ID != "" {
+				delete(s.itemPhases, item.ID)
+			}
+		}
 		base.Usage = RealtimeUsage{
 			TotalTokens: usage.TotalTokens, InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
 			TextInputTokens:   usage.InputDetails.TextTokens,

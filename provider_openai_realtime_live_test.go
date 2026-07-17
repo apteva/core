@@ -26,13 +26,16 @@ func TestOpenAIRealtimeLiveToolContinuation(t *testing.T) {
 	provider := NewOpenAIRealtimeProvider(key)
 	session, err := provider.Open(ctx, RealtimeSessionOpts{
 		Model: provider.Models()[ModelSmall], Voice: provider.DefaultVoice(),
-		Instructions: "Call probe exactly once, then say the returned value exactly and nothing else.",
+		Instructions: realtimeThreadReasoningPrompt + realtimeConversationPrompt + `
+
+[LIVE TEST]
+Call probe exactly once, then say the returned value exactly and nothing else. Keep the probe name and all tool mechanics private.`,
 		Tools: []NativeTool{{
 			Name: "probe", Description: "Return the deterministic test value.",
 			Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 		}},
 		AudioInFmt: AudioPCM16, AudioOutFmt: AudioPCM16,
-		AudioInRate: 24000, AudioOutRate: 24000, TranscribeInput: true,
+		AudioInRate: 24000, AudioOutRate: 24000, Reasoning: "low", TranscribeInput: true,
 		SafetyIdentifier: "apt_realtime_smoke",
 	})
 	if err != nil {
@@ -63,11 +66,19 @@ func TestOpenAIRealtimeLiveToolContinuation(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if event.Type == RealtimeEventTranscriptOutput && event.Final && strings.Contains(strings.ToUpper(event.Transcript), "PONG") {
-				if !toolSeen {
-					t.Fatal("model answered without calling probe")
+			if event.Type == RealtimeEventTranscriptOutput && event.Final {
+				spoken := strings.ToLower(event.Transcript)
+				for _, internal := range []string{"probe", "tool", "function", " api", "thread", "channel"} {
+					if strings.Contains(spoken, internal) {
+						t.Fatalf("model narrated internal mechanics: %q", event.Transcript)
+					}
 				}
-				return
+				if strings.Contains(strings.ToUpper(event.Transcript), "PONG") {
+					if !toolSeen {
+						t.Fatal("model answered without calling probe")
+					}
+					return
+				}
 			}
 		}
 	}

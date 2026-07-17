@@ -62,6 +62,11 @@ func (p *OpenAIRealtimeProvider) DefaultTranscriptionModel() string {
 	return "gpt-4o-mini-transcribe"
 }
 
+// DefaultRealtimeReasoning follows OpenAI's voice-agent guidance: low is the
+// responsive production starting point when the operator did not explicitly
+// select an effort. Explicit thread profiles still win.
+func (p *OpenAIRealtimeProvider) DefaultRealtimeReasoning() string { return "low" }
+
 func (p *OpenAIRealtimeProvider) applyRealtimeConfig(config ProviderConfig) {
 	applyRealtimeModelAndVoiceConfig(p.models, &p.defaultVoice, config)
 }
@@ -77,3 +82,4 @@ func (p *OpenAIRealtimeProvider) Open(ctx context.Context, opts RealtimeSessionO
 
 var _ RealtimeProvider = (*OpenAIRealtimeProvider)(nil)
 var _ configurableRealtimeProvider = (*OpenAIRealtimeProvider)(nil)
+var _ realtimeReasoningDefaultProvider = (*OpenAIRealtimeProvider)(nil)

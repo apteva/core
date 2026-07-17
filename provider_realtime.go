@@ -52,6 +52,14 @@ type configurableRealtimeProvider interface {
 	applyRealtimeConfig(ProviderConfig)
 }
 
+// realtimeReasoningDefaultProvider optionally supplies a voice-optimized
+// reasoning effort when the thread profile leaves reasoning on auto. It is
+// deliberately separate from RealtimeProvider because compatible providers
+// expose different effort scales and defaults.
+type realtimeReasoningDefaultProvider interface {
+	DefaultRealtimeReasoning() string
+}
+
 func applyRealtimeModelAndVoiceConfig(models map[ModelTier]string, voice *string, config ProviderConfig) {
 	for tierName, model := range config.Models {
 		if tier, ok := modelNames[strings.ToLower(strings.TrimSpace(tierName))]; ok && strings.TrimSpace(model) != "" {
@@ -192,6 +200,7 @@ const (
 	RealtimeEventTranscriptInput  RealtimeEventType = "transcript_input"  // user said
 	RealtimeEventTranscriptOutput RealtimeEventType = "transcript_output" // model said
 	RealtimeEventToolCall         RealtimeEventType = "tool_call"
+	RealtimeEventResponseStarted  RealtimeEventType = "response_started"
 	RealtimeEventResponseDone     RealtimeEventType = "response_done"
 	RealtimeEventSpeechStarted    RealtimeEventType = "speech_started"
 	RealtimeEventRateLimits       RealtimeEventType = "rate_limits"
@@ -220,6 +229,7 @@ type RealtimeEvent struct {
 	// truncate unplayed audio correctly on barge-in.
 	ResponseID   string
 	ItemID       string
+	Phase        string // provider output phase, e.g. commentary or final_answer
 	AudioStartMS int
 	AudioEndMS   int
 	Usage        RealtimeUsage

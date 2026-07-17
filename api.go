@@ -176,6 +176,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 		"threads":               a.thinker.threads.Count() + 1, // +1 for main
 		"memories":              a.thinker.memory.Count(),
 		"paused":                status.Paused,
+		"llm_active":            status.LLMActive,
 		"mode":                  a.thinker.config.GetMode(),
 		"execution_control":     a.thinker.executionStatus(),
 		"execution_checkpoints": a.thinker.executionCheckpointMeta(),
