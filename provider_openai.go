@@ -34,8 +34,18 @@ type OpenAICompatProvider struct {
 // thin wrappers such as XAIProvider reuse all message, tool-call, streaming,
 // and usage parsing without teaching every compatible provider about xAI.
 type openAICompatRequestOptions struct {
-	Fields  map[string]any
-	Headers map[string]string
+	Fields         map[string]any
+	Headers        map[string]string
+	OptionalFields map[string]openAICompatOptionalField
+}
+
+// openAICompatOptionalField is a provider-specific request field that can be
+// removed safely when a model rejects it. The transport retries the identical
+// prepared turn without the field and lets the provider wrapper remember the
+// model-specific incompatibility for later calls.
+type openAICompatOptionalField struct {
+	Value         any
+	OnUnsupported func()
 }
 
 type openAICompatRequestOptionsContextKey struct{}
@@ -53,6 +63,26 @@ func openAICompatRequestOptionsFromContext(ctx context.Context) openAICompatRequ
 	}
 	options, _ := ctx.Value(openAICompatRequestOptionsContextKey{}).(openAICompatRequestOptions)
 	return options
+}
+
+func openAIOptionalFieldUnsupported(status int, responseBody, field string) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	body := strings.ToLower(responseBody)
+	field = strings.ToLower(strings.TrimSpace(field))
+	if field == "" || !strings.Contains(body, field) {
+		return false
+	}
+	for _, marker := range []string{
+		"unsupported", "not supported", "does not support", "unknown",
+		"unrecognized", "invalid", "only supports", "must be", "expected",
+	} {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *OpenAICompatProvider) promptCacheHintsEnabled() bool {
@@ -295,14 +325,12 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	for key, value := range requestOptions.Fields {
 		reqMap[key] = value
 	}
+	for key, field := range requestOptions.OptionalFields {
+		reqMap[key] = field.Value
+	}
 	if hints := openAIPromptCacheHintsForScope(p.name, model, openAIPromptCacheStablePrefix(openAIMessages), reqMap["tools"], openAIPromptCacheScopeFromContext(ctx)); hints.Key != "" && p.promptCacheHintsEnabled() {
 		reqMap["prompt_cache_key"] = hints.Key
 		reqMap["prompt_cache_retention"] = hints.Retention
-	}
-
-	body, err := json.Marshal(reqMap)
-	if err != nil {
-		return ChatResponse{}, err
 	}
 
 	// Log message count and types for debugging
@@ -334,48 +362,60 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		return llmHTTPClient.Do(req)
 	}
 
-	resp, err := doRequest(body)
-	if err != nil {
-		return ChatResponse{}, err
-	}
+	var resp *http.Response
+	var reqIDs map[string]string
+	for {
+		body, err := json.Marshal(reqMap)
+		if err != nil {
+			return ChatResponse{}, err
+		}
+		resp, err = doRequest(body)
+		if err != nil {
+			return ChatResponse{}, err
+		}
 
-	// Capture provider-side request identifiers so a future stall /
-	// hang can be cross-referenced with the provider's own logs without
-	// another round-trip. Different vendors use different header names
-	// (Fireworks ships x-request-id; some return x-fw-request-id). Log
-	// whatever we find.
-	reqIDs := extractProviderRequestIDs(resp.Header)
-	if len(reqIDs) > 0 {
-		logMsg("PROVIDER", fmt.Sprintf("model=%s request_ids=%v", model, reqIDs))
-	}
+		// Capture provider-side request identifiers so a future stall /
+		// hang can be cross-referenced with the provider's own logs without
+		// another round-trip. Different vendors use different header names
+		// (Fireworks ships x-request-id; some return x-fw-request-id). Log
+		// whatever we find.
+		reqIDs = extractProviderRequestIDs(resp.Header)
+		if len(reqIDs) > 0 {
+			logMsg("PROVIDER", fmt.Sprintf("model=%s request_ids=%v", model, reqIDs))
+		}
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
 
-	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if _, ok := reqMap["prompt_cache_key"]; ok && openAICacheHintsUnsupported(resp.StatusCode, string(respBody)) {
 			p.disablePromptCacheHints()
 			delete(reqMap, "prompt_cache_key")
 			delete(reqMap, "prompt_cache_retention")
-			retryBody, err := json.Marshal(reqMap)
-			if err != nil {
-				return ChatResponse{}, err
-			}
 			logMsg("OPENAI", fmt.Sprintf("cache hints unsupported, retrying without them: %d %s", resp.StatusCode, string(respBody)))
-			resp, err = doRequest(retryBody)
-			if err != nil {
-				return ChatResponse{}, err
+			continue
+		}
+
+		retriedOptional := false
+		for key, field := range requestOptions.OptionalFields {
+			if _, present := reqMap[key]; !present || !openAIOptionalFieldUnsupported(resp.StatusCode, string(respBody), key) {
+				continue
 			}
-			reqIDs = extractProviderRequestIDs(resp.Header)
-			if resp.StatusCode == http.StatusOK {
-				goto streamOK
+			delete(reqMap, key)
+			if field.OnUnsupported != nil {
+				field.OnUnsupported()
 			}
-			respBody, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
+			logMsg("OPENAI", fmt.Sprintf("optional field %s unsupported for model=%s, retrying prepared turn without it: %d %s", key, model, resp.StatusCode, string(respBody)))
+			retriedOptional = true
+			break
+		}
+		if retriedOptional {
+			continue
 		}
 		return ChatResponse{}, fmt.Errorf("API error %d: %s (request_ids=%v)", resp.StatusCode, string(respBody), reqIDs)
 	}
 
-streamOK:
 	// Wrap the streaming body in an idle-read monitor. Any pause longer
 	// than streamIdleTimeout without a single byte arriving is treated
 	// as a provider stall — we close the body so the scanner unblocks
@@ -608,19 +648,22 @@ func NewFireworksProvider(apiKey string) LLMProvider {
 // not apply, so the agent uses the same capable model end-to-end. Users can
 // still override individual tiers in the dashboard provider settings.
 func NewOpenCodeGoProvider(apiKey string) LLMProvider {
-	return &OpenAICompatProvider{
-		name:       "opencode-go",
-		apiKey:     apiKey,
-		url:        "https://opencode.ai/zen/go/v1/chat/completions",
-		authHeader: "Bearer",
-		models: map[ModelTier]string{
-			ModelLarge:  "glm-5.2",
-			ModelMedium: "glm-5.2",
-			ModelSmall:  "glm-5.2",
+	return &OpenCodeGoProvider{
+		compat: &OpenAICompatProvider{
+			name:       "opencode-go",
+			apiKey:     apiKey,
+			url:        "https://opencode.ai/zen/go/v1/chat/completions",
+			authHeader: "Bearer",
+			models: map[ModelTier]string{
+				ModelLarge:  "glm-5.2",
+				ModelMedium: "glm-5.2",
+				ModelSmall:  "glm-5.2",
+			},
+			inputCost:  0,
+			cachedCost: 0,
+			outputCost: 0,
 		},
-		inputCost:  0,
-		cachedCost: 0,
-		outputCost: 0,
+		support: newOpenCodeGoReasoningSupport(),
 	}
 }
 

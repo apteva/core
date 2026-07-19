@@ -10,12 +10,12 @@ import (
 )
 
 func TestRealtimePromptKeepsReasoningPrivateWithoutChangingNormalWorkers(t *testing.T) {
-	normal := formatThreadBasePrompt(false, false, "worker", "main coordinator")
+	normal := formatThreadBasePrompt(false, false, false, "worker", "main coordinator")
 	if !strings.Contains(normal, "Think out loud") || strings.Contains(normal, "LIVE TURN-TAKING") {
 		t.Fatalf("normal worker prompt changed unexpectedly:\n%s", normal)
 	}
 
-	realtime := formatThreadBasePrompt(false, true, "voice", "main coordinator") + realtimeConversationPrompt
+	realtime := formatThreadBasePrompt(false, true, false, "voice", "main coordinator") + realtimeConversationPrompt
 	for _, forbidden := range []string{"Think out loud", "You MUST report results", "pace(sleep=\"5m\")"} {
 		if strings.Contains(realtime, forbidden) {
 			t.Fatalf("realtime prompt contains %q:\n%s", forbidden, realtime)
@@ -343,7 +343,7 @@ func TestRealtimeSpeechStartTruncatesAndClearsPlayback(t *testing.T) {
 	thinker := newTestThinker()
 	session := newFakeRealtimeSession()
 	control := make(chan string, 1)
-	audioOut := make(chan []byte, 1)
+	audioOut := make(chan RealtimeAudioFrame, 1)
 	rt := newRealtimeThinker(context.Background(), thinker, &fakeRealtimeProvider{}, "", nil, audioOut, control)
 	rt.replaceSession(session)
 	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-7", Audio: make([]byte, realtimePCMBytesPerSecond/2)})
@@ -355,6 +355,208 @@ func TestRealtimeSpeechStartTruncatesAndClearsPlayback(t *testing.T) {
 	session.mu.Unlock()
 	if got := <-control; got != "interrupt" {
 		t.Fatalf("control = %q", got)
+	}
+}
+
+func TestRealtimeSpeechStartUsesAcknowledgedPlayback(t *testing.T) {
+	thinker := newTestThinker()
+	session := newFakeRealtimeSession()
+	control := make(chan string, 1)
+	audioOut := make(chan RealtimeAudioFrame, 1)
+	rt := newRealtimeThinker(context.Background(), thinker, &fakeRealtimeProvider{}, "", nil, audioOut, control)
+	rt.replaceSession(session)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-8", Audio: make([]byte, realtimePCMBytesPerSecond)})
+	frame := <-audioOut
+	if frame.ItemID != "item-8" || frame.AudioEndMS != 1000 {
+		t.Fatalf("audio frame = %#v", frame)
+	}
+	rt.acknowledgePlayback("item-8", 320)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventSpeechStarted})
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if len(session.truncations) != 1 || session.truncations[0].endMS != 320 {
+		t.Fatalf("truncations = %#v", session.truncations)
+	}
+}
+
+func TestRealtimePlaybackAcknowledgementDoesNotLeakAcrossItems(t *testing.T) {
+	thinker := newTestThinker()
+	session := newFakeRealtimeSession()
+	audioOut := make(chan RealtimeAudioFrame, 2)
+	rt := newRealtimeThinker(context.Background(), thinker, &fakeRealtimeProvider{}, "", nil, audioOut, nil)
+	rt.replaceSession(session)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-old", Audio: make([]byte, realtimePCMBytesPerSecond/2)})
+	<-audioOut
+	rt.acknowledgePlayback("item-old", 200)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-new", Audio: make([]byte, realtimePCMBytesPerSecond/4)})
+	<-audioOut
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventSpeechStarted})
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if len(session.truncations) != 1 || session.truncations[0].itemID != "item-new" || session.truncations[0].endMS != 250 {
+		t.Fatalf("truncations = %#v", session.truncations)
+	}
+}
+
+func TestRealtimeInterruptionDrainsQueueAndDropsCanceledAudioTail(t *testing.T) {
+	session := newFakeRealtimeSession()
+	audioOut := make(chan RealtimeAudioFrame, 4)
+	control := make(chan string, 1)
+	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, audioOut, control)
+	rt.replaceSession(session)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-canceled", Audio: make([]byte, 480)})
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventSpeechStarted})
+	if len(audioOut) != 0 {
+		t.Fatalf("queued output was not drained: %d frame(s)", len(audioOut))
+	}
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-canceled", Audio: make([]byte, 480)})
+	if len(audioOut) != 0 {
+		t.Fatal("late audio from the interrupted item was queued")
+	}
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseStarted, ResponseID: "response-new"})
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ResponseID: "response-new", ItemID: "item-new", Audio: make([]byte, 480)})
+	if len(audioOut) != 1 {
+		t.Fatal("new response audio remained suppressed")
+	}
+}
+
+func TestRealtimeOutputOverflowAbortsInsteadOfDroppingMiddleAudio(t *testing.T) {
+	session := newFakeRealtimeSession()
+	audioOut := make(chan RealtimeAudioFrame, 1)
+	control := make(chan string, 1)
+	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, audioOut, control)
+	rt.replaceSession(session)
+
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-overflow", Audio: make([]byte, realtimePCMBytesPerSecond)})
+	rt.acknowledgePlayback("item-overflow", 220)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-overflow", Audio: make([]byte, realtimePCMBytesPerSecond)})
+
+	if len(audioOut) != 0 {
+		t.Fatalf("overflow left %d stale frame(s) queued", len(audioOut))
+	}
+	if got := <-control; got != "interrupt" {
+		t.Fatalf("overflow control=%q", got)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.interrupts != 1 {
+		t.Fatalf("provider interrupts=%d, want 1", session.interrupts)
+	}
+	if len(session.truncations) != 1 || session.truncations[0].itemID != "item-overflow" || session.truncations[0].endMS != 220 {
+		t.Fatalf("overflow truncations=%#v", session.truncations)
+	}
+}
+
+func TestRealtimeRendererSpeechFallbackIsIdempotentWithProviderVAD(t *testing.T) {
+	session := newFakeRealtimeSession()
+	audioOut := make(chan RealtimeAudioFrame, 2)
+	control := make(chan string, 2)
+	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, audioOut, control)
+	rt.replaceSession(session)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-local-vad", Audio: make([]byte, realtimePCMBytesPerSecond)})
+	<-audioOut
+	rt.acknowledgePlayback("item-local-vad", 140)
+
+	rt.rendererSpeechStarted()
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventSpeechStarted})
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.interrupts != 1 {
+		t.Fatalf("provider interrupts=%d, want one local fallback cancellation", session.interrupts)
+	}
+	if len(session.truncations) != 1 || session.truncations[0].endMS != 140 {
+		t.Fatalf("fallback truncations=%#v", session.truncations)
+	}
+	if len(control) != 1 {
+		t.Fatalf("clear controls=%d, want one", len(control))
+	}
+}
+
+func TestRealtimeRendererOverflowIgnoresStaleItem(t *testing.T) {
+	session := newFakeRealtimeSession()
+	audioOut := make(chan RealtimeAudioFrame, 2)
+	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, audioOut, nil)
+	rt.replaceSession(session)
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-current", Audio: make([]byte, 480)})
+
+	rt.rendererPlaybackOverflow("item-stale")
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.interrupts != 0 || len(session.truncations) != 0 {
+		t.Fatalf("stale overflow changed provider state: interrupts=%d truncations=%#v", session.interrupts, session.truncations)
+	}
+	if len(audioOut) != 1 {
+		t.Fatal("stale overflow drained current audio")
+	}
+}
+
+func TestRealtimeResponseRequestsAreSerialized(t *testing.T) {
+	session := newFakeRealtimeSession()
+	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, nil, nil)
+	rt.replaceSession(session)
+	if err := rt.requestProviderResponse(session); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.requestProviderResponse(session); err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	if session.responses != 1 {
+		t.Fatalf("responses before completion = %d", session.responses)
+	}
+	session.mu.Unlock()
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: "one"})
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.responses != 2 {
+		t.Fatalf("responses after completion = %d", session.responses)
+	}
+}
+
+func TestRealtimeToolContinuationCoalescesWithPendingResponse(t *testing.T) {
+	session := newFakeRealtimeSession()
+	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, nil, nil)
+	rt.replaceSession(session)
+	if err := rt.requestProviderResponse(session); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.requestProviderResponse(session); err != nil {
+		t.Fatal(err)
+	}
+	rt.beginToolCall(RealtimeEvent{ResponseID: "response-tools", ToolCallID: "call-1"}, session)
+	rt.completeToolCall("call-1")
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: "response-tools"})
+	session.mu.Lock()
+	if session.responses != 2 {
+		t.Fatalf("responses after tool completion = %d, want one coalesced continuation", session.responses)
+	}
+	session.mu.Unlock()
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: "continuation"})
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.responses != 2 {
+		t.Fatalf("unexpected extra response after continuation: %d", session.responses)
+	}
+}
+
+func TestRealtimeSessionReplacementResetsResponseOwnership(t *testing.T) {
+	first := newFakeRealtimeSession()
+	second := newFakeRealtimeSession()
+	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, nil, nil)
+	rt.replaceSession(first)
+	if err := rt.requestProviderResponse(first); err != nil {
+		t.Fatal(err)
+	}
+	rt.replaceSession(second)
+	if err := rt.requestProviderResponse(second); err != nil {
+		t.Fatal(err)
+	}
+	second.mu.Lock()
+	defer second.mu.Unlock()
+	if second.responses != 1 {
+		t.Fatalf("replacement session responses = %d, want 1", second.responses)
 	}
 }
 

@@ -36,16 +36,24 @@ type RealtimeThinker struct {
 	rtSession RealtimeSession
 
 	audioIn      <-chan []byte
-	audioOut     chan<- []byte
+	audioOut     chan RealtimeAudioFrame
 	audioControl chan<- string
 
-	transcriptMu sync.Mutex
-	outputMu     sync.Mutex
-	outputItemID string
-	outputBytes  int
-	stateMu      sync.Mutex
-	state        string
-	statePhase   string
+	transcriptMu    sync.Mutex
+	outputMu        sync.Mutex
+	outputItemID    string
+	outputBytes     int
+	playedItemID    string
+	playedMS        int
+	playbackTracked bool
+	interruptedItem string
+	suppressOutput  bool
+	responseMu      sync.Mutex
+	responseActive  bool
+	responsePending bool
+	stateMu         sync.Mutex
+	state           string
+	statePhase      string
 
 	toolBatchMu     sync.Mutex
 	toolBatches     map[string]*realtimeToolBatch
@@ -83,7 +91,7 @@ func newRealtimeThinker(
 	provider RealtimeProvider,
 	voice string,
 	audioIn <-chan []byte,
-	audioOut chan<- []byte,
+	audioOut chan RealtimeAudioFrame,
 	audioControl chan<- string,
 ) *RealtimeThinker {
 	if voice == "" {
@@ -139,7 +147,7 @@ func startRealtimeThinker(
 	provider RealtimeProvider,
 	voice string,
 	audioIn <-chan []byte,
-	audioOut chan<- []byte,
+	audioOut chan RealtimeAudioFrame,
 	audioControl chan<- string,
 ) (*RealtimeThinker, error) {
 	rt := newRealtimeThinker(ctx, thinker, provider, voice, audioIn, audioOut, audioControl)
@@ -181,6 +189,10 @@ func (rt *RealtimeThinker) replaceSession(next RealtimeSession) {
 	rt.rtSession = next
 	rt.sessionMu.Unlock()
 	if previous != nil && previous != next {
+		rt.responseMu.Lock()
+		rt.responseActive = false
+		rt.responsePending = false
+		rt.responseMu.Unlock()
 		rt.toolBatchMu.Lock()
 		rt.toolBatches = map[string]*realtimeToolBatch{}
 		rt.toolCallBatches = map[string]string{}
@@ -221,7 +233,7 @@ func (rt *RealtimeThinker) completeToolCall(callID string) {
 	rt.toolBatchMu.Unlock()
 	if continueSession != nil {
 		rt.setConversationState("thinking", RealtimeEvent{})
-		_ = continueSession.RequestResponse()
+		_ = rt.requestProviderResponse(continueSession)
 	}
 }
 
@@ -247,7 +259,7 @@ func (rt *RealtimeThinker) completeToolResponse(responseID string) bool {
 	rt.toolBatchMu.Unlock()
 	if continueSession != nil {
 		rt.setConversationState("thinking", RealtimeEvent{ResponseID: responseID})
-		_ = continueSession.RequestResponse()
+		_ = rt.requestProviderResponse(continueSession)
 	}
 	return hadToolBatch
 }
@@ -351,6 +363,143 @@ func (rt *RealtimeThinker) setConversationState(state string, event RealtimeEven
 	rt.emit("realtime.state", data)
 }
 
+func (rt *RealtimeThinker) requestProviderResponse(session RealtimeSession) error {
+	if session == nil {
+		return errors.New("realtime session unavailable")
+	}
+	rt.responseMu.Lock()
+	if rt.responseActive {
+		rt.responsePending = true
+		rt.responseMu.Unlock()
+		return nil
+	}
+	rt.responseActive = true
+	rt.responseMu.Unlock()
+	if err := session.RequestResponse(); err != nil {
+		rt.responseMu.Lock()
+		rt.responseActive = false
+		rt.responseMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (rt *RealtimeThinker) responseStarted() {
+	rt.responseMu.Lock()
+	rt.responseActive = true
+	rt.responseMu.Unlock()
+}
+
+func (rt *RealtimeThinker) responseFinished(session RealtimeSession) {
+	rt.responseMu.Lock()
+	pending := rt.responsePending
+	rt.responsePending = false
+	rt.responseActive = false
+	rt.responseMu.Unlock()
+	if pending {
+		_ = rt.requestProviderResponse(session)
+	}
+}
+
+func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int) {
+	if itemID == "" || audioEndMS < 0 {
+		return
+	}
+	rt.outputMu.Lock()
+	defer rt.outputMu.Unlock()
+	if itemID != rt.outputItemID {
+		return
+	}
+	generatedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
+	if audioEndMS > generatedMS {
+		audioEndMS = generatedMS
+	}
+	if itemID != rt.playedItemID {
+		rt.playedItemID, rt.playedMS = itemID, 0
+	}
+	if audioEndMS > rt.playedMS {
+		rt.playedMS = audioEndMS
+	}
+	rt.playbackTracked = true
+}
+
+func (rt *RealtimeThinker) discardQueuedOutput() (frames, bytes int) {
+	if rt.audioOut == nil {
+		return 0, 0
+	}
+	for {
+		select {
+		case frame, ok := <-rt.audioOut:
+			if !ok {
+				return frames, bytes
+			}
+			frames++
+			bytes += len(frame.Audio)
+		default:
+			return frames, bytes
+		}
+	}
+}
+
+func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, cancelProvider, requirePlaybackAck bool) bool {
+	rt.outputMu.Lock()
+	itemID := rt.outputItemID
+	if expectedItemID != "" && itemID != expectedItemID {
+		rt.outputMu.Unlock()
+		return false
+	}
+	generatedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
+	playedMS := generatedMS
+	if rt.playbackTracked && rt.playedItemID == itemID {
+		playedMS = rt.playedMS
+	} else if requirePlaybackAck {
+		playedMS = 0
+	}
+	rt.outputItemID, rt.outputBytes = "", 0
+	rt.playedItemID, rt.playedMS = "", 0
+	rt.playbackTracked = false
+	rt.interruptedItem = itemID
+	rt.suppressOutput = itemID != ""
+	rt.outputMu.Unlock()
+
+	drainedFrames, drainedBytes := rt.discardQueuedOutput()
+	session := rt.currentSession()
+	if cancelProvider && session != nil {
+		if err := session.Interrupt(); err != nil {
+			rt.emit("realtime.interrupt_error", map[string]any{"reason": reason, "error": err.Error()})
+		}
+	}
+	if session != nil && itemID != "" {
+		if err := session.Truncate(itemID, playedMS); err != nil {
+			rt.emit("realtime.truncate_error", map[string]any{"reason": reason, "item_id": itemID, "error": err.Error()})
+		}
+	}
+	if itemID != "" && rt.audioControl != nil {
+		select {
+		case rt.audioControl <- "interrupt":
+		case <-rt.ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+			rt.emit("realtime.control_overflow", map[string]any{"control": "interrupt", "reason": reason})
+		}
+	}
+	rt.emit("realtime.playback_interrupted", map[string]any{
+		"reason": reason, "item_id": itemID, "generated_ms": generatedMS, "played_ms": playedMS,
+		"drained_frames": drainedFrames, "drained_bytes": drainedBytes, "provider_cancelled": cancelProvider,
+	})
+	return itemID != "" || drainedFrames > 0
+}
+
+func (rt *RealtimeThinker) rendererSpeechStarted() {
+	rt.setConversationState("listening", RealtimeEvent{})
+	rt.interruptPlayback("renderer_speech_started", "", true, true)
+}
+
+func (rt *RealtimeThinker) rendererPlaybackOverflow(itemID string) {
+	if rt.interruptPlayback("renderer_overflow", itemID, true, true) {
+		rt.setConversationState("listening", RealtimeEvent{})
+	}
+}
+
 // Run survives normal provider-enforced session endings. Only explicit thread
 // stop/cancellation ends the worker and invokes the normal cleanup path.
 func (rt *RealtimeThinker) Run() {
@@ -445,38 +594,39 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		if rt.paused {
 			return
 		}
-		rt.setConversationState("speaking", event)
 		if rt.audioOut != nil {
-			select {
-			case rt.audioOut <- event.Audio:
-				rt.outputMu.Lock()
-				if event.ItemID != "" && event.ItemID != rt.outputItemID {
-					rt.outputItemID, rt.outputBytes = event.ItemID, 0
-				}
-				rt.outputBytes += len(event.Audio)
+			rt.outputMu.Lock()
+			if rt.suppressOutput && (event.ItemID == "" || event.ItemID == rt.interruptedItem) {
 				rt.outputMu.Unlock()
+				rt.emit("realtime.audio_drop", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "interrupted_item"})
+				return
+			}
+			if rt.suppressOutput && event.ItemID != "" && event.ItemID != rt.interruptedItem {
+				rt.suppressOutput = false
+				rt.interruptedItem = ""
+			}
+			if event.ItemID != "" && event.ItemID != rt.outputItemID {
+				rt.outputItemID, rt.outputBytes = event.ItemID, 0
+				rt.playedItemID, rt.playedMS = event.ItemID, 0
+				rt.playbackTracked = false
+			}
+			endMS := (rt.outputBytes + len(event.Audio)) * 1000 / realtimePCMBytesPerSecond
+			frame := RealtimeAudioFrame{Audio: event.Audio, ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS}
+			rt.outputBytes += len(event.Audio)
+			rt.outputMu.Unlock()
+			select {
+			case rt.audioOut <- frame:
 			default:
-				rt.emit("realtime.audio_drop", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "consumer_backpressure"})
+				rt.emit("realtime.audio_overflow", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "consumer_backpressure"})
+				rt.interruptPlayback("core_output_overflow", event.ItemID, true, true)
+				return
 			}
 		}
+		rt.setConversationState("speaking", event)
 
 	case RealtimeEventSpeechStarted:
 		rt.setConversationState("listening", event)
-		rt.outputMu.Lock()
-		itemID := rt.outputItemID
-		playedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
-		rt.outputItemID, rt.outputBytes = "", 0
-		rt.outputMu.Unlock()
-		if session := rt.currentSession(); session != nil && itemID != "" {
-			_ = session.Truncate(itemID, playedMS)
-		}
-		if rt.audioControl != nil {
-			select {
-			case rt.audioControl <- "interrupt":
-			default:
-				rt.emit("realtime.control_drop", map[string]any{"control": "interrupt"})
-			}
-		}
+		rt.interruptPlayback("provider_speech_started", "", false, false)
 
 	case RealtimeEventTranscriptOutput:
 		if event.Final && strings.TrimSpace(event.Transcript) != "" {
@@ -490,6 +640,11 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 
 	case RealtimeEventResponseStarted:
+		rt.outputMu.Lock()
+		rt.suppressOutput = false
+		rt.interruptedItem = ""
+		rt.outputMu.Unlock()
+		rt.responseStarted()
 		rt.setConversationState("thinking", event)
 
 	case RealtimeEventToolCall:
@@ -504,7 +659,9 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.dispatchToolCall(event)
 
 	case RealtimeEventResponseDone:
-		if !rt.completeToolResponse(event.ResponseID) {
+		hadToolBatch := rt.completeToolResponse(event.ResponseID)
+		rt.responseFinished(rt.currentSession())
+		if !hadToolBatch {
 			rt.setConversationState("listening", event)
 		}
 		cost := calculateCostForRealtimeProvider(rt.provider, rt.opts.Model, event.Usage)
@@ -672,5 +829,5 @@ func (rt *RealtimeThinker) requestTextResponse(message string) error {
 	if err := session.SendText("user", message); err != nil {
 		return err
 	}
-	return session.RequestResponse()
+	return rt.requestProviderResponse(session)
 }

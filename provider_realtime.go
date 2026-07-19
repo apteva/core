@@ -139,6 +139,17 @@ type RealtimeUsage struct {
 	TextInputMessages  int
 }
 
+// RealtimeAudioFrame is the provider-neutral unit sent to an external audio
+// renderer. Audio is always encoded in the canonical bridge format (PCM16,
+// 24 kHz, mono). ItemID and AudioEndMS let the renderer report how much of an
+// assistant item was actually played without knowing the provider protocol.
+type RealtimeAudioFrame struct {
+	Audio      []byte
+	ResponseID string
+	ItemID     string
+	AudioEndMS int
+}
+
 // RealtimeSession is the live, bidirectional handle to a single
 // model session. All methods are safe to call concurrently with each
 // other and with Events() consumption.

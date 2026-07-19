@@ -82,7 +82,7 @@ func TestAudioInput(t *testing.T) {
 
 func TestRealtimeAudioFailedUpgradeDoesNotConsumeToken(t *testing.T) {
 	audioIn := make(chan []byte, 1)
-	audioOut := make(chan []byte, 1)
+	audioOut := make(chan RealtimeAudioFrame, 1)
 	token := registerAudioBridge("voice-test", audioIn, audioOut, make(chan string, 1))
 	defer unregisterAudioBridge("voice-test")
 
@@ -96,7 +96,7 @@ func TestRealtimeAudioFailedUpgradeDoesNotConsumeToken(t *testing.T) {
 
 func TestRealtimeAudioTokenRenewalInvalidatesPreviousCapability(t *testing.T) {
 	audioIn := make(chan []byte, 1)
-	audioOut := make(chan []byte, 1)
+	audioOut := make(chan RealtimeAudioFrame, 1)
 	control := make(chan string, 1)
 	first := registerAudioBridge("voice-renew", audioIn, audioOut, control)
 	defer unregisterAudioBridge("voice-renew")

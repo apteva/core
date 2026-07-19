@@ -158,6 +158,22 @@ func TestOpenAIRealtimeCloseAndEnqueueDoNotRaceOnClosedChannel(t *testing.T) {
 	}
 }
 
+func TestOpenAIRealtimeSendTextDoesNotCreateResponse(t *testing.T) {
+	session := newTranslationSession()
+	if err := session.SendText("user", "context only"); err != nil {
+		t.Fatal(err)
+	}
+	frame := <-session.outbox
+	if strings.Contains(string(frame.data), "response.create") || !strings.Contains(string(frame.data), "conversation.item.create") {
+		t.Fatalf("unexpected SendText frame: %s", frame.data)
+	}
+	select {
+	case extra := <-session.outbox:
+		t.Fatalf("SendText emitted an extra frame: %s", extra.data)
+	default:
+	}
+}
+
 func TestRealtimeCostSeparatesCachedTextAndAudio(t *testing.T) {
 	provider := NewOpenAIRealtimeProvider("test")
 	cost := calculateCostForRealtimeProvider(provider, "gpt-realtime-2.1", RealtimeUsage{

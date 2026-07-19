@@ -210,12 +210,14 @@ type ServerToolResult struct {
 
 // ChatResponse is the structured return from Chat().
 type ChatResponse struct {
-	Text          string                 // streamed text content
-	Reasoning     string                 // accumulated chain-of-thought (Fireworks reasoning_content / OpenRouter reasoning); empty when the provider didn't emit any
-	ToolCalls     []NativeToolCall       // structured tool calls WE need to execute
-	ServerResults []ServerToolResult     // tools the PROVIDER already executed
-	ProviderState *ProviderResponseState // opaque provider output items needed for stateless continuation
-	Usage         TokenUsage
+	Text                     string                 // streamed text content
+	Reasoning                string                 // accumulated chain-of-thought (Fireworks reasoning_content / OpenRouter reasoning); empty when the provider didn't emit any
+	RequestedReasoningEffort string                 // agent-level effort requested for this call (auto when no explicit choice was made)
+	EffectiveReasoningEffort string                 // effort sent/accepted by the provider, or provider-default when an optional control was rejected
+	ToolCalls                []NativeToolCall       // structured tool calls WE need to execute
+	ServerResults            []ServerToolResult     // tools the PROVIDER already executed
+	ProviderState            *ProviderResponseState // opaque provider output items needed for stateless continuation
+	Usage                    TokenUsage
 }
 
 // LLMProvider abstracts the LLM API call.
@@ -392,6 +394,16 @@ func applyModelOverrides(provider LLMProvider, models map[string]string) {
 		}
 		if small != "" {
 			p.models[ModelSmall] = small
+		}
+	case *OpenCodeGoProvider:
+		if large != "" {
+			p.compat.models[ModelLarge] = large
+		}
+		if medium != "" {
+			p.compat.models[ModelMedium] = medium
+		}
+		if small != "" {
+			p.compat.models[ModelSmall] = small
 		}
 	case *XAIProvider:
 		if large != "" {

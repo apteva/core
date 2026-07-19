@@ -434,6 +434,7 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		Directive       string   `json:"directive"`
 		DirectiveSuffix string   `json:"directive_suffix"`
 		Tools           []string `json:"tools,omitempty"`
+		Conversation    *bool    `json:"conversation,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -448,6 +449,12 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 			directive = directive + body.DirectiveSuffix
 		}
 	}
+	if body.Conversation != nil {
+		if err := a.thinker.threads.SetConversation(id, *body.Conversation); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+	}
 	if err := a.thinker.threads.Update(id, "", directive, body.Tools); err != nil {
 		// Update returns "thread not found" for unknown ids.
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -460,9 +467,77 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 	writeJSON(w, map[string]string{"status": "updated", "id": id})
 }
 
+// persistAPIThread reconciles an idempotent API spawn request with the live
+// thread's durable state. Existing non-ephemeral threads are always backfilled,
+// which repairs threads created by older cores that returned "created" without
+// saving Config.Threads. A request may upgrade an existing thread to
+// conversation mode, but never demotes one.
+func (a *APIServer) persistAPIThread(id string, conversationRequested, ephemeralRequested bool) error {
+	before, err := a.thinker.threads.PersistentState(id)
+	if err != nil {
+		return err
+	}
+	wasEphemeral, err := a.thinker.threads.EphemeralState(id)
+	if err != nil {
+		return err
+	}
+
+	conversationChanged := conversationRequested && !before.Conversation
+	if conversationChanged {
+		if err := a.thinker.threads.SetConversation(id, true); err != nil {
+			return err
+		}
+	}
+	rollbackConversation := func() {
+		if conversationChanged {
+			_ = a.thinker.threads.SetConversation(id, before.Conversation)
+		}
+	}
+
+	// Existing durable threads remain durable even if an idempotent repost
+	// happens to include ephemeral=true. A genuinely ephemeral live thread is
+	// only promoted when the request asks for normal persistence.
+	shouldPersist := !wasEphemeral || !ephemeralRequested
+	if !shouldPersist {
+		return nil
+	}
+	state, err := a.thinker.threads.PersistentState(id)
+	if err != nil {
+		rollbackConversation()
+		return err
+	}
+	if err := a.thinker.config.SaveThread(state); err != nil {
+		rollbackConversation()
+		return fmt.Errorf("persist thread: %w", err)
+	}
+	if wasEphemeral && !ephemeralRequested {
+		if err := a.thinker.threads.SetEphemeral(id, false); err != nil {
+			removeErr := a.thinker.config.RemoveThread(id)
+			rollbackConversation()
+			if removeErr != nil {
+				return fmt.Errorf("promote live thread: %v (rollback persistence: %w)", err, removeErr)
+			}
+			return fmt.Errorf("promote live thread: %w", err)
+		}
+	}
+	return nil
+}
+
+// rollbackAPICreatedThread removes every live artifact of a spawn that could
+// not cross the persistence boundary. Marking it ephemeral first also removes
+// any session entries it managed to create before the configuration write
+// failed. Kill performs audio-bridge cleanup; the explicit unregister is an
+// idempotent final guard for partially-started realtime threads.
+func (a *APIServer) rollbackAPICreatedThread(id string) {
+	_ = a.thinker.threads.SetEphemeral(id, true)
+	a.thinker.threads.Kill(id)
+	unregisterAudioBridge(id)
+}
+
 // spawnThread handles POST /threads/{id}. Idempotent: if the thread
-// already exists, returns its current state with status="exists"
-// without mutating it; if not, spawns a new one with the given
+// already exists, returns its current state with status="exists". A
+// conversation request still upgrades an existing thread's reporting mode;
+// if not, spawns a new one with the given
 // directive + tools + mcp and returns status="created". Missing
 // fields fall back to inherit-from-main: directive=main's directive,
 // tools=[] (spawnInternal supplies the safe baseline: send, done,
@@ -482,6 +557,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		Tools                      []string `json:"tools"`
 		MCP                        []string `json:"mcp"`
 		Realtime                   bool     `json:"realtime,omitempty"`
+		Conversation               bool     `json:"conversation,omitempty"`
 		Ephemeral                  bool     `json:"ephemeral,omitempty"`
 		Voice                      string   `json:"voice,omitempty"`
 		ProviderName               string   `json:"provider,omitempty"`
@@ -498,10 +574,17 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	}
 
 	if t := findThinkerByID(a.thinker, id); t != nil {
+		// The server may lose its in-memory spawn cache while core keeps the
+		// thread alive. Preserve POST idempotency, restore the conversation
+		// reporting contract, and backfill a missing durable record.
+		if err := a.persistAPIThread(id, body.Conversation, body.Ephemeral); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		writeJSON(w, map[string]any{
 			"status":    "exists",
 			"id":        id,
-			"iteration": t.iteration,
+			"iteration": t.status().Iteration,
 		})
 		return
 	}
@@ -530,6 +613,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		MCPNames:      body.MCP,
 		BypassNoSpawn: true,
 		Realtime:      body.Realtime,
+		Conversation:  body.Conversation,
 		Ephemeral:     body.Ephemeral,
 		Voice:         body.Voice,
 		ProviderName:  body.ProviderName,
@@ -571,12 +655,11 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 			return
 		}
 		audioIn := make(chan []byte, 64)
-		audioOut := make(chan []byte, 64)
+		audioOut := make(chan RealtimeAudioFrame, 64)
 		audioControl := make(chan string, 8)
 		opts.AudioIn = audioIn
 		opts.AudioOut = audioOut
 		opts.AudioControl = audioControl
-		audioToken = registerAudioBridge(id, audioIn, audioOut, audioControl)
 	}
 
 	if err := a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts); err != nil {
@@ -585,17 +668,27 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		// success — the caller's intent (a live thread by this name)
 		// is satisfied.
 		if strings.Contains(err.Error(), "already exists") {
-			if body.Realtime {
-				unregisterAudioBridge(id)
+			if err := a.persistAPIThread(id, body.Conversation, body.Ephemeral); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
 			writeJSON(w, map[string]any{"status": "exists", "id": id})
 			return
 		}
-		if body.Realtime {
-			unregisterAudioBridge(id)
-		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if err := a.persistAPIThread(id, body.Conversation, body.Ephemeral); err != nil {
+		a.rollbackAPICreatedThread(id)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Publish a bridge token only after a persistent thread has crossed its
+	// durability boundary (or immediately for an explicitly ephemeral one).
+	// This avoids leaking a token — or unregistering an existing thread's live
+	// bridge — when a concurrent duplicate or persistence failure occurs.
+	if body.Realtime {
+		audioToken = registerAudioBridge(id, opts.AudioIn, opts.AudioOut, opts.AudioControl)
 	}
 	resp := map[string]any{"status": "created", "id": id}
 	if body.Realtime {
@@ -806,6 +899,7 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	// spawnThread — treat as success.
 	if threadID != "main" && findThinkerByID(a.thinker, threadID) == nil && !a.thinker.bus.HasSubscriber(threadID) {
 		directive := a.thinker.config.GetDirective()
+		created := false
 		if err := a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}); err != nil {
 			if !strings.Contains(err.Error(), "already exists") {
 				logMsg("API", fmt.Sprintf("lazy spawn %q failed: %v", threadID, err))
@@ -813,7 +907,15 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
+			created = true
 			logMsg("API", fmt.Sprintf("lazy-spawned thread %q for inbound event", threadID))
+		}
+		if err := a.persistAPIThread(threadID, false, false); err != nil {
+			if created {
+				a.rollbackAPICreatedThread(threadID)
+			}
+			http.Error(w, "persist lazy-spawned thread: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
 	}
 

@@ -473,13 +473,15 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 // --- Convenience emitters with typed data ---
 
 type LLMDoneData struct {
-	Model            string `json:"model"`
-	Reasoning        string `json:"reasoning,omitempty"`
-	TokensIn         int    `json:"tokens_in"`
-	TokensCached     int    `json:"tokens_cached"`
-	CacheWriteTokens int    `json:"cache_write_tokens,omitempty"`
-	TokensOut        int    `json:"tokens_out"`
-	DurationMs       int64  `json:"duration_ms"`
+	Model              string `json:"model"`
+	Reasoning          string `json:"reasoning,omitempty"` // legacy alias for requested effort
+	ReasoningRequested string `json:"reasoning_requested,omitempty"`
+	ReasoningEffective string `json:"reasoning_effective,omitempty"`
+	TokensIn           int    `json:"tokens_in"`
+	TokensCached       int    `json:"tokens_cached"`
+	CacheWriteTokens   int    `json:"cache_write_tokens,omitempty"`
+	TokensOut          int    `json:"tokens_out"`
+	DurationMs         int64  `json:"duration_ms"`
 	// cost_usd is no longer populated by core — pricing lives in the
 	// server, which enriches llm.done events with a canonical
 	// cost_usd on ingest. Removing the field from the Go type keeps

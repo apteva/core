@@ -109,7 +109,8 @@ func executeTool(t *Thinker, call toolCall) {
 		}
 		var resp ToolResponse
 		if t.registry != nil {
-			if res, ok := t.registry.Dispatch(call.Name, call.Args); ok {
+			dispatchArgs := toolDispatchArgs(t, call)
+			if res, ok := t.registry.Dispatch(call.Name, dispatchArgs); ok {
 				resp = res
 			} else {
 				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
@@ -117,7 +118,6 @@ func executeTool(t *Thinker, call toolCall) {
 		} else {
 			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
 		}
-
 		resultPreview := resp.Text
 		if len(resultPreview) > 200 {
 			resultPreview = resultPreview[:200] + "..."
@@ -192,6 +192,25 @@ func executeTool(t *Thinker, call toolCall) {
 			ToolResult: &toolResult,
 		})
 	}()
+}
+
+func toolDispatchArgs(t *Thinker, call toolCall) map[string]string {
+	if t == nil || t.registry == nil {
+		return call.Args
+	}
+	def := t.registry.Get(call.Name)
+	if def == nil || !def.MCP || def.MCPServer != "channels" {
+		return call.Args
+	}
+	// The Channels MCP uses this opaque runtime value to route an answer back
+	// to the durable Apteva conversation that triggered this thinker. It is
+	// injected after telemetry and absent from the model-visible schema.
+	out := make(map[string]string, len(call.Args)+1)
+	for key, value := range call.Args {
+		out[key] = value
+	}
+	out["_apteva_caller_context"] = t.threadID
+	return out
 }
 
 func collapseWhitespace(s string) string {

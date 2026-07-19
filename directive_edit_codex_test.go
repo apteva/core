@@ -7,9 +7,30 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// forcedFirstResponseProvider makes the first half of recovery/continuation
+// smokes deterministic, then delegates every subsequent turn to real Codex.
+type forcedFirstResponseProvider struct {
+	LLMProvider
+	mu       sync.Mutex
+	forced   bool
+	response ChatResponse
+}
+
+func (p *forcedFirstResponseProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+	p.mu.Lock()
+	if !p.forced {
+		p.forced = true
+		p.mu.Unlock()
+		return p.response, nil
+	}
+	p.mu.Unlock()
+	return p.LLMProvider.Chat(ctx, messages, model, tools, onChunk, onThinking, onToolChunk)
+}
 
 // TestCodexRecurringInstructionUsesMainWakeLoop is an opt-in behavioral smoke
 // against the real Codex provider. It sends the same kind of durable owner
@@ -28,6 +49,232 @@ func TestCodexRecurringInstructionUsesMainWakeLoop(t *testing.T) {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
 	runRecurringInstructionUsesMainWakeLoop(t, NewOpenAICodexProvider(token))
+}
+
+// TestCodexRecurringNotificationUsesSectionEditSmoke reproduces the structured
+// directive shape from the live regression: durable recurring work must patch
+// one section without attempting to replace Role/Rules.
+func TestCodexRecurringNotificationUsesSectionEditSmoke(t *testing.T) {
+	if os.Getenv("RUN_CODEX_RECURRING_EVOLVE_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_RECURRING_EVOLVE_SMOKE=1 to run the recurring evolve smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex recurring evolve smoke in short mode")
+	}
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+	}
+	runRecurringNotificationUsesSectionEditSmoke(t, NewOpenAICodexProvider(token))
+}
+
+func runRecurringNotificationUsesSectionEditSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+	original := strings.Join([]string{
+		"# Role",
+		"You help the operator manage reminders and notifications.",
+		"",
+		"# Operating Rules",
+		"Send notifications only when they are currently due; never send a future notification early.",
+	}, "\n")
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: original,
+		Mode:      ModeAutonomous,
+	}
+	thinker := NewThinker("", provider, cfg)
+	defer thinker.Stop()
+	thinker.InjectConsole(`From now on, every day at 09:00 UTC, send the operator exactly "Daily check-in." Persist this as durable recurring policy, but do not send it before it is due.`)
+	started := time.Now()
+	go thinker.Run()
+
+	deadline := time.Now().Add(4 * time.Minute)
+	seenEventIDs := map[string]bool{}
+	evolveAttempts := 0
+	evolveFailures := 0
+	evolveSucceeded := false
+	var latestEvolveArgs map[string]string
+	for time.Now().Before(deadline) {
+		events, _ := thinker.telemetry.StoredEvents(0)
+		for _, event := range events {
+			if event.ThreadID != "main" || event.Time.Before(started) || seenEventIDs[event.ID] {
+				continue
+			}
+			seenEventIDs[event.ID] = true
+			switch event.Type {
+			case "tool.call":
+				var data ToolCallData
+				if json.Unmarshal(event.Data, &data) != nil {
+					continue
+				}
+				switch data.Name {
+				case "spawn":
+					t.Fatalf("recurring notification spawned a waiting worker: args=%v", data.Args)
+				case "evolve":
+					evolveAttempts++
+					latestEvolveArgs = data.Args
+					if evolveAttempts > 2 {
+						t.Fatalf("recurring notification entered an evolve loop: attempts=%d args=%v", evolveAttempts, data.Args)
+					}
+				}
+			case "tool.result":
+				var data ToolResultData
+				if json.Unmarshal(event.Data, &data) == nil && data.Name == "evolve" && !data.Success {
+					evolveFailures++
+					if evolveFailures > 1 {
+						t.Fatalf("recurring notification evolve failed repeatedly: %+v", data)
+					}
+				}
+			case "directive.evolved":
+				evolveSucceeded = true
+			}
+		}
+
+		if evolveSucceeded {
+			directive := cfg.GetDirective()
+			lower := strings.ToLower(directive)
+			if !strings.Contains(lower, "daily check-in") || !strings.Contains(directive, "09:00 UTC") {
+				t.Fatalf("evolved directive missing daily notification policy:\n%s", directive)
+			}
+			if !strings.Contains(directive, "# Role\nYou help the operator manage reminders and notifications.") ||
+				!strings.Contains(directive, "# Operating Rules") ||
+				!strings.Contains(directive, "Send notifications only when they are currently due; never send a future notification early.") {
+				t.Fatalf("section edit did not preserve existing directive sections:\n%s", directive)
+			}
+			if strings.TrimSpace(latestEvolveArgs["directive"]) != "" || latestEvolveArgs["edit_mode"] == "replace" || strings.TrimSpace(latestEvolveArgs["section"]) == "" {
+				t.Fatalf("successful evolve did not use a section edit: attempts=%d args=%v directive=\n%s", evolveAttempts, latestEvolveArgs, directive)
+			}
+			for _, forbidden := range []string{"next due", "last completed", "next-due", "last-completed"} {
+				if strings.Contains(lower, forbidden) {
+					t.Fatalf("directive stored execution state %q:\n%s", forbidden, directive)
+				}
+			}
+			t.Logf("daily notification evolved with attempts=%d recoverable_failures=%d:\n%s", evolveAttempts, evolveFailures, directive)
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("timed out: evolve_attempts=%d evolve_failures=%d evolved=%v directive=\n%s", evolveAttempts, evolveFailures, evolveSucceeded, cfg.GetDirective())
+}
+
+// TestCodexAlreadyCurrentEvolveStillRepliesSmoke proves that a no-op evolve
+// result receives one immediate completion turn, allowing main to answer the
+// thread that is waiting for confirmation.
+func TestCodexAlreadyCurrentEvolveStillRepliesSmoke(t *testing.T) {
+	if os.Getenv("RUN_CODEX_RECURRING_EVOLVE_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_RECURRING_EVOLVE_SMOKE=1 to run the recurring evolve smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex recurring evolve smoke in short mode")
+	}
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+	}
+	runAlreadyCurrentEvolveStillRepliesSmoke(t, NewOpenAICodexProvider(token))
+}
+
+func runAlreadyCurrentEvolveStillRepliesSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+	directive := strings.Join([]string{
+		"# Role",
+		"You help the operator manage reminders and notifications.",
+		"",
+		"# Schedule",
+		`- Every day at 09:00 UTC, send the operator exactly "Daily check-in."`,
+	}, "\n")
+	provider = &forcedFirstResponseProvider{
+		LLMProvider: provider,
+		response: ChatResponse{ToolCalls: []NativeToolCall{{
+			ID:   "forced-noop-evolve",
+			Name: "evolve",
+			Args: map[string]string{
+				"edit_mode": "section_replace",
+				"section":   "Schedule",
+				"content":   `- Every day at 09:00 UTC, send the operator exactly "Daily check-in."`,
+				"_reason":   "Confirming durable schedule",
+			},
+		}}},
+	}
+	cfg := &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive, Mode: ModeAutonomous}
+	thinker := NewThinker("", provider, cfg)
+	defer thinker.Stop()
+	if err := thinker.threads.SpawnWithOpts("chat-test", "# Role\nRelay confirmations to the operator.", []string{"send", "pace"}, SpawnOpts{DeferRun: true, Conversation: true}); err != nil {
+		t.Fatalf("spawn waiting conversation thread: %v", err)
+	}
+	thinker.bus.Publish(Event{
+		Type: EventInbox,
+		From: "chat-test",
+		To:   "main",
+		Text: `[from-conversation:chat-test] The operator asked for the existing daily 09:00 UTC notification policy. Confirm the durable configuration back to me with send(id="chat-test", message="...") before going idle; the user is waiting.`,
+	})
+	started := time.Now()
+	go thinker.Run()
+
+	deadline := time.Now().Add(3 * time.Minute)
+	seenEventIDs := map[string]bool{}
+	seenNoOp := false
+	seenReply := false
+	evolveCalls := 0
+	sendCalls := 0
+	for time.Now().Before(deadline) {
+		events, _ := thinker.telemetry.StoredEvents(0)
+		for _, event := range events {
+			if event.ThreadID != "main" || event.Time.Before(started) || seenEventIDs[event.ID] {
+				continue
+			}
+			seenEventIDs[event.ID] = true
+			switch event.Type {
+			case "tool.call":
+				var data ToolCallData
+				if json.Unmarshal(event.Data, &data) != nil {
+					continue
+				}
+				if data.Name == "evolve" {
+					evolveCalls++
+					if evolveCalls > 2 {
+						t.Fatalf("already-current evolve entered a loop: calls=%d args=%v", evolveCalls, data.Args)
+					}
+				}
+				if data.Name == "send" && data.Args["id"] == "chat-test" {
+					sendCalls++
+					if sendCalls > 1 {
+						t.Fatalf("main duplicated its confirmation after the send receipt: calls=%d args=%v", sendCalls, data.Args)
+					}
+					seenReply = true
+				}
+			case "tool.result":
+				var data ToolResultData
+				if json.Unmarshal(event.Data, &data) == nil && data.Name == "evolve" && strings.Contains(data.Result, "directive already current") {
+					seenNoOp = true
+				}
+			case "directive.evolved":
+				t.Fatal("already-current evolve emitted directive.evolved")
+			}
+		}
+		if seenNoOp && seenReply {
+			time.Sleep(1500 * time.Millisecond)
+			events, _ = thinker.telemetry.StoredEvents(0)
+			for _, event := range events {
+				if event.ThreadID != "main" || event.Type != "tool.call" || seenEventIDs[event.ID] {
+					continue
+				}
+				var data ToolCallData
+				if json.Unmarshal(event.Data, &data) == nil && data.Name == "send" && data.Args["id"] == "chat-test" {
+					t.Fatalf("main duplicated its confirmation on the receipt-processing turn: args=%v", data.Args)
+				}
+			}
+			if cfg.GetDirective() != directive {
+				t.Fatalf("already-current evolve changed the directive:\n%s", cfg.GetDirective())
+			}
+			t.Logf("Codex replied after an already-current evolve result")
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for no-op completion: no_op=%v reply=%v evolve_calls=%d", seenNoOp, seenReply, evolveCalls)
 }
 
 // TestCodexBoundedOneOffStaysOnMainSmoke verifies that a bounded task is
@@ -127,7 +374,9 @@ func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider)
 	}, "\n"))
 
 	deadline := time.Now().Add(4 * time.Minute)
-	seenEvolve := false
+	evolveAttempts := 0
+	evolveFailures := 0
+	evolveSucceeded := false
 	seenPace := false
 	seenPaceResult := false
 	seenEventIDs := map[string]bool{}
@@ -157,26 +406,44 @@ func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider)
 						t.Fatalf("recurring instruction searched for a scheduler: args=%v", data.Args)
 					}
 				case "evolve":
-					if seenEvolve {
-						t.Fatalf("same recurring instruction called evolve more than once: args=%v", data.Args)
+					evolveAttempts++
+					if evolveAttempts > 2 {
+						t.Fatalf("recurring instruction entered an evolve retry loop: attempts=%d args=%v", evolveAttempts, data.Args)
 					}
-					seenEvolve = true
 				case "pace":
 					seenPace = true
 					paceArgs = data.Args
 				}
 			case "tool.result":
 				var data ToolResultData
-				if json.Unmarshal(event.Data, &data) == nil && data.Name == "pace" {
-					if !data.Success || strings.HasPrefix(data.Result, "error:") {
-						t.Fatalf("pace failed: %+v", data)
+				if json.Unmarshal(event.Data, &data) == nil {
+					switch data.Name {
+					case "evolve":
+						if !data.Success || strings.HasPrefix(data.Result, "error:") {
+							evolveFailures++
+							if evolveFailures > 1 {
+								t.Fatalf("evolve failed more than once instead of recovering: %+v", data)
+							}
+						}
+					case "pace":
+						if !data.Success || strings.HasPrefix(data.Result, "error:") {
+							t.Fatalf("pace failed: %+v", data)
+						}
+						seenPaceResult = true
 					}
-					seenPaceResult = true
 				}
+			case "directive.evolved":
+				evolveSucceeded = true
 			}
 		}
 
-		if seenEvolve && seenPace && seenPaceResult {
+		if evolveSucceeded && seenPace && seenPaceResult {
+			if evolveAttempts == 0 {
+				t.Fatal("directive.evolved emitted without an evolve attempt")
+			}
+			if evolveAttempts > 1 && evolveFailures != 1 {
+				t.Fatalf("multiple evolve attempts without exactly one recoverable rejection: attempts=%d failures=%d", evolveAttempts, evolveFailures)
+			}
 			sleep := paceArgs["sleep"]
 			duration, ok := parseSleepDuration(sleep)
 			if !ok || duration <= 0 || duration > maxSleep {
@@ -218,7 +485,7 @@ func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatalf("timed out: evolve=%v pace=%v pace_result=%v directive=\n%s", seenEvolve, seenPace, seenPaceResult, cfg.GetDirective())
+	t.Fatalf("timed out: evolve_attempts=%d evolve_failures=%d evolve_succeeded=%v pace=%v pace_result=%v directive=\n%s", evolveAttempts, evolveFailures, evolveSucceeded, seenPace, seenPaceResult, cfg.GetDirective())
 }
 
 func runRecurringCompletionDoesNotEvolveSmoke(t *testing.T, provider LLMProvider, directive string) {
@@ -622,6 +889,17 @@ func TestCodexMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T) {
 func runMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T, provider LLMProvider) {
 	t.Helper()
 	t.Chdir(t.TempDir())
+	provider = &forcedFirstResponseProvider{
+		LLMProvider: provider,
+		response: ChatResponse{ToolCalls: []NativeToolCall{{
+			ID:   "forced-invalid-evolve",
+			Name: "evolve",
+			Args: map[string]string{
+				"directive": "# Role\nReplacement should be rejected",
+				"_reason":   "Testing replacement guard",
+			},
+		}}},
+	}
 	original := strings.Join([]string{
 		"# Role",
 		"You maintain this directive when asked.",
@@ -637,17 +915,21 @@ func runMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T, provider LLMProvi
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 
-	go thinker.Run()
 	thinker.InjectConsole(strings.Join([]string{
-		"Test the directive replacement guard now.",
+		"Test the directive replacement guard now. This is a negative test, not a durable policy change.",
 		`Call evolve with directive="# Role\nReplacement should be rejected" and no section/edit mode.`,
 		"Do not use section edits. Do not spawn, update children, or change tools.",
 		"After the tool returns, reply exactly: RESULT: replacement rejected",
 	}, "\n"))
+	go thinker.Run()
 
 	deadline := time.After(4 * time.Minute)
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
+	seenRejectedResult := false
+	llmDoneAfterRejection := 0
+	seenRecoveryReply := false
+	seenEventIDs := map[string]bool{}
 	for {
 		select {
 		case <-deadline:
@@ -658,10 +940,27 @@ func runMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T, provider LLMProvi
 			}
 			events, _ := thinker.telemetry.StoredEvents(0)
 			for _, ev := range events {
-				if ev.Type == "tool.result" && strings.Contains(string(ev.Data), "full directive replacement is disabled") {
-					t.Logf("directive replacement rejected as expected")
-					return
+				if seenEventIDs[ev.ID] {
+					continue
 				}
+				seenEventIDs[ev.ID] = true
+				if !seenRejectedResult {
+					if ev.Type == "tool.result" && strings.Contains(string(ev.Data), "full directive replacement is disabled") {
+						seenRejectedResult = true
+					}
+					continue
+				}
+				if ev.Type == "llm.done" {
+					llmDoneAfterRejection++
+					var data LLMDoneData
+					if json.Unmarshal(ev.Data, &data) == nil && strings.Contains(data.Message, "RESULT: replacement rejected") {
+						seenRecoveryReply = true
+					}
+				}
+			}
+			if seenRejectedResult && llmDoneAfterRejection >= 2 && seenRecoveryReply {
+				t.Logf("directive replacement rejected and Codex received an immediate recovery turn")
+				return
 			}
 		}
 	}

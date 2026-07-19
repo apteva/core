@@ -12,19 +12,20 @@ import (
 const configFile = "config.json"
 
 type PersistentThread struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name,omitempty"`      // human-readable label; empty = display as ID
-	ParentID  string   `json:"parent_id,omitempty"` // empty = child of main
-	Depth     int      `json:"depth,omitempty"`     // 0 = main's direct child
-	System    bool     `json:"system,omitempty"`    // system thread (can't be killed by LLM)
-	Directive string   `json:"directive"`
-	Tools     []string `json:"tools"`
-	MCPNames  []string `json:"mcp_names,omitempty"` // MCP servers to connect on respawn
-	Model     string   `json:"model,omitempty"`     // starting model tier: large, medium, small
-	Reasoning string   `json:"reasoning,omitempty"` // starting reasoning effort: auto, low, medium, high, ...
-	Provider  string   `json:"provider,omitempty"`  // provider selected for this thread
-	Realtime  bool     `json:"realtime,omitempty"`  // spawn as a realtime (voice/audio) thread
-	Voice     string   `json:"voice,omitempty"`     // realtime voice id (e.g. "marin"); empty = provider default
+	ID           string   `json:"id"`
+	Name         string   `json:"name,omitempty"`      // human-readable label; empty = display as ID
+	ParentID     string   `json:"parent_id,omitempty"` // empty = child of main
+	Depth        int      `json:"depth,omitempty"`     // 0 = main's direct child
+	System       bool     `json:"system,omitempty"`    // system thread (can't be killed by LLM)
+	Directive    string   `json:"directive"`
+	Tools        []string `json:"tools"`
+	MCPNames     []string `json:"mcp_names,omitempty"`    // MCP servers to connect on respawn
+	Model        string   `json:"model,omitempty"`        // starting model tier: large, medium, small
+	Reasoning    string   `json:"reasoning,omitempty"`    // starting reasoning effort: auto, low, medium, high, ...
+	Provider     string   `json:"provider,omitempty"`     // provider selected for this thread
+	Realtime     bool     `json:"realtime,omitempty"`     // spawn as a realtime (voice/audio) thread
+	Conversation bool     `json:"conversation,omitempty"` // user-facing conversation; no mandatory completion report to parent
+	Voice        string   `json:"voice,omitempty"`        // realtime voice id (e.g. "marin"); empty = provider default
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
@@ -178,11 +179,26 @@ func (c *Config) update(fn func()) error {
 func (c *Config) restore(data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// The byte slice came from this exact type immediately before mutation.
-	// Preserve runtime-only fields, which are intentionally absent from JSON.
-	path, loadErr := c.path, c.loadErr
-	_ = json.Unmarshal(data, c)
-	c.path, c.loadErr = path, loadErr
+	// Decode into a fresh value before copying persisted fields back. Decoding
+	// directly into c does not clear fields omitted by `omitempty`; for example,
+	// rolling back the first SaveThread would leave the newly-added Threads
+	// entry in memory because the pre-mutation JSON contained no `threads` key.
+	// Runtime-only state and mutexes intentionally remain on c.
+	var restored Config
+	if err := json.Unmarshal(data, &restored); err != nil {
+		return
+	}
+	c.Directive = restored.Directive
+	c.Mode = restored.Mode
+	c.Unconscious = restored.Unconscious
+	c.RealtimeEnabled = restored.RealtimeEnabled
+	c.RealtimeVoice = restored.RealtimeVoice
+	c.RealtimeVoiceMCP = restored.RealtimeVoiceMCP
+	c.Providers = restored.Providers
+	c.Provider = restored.Provider
+	c.Threads = restored.Threads
+	c.MCPServers = restored.MCPServers
+	c.Execution = restored.Execution
 }
 
 func (c *Config) GetDirective() string {

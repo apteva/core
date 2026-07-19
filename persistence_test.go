@@ -60,6 +60,20 @@ func TestConfigMutationRollsBackWhenPersistenceFails(t *testing.T) {
 	}
 }
 
+func TestConfigFailedFirstThreadSaveRestoresOmittedEmptySlice(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{Directive: "test", path: filepath.Join(blocker, "config.json")}
+	if err := cfg.SaveThread(PersistentThread{ID: "must-rollback", Directive: "work"}); err == nil {
+		t.Fatal("SaveThread unexpectedly succeeded")
+	}
+	if threads := cfg.GetThreads(); len(threads) != 0 {
+		t.Fatalf("failed SaveThread left an in-memory record: %#v", threads)
+	}
+}
+
 func TestConfigConcurrentMutationsAlwaysPersistValidJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	cfg := &Config{path: path}

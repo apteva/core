@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,9 +36,9 @@ const maxRealtimeAudioFrameBytes = 1 << 20
 
 type audioBridgeRegistration struct {
 	threadID string
-	audioIn  chan []byte // bridge writes here (caller → model)
-	audioOut chan []byte // bridge reads here (model → caller)
-	control  chan string // low-volume JSON/text playback controls
+	audioIn  chan []byte             // bridge writes here (caller → model)
+	audioOut chan RealtimeAudioFrame // bridge reads here (model → caller)
+	control  chan string             // low-volume JSON/text playback controls
 	created  time.Time
 }
 
@@ -63,7 +64,7 @@ func generateAudioToken() string {
 // registerAudioBridge stashes the channels under a freshly-generated
 // token and returns the token. Sweeps any tokens older than TTL so
 // the map doesn't grow unbounded if callers never connect.
-func registerAudioBridge(threadID string, audioIn, audioOut chan []byte, control chan string) string {
+func registerAudioBridge(threadID string, audioIn chan []byte, audioOut chan RealtimeAudioFrame, control chan string) string {
 	audioBridgeMu.Lock()
 	defer audioBridgeMu.Unlock()
 	now := time.Now()
@@ -87,7 +88,7 @@ func registerAudioBridge(threadID string, audioIn, audioOut chan []byte, control
 // thread, then mints a fresh single-use token over the same long-lived audio
 // channels. The realtime provider session and transcript stay intact while a
 // browser changes network or wakes from sleep.
-func renewAudioBridge(threadID string, audioIn, audioOut chan []byte, control chan string) string {
+func renewAudioBridge(threadID string, audioIn chan []byte, audioOut chan RealtimeAudioFrame, control chan string) string {
 	unregisterAudioBridge(threadID)
 	return registerAudioBridge(threadID, audioIn, audioOut, control)
 }
@@ -259,22 +260,55 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("oversized/invalid frame for thread=%s: bytes=%d err=%v", thread, len(data), err))
 				return
 			}
+			if header.OpCode == ws.OpText {
+				var control struct {
+					Type       string `json:"type"`
+					ItemID     string `json:"item_id"`
+					AudioEndMS int    `json:"audio_end_ms"`
+				}
+				if json.Unmarshal(data, &control) == nil && a.thinker != nil && a.thinker.threads != nil {
+					switch control.Type {
+					case "playback.progress":
+						if control.ItemID != "" && control.AudioEndMS >= 0 {
+							a.thinker.threads.realtimePlaybackProgress(thread, control.ItemID, control.AudioEndMS)
+						}
+					case "playback.overflow":
+						if control.ItemID != "" {
+							a.thinker.threads.realtimePlaybackOverflow(thread, control.ItemID)
+						}
+					case "input.speech_started":
+						a.thinker.threads.realtimeInputSpeechStarted(thread)
+					}
+				}
+				continue
+			}
 			if header.OpCode != ws.OpBinary || len(data) == 0 {
 				continue
 			}
+			timer := time.NewTimer(100 * time.Millisecond)
 			select {
 			case reg.audioIn <- data:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				return
-			default:
-				// Thread's audio loop is slow — drop the frame
-				// rather than backpressure the network. Matches the
-				// realtime thread's own drop-on-saturation policy.
+			case <-timer.C:
 				if a.thinker != nil && a.thinker.telemetry != nil {
-					a.thinker.telemetry.Emit("realtime.audio_drop", thread, map[string]any{
+					a.thinker.telemetry.Emit("realtime.audio_overflow", thread, map[string]any{
 						"direction": "input", "bytes": len(data), "reason": "thread_backpressure",
 					})
 				}
+				return
 			}
 		}
 	}()
@@ -283,12 +317,20 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		select {
 		case <-ctx.Done():
 			return
-		case pcm, ok := <-reg.audioOut:
+		case frame, ok := <-reg.audioOut:
 			if !ok {
 				return
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
-			if err := wsutil.WriteServerBinary(conn, pcm); err != nil {
+			metadata, _ := json.Marshal(map[string]any{
+				"type": "audio.frame", "response_id": frame.ResponseID,
+				"item_id": frame.ItemID, "audio_end_ms": frame.AudioEndMS,
+			})
+			if err := wsutil.WriteServerMessage(conn, ws.OpText, metadata); err != nil {
+				logMsg("REALTIME-AUDIO", fmt.Sprintf("metadata write end for thread=%s: %v", thread, err))
+				return
+			}
+			if err := wsutil.WriteServerBinary(conn, frame.Audio); err != nil {
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
 				return
 			}

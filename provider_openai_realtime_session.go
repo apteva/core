@@ -522,7 +522,7 @@ func (s *openaiRealtimeSession) appendText(role, text string, respond bool) erro
 }
 
 func (s *openaiRealtimeSession) SendText(role, text string) error {
-	return s.appendText(role, text, true)
+	return s.appendText(role, text, false)
 }
 
 func (s *openaiRealtimeSession) SendToolResult(callID, result string, isError bool) error {

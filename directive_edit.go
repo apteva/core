@@ -82,18 +82,24 @@ func applySingleDirectiveEdit(current string, edit directiveEdit) (string, []str
 			return "", nil, fmt.Errorf("replace requires directive or content")
 		}
 		if directiveHasMarkdownSections(current) {
-			return "", nil, fmt.Errorf("full directive replacement is disabled for structured Markdown directives; use section edit modes")
+			return "", nil, fmt.Errorf("full directive replacement is disabled for structured Markdown directives; use section_append to add a rule or missing section, section_replace to rewrite one section, or edits for multiple sections; do not pass the complete directive")
 		}
 		return replacement, nil, nil
 	case "section_append":
 		if strings.TrimSpace(edit.Section) == "" || strings.TrimSpace(edit.Content) == "" {
 			return "", nil, fmt.Errorf("section_append requires section and content")
 		}
+		if err := validateMarkdownSectionContent(edit.Section, edit.Content); err != nil {
+			return "", nil, err
+		}
 		content, stripped := normalizeMarkdownSectionContent(edit.Section, edit.Content)
 		return markdownSectionAppend(current, edit.Section, content), redundantHeadingWarnings(edit.Section, stripped), nil
 	case "section_replace":
 		if strings.TrimSpace(edit.Section) == "" {
 			return "", nil, fmt.Errorf("section_replace requires section")
+		}
+		if err := validateMarkdownSectionContent(edit.Section, edit.Content); err != nil {
+			return "", nil, err
 		}
 		content, stripped := normalizeMarkdownSectionContent(edit.Section, edit.Content)
 		return markdownSectionReplace(current, edit.Section, content), redundantHeadingWarnings(edit.Section, stripped), nil
@@ -118,6 +124,14 @@ func applySingleDirectiveEdit(current string, edit directiveEdit) (string, []str
 	default:
 		return "", nil, fmt.Errorf("unknown edit_mode %q", firstNonEmptyDirectiveEdit(edit.EditMode, edit.Mode))
 	}
+}
+
+func directiveEditCorrectionResult(err error) string {
+	return fmt.Sprintf("error: %v. Correct the evolve arguments and retry once now with the smallest valid section edit; do not abandon the durable update or repeat the same invalid call", err)
+}
+
+func directiveEditFinalFailureResult(err error) string {
+	return fmt.Sprintf("error: %v. The correction was also rejected; do not call evolve again for this instruction. Report the failure to the requester before pacing", err)
 }
 
 func normalizeDirectiveEditMode(mode string) string {
@@ -354,6 +368,18 @@ func directiveHasMarkdownSections(s string) bool {
 
 func normalizeSectionName(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
+}
+
+func validateMarkdownSectionContent(section, content string) error {
+	want := normalizeSectionName(section)
+	for _, line := range directiveLines(content) {
+		name, isHeading := markdownHeadingName(line)
+		if !isHeading || normalizeSectionName(name) == want {
+			continue
+		}
+		return fmt.Errorf("section %q content must not contain the unrelated Markdown heading %q; pass only this section's body, or use edits for multiple sections", strings.TrimSpace(section), strings.TrimSpace(name))
+	}
+	return nil
 }
 
 func normalizeMarkdownSectionContent(section, content string) (string, int) {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -278,13 +279,14 @@ func TestMainEvolveIdenticalEditIsNoOp(t *testing.T) {
 		NativeID: "call-1",
 	}}, nil)
 
-	if thinker.kickNextTurn {
-		t.Fatal("identical evolve should not kick another turn")
+	if !thinker.kickNextTurn {
+		t.Fatal("identical evolve should kick one completion turn")
 	}
 	if thinker.messages[0].Content != "stable prompt" {
 		t.Fatal("identical evolve rebuilt the system prompt")
 	}
-	if len(results) != 1 || results[0].Content != "directive already current" {
+	if len(results) != 1 || !strings.Contains(results[0].Content, "directive already current") ||
+		!strings.Contains(results[0].Content, "reply to the requester before pacing") {
 		t.Fatalf("results = %+v", results)
 	}
 	telemetryEvents, _ := thinker.telemetry.StoredEvents(0)
@@ -292,6 +294,37 @@ func TestMainEvolveIdenticalEditIsNoOp(t *testing.T) {
 		if event.Type == "directive.evolved" {
 			t.Fatalf("identical evolve emitted directive.evolved: %+v", event)
 		}
+	}
+
+	thinker.kickNextTurn = false
+	mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace",
+			"section":   "Schedule",
+			"content":   "- cadence: weekly",
+		},
+		Raw:      "evolve",
+		NativeID: "call-2",
+	}}, nil)
+	if thinker.kickNextTurn {
+		t.Fatal("second consecutive identical evolve should not create a completion loop")
+	}
+
+	// Once the model moves on, a later task gets its own bounded completion.
+	mainToolHandler(thinker)(thinker, nil, nil)
+	mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace",
+			"section":   "Schedule",
+			"content":   "- cadence: weekly",
+		},
+		Raw:      "evolve",
+		NativeID: "call-3",
+	}}, nil)
+	if !thinker.kickNextTurn {
+		t.Fatal("completion guard did not reset after a non-evolve turn")
 	}
 }
 
@@ -316,20 +349,37 @@ func TestWorkerEvolveIdenticalEditIsNoOp(t *testing.T) {
 		NativeID: "call-1",
 	}}, nil)
 
-	if worker.Thinker.kickNextTurn {
-		t.Fatal("identical worker evolve should not kick another turn")
+	if !worker.Thinker.kickNextTurn {
+		t.Fatal("identical worker evolve should kick one completion turn")
 	}
 	if worker.Thinker.messages[0].Content != originalPrompt {
 		t.Fatal("identical worker evolve rebuilt the system prompt")
 	}
-	if len(results) != 1 || results[0].Content != "directive already current" {
+	if len(results) != 1 || !strings.Contains(results[0].Content, "directive already current") {
 		t.Fatalf("results = %+v", results)
+	}
+
+	worker.Thinker.kickNextTurn = false
+	threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace",
+			"section":   "Schedule",
+			"content":   "- cadence: weekly",
+		},
+		Raw:      "evolve",
+		NativeID: "call-2",
+	}}, nil)
+	if worker.Thinker.kickNextTurn {
+		t.Fatal("second consecutive worker no-op should not create a completion loop")
 	}
 }
 
 func TestMainEvolveRejectsFullReplaceForMarkdown(t *testing.T) {
 	events := []APIEvent{}
 	directive := "# Role\nOld role\n# Goals\n- Ship"
+	telemetry := NewTelemetry()
+	defer telemetry.Stop()
 	thinker := &Thinker{
 		config:    &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive},
 		messages:  []Message{{Role: "system", Content: "old prompt"}},
@@ -338,6 +388,7 @@ func TestMainEvolveRejectsFullReplaceForMarkdown(t *testing.T) {
 		apiLog:    &events,
 		apiMu:     &sync.RWMutex{},
 		apiNotify: make(chan struct{}, 1),
+		telemetry: telemetry,
 	}
 	thinker.directive = directive
 
@@ -351,11 +402,100 @@ func TestMainEvolveRejectsFullReplaceForMarkdown(t *testing.T) {
 	if got := thinker.config.GetDirective(); got != directive {
 		t.Fatalf("directive changed:\n%s\nwant:\n%s", got, directive)
 	}
-	if thinker.kickNextTurn {
-		t.Fatal("kickNextTurn should remain false after rejected evolve")
+	if !thinker.kickNextTurn {
+		t.Fatal("rejected evolve should kick one immediate correction turn")
 	}
-	if len(results) != 1 || results[0].CallID != "call-1" || !strings.Contains(results[0].Content, "full directive replacement is disabled") {
+	if len(results) != 1 || results[0].CallID != "call-1" || !results[0].IsError ||
+		!strings.Contains(results[0].Content, "full directive replacement is disabled") ||
+		!strings.Contains(results[0].Content, "retry once now") {
 		t.Fatalf("unexpected tool results: %+v", results)
+	}
+	telemetryEvents, _ := telemetry.StoredEvents(0)
+	resultFound := false
+	for _, event := range telemetryEvents {
+		if event.Type != "tool.result" {
+			continue
+		}
+		var data ToolResultData
+		if json.Unmarshal(event.Data, &data) == nil && data.Name == "evolve" {
+			resultFound = true
+			if data.Success {
+				t.Fatalf("rejected evolve was reported as successful: %+v", data)
+			}
+		}
+	}
+	if !resultFound {
+		t.Fatal("rejected evolve did not emit tool.result telemetry")
+	}
+
+	// Simulate Run consuming the first correction kick. A second rejection gets
+	// one final reporting turn, then a third identical failure must stop.
+	thinker.kickNextTurn = false
+	_, _, secondResults := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name:     "evolve",
+		Args:     map[string]string{"directive": "# Role\nNew role"},
+		Raw:      "evolve",
+		NativeID: "call-2",
+	}}, nil)
+	if !thinker.kickNextTurn {
+		t.Fatal("second rejected evolve should kick one final reporting turn")
+	}
+	if len(secondResults) != 1 || !secondResults[0].IsError || !strings.Contains(secondResults[0].Content, "do not call evolve again") {
+		t.Fatalf("second rejection results = %+v", secondResults)
+	}
+	thinker.kickNextTurn = false
+	mainToolHandler(thinker)(thinker, []toolCall{{
+		Name:     "evolve",
+		Args:     map[string]string{"directive": "# Role\nNew role"},
+		Raw:      "evolve",
+		NativeID: "call-3",
+	}}, nil)
+	if thinker.kickNextTurn {
+		t.Fatal("third rejected evolve should not continue the retry loop")
+	}
+}
+
+func TestWorkerEvolveRejectsFullReplaceAndKicksOneCorrectionTurn(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	directive := "# Role\nReview reports.\n\n# Schedule\n- weekly"
+	if err := thinker.threads.SpawnWithOpts("worker", directive, nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	worker := thinker.threads.threads["worker"]
+
+	_, _, results := threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name:     "evolve",
+		Args:     map[string]string{"edit_mode": "replace", "content": "# Role\nReplace everything"},
+		Raw:      "evolve",
+		NativeID: "call-1",
+	}}, nil)
+	if !worker.Thinker.kickNextTurn {
+		t.Fatal("rejected worker evolve should kick one immediate correction turn")
+	}
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "retry once now") {
+		t.Fatalf("worker rejection results = %+v", results)
+	}
+
+	worker.Thinker.kickNextTurn = false
+	threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name:     "evolve",
+		Args:     map[string]string{"edit_mode": "replace", "content": "# Role\nReplace everything"},
+		Raw:      "evolve",
+		NativeID: "call-2",
+	}}, nil)
+	if !worker.Thinker.kickNextTurn {
+		t.Fatal("second rejected worker evolve should kick one final reporting turn")
+	}
+	worker.Thinker.kickNextTurn = false
+	threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name:     "evolve",
+		Args:     map[string]string{"edit_mode": "replace", "content": "# Role\nReplace everything"},
+		Raw:      "evolve",
+		NativeID: "call-3",
+	}}, nil)
+	if worker.Thinker.kickNextTurn {
+		t.Fatal("third rejected worker evolve should not continue the retry loop")
 	}
 }
 
@@ -600,6 +740,127 @@ func TestChildSendCannotTargetSystemSibling(t *testing.T) {
 		if event.Type == "thread.message" {
 			t.Fatalf("rejected child send emitted thread.message telemetry: %+v", event)
 		}
+	}
+}
+
+func TestMainSendReceiptKicksOnceWithoutHotLoop(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	if err := thinker.threads.SpawnWithOpts("worker", "Receive work.", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	worker := thinker.threads.threads["worker"]
+	call := toolCall{
+		Name:     "send",
+		Args:     map[string]string{"id": "worker", "message": "inspect account 42"},
+		Raw:      "send",
+		NativeID: "send-1",
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn {
+		t.Fatal("successful main send should kick one receipt-processing turn")
+	}
+	if len(results) != 1 || results[0].IsError ||
+		!strings.Contains(results[0].Content, "Message delivered to worker") ||
+		!strings.Contains(results[0].Content, "not completion by the recipient") ||
+		!strings.Contains(results[0].Content, "Do not resend") {
+		t.Fatalf("send receipt = %+v", results)
+	}
+	if got := worker.Thinker.drainEventTexts(); len(got) != 1 || got[0] != "[from:main] inspect account 42" {
+		t.Fatalf("worker inbox = %v", got)
+	}
+
+	thinker.kickNextTurn = false
+	call.NativeID = "send-2"
+	mainToolHandler(thinker)(thinker, []toolCall{call}, nil)
+	if thinker.kickNextTurn {
+		t.Fatal("second consecutive send should not rearm the completion loop")
+	}
+
+	mainToolHandler(thinker)(thinker, nil, nil)
+	call.NativeID = "send-3"
+	mainToolHandler(thinker)(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn {
+		t.Fatal("send completion guard did not reset after a non-send turn")
+	}
+}
+
+func TestWorkerSendReceiptKicksAndDeliversToMain(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	if err := thinker.threads.SpawnWithOpts("worker", "Report to main.", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	thinker.drainEventTexts() // discard the worker-started event
+	worker := thinker.threads.threads["worker"]
+
+	_, _, results := threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name:     "send",
+		Args:     map[string]string{"id": "main", "message": "analysis ready"},
+		Raw:      "send",
+		NativeID: "send-1",
+	}}, nil)
+	if !worker.Thinker.kickNextTurn {
+		t.Fatal("successful worker send should kick one receipt-processing turn")
+	}
+	if len(results) != 1 || results[0].IsError || !strings.Contains(results[0].Content, "Message delivered to main") {
+		t.Fatalf("worker send receipt = %+v", results)
+	}
+	if got := thinker.drainEventTexts(); len(got) != 1 || got[0] != "[from:worker] analysis ready" {
+		t.Fatalf("main inbox = %v", got)
+	}
+}
+
+func TestConversationSendToMainUsesAuthoritativeRelayEnvelope(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	if err := thinker.threads.SpawnWithOpts("chat-test", "Relay owner requests.", nil, SpawnOpts{
+		DeferRun:     true,
+		Conversation: true,
+	}); err != nil {
+		t.Fatalf("spawn conversation: %v", err)
+	}
+	thinker.drainEventTexts()
+	conversation := thinker.threads.threads["chat-test"]
+
+	_, _, results := threadToolHandler(conversation, thinker.threads)(conversation.Thinker, []toolCall{{
+		Name:     "send",
+		Args:     map[string]string{"id": "main", "message": "From now on, run the daily check-in at 10:00 UTC."},
+		Raw:      "send",
+		NativeID: "send-conversation",
+	}}, nil)
+	if len(results) != 1 || results[0].IsError {
+		t.Fatalf("conversation send result = %+v", results)
+	}
+	if got := thinker.drainEventTexts(); len(got) != 1 || got[0] != "[from-conversation:chat-test] From now on, run the daily check-in at 10:00 UTC." {
+		t.Fatalf("main inbox = %v", got)
+	}
+}
+
+func TestSendFailureCorrectionAndReportingTurnsAreBounded(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	handler := mainToolHandler(thinker)
+	call := toolCall{Name: "send", Args: map[string]string{"id": "main"}, Raw: "send", NativeID: "send-1"}
+
+	_, _, first := handler(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn || len(first) != 1 || !first[0].IsError || !strings.Contains(first[0].Content, "retry once now") {
+		t.Fatalf("first send failure = kick:%v results:%+v", thinker.kickNextTurn, first)
+	}
+
+	thinker.kickNextTurn = false
+	call.NativeID = "send-2"
+	_, _, second := handler(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn || len(second) != 1 || !strings.Contains(second[0].Content, "do not call send again") {
+		t.Fatalf("second send failure = kick:%v results:%+v", thinker.kickNextTurn, second)
+	}
+
+	thinker.kickNextTurn = false
+	call.NativeID = "send-3"
+	handler(thinker, []toolCall{call}, nil)
+	if thinker.kickNextTurn {
+		t.Fatal("third consecutive send failure should not continue the retry loop")
 	}
 }
 

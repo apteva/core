@@ -207,17 +207,17 @@ func TestApplyDirectiveEditSectionReplaceConsolidatesDuplicateSections(t *testin
 	}
 }
 
-func TestApplyDirectiveEditWarnsWhenContentIntroducesDuplicateHeading(t *testing.T) {
-	_, summary, err := applyDirectiveEdit("# Schedule\n- daily\n# Goals\n- Ship", map[string]string{
+func TestApplyDirectiveEditRejectsContentThatIntroducesUnrelatedHeading(t *testing.T) {
+	_, _, err := applyDirectiveEdit("# Schedule\n- daily\n# Goals\n- Ship", map[string]string{
 		"edit_mode": "section_append",
 		"section":   "Schedule",
 		"content":   "# Goals\n- Added in the wrong section",
 	})
-	if err != nil {
-		t.Fatalf("applyDirectiveEdit error: %v", err)
+	if err == nil {
+		t.Fatal("expected unrelated heading to be rejected")
 	}
-	if !strings.Contains(summary, `warning: directive contains 2 "Goals" headings`) {
-		t.Fatalf("summary = %q", summary)
+	if !strings.Contains(err.Error(), `must not contain the unrelated Markdown heading "Goals"`) {
+		t.Fatalf("error = %q", err)
 	}
 }
 
