@@ -58,6 +58,8 @@ func TestAPI_Status(t *testing.T) {
 	thinker.rate = RateFast
 	thinker.agentSleep = 2 * time.Second
 	thinker.model = ModelLarge
+	nextWake := time.Date(2026, 7, 23, 12, 34, 56, 789, time.FixedZone("test", 2*60*60))
+	thinker.nextWakeAt = nextWake
 	thinker.publishRuntimeStatus()
 
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -77,6 +79,9 @@ func TestAPI_Status(t *testing.T) {
 	}
 	if body["model"] != "large" {
 		t.Errorf("expected model large, got %v", body["model"])
+	}
+	if body["next_wake_at"] != nextWake.UTC().Format(time.RFC3339Nano) {
+		t.Errorf("expected next_wake_at %q, got %v", nextWake.UTC().Format(time.RFC3339Nano), body["next_wake_at"])
 	}
 	if body["core_version"] == "" {
 		t.Errorf("expected core_version in status")

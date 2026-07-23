@@ -90,7 +90,7 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Core tools — always in prompt
 	tr.Register(&ToolDef{
 		Name:        "pace",
-		Description: "Set this thread's next automatic wake and optional model/provider profile. Sleep persists until changed, and events wake the thread sooner.",
+		Description: "Set this thread's next automatic wake and optional model/provider profile. Sleep and the pending wake survive restarts until changed, and events wake the thread sooner.",
 		Syntax:      `[[pace sleep="5m" model="small" reasoning="low" provider="anthropic"]]`,
 		Rules:       `sleep accepts ms, s, m, or h and is capped at 24h; do not use d or w. For longer cadences, sleep 24h and reassess using the fresh [CURRENT TIME]. No scheduler or waiting thread is required. Call pace again only when the desired wake or model profile changes.`,
 		Core:        true,
@@ -109,9 +109,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "send",
-		Description: "Send a message to another thread. Use id=\"parent\" to report to your parent thread. ALWAYS send results back after completing work.",
+		Description: "Send a message to another thread. Use id=\"parent\" for a final requested result, meaningful milestone, blocker, authority request, or conflict that your parent needs to handle.",
 		Syntax:      `send(id="parent", message="...", media="url1 url2")`,
-		Rules:       `Use id="parent" for your parent thread. Use id="main" for the top coordinator. media is optional — space-separated URLs (audio, images, video). Media URLs are sent natively to the target thread's LLM for analysis. You MUST send results back to your parent after completing any task. A delivery receipt confirms only that the message reached the target; if you requested work or a reply, wait for the target's response before reporting completion, and never resend merely because you received the delivery receipt.`,
+		Rules:       `Use id="parent" for your parent thread. Use id="main" for the top coordinator. Communicate directly with a known responsible thread when permitted. Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures within the owning thread. media is optional — space-separated URLs (audio, images, video). Media URLs are sent natively to the target thread's LLM for analysis. A delivery receipt confirms only that the message reached the target; if you requested work or a reply, wait for the target's response before reporting completion, and never resend merely because you received the delivery receipt.`,
 		Core:        true,
 		// Explicit schema with required fields so the LLM is forced to
 		// include id and message. Without this, schemaFromSyntax would
@@ -132,7 +132,7 @@ func (tr *ToolRegistry) registerDefaults() {
 		Name:        "done",
 		Description: "Permanently terminate this thread. Send a final message and shut down.",
 		Syntax:      `[[done message="Final result"]]`,
-		Rules:       `PERMANENTLY kills this thread. A one-shot worker should call done after reporting its completed result. Persistent or conversational threads should remain active after ordinary replies.`,
+		Rules:       `PERMANENTLY kills this thread. A one-shot worker should call done after reporting any final result owed to its parent. Persistent or conversational threads should remain active after ordinary replies.`,
 		Core:        true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -188,7 +188,7 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Use it for independent or ongoing work that materially benefits from separate ownership, parallelism, long-running execution, or context isolation; do not spawn when the current thread can complete the work directly. By default the worker starts thinking immediately on its directive; pass paused=\"true\" to spawn it dormant — it'll wake on the first `send` you give it. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
+		Description: "Create a new thread with its own directive, tools, and continuous thinking loop. Use it when work materially benefits from distinct ownership or operational state, parallel execution, waiting or retries, continued operation, substantial context isolation, or independent failure handling. For multiple independent work units, assign focused owners instead of executing the first unit on the current thread. Capability alone does not determine ownership: keep only very small immediately completing actions local. Group closely related continuing responsibilities under one focused owner instead of creating one thread per schedule. By default the worker starts thinking immediately on its directive; pass paused=\"true\" to spawn it dormant — it'll wake on the first `send` you give it. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
 		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec,store_lookup", mcp="store", model="medium", reasoning="low", paused="true", realtime="true", voice="marin")`,
 		Rules:       `id: unique name. directive: what the thread does. tools: comma-separated FULL tool names the worker needs, including MCP tools exactly as visible (e.g. store_lookup). If a worker needs visible tools, do not leave tools empty. mcp: optional comma-separated MCP server names for catalog servers; it does not replace tools when full tool names are visible and may be unavailable for no_spawn/app servers. provider: LLM provider name (optional). model: starting tier ("large", "medium", "small"). reasoning/thinking: starting reasoning effort ("auto", "none", "minimal", "low", "medium", "high", "xhigh"; provider support varies). paused: "true" to spawn dormant. realtime: "true" to use a configured bidirectional voice/audio provider. voice: optional realtime voice id. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
 		Core:        true,

@@ -113,6 +113,27 @@ func TestOpenCodeGoBoundedOneOffStaysOnMainSmoke(t *testing.T) {
 	runBoundedOneOffStaysOnMainSmoke(t, NewOpenCodeGoProvider(key))
 }
 
+func TestOpenCodeGoOwnershipScalingSmoke(t *testing.T) {
+	if os.Getenv("RUN_OPENCODE_GO_OWNERSHIP_SMOKE") == "" {
+		t.Skip("set RUN_OPENCODE_GO_OWNERSHIP_SMOKE=1 to run the GLM ownership smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping GLM ownership smoke in short mode")
+	}
+	loadIntegrationEnv()
+	key := strings.TrimSpace(os.Getenv("OPENCODE_GO_API_KEY"))
+	if key == "" {
+		t.Skip("OPENCODE_GO_API_KEY not set")
+	}
+	provider := NewOpenCodeGoProvider(key)
+	t.Run("recurring responsibilities scale out", func(t *testing.T) {
+		runRecurringResponsibilitiesScaleOutSmoke(t, provider)
+	})
+	t.Run("substantial parallel work delegates", func(t *testing.T) {
+		runSubstantialWorkDelegatesSmoke(t, provider)
+	})
+}
+
 // TestOpenCodeGoMiniMaxM3DirectiveBehaviorSuite runs the complete
 // provider-neutral directive behavior suite through MiniMax M3.
 func TestOpenCodeGoMiniMaxM3DirectiveBehaviorSuite(t *testing.T) {

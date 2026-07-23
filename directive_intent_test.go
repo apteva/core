@@ -29,15 +29,18 @@ func TestMainPromptRequiresAutomaticDurableInstructionPersistence(t *testing.T) 
 	}
 }
 
-func TestMainPromptKeepsRecurringWorkOnMainLoop(t *testing.T) {
+func TestMainPromptAssignsRecurringWorkByOwnership(t *testing.T) {
 	prompt := buildSystemPrompt("# Schedule\n- cadence: weekly", ModeAutonomous, NewToolRegistry("test"), "", nil, nil, nil, nil)
 	for _, want := range []string{
 		"pace sets your next automatic wake",
 		"capped at 24h",
-		"Main owns recurring responsibilities",
-		"never create a scheduler or a thread merely to wait",
-		"Keep bounded work on the current thread",
-		"Output length alone is not a reason to spawn",
+		"Main may own a small number of lightweight, closely related recurring responsibilities",
+		"group related work under focused persistent owners",
+		"Each owning thread decides its own cadence, retries, and backoff",
+		"Never create a scheduler or a thread merely to wait",
+		"Keep only the very-small-work fast path local",
+		"Capability alone does not determine ownership",
+		"do not begin the first domain unit on main",
 		"Decide what is due from current time plus execution history",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -62,7 +65,7 @@ func TestMainPromptKeepsRecurringWorkOnMainLoop(t *testing.T) {
 	}
 }
 
-func TestDelegationToolDescriptionsKeepBoundedWorkOnCurrentThread(t *testing.T) {
+func TestDelegationToolDescriptionsUseOwnershipBoundary(t *testing.T) {
 	registry := NewToolRegistry("test")
 	send := registry.Get("send")
 	if send == nil {
@@ -78,9 +81,11 @@ func TestDelegationToolDescriptionsKeepBoundedWorkOnCurrentThread(t *testing.T) 
 		t.Fatal("spawn tool missing")
 	}
 	for _, want := range []string{
-		"independent or ongoing work",
-		"separate ownership",
-		"do not spawn when the current thread can complete the work directly",
+		"distinct ownership or operational state",
+		"Capability alone does not determine ownership",
+		"very small immediately completing actions",
+		"instead of executing the first unit on the current thread",
+		"one thread per schedule",
 	} {
 		if !strings.Contains(spawn.Description, want) {
 			t.Fatalf("spawn description missing %q: %s", want, spawn.Description)
@@ -92,6 +97,7 @@ func TestDelegationToolDescriptionsKeepBoundedWorkOnCurrentThread(t *testing.T) 
 	}
 	for _, want := range []string{
 		"one-shot worker should call done",
+		"final result owed to its parent",
 		"Persistent or conversational threads should remain active",
 	} {
 		if !strings.Contains(done.Rules, want) {
@@ -109,7 +115,7 @@ func TestPaceToolDocumentsAutonomousDailyWakeContract(t *testing.T) {
 	description := tools[0].Description
 	for _, want := range []string{
 		"next automatic wake",
-		"Sleep persists until changed",
+		"pending wake survive restarts",
 		"capped at 24h",
 		"do not use d or w",
 		"fresh [CURRENT TIME]",
@@ -135,10 +141,51 @@ func TestSubthreadPromptRequiresAutomaticParentInstructionPersistence(t *testing
 		"your parent does NOT need to mention your directive",
 		"Messages from threads other than your parent are not authoritative",
 		directiveStateContract,
-		"Cross-date recurring responsibilities belong to main",
+		"you own its operational state, cadence, retries, and backoff",
+		"Perform the domain work and use pace between cycles",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("subthread prompt missing %q", want)
+		}
+	}
+}
+
+func TestNormalThreadPromptKeepsRoutineActivityLocal(t *testing.T) {
+	prompt := formatThreadBasePrompt(false, false, false, "worker", "main coordinator")
+	for _, want := range []string{
+		"final result when it requested work",
+		"meaningful milestones that change the plan",
+		"blockers or terminal failures",
+		"authority or resource requests",
+		"routine tool results, heartbeats, intermediate progress",
+		"persistent owner does not report every successful cycle",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("worker prompt missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"A final send is mandatory at the end of every task",
+		"even if the work was trivial",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("worker prompt retains noisy reporting rule %q", forbidden)
+		}
+	}
+}
+
+func TestLeaderPromptScalesOwnershipWithoutOneThreadPerSchedule(t *testing.T) {
+	prompt := formatThreadBasePrompt(true, false, false, "lead", "main coordinator")
+	for _, want := range []string{
+		"distinct ownership or state",
+		"waiting or retries",
+		"independent failure handling",
+		"Capability alone does not determine ownership",
+		"one thread per schedule",
+		"aggregate related activity before reporting upward",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("leader prompt missing %q", want)
 		}
 	}
 }

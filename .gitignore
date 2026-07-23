@@ -34,3 +34,4 @@ history.bak.*/
 memory.jsonl.*
 # Generic log catch-all so test runs don't leak transcripts.
 *.log
+test-artifacts/

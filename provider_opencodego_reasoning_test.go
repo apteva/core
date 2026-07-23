@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestOpenCodeGoReasoning_DefaultMinimalAndExplicitOverride(t *testing.T) {
+func TestOpenCodeGoReasoning_ModelAwareAutoAndExplicitOverride(t *testing.T) {
 	var bodies []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -33,12 +33,23 @@ func TestOpenCodeGoReasoning_DefaultMinimalAndExplicitOverride(t *testing.T) {
 		t.Fatalf("default reasoning telemetry = requested %q effective %q", resp.RequestedReasoningEffort, resp.EffectiveReasoningEffort)
 	}
 
+	resp, err = provider.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, "glm-5.2", nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("GLM auto Chat: %v", err)
+	}
+	if got := bodies[1]["reasoning_effort"]; got != "medium" {
+		t.Fatalf("GLM auto reasoning_effort = %#v, want medium", got)
+	}
+	if resp.RequestedReasoningEffort != "auto" || resp.EffectiveReasoningEffort != "medium" {
+		t.Fatalf("GLM auto reasoning telemetry = requested %q effective %q", resp.RequestedReasoningEffort, resp.EffectiveReasoningEffort)
+	}
+
 	high := provider.WithReasoning(ReasoningSettings{Level: ReasoningHigh}).(*OpenCodeGoProvider)
 	resp, err = high.Chat(context.Background(), []Message{{Role: "user", Content: "hello"}}, "kimi-k3", nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("explicit Chat: %v", err)
 	}
-	if got := bodies[1]["reasoning_effort"]; got != "high" {
+	if got := bodies[2]["reasoning_effort"]; got != "high" {
 		t.Fatalf("explicit reasoning_effort = %#v, want high", got)
 	}
 	if resp.RequestedReasoningEffort != "high" || resp.EffectiveReasoningEffort != "high" {
@@ -85,8 +96,8 @@ func TestOpenCodeGoReasoning_UnsupportedModelRetriesAndRemembers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("other-model Chat: %v", err)
 	}
-	if resp.EffectiveReasoningEffort != "minimal" {
-		t.Fatalf("other-model effective reasoning = %q, want minimal", resp.EffectiveReasoningEffort)
+	if resp.EffectiveReasoningEffort != "medium" {
+		t.Fatalf("other-model effective reasoning = %q, want medium", resp.EffectiveReasoningEffort)
 	}
 
 	if len(bodies) != 4 {
@@ -101,8 +112,8 @@ func TestOpenCodeGoReasoning_UnsupportedModelRetriesAndRemembers(t *testing.T) {
 	if _, present := bodies[2]["reasoning_effort"]; present {
 		t.Fatalf("remembered model retried reasoning_effort: %#v", bodies[2])
 	}
-	if bodies[3]["reasoning_effort"] != "minimal" {
-		t.Fatalf("other model did not retain minimal default: %#v", bodies[3])
+	if bodies[3]["reasoning_effort"] != "medium" {
+		t.Fatalf("GLM did not receive its medium auto default: %#v", bodies[3])
 	}
 }
 

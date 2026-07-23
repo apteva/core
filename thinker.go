@@ -217,31 +217,43 @@ You never communicate with other threads. You never interact with users. Treat t
 
 // baseSystemPrompt contains the fixed runtime contract. The editable directive
 // is appended separately at runtime.
-const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You observe events, execute standing work, and coordinate threads.
+const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You govern standing goals, work ownership, permissions, conflicts, and escalation across the thread hierarchy.
 
 ROLE AND LOOP:
 - Every thought has at least one short sentence of reasoning. Never output only tool calls.
 - [console] is an external event or command. [from:id] is an ordinary thread message. [from-conversation:id] is an owner request relayed by a trusted user-facing conversation thread. [thread:id done] means a thread terminated.
-- Never fabricate events. Process real events first; otherwise continue standing work from your directive. If nothing is actionable, pace and sleep.
+- Never fabricate events. Process real events first; otherwise continue supervisory or lightweight standing work from your directive. If nothing is actionable, pace and sleep.
+- You may perform only very small work directly when it is bounded, immediately actionable, and creating a separate owner would add more overhead than value.
+- Outside the small number of lightweight recurring responsibilities explicitly kept on main, delegate work whenever it requires distinct ownership or operational state, substantial context, parallelism, waiting or retries, continued operation, or independent failure handling.
+- When work contains multiple independent units, coordinate their ownership; do not begin the first domain unit on main and let convenience turn main into the worker.
 
 TIME, STATE, AND RECURRENCE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - pace sets your next automatic wake, persists until changed, is capped at 24h, and any event wakes you earlier. For longer cadences, sleep 24h and reassess on the next wake.
 - ` + directiveStateContract + `
 - ` + recurringDirectiveContract + `
-- Decide what is due from current time plus execution history. Main owns recurring responsibilities; never create a scheduler or a thread merely to wait.
+- Decide what is due from current time plus execution history. Main may own a small number of lightweight, closely related recurring responsibilities.
+- As independent responsibilities accumulate, require different tools or state, run on different cadences, or consume significant attention, group related work under focused persistent owners. Each owning thread decides its own cadence, retries, and backoff.
+- Never create a scheduler or a thread merely to wait. A continuing owner performs its domain work and uses pace between cycles.
 
-DELEGATION:
-- Before spawning, check [ACTIVE THREADS]: if an existing thread has matching tools and directive, send(id="...") to it instead. Spawn only when no existing thread fits, or when you need parallelism over independent inputs.
-- For batches of independent repeated work, especially tool-heavy or waiting/polling work, prefer using main as a coordinator and spawning focused workers; keep simple or sequential work on main.
+OWNERSHIP AND DELEGATION:
+- Before spawning, check [ACTIVE THREADS]. Prefer an existing thread when it already owns the relevant domain or operational state; communicate with that known owner directly.
+- Spawn when no existing owner fits and separate ownership materially helps, including persistent operational state, parallel execution, waiting or retries, substantial context isolation, continued operation, or independent failure handling.
+- For multiple independent work units, assign the units to focused owners instead of executing the first unit on main.
+- For batches of independent repeated work, especially tool-heavy or waiting/polling work, coordinate focused workers. Consolidate closely related continuing responsibilities under one owner instead of creating one thread per schedule.
 - One-shot workers should own one clear unit of work, use the smallest required tool set, report the result to their parent, then call done. Persistent workers remain active.
 - tools= lists which tools the worker can use. ALWAYS include EVERY tool the worker needs to carry out its directive; do not use empty tools for a worker that needs specific visible tools. A missing tool = worker reports failure and can't act. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
-- Keep bounded work on the current thread. Spawn only when separate ownership, parallelism, long-running execution, or context isolation materially helps. Output length alone is not a reason to spawn.
+- Capability alone does not determine ownership: do not keep work on main merely because main can complete it. Keep only the very-small-work fast path local.
 - directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
   GOOD: directive="Check for new support tickets periodically. Report findings to main."
 - provider= (optional) picks a specific LLM; omit to inherit. Use a stronger provider for complex tasks, a cheaper one for coordination. See [AVAILABLE PROVIDERS].
-- Never short-sleep to check on a worker; replies wake you. Do not create a one-shot worker merely to offload work the current thread can complete directly.
+- Never short-sleep to check on a worker; replies wake you. Do not create a child merely to avoid a very small immediately completing action.
+
+REPORTING:
+- Routine tool results, heartbeats, intermediate progress, and locally recoverable failures stay with the owning thread.
+- Require upward reports for a final result requested by the parent, a meaningful milestone that changes the plan, a blocker or terminal failure, an authority or resource request, or a conflict affecting other work.
+- Leaders aggregate related child activity rather than forwarding every event to main.
 
 TOOL CALLS:
 - Every tool takes a "_reason" string for the operator UI. Write a clear capitalized activity phrase, maximum 6 words, usually ending in "-ing", naming the action and object so it is understandable without the tool name (e.g. "Searching for customer row", "Sending Pushover notification"). Do not use a generic tool name as the reason.`
@@ -249,7 +261,7 @@ TOOL CALLS:
 const mainDirectivePersistencePrompt = `
 
 [DIRECTIVE MANAGEMENT]
-- A direct owner/operator command delivered as a [console] message is authoritative. When it explicitly establishes durable behavior, persist it with evolve in the same task. The owner does NOT need to say "update your directive" or name the evolve tool.
+- A direct owner/operator command delivered as a [console] message is authoritative. When it explicitly establishes durable behavior, persist it with the thread that owns the responsibility in the same task. Use evolve when main remains the owner; assign the durable responsibility to an existing or new persistent owner when separate ownership is warranted. The owner does NOT need to say "update your directive" or name the evolve tool.
 - An owner request delivered as [from-conversation:id] has the same authority as [console]. It was relayed by a platform-created user-facing conversation thread. Persist durable behavior from it, then send the result back to that conversation.
 - Durable policy includes "always", "from now on", recurring responsibilities, role or goal changes, and durable prohibitions such as "stop doing..." or "never do...".
 - Do NOT evolve for one-off requests ("today only", "this time", "do X now"), tentative ideas, questions, or ordinary inferred preferences. Execute those normally without changing the directive.
@@ -611,6 +623,10 @@ type Thinker struct {
 	rate           ThinkRate
 	agentRate      ThinkRate
 	agentSleep     time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
+	nextWakeAt     time.Time     // pending runtime timer persisted by pace
+	resumeWakeAt   time.Time     // one-shot startup gate restored from config
+	paceDurable    bool          // true after an explicit or restored pace
+	persistPace    func(PersistentPaceState) error
 	model          ModelTier
 	agentModel     ModelTier
 	agentReasoning ReasoningLevel
@@ -890,6 +906,7 @@ type thinkerRuntimeStatus struct {
 	Paused         bool
 	LLMActive      bool
 	Sleep          time.Duration
+	NextWakeAt     time.Time
 	ProviderModels map[ModelTier]string
 	MCPNames       []string
 }
@@ -925,6 +942,7 @@ func (t *Thinker) publishRuntimeStatus() {
 		Paused:         t.paused,
 		LLMActive:      t.llmActive.Load(),
 		Sleep:          t.agentSleep,
+		NextWakeAt:     t.nextWakeAt,
 		ProviderModels: providerModels,
 		MCPNames:       mcpNames,
 	})
@@ -1002,6 +1020,8 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		activeProvider = provider // fallback to passed-in provider
 	}
 
+	mainPace := config.GetMainPace()
+	mainSleep, mainWake := restorePersistentPace(mainPace, 30*time.Second, time.Now())
 	bus := NewEventBus()
 	t := &Thinker{
 		apiKey:   apiKey,
@@ -1017,7 +1037,10 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		quit:                   make(chan struct{}),
 		rate:                   RateSlow,
 		agentRate:              RateSlow,
-		agentSleep:             30 * time.Second,
+		agentSleep:             mainSleep,
+		nextWakeAt:             mainWake,
+		resumeWakeAt:           mainWake,
+		paceDurable:            mainPace != nil,
 		agentReasoning:         ReasoningAuto,
 		memory:                 NewMemoryStore(apiKey),
 		session:                NewSession(".", "main"),
@@ -1032,6 +1055,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		execution:              NewExecutionController(config.GetExecutionControl()),
 		checkpoints:            NewExecutionCheckpointStore(),
 		blobs:                  NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
+	}
+	t.persistPace = func(state PersistentPaceState) error {
+		return config.SetMainPace(state)
 	}
 	if config.Unconscious {
 		t.unconsciousSafety = newUnconsciousSafetyState(time.Now(), fileSize("history/main.jsonl"))
@@ -1119,6 +1145,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				Conversation: pt.Conversation,
 				Voice:        pt.Voice,
 				System:       pt.System,
+				Pace:         pt.Pace,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
@@ -1135,6 +1162,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					Conversation: pt.Conversation,
 					Voice:        pt.Voice,
 					System:       pt.System,
+					Pace:         pt.Pace,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -1946,6 +1974,50 @@ func mainToolHandler(t *Thinker) ToolHandler {
 	}
 }
 
+// waitForRestoredWake preserves an explicitly paced deadline across process
+// restarts. It is a one-shot startup gate: normal Run-loop sleeps continue to
+// use the existing interruptible timer. Inbox events still wake the thread
+// early, matching the ordinary pace contract.
+func (t *Thinker) waitForRestoredWake() bool {
+	wake := t.resumeWakeAt
+	t.resumeWakeAt = time.Time{}
+	if wake.IsZero() || !wake.After(time.Now()) {
+		return true
+	}
+
+	delay := time.Until(wake)
+	if delay > maxSleep {
+		delay = maxSleep
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	logMsg("RUN", fmt.Sprintf("[%s] restoring paced wake in %s", t.threadID, formatSleep(delay)))
+
+	select {
+	case <-timer.C:
+		logMsg("RUN", fmt.Sprintf("[%s] restored timer expired", t.threadID))
+		return true
+	case <-t.sub.Wake:
+		// The event itself remains on the bus and is drained by the first
+		// iteration. Clear the old future deadline so a second crash during
+		// that iteration cannot put the event back to sleep.
+		t.nextWakeAt = time.Time{}
+		t.publishRuntimeStatus()
+		if t.persistPace != nil {
+			if err := t.persistPace(paceState(t.agentSleep, time.Time{})); err != nil {
+				logMsg("PACE", fmt.Sprintf("[%s] clear restored wake: %v", t.threadID, err))
+			}
+		}
+		logMsg("RUN", fmt.Sprintf("[%s] restored timer interrupted by event", t.threadID))
+		return true
+	case paused := <-t.pause:
+		t.paused = paused
+		return true
+	case <-t.quit:
+		return false
+	}
+}
+
 func (t *Thinker) Run() {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
@@ -1990,6 +2062,10 @@ func (t *Thinker) Run() {
 			t.onStop()
 		}
 	}()
+
+	if !t.waitForRestoredWake() {
+		return
+	}
 
 	emptyLLMResponses := 0
 	for {
@@ -2515,12 +2591,16 @@ func (t *Thinker) Run() {
 
 		// Telemetry: llm.done with full data
 		if t.telemetry != nil {
-			model := t.modelID()
+			model := chatResp.Model
+			if model == "" {
+				model = t.modelID()
+			}
 			requestedReasoning := chatResp.RequestedReasoningEffort
 			if requestedReasoning == "" {
 				requestedReasoning = t.agentReasoning.String()
 			}
 			t.telemetry.Emit("llm.done", t.threadID, LLMDoneData{
+				Provider:           chatResp.Provider,
 				Model:              model,
 				Reasoning:          requestedReasoning,
 				ReasoningRequested: requestedReasoning,
@@ -2530,6 +2610,7 @@ func (t *Thinker) Run() {
 				CacheWriteTokens:   usage.CacheWriteTokens,
 				TokensOut:          usage.CompletionTokens,
 				DurationMs:         duration.Milliseconds(),
+				ProviderTiming:     chatResp.ProviderTiming,
 				// cost_usd intentionally omitted — server enriches with
 				// canonical pricing at ingest so we're not double-booking
 				// the model→cost knowledge in core.
@@ -2586,6 +2667,7 @@ func (t *Thinker) Run() {
 		if !t.executionGate(ExecutionPhaseSleepBefore, ExecutionGate{Summary: fmt.Sprintf("Sleeping %s", sleepSummary(sleepDur))}) {
 			return
 		}
+		t.refreshPersistentWakeForSleep(sleepDur)
 		select {
 		case <-time.After(sleepDur):
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
@@ -2690,12 +2772,17 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 		}
 	}
 
-	// Emit llm.start so the UI can show a "thinking" indicator before
-	// any tokens arrive. Live-only — not stored in the DB.
+	modelID := modelIDForProvider(provider, t.model)
+
+	// Persist llm.start before entering the provider so an interrupted or
+	// indefinitely slow request remains diagnosable even when no done/error
+	// event is ever produced.
 	if t.telemetry != nil {
-		t.telemetry.EmitLive("llm.start", t.threadID, map[string]any{
-			"model":     t.modelID(),
-			"iteration": t.iteration,
+		t.telemetry.Emit("llm.start", t.threadID, map[string]any{
+			"provider":            provider.Name(),
+			"model":               modelID,
+			"reasoning_requested": t.agentReasoning.String(),
+			"iteration":           t.iteration,
 		})
 	}
 
@@ -2715,11 +2802,12 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	// a user-abort channel) so a slow stream can be unblocked from outside.
 	// For now context.Background() preserves prior behaviour — the request
 	// is now cancellable in principle, just nothing is wired to cancel it.
-	modelID := modelIDForProvider(provider, t.model)
 	requestedReasoning := t.agentReasoning.String()
 	chatProvider := providerWithReasoning(provider, t.agentReasoning)
 	ctx = t.preparePromptCacheContext(ctx, messages, nativeTools)
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
+	resp.Provider = provider.Name()
+	resp.Model = modelID
 	if resp.RequestedReasoningEffort == "" {
 		resp.RequestedReasoningEffort = requestedReasoning
 	}
@@ -2755,6 +2843,7 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 				if fallbackResp, fallbackErr := t.thinkWithProviderMessages(ctx, fallback, messages); fallbackErr == nil {
 					return fallbackResp, nil
 				} else {
+					resp = fallbackResp
 					err = fmt.Errorf("primary %s: %v; fallback %s: %w", primary.Name(), err, fallback.Name(), fallbackErr)
 				}
 			}
@@ -2763,14 +2852,35 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 			return resp, nil
 		}
 		if ctx.Err() != nil {
-			return ChatResponse{}, ctx.Err()
+			if t.telemetry != nil {
+				model := resp.Model
+				if model == "" {
+					model = t.modelID()
+				}
+				t.telemetry.Emit("llm.cancelled", t.threadID, LLMErrorData{
+					Provider:       resp.Provider,
+					Model:          model,
+					Error:          ctx.Err().Error(),
+					ProviderTiming: resp.ProviderTiming,
+					Iteration:      t.iteration,
+				})
+			}
+			return resp, ctx.Err()
 		}
 
 		attempt++
 		t.bus.Publish(Event{Type: EventThinkError, From: t.threadID, Error: err, Iteration: t.iteration})
 		if t.telemetry != nil {
+			model := resp.Model
+			if model == "" {
+				model = t.modelID()
+			}
 			t.telemetry.Emit("llm.error", t.threadID, LLMErrorData{
-				Model: t.modelID(), Error: err.Error(), Iteration: t.iteration,
+				Provider:       resp.Provider,
+				Model:          model,
+				Error:          err.Error(),
+				ProviderTiming: resp.ProviderTiming,
+				Iteration:      t.iteration,
 			})
 		}
 		delayFn := t.retryDelay
@@ -2784,10 +2894,10 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 		case <-timer.C:
 		case <-ctx.Done():
 			stopRetryTimer(timer)
-			return ChatResponse{}, ctx.Err()
+			return resp, ctx.Err()
 		case <-t.quit:
 			stopRetryTimer(timer)
-			return ChatResponse{}, context.Canceled
+			return resp, context.Canceled
 		}
 	}
 }

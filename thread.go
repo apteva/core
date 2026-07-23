@@ -37,7 +37,7 @@ TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - pace sets your next automatic wake, persists until changed, is capped at 24h, and events wake you earlier. Timing is approximate.
 - ` + directiveStateContract + `
-- Cross-date recurring responsibilities belong to main. Perform focused due work for your parent; do not become a timer that merely waits.
+- If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
 IMPORTANT — tool calls and done:
 - NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
@@ -54,7 +54,9 @@ IDENTITY:
 - Only call done if you are certain this thread should never run again.
 
 SPAWNING SUB-THREADS:
-- Use spawn(id="..." directive="..." tools="...") to create workers for parallel or long-running tasks.
+- Use spawn(id="..." directive="..." tools="...") when work benefits from distinct ownership or state, parallel execution, waiting or retries, substantial context isolation, continued operation, or independent failure handling.
+- Keep only very small immediately completing actions local. Capability alone does not determine ownership.
+- Consolidate closely related continuing responsibilities under one focused owner instead of creating one thread per schedule.
 - Use kill(id="...") to stop a sub-thread.
 - Use update(id="..." directive="..." tools="...") to change a sub-thread's directive or tools.
 - Your sub-threads report to YOU, not to main. You coordinate your team.
@@ -75,15 +77,17 @@ TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - pace sets your next automatic wake, persists until changed, is capped at 24h, and events wake you earlier. Timing is approximate.
 - ` + directiveStateContract + `
-- Cross-date recurring responsibilities belong to main. Perform focused due work for your parent; do not become a timer that merely waits.
+- If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
 IMPORTANT — tool calls and done:
 - NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
 - Always wait for tool results before calling done — you need to confirm the action succeeded.`
 
-const normalThreadReportingPrompt = `- You MUST report results to your parent via send(id="parent", message="...") BEFORE pacing to a long sleep. Your parent is waiting for that reply — silent completion leaves them blocked. A final send is mandatory at the end of every task, even if the work was trivial or everything was already done.`
+const normalThreadReportingPrompt = `- Send your parent the final result when it requested work and is waiting for an answer. Also report meaningful milestones that change the plan, blockers or terminal failures, authority or resource requests, and conflicts affecting other work.
+- Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures in this thread. A persistent owner does not report every successful cycle unless its parent explicitly requested that result.
+- If you lead children, aggregate related activity before reporting upward instead of forwarding every event.`
 
-const normalThreadIdlePrompt = `- When done with current work AND after sending your result, sleep until needed again: pace(sleep="5m") or pace(sleep="1h") etc.`
+const normalThreadIdlePrompt = `- When current work is done and any result owed to your parent has been sent, sleep until needed again: pace(sleep="5m") or pace(sleep="1h") etc.`
 
 const normalThreadReasoningPrompt = `- Think out loud — explain what you're doing and why. Never output empty thoughts.`
 
@@ -175,6 +179,7 @@ type ThreadInfo struct {
 	Running      bool
 	Iteration    int
 	Rate         ThinkRate
+	NextWakeAt   time.Time
 	Model        ModelTier
 	Reasoning    ReasoningLevel
 	Provider     string // active provider name
@@ -302,6 +307,9 @@ type SpawnOpts struct {
 	// BridgeDisconnectTTL asks core to stop this realtime thread if its audio
 	// bridge remains disconnected for the duration. Zero disables cleanup.
 	BridgeDisconnectTTL time.Duration
+	// Pace restores the runtime-owned cadence/deadline of a persistent thread.
+	// It is not exposed through spawn and never enters the thread directive.
+	Pace *PersistentPaceState
 	// InitialMessage is sent to the realtime provider after the first audio
 	// bridge connects, then immediately requests a response.
 	InitialMessage string
@@ -607,6 +615,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if err != nil {
 		return fmt.Errorf("reserve thread id: %w", err)
 	}
+	initialSleep, initialWake := restorePersistentPace(opts.Pace, 10*time.Second, time.Now())
 	thinker := &Thinker{
 		apiKey:   tm.parent.apiKey,
 		pool:     tm.parent.pool,
@@ -620,7 +629,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		quit:                   make(chan struct{}),
 		rate:                   RateReactive,
 		agentRate:              RateNormal,
-		agentSleep:             10 * time.Second,
+		agentSleep:             initialSleep,
+		nextWakeAt:             initialWake,
+		resumeWakeAt:           initialWake,
+		paceDurable:            opts.Pace != nil,
 		model:                  initialModel,
 		agentModel:             initialModel,
 		agentReasoning:         initialReasoning,
@@ -690,6 +702,13 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	thinker.onStop = func() { tm.cleanupThread(thinker.threadID) }
 	thread.Thinker = thinker
+	if !thread.Ephemeral {
+		thinker.persistPace = func(state PersistentPaceState) error {
+			persisted := persistentThreadState(thread)
+			persisted.Pace = clonePersistentPaceState(&state)
+			return tm.parent.config.SaveThread(persisted)
+		}
+	}
 	thinker.telemetry = tm.parent.telemetry     // share telemetry
 	thinker.execution = tm.parent.execution     // share instance-level execution control
 	thinker.checkpoints = tm.parent.checkpoints // share instance-level restore checkpoints
@@ -1448,6 +1467,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Running:      true,
 			Iteration:    status.Iteration,
 			Rate:         status.Rate,
+			NextWakeAt:   status.NextWakeAt,
 			Model:        status.Model,
 			Reasoning:    status.Reasoning,
 			Provider:     providerName,
@@ -1527,6 +1547,12 @@ func persistentThreadState(thread *Thread) PersistentThread {
 		status := thread.Thinker.status()
 		state.Model = status.Model.String()
 		state.Reasoning = status.Reasoning.String()
+		if !status.NextWakeAt.IsZero() {
+			state.Pace = &PersistentPaceState{
+				Sleep:      formatPaceDuration(status.Sleep),
+				NextWakeAt: status.NextWakeAt,
+			}
+		}
 		if !thread.IsRealtime && status.Provider != "" {
 			state.Provider = status.Provider
 		}

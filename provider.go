@@ -214,10 +214,27 @@ type ChatResponse struct {
 	Reasoning                string                 // accumulated chain-of-thought (Fireworks reasoning_content / OpenRouter reasoning); empty when the provider didn't emit any
 	RequestedReasoningEffort string                 // agent-level effort requested for this call (auto when no explicit choice was made)
 	EffectiveReasoningEffort string                 // effort sent/accepted by the provider, or provider-default when an optional control was rejected
+	Provider                 string                 // provider that served this attempt
+	Model                    string                 // concrete provider model used for this attempt
+	ProviderTiming           ProviderTiming         // transport phase timings, when reported by the provider
 	ToolCalls                []NativeToolCall       // structured tool calls WE need to execute
 	ServerResults            []ServerToolResult     // tools the PROVIDER already executed
 	ProviderState            *ProviderResponseState // opaque provider output items needed for stateless continuation
 	Usage                    TokenUsage
+}
+
+// ProviderTiming separates provider/gateway latency from model output time.
+// Durations are measured from the start of one Chat call. Pointer fields
+// distinguish an immediate 0ms phase from a phase that was never reached.
+type ProviderTiming struct {
+	RequestAttempts    int               `json:"request_attempts,omitempty"`
+	ResponseHeadersMs  *int64            `json:"response_headers_ms,omitempty"`
+	FirstChunkMs       *int64            `json:"first_chunk_ms,omitempty"`
+	FirstToolCallMs    *int64            `json:"first_tool_call_ms,omitempty"`
+	CompletionMs       int64             `json:"completion_ms"`
+	StreamChunks       int               `json:"stream_chunks,omitempty"`
+	TerminalPhase      string            `json:"terminal_phase,omitempty"`
+	ProviderRequestIDs map[string]string `json:"provider_request_ids,omitempty"`
 }
 
 // LLMProvider abstracts the LLM API call.

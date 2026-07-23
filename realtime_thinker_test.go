@@ -268,6 +268,36 @@ func TestRealtimeGreetingStartsOnceAfterAudioBridgeConnects(t *testing.T) {
 	}
 }
 
+func TestRealtimeInboxTextRequestsResponse(t *testing.T) {
+	t.Chdir(t.TempDir())
+	parent := newTestThinker()
+	parent.config.RealtimeEnabled = true
+	session := newFakeRealtimeSession()
+	provider := &fakeRealtimeProvider{sessions: []*fakeRealtimeSession{session}}
+	parent.pool = &ProviderPool{
+		providers: map[string]LLMProvider{"fireworks": parent.provider}, order: []string{"fireworks"}, default_: "fireworks",
+		realtimeProviders: map[string]RealtimeProvider{"fake-realtime": provider}, realtimeOrder: []string{"fake-realtime"}, realtimeDefault: "fake-realtime",
+	}
+	if err := parent.threads.SpawnWithOpts("voice-followup", "answer the caller", nil, SpawnOpts{
+		Realtime: true, ProviderName: "fake-realtime", DeferRun: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	thread := parent.threads.threads["voice-followup"]
+	thread.Realtime.replaceSession(session)
+
+	thread.Realtime.handleBusEvent(Event{Type: EventInbox, To: "voice-followup", Text: "I would like an appointment."})
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if len(session.texts) != 1 || session.texts[0].Role != "user" || session.texts[0].Content != "I would like an appointment." {
+		t.Fatalf("inbox messages = %#v", session.texts)
+	}
+	if session.responses != 1 {
+		t.Fatalf("inbox responses = %d, want 1", session.responses)
+	}
+}
+
 func TestRealtimeParallelToolBatchContinuesOnceAfterEveryResult(t *testing.T) {
 	session := newFakeRealtimeSession()
 	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, nil, nil)

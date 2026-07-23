@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -198,7 +199,15 @@ func TestIntegration_OpenCodeGo_BasicChat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat error: %v", err)
 	}
-	t.Logf("text=%q tokens_in=%d tokens_out=%d", strings.TrimSpace(resp.Text), resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	timingJSON, _ := json.Marshal(resp.ProviderTiming)
+	t.Logf(
+		"text=%q tokens_in=%d tokens_out=%d reasoning=%s timing=%s",
+		strings.TrimSpace(resp.Text),
+		resp.Usage.PromptTokens,
+		resp.Usage.CompletionTokens,
+		resp.EffectiveReasoningEffort,
+		timingJSON,
+	)
 	if strings.TrimSpace(resp.Text) == "" {
 		t.Fatal("empty text reply")
 	}

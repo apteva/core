@@ -277,8 +277,9 @@ func runAlreadyCurrentEvolveStillRepliesSmoke(t *testing.T, provider LLMProvider
 	t.Fatalf("timed out waiting for no-op completion: no_op=%v reply=%v evolve_calls=%d", seenNoOp, seenReply, evolveCalls)
 }
 
-// TestCodexBoundedOneOffStaysOnMainSmoke verifies that a bounded task is
-// completed directly even when spawn is available to the model.
+// TestCodexBoundedOneOffStaysOnMainSmoke verifies the deliberately narrow
+// fast path: a very small immediately completing action stays on main even
+// when spawn is available.
 func TestCodexBoundedOneOffStaysOnMainSmoke(t *testing.T) {
 	if os.Getenv("RUN_CODEX_DIRECTIVE_EDIT_SMOKE") == "" {
 		t.Skip("set RUN_CODEX_DIRECTIVE_EDIT_SMOKE=1 to run the Codex bounded-work smoke")
@@ -311,7 +312,7 @@ func runBoundedOneOffStaysOnMainSmoke(t *testing.T, provider LLMProvider) {
 	}, "\n"), ModeAutonomous, registry, "", nil, nil, pool, nil)
 	messages := appendEphemeralTurnContext([]Message{
 		{Role: "system", Content: prompt},
-		{Role: "user", Content: "[console] Complete this bounded one-off request directly: draft a concise customer update from these facts: the migration finished, validation passed, and no action is required. Deliver it with deliver_result."},
+		{Role: "user", Content: "[console] Complete this very small immediately actionable request: turn these three supplied facts into one concise customer update—migration finished, validation passed, no action required—and deliver it with deliver_result. No lookup, waiting, retries, persistent state, or separate ownership is involved."},
 	}, "", time.Now().UTC().Format(time.RFC3339), false)
 	tools := append(registry.NativeTools(nil, nil), NativeTool{
 		Name:        "deliver_result",
@@ -347,6 +348,149 @@ func runBoundedOneOffStaysOnMainSmoke(t *testing.T, provider LLMProvider) {
 	}
 	if !delivered {
 		t.Fatalf("bounded one-off request was not delivered directly: text=%q calls=%v", response.Text, response.ToolCalls)
+	}
+}
+
+// TestCodexOwnershipScalingSmoke verifies both sides of the new ownership
+// boundary against the real model: accumulating independent recurring streams
+// create persistent owners, while a substantial parallel one-off creates job
+// workers instead of being absorbed by main.
+func TestCodexOwnershipScalingSmoke(t *testing.T) {
+	if os.Getenv("RUN_CODEX_OWNERSHIP_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_OWNERSHIP_SMOKE=1 to run the Codex ownership smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex ownership smoke in short mode")
+	}
+	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
+	}
+	provider := NewOpenAICodexProvider(token)
+	t.Run("recurring responsibilities scale out", func(t *testing.T) {
+		runRecurringResponsibilitiesScaleOutSmoke(t, provider)
+	})
+	t.Run("substantial parallel work delegates", func(t *testing.T) {
+		runSubstantialWorkDelegatesSmoke(t, provider)
+	})
+}
+
+func runRecurringResponsibilitiesScaleOutSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
+	registry := NewToolRegistry("")
+	providerName := provider.Name()
+	pool := &ProviderPool{
+		providers: map[string]LLMProvider{providerName: provider},
+		order:     []string{providerName},
+		default_:  providerName,
+	}
+	prompt := buildSystemPrompt(strings.Join([]string{
+		"# Role",
+		"You coordinate the workspace and currently own one lightweight weekly KPI summary.",
+		"",
+		"# Responsibilities",
+		"- Produce the closely related KPI summary every Friday.",
+	}, "\n"), ModeAutonomous, registry, "", nil, nil, pool, nil)
+	messages := appendEphemeralTurnContext([]Message{
+		{Role: "system", Content: prompt},
+		{Role: "user", Content: strings.Join([]string{
+			"[console] Add these durable independent responsibilities:",
+			"- Triage new support cases every 15 minutes and maintain support follow-up state.",
+			"- Reconcile inventory every hour, retry transient source failures, and retain anomaly state.",
+			"- Prepare the monthly finance close with its own records and failure handling.",
+			"Establish appropriate durable ownership now. Do not execute any of these cycles yet.",
+		}, "\n")},
+	}, "", time.Now().UTC().Format(time.RFC3339), false)
+	tools := append(registry.NativeTools(nil, nil),
+		NativeTool{
+			Name:        "support_cases",
+			Description: "Read and update support case operational state.",
+			Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		NativeTool{
+			Name:        "inventory_reconcile",
+			Description: "Reconcile inventory and retain anomaly state.",
+			Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		NativeTool{
+			Name:        "finance_close",
+			Description: "Prepare finance close records.",
+			Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	response, err := provider.Chat(ctx, messages, provider.Models()[ModelLarge], tools, nil, nil, nil)
+	if err != nil {
+		timing, _ := json.Marshal(response.ProviderTiming)
+		t.Fatalf("recurring ownership chat: %v provider_timing=%s", err, timing)
+	}
+	spawned := 0
+	for _, call := range response.ToolCalls {
+		switch call.Name {
+		case "spawn":
+			spawned++
+			if strings.TrimSpace(call.Args["directive"]) == "" {
+				t.Fatalf("spawned recurring owner without directive: args=%v", call.Args)
+			}
+		case "support_cases", "inventory_reconcile", "finance_close":
+			t.Fatalf("main started executing an explicitly not-due recurring cycle: call=%s args=%v", call.Name, call.Args)
+		}
+	}
+	if spawned == 0 {
+		t.Fatalf("independent recurring streams stayed on main instead of creating focused owners: text=%q calls=%v", response.Text, response.ToolCalls)
+	}
+}
+
+func runSubstantialWorkDelegatesSmoke(t *testing.T, provider LLMProvider) {
+	t.Helper()
+	registry := NewToolRegistry("")
+	providerName := provider.Name()
+	pool := &ProviderPool{
+		providers: map[string]LLMProvider{providerName: provider},
+		order:     []string{providerName},
+		default_:  providerName,
+	}
+	prompt := buildSystemPrompt("# Role\nCoordinate work and deliver accurate outcomes.", ModeAutonomous, registry, "", nil, nil, pool, nil)
+	messages := appendEphemeralTurnContext([]Message{
+		{Role: "system", Content: prompt},
+		{Role: "user", Content: strings.Join([]string{
+			"[console] Produce a one-off comparative market brief across these eight independent regions: France, Germany, Spain, Italy, Japan, South Korea, Brazil, and Mexico.",
+			"Each region requires external research, source verification, and a separate risk assessment; the research can run in parallel and will produce substantial context.",
+			"After the independent results return, synthesize them into one recommendation.",
+		}, "\n")},
+	}, "", time.Now().UTC().Format(time.RFC3339), false)
+	tools := append(registry.NativeTools(nil, nil), NativeTool{
+		Name:        "research_region",
+		Description: "Research and verify sources for one named region.",
+		Parameters: map[string]any{
+			"type":     "object",
+			"required": []string{"region"},
+			"properties": map[string]any{
+				"region": map[string]any{"type": "string"},
+			},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	response, err := provider.Chat(ctx, messages, provider.Models()[ModelLarge], tools, nil, nil, nil)
+	if err != nil {
+		timing, _ := json.Marshal(response.ProviderTiming)
+		t.Fatalf("substantial-work chat: %v provider_timing=%s", err, timing)
+	}
+	spawned := 0
+	for _, call := range response.ToolCalls {
+		switch call.Name {
+		case "spawn":
+			spawned++
+		case "research_region":
+			t.Fatalf("main absorbed substantial parallel research instead of assigning ownership: args=%v", call.Args)
+		}
+	}
+	if spawned == 0 {
+		t.Fatalf("substantial parallel work was not delegated: text=%q calls=%v", response.Text, response.ToolCalls)
 	}
 }
 

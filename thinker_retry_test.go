@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -102,6 +103,32 @@ func TestCallLLMWithRetryPreservesPreparedTurn(t *testing.T) {
 	}
 }
 
+func TestThinkWithProviderPersistsAttributedLLMStart(t *testing.T) {
+	provider := &scriptedRetryProvider{name: "test-provider", response: ChatResponse{Text: "done"}}
+	thinker := retryTestThinker(provider)
+	thinker.telemetry = &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})}
+
+	resp, err := thinker.thinkWithProviderMessages(context.Background(), provider, thinker.messages)
+	if err != nil {
+		t.Fatalf("thinkWithProviderMessages: %v", err)
+	}
+	if resp.Provider != "test-provider" || resp.Model != "test" {
+		t.Fatalf("response attribution = provider %q model %q", resp.Provider, resp.Model)
+	}
+
+	events, _ := thinker.telemetry.Events(0)
+	if len(events) != 1 || events[0].Type != "llm.start" {
+		t.Fatalf("stored events = %#v, want one llm.start", events)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(events[0].Data, &data); err != nil {
+		t.Fatalf("decode llm.start: %v", err)
+	}
+	if data["provider"] != "test-provider" || data["model"] != "test" {
+		t.Fatalf("llm.start attribution = %#v", data)
+	}
+}
+
 func TestCallLLMWithRetryFallbackDoesNotBecomePermanent(t *testing.T) {
 	primary := &scriptedRetryProvider{name: "primary", failures: 100}
 	fallback := &scriptedRetryProvider{name: "fallback", response: ChatResponse{Text: "fallback result"}}
@@ -123,6 +150,7 @@ func TestCallLLMWithRetryFallbackDoesNotBecomePermanent(t *testing.T) {
 func TestStopCancelsInFlightProviderCall(t *testing.T) {
 	provider := &scriptedRetryProvider{name: "blocking", block: true, started: make(chan struct{})}
 	thinker := retryTestThinker(provider)
+	thinker.telemetry = &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	thinker.runContextMu.Lock()
 	thinker.runCancel = cancel
@@ -138,6 +166,16 @@ func TestStopCancelsInFlightProviderCall(t *testing.T) {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("error = %v", err)
+		}
+		events, _ := thinker.telemetry.Events(0)
+		cancelled := false
+		for _, event := range events {
+			if event.Type == "llm.cancelled" {
+				cancelled = true
+			}
+		}
+		if !cancelled {
+			t.Fatalf("stored telemetry = %#v, want llm.cancelled", events)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Stop did not cancel provider call")

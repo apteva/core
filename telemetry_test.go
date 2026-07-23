@@ -108,9 +108,15 @@ func TestTelemetry_Emit(t *testing.T) {
 	}
 
 	tel.Emit("llm.done", "main", LLMDoneData{
+		Provider: "test-provider",
 		Model:    "test-model",
 		TokensIn: 100, TokensCached: 40, CacheWriteTokens: 25, TokensOut: 50,
-		DurationMs:      1500,
+		DurationMs: 1500,
+		ProviderTiming: ProviderTiming{
+			RequestAttempts: 1,
+			TerminalPhase:   "completed",
+			CompletionMs:    1400,
+		},
 		Iteration:       1,
 		NativeToolCount: 12,
 		ActiveMCPCount:  3,
@@ -149,6 +155,9 @@ func TestTelemetry_Emit(t *testing.T) {
 	}
 	if data.NativeToolCount != 12 || data.ActiveMCPCount != 3 || data.ToolMode != "discovery" {
 		t.Errorf("cache diagnostics missing from llm.done: %+v", data)
+	}
+	if data.Provider != "test-provider" || data.RequestAttempts != 1 || data.TerminalPhase != "completed" || data.CompletionMs != 1400 {
+		t.Errorf("provider timing diagnostics missing from llm.done: %+v", data)
 	}
 }
 

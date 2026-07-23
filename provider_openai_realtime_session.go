@@ -47,6 +47,7 @@ type openaiRealtimeSession struct {
 	audioInBytesPerSecond    float64
 	audioOutBytesPerSecond   float64
 	closeOnce                sync.Once
+	lifecycle                realtimeSessionLifecycle
 	droppedAudio             atomic.Uint64
 	itemPhases               map[string]string
 }
@@ -177,9 +178,7 @@ func openAICompatibleRealtimeSession(ctx context.Context, opts RealtimeSessionOp
 	}
 	s.outbox <- realtimeOutboundFrame{op: ws.OpText, data: sessUpdate}
 
-	go s.readLoop()
-	go s.writeLoop()
-	go s.pingLoop()
+	s.lifecycle.start(s.events, s.readLoop, s.writeLoop, s.pingLoop)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -283,7 +282,6 @@ func buildSessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, 
 }
 
 func (s *openaiRealtimeSession) readLoop() {
-	defer close(s.events)
 	for {
 		data, op, err := wsutil.ReadServerData(s.conn)
 		if err != nil {
@@ -294,6 +292,7 @@ func (s *openaiRealtimeSession) readLoop() {
 			}
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("ws read: %w", err)})
 			s.emitControl(RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.droppedAudio.Load()})
+			_ = s.Close()
 			return
 		}
 		if op != ws.OpText {
@@ -445,7 +444,7 @@ func (s *openaiRealtimeSession) writeLoop() {
 		case frame := <-s.outbox:
 			if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
 				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("ws write: %w", err)})
-				_ = s.conn.Close()
+				_ = s.Close()
 				return
 			}
 		}

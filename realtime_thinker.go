@@ -814,8 +814,7 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	if strings.TrimSpace(note) == "" {
 		return
 	}
-	rt.setConversationState("thinking", RealtimeEvent{})
-	if err := session.SendText("user", note); err != nil {
+	if err := rt.requestTextResponse(note); err != nil {
 		logMsg("REALTIME", fmt.Sprintf("[%s] inject text: %v", rt.threadID, err))
 	}
 }

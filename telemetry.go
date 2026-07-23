@@ -473,6 +473,7 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 // --- Convenience emitters with typed data ---
 
 type LLMDoneData struct {
+	Provider           string `json:"provider,omitempty"`
 	Model              string `json:"model"`
 	Reasoning          string `json:"reasoning,omitempty"` // legacy alias for requested effort
 	ReasoningRequested string `json:"reasoning_requested,omitempty"`
@@ -482,6 +483,7 @@ type LLMDoneData struct {
 	CacheWriteTokens   int    `json:"cache_write_tokens,omitempty"`
 	TokensOut          int    `json:"tokens_out"`
 	DurationMs         int64  `json:"duration_ms"`
+	ProviderTiming
 	// cost_usd is no longer populated by core — pricing lives in the
 	// server, which enriches llm.done events with a canonical
 	// cost_usd on ingest. Removing the field from the Go type keeps
@@ -523,9 +525,11 @@ type LLMChunkData struct {
 }
 
 type LLMErrorData struct {
-	Model     string `json:"model"`
-	Error     string `json:"error"`
-	Iteration int    `json:"iteration"`
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model"`
+	Error    string `json:"error"`
+	ProviderTiming
+	Iteration int `json:"iteration"`
 }
 
 type ThreadSpawnData struct {

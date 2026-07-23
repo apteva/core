@@ -7,25 +7,36 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const configFile = "config.json"
 
+// PersistentPaceState is runtime scheduling state, not directive content.
+// Sleep preserves the thread's chosen cadence; NextWakeAt preserves the
+// pending timer across a process restart. Both remain capped by the runtime's
+// 24-hour maximum when restored.
+type PersistentPaceState struct {
+	Sleep      string    `json:"sleep,omitempty"`
+	NextWakeAt time.Time `json:"next_wake_at,omitempty"`
+}
+
 type PersistentThread struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name,omitempty"`      // human-readable label; empty = display as ID
-	ParentID     string   `json:"parent_id,omitempty"` // empty = child of main
-	Depth        int      `json:"depth,omitempty"`     // 0 = main's direct child
-	System       bool     `json:"system,omitempty"`    // system thread (can't be killed by LLM)
-	Directive    string   `json:"directive"`
-	Tools        []string `json:"tools"`
-	MCPNames     []string `json:"mcp_names,omitempty"`    // MCP servers to connect on respawn
-	Model        string   `json:"model,omitempty"`        // starting model tier: large, medium, small
-	Reasoning    string   `json:"reasoning,omitempty"`    // starting reasoning effort: auto, low, medium, high, ...
-	Provider     string   `json:"provider,omitempty"`     // provider selected for this thread
-	Realtime     bool     `json:"realtime,omitempty"`     // spawn as a realtime (voice/audio) thread
-	Conversation bool     `json:"conversation,omitempty"` // user-facing conversation; no mandatory completion report to parent
-	Voice        string   `json:"voice,omitempty"`        // realtime voice id (e.g. "marin"); empty = provider default
+	ID           string               `json:"id"`
+	Name         string               `json:"name,omitempty"`      // human-readable label; empty = display as ID
+	ParentID     string               `json:"parent_id,omitempty"` // empty = child of main
+	Depth        int                  `json:"depth,omitempty"`     // 0 = main's direct child
+	System       bool                 `json:"system,omitempty"`    // system thread (can't be killed by LLM)
+	Directive    string               `json:"directive"`
+	Tools        []string             `json:"tools"`
+	MCPNames     []string             `json:"mcp_names,omitempty"`    // MCP servers to connect on respawn
+	Model        string               `json:"model,omitempty"`        // starting model tier: large, medium, small
+	Reasoning    string               `json:"reasoning,omitempty"`    // starting reasoning effort: auto, low, medium, high, ...
+	Provider     string               `json:"provider,omitempty"`     // provider selected for this thread
+	Realtime     bool                 `json:"realtime,omitempty"`     // spawn as a realtime (voice/audio) thread
+	Conversation bool                 `json:"conversation,omitempty"` // user-facing conversation; no mandatory completion report to parent
+	Voice        string               `json:"voice,omitempty"`        // realtime voice id (e.g. "marin"); empty = provider default
+	Pace         *PersistentPaceState `json:"pace,omitempty"`         // runtime cadence/deadline; never part of the directive
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
@@ -82,6 +93,7 @@ type Config struct {
 	Providers        []ProviderConfig       `json:"providers,omitempty"` // multi-provider pool
 	Provider         *ProviderConfig        `json:"provider,omitempty"`  // legacy single-provider (auto-migrated to Providers on load)
 	Threads          []PersistentThread     `json:"threads,omitempty"`
+	MainPace         *PersistentPaceState   `json:"main_pace,omitempty"`
 	MCPServers       []MCPServerConfig      `json:"mcp_servers,omitempty"`
 	Execution        ExecutionControlConfig `json:"execution_control,omitempty"`
 }
@@ -197,6 +209,7 @@ func (c *Config) restore(data []byte) {
 	c.Providers = restored.Providers
 	c.Provider = restored.Provider
 	c.Threads = restored.Threads
+	c.MainPace = restored.MainPace
 	c.MCPServers = restored.MCPServers
 	c.Execution = restored.Execution
 }
@@ -267,6 +280,27 @@ func (c *Config) SetRealtimeVoiceMCP(names []string) error {
 
 func (c *Config) SetDirective(d string) error {
 	return c.update(func() { c.Directive = d })
+}
+
+func clonePersistentPaceState(state *PersistentPaceState) *PersistentPaceState {
+	if state == nil {
+		return nil
+	}
+	copy := *state
+	return &copy
+}
+
+func (c *Config) GetMainPace() *PersistentPaceState {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return clonePersistentPaceState(c.MainPace)
+}
+
+func (c *Config) SetMainPace(state PersistentPaceState) error {
+	return c.update(func() { c.MainPace = clonePersistentPaceState(&state) })
 }
 
 func (c *Config) ClearThreads() error {
@@ -344,6 +378,9 @@ func (c *Config) GetThreads() []PersistentThread {
 	defer c.mu.RUnlock()
 	out := make([]PersistentThread, len(c.Threads))
 	copy(out, c.Threads)
+	for i := range out {
+		out[i].Pace = clonePersistentPaceState(out[i].Pace)
+	}
 	return out
 }
 

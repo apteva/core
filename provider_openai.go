@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // OpenAICompatProvider works with any OpenAI-compatible API:
@@ -297,6 +298,21 @@ func toOpenAIMessages(messages []Message) []any {
 }
 
 func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+	callStart := time.Now()
+	timing := ProviderTiming{}
+	elapsedMs := func() int64 {
+		return time.Since(callStart).Milliseconds()
+	}
+	markMs := func() *int64 {
+		ms := elapsedMs()
+		return &ms
+	}
+	failed := func(phase string, err error) (ChatResponse, error) {
+		timing.CompletionMs = elapsedMs()
+		timing.TerminalPhase = phase
+		return ChatResponse{ProviderTiming: timing}, err
+	}
+
 	requestOptions := openAICompatRequestOptionsFromContext(ctx)
 	// Build request
 	openAIMessages := toOpenAIMessages(messages)
@@ -367,12 +383,14 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	for {
 		body, err := json.Marshal(reqMap)
 		if err != nil {
-			return ChatResponse{}, err
+			return failed("request_encode", err)
 		}
+		timing.RequestAttempts++
 		resp, err = doRequest(body)
 		if err != nil {
-			return ChatResponse{}, err
+			return failed("response_headers", err)
 		}
+		timing.ResponseHeadersMs = markMs()
 
 		// Capture provider-side request identifiers so a future stall /
 		// hang can be cross-referenced with the provider's own logs without
@@ -380,6 +398,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		// (Fireworks ships x-request-id; some return x-fw-request-id). Log
 		// whatever we find.
 		reqIDs = extractProviderRequestIDs(resp.Header)
+		timing.ProviderRequestIDs = reqIDs
 		if len(reqIDs) > 0 {
 			logMsg("PROVIDER", fmt.Sprintf("model=%s request_ids=%v", model, reqIDs))
 		}
@@ -413,7 +432,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		if retriedOptional {
 			continue
 		}
-		return ChatResponse{}, fmt.Errorf("API error %d: %s (request_ids=%v)", resp.StatusCode, string(respBody), reqIDs)
+		return failed("http_status", fmt.Errorf("API error %d: %s (request_ids=%v)", resp.StatusCode, string(respBody), reqIDs))
 	}
 
 	// Wrap the streaming body in an idle-read monitor. Any pause longer
@@ -453,6 +472,10 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
+		timing.StreamChunks++
+		if timing.FirstChunkMs == nil {
+			timing.FirstChunkMs = markMs()
+		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
 			break
@@ -484,7 +507,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 			continue
 		}
 		if event.Error != nil {
-			return ChatResponse{}, fmt.Errorf("provider stream error (%s/%v): %s", event.Error.Type, event.Error.Code, event.Error.Message)
+			return failed("stream_error", fmt.Errorf("provider stream error (%s/%v): %s", event.Error.Type, event.Error.Code, event.Error.Message))
 		}
 		if len(event.Choices) > 0 {
 			delta := event.Choices[0].Delta
@@ -512,6 +535,9 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 				}
 			}
 			for _, tc := range delta.ToolCalls {
+				if timing.FirstToolCallMs == nil {
+					timing.FirstToolCallMs = markMs()
+				}
 				pt, ok := pendingTools[tc.Index]
 				if !ok {
 					pt = &struct {
@@ -566,9 +592,9 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	// (and tests) can tell them apart from transport errors.
 	if scerr := scanner.Err(); scerr != nil {
 		if errors.Is(scerr, ErrStreamIdleTimeout) {
-			return ChatResponse{}, fmt.Errorf("%w (model=%s request_ids=%v)", ErrStreamIdleTimeout, model, reqIDs)
+			return failed("stream_read", fmt.Errorf("%w (model=%s request_ids=%v)", ErrStreamIdleTimeout, model, reqIDs))
 		}
-		return ChatResponse{}, fmt.Errorf("stream read error: %w (model=%s request_ids=%v)", scerr, model, reqIDs)
+		return failed("stream_read", fmt.Errorf("stream read error: %w (model=%s request_ids=%v)", scerr, model, reqIDs))
 	}
 
 	// Assemble completed tool calls
@@ -607,11 +633,14 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		})
 	}
 
+	timing.CompletionMs = elapsedMs()
+	timing.TerminalPhase = "completed"
 	return ChatResponse{
-		Text:      full.String(),
-		Reasoning: fullReasoning.String(),
-		ToolCalls: toolCalls,
-		Usage:     usage,
+		Text:           full.String(),
+		Reasoning:      fullReasoning.String(),
+		ToolCalls:      toolCalls,
+		Usage:          usage,
+		ProviderTiming: timing,
 	}, nil
 }
 

@@ -7,10 +7,10 @@ import (
 )
 
 // OpenCodeGoProvider is a thin policy wrapper over the shared OpenAI-
-// compatible transport. Auto requests the optional minimal effort for
-// interactive responsiveness while an explicit agent choice still wins.
-// Models that reject the field are remembered and use their provider default
-// on subsequent requests.
+// compatible transport. Auto uses a model-aware effort chosen for reliable
+// tool workflows while an explicit agent choice still wins. Models that reject
+// the field are remembered and use their provider default on subsequent
+// requests.
 type OpenCodeGoProvider struct {
 	compat    *OpenAICompatProvider
 	reasoning ReasoningSettings
@@ -81,7 +81,7 @@ func (p *OpenCodeGoProvider) WithReasoning(settings ReasoningSettings) LLMProvid
 
 func (p *OpenCodeGoProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
 	requested := normalizeReasoningLevel(p.reasoning.Level).String()
-	effort := openCodeGoReasoningEffort(p.reasoning.Level)
+	effort := openCodeGoReasoningEffort(model, p.reasoning.Level)
 
 	if p.support.accepts(model) {
 		ctx = withOpenAICompatRequestOptions(ctx, openAICompatRequestOptions{
@@ -106,9 +106,12 @@ func (p *OpenCodeGoProvider) Chat(ctx context.Context, messages []Message, model
 	return resp, err
 }
 
-func openCodeGoReasoningEffort(level ReasoningLevel) string {
+func openCodeGoReasoningEffort(model string, level ReasoningLevel) string {
 	switch normalizeReasoningLevel(level) {
 	case ReasoningAuto:
+		if normalizeOpenCodeGoModel(model) == "glm-5.2" {
+			return "medium"
+		}
 		return "minimal"
 	case ReasoningNone:
 		return "none"

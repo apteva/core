@@ -253,6 +253,7 @@ type googleRealtimeSession struct {
 
 	closeOnce sync.Once
 	readyOnce sync.Once
+	lifecycle realtimeSessionLifecycle
 	seq       atomic.Uint64
 	dropped   atomic.Uint64
 
@@ -299,9 +300,7 @@ func openGoogleRealtimeSession(ctx context.Context, provider *GoogleRealtimeProv
 		configFingerprint: googleRealtimeConfigFingerprint(opts.Instructions, opts.Tools),
 	}
 	s.outbox <- realtimeOutboundFrame{op: ws.OpText, data: setup}
-	go s.readLoop()
-	go s.writeLoop()
-	go s.pingLoop()
+	s.lifecycle.start(s.events, s.readLoop, s.writeLoop, s.pingLoop)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -422,7 +421,6 @@ func appendGoogleTranscript(current, update string) string {
 }
 
 func (s *googleRealtimeSession) readLoop() {
-	defer close(s.events)
 	for {
 		data, op, err := wsutil.ReadServerData(s.conn)
 		if err != nil {
@@ -435,6 +433,7 @@ func (s *googleRealtimeSession) readLoop() {
 			s.signalReady(signalErr)
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: signalErr})
 			s.emitControl(RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.dropped.Load()})
+			_ = s.Close()
 			return
 		}
 		// Gemini currently returns its JSON protocol messages in binary

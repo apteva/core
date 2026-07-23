@@ -171,6 +171,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 		"core_build_time":       BuildTime,
 		"iteration":             status.Iteration,
 		"rate":                  formatSleep(status.Sleep),
+		"next_wake_at":          formatNextWakeAt(status.NextWakeAt),
 		"model":                 status.Model.String(),
 		"reasoning":             status.Reasoning.String(),
 		"threads":               a.thinker.threads.Count() + 1, // +1 for main
@@ -184,21 +185,22 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 }
 
 type threadJSON struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name,omitempty"`
-	ParentID  string   `json:"parent_id,omitempty"`
-	Depth     int      `json:"depth"`
-	Directive string   `json:"directive,omitempty"`
-	Tools     []string `json:"tools,omitempty"`
-	MCPNames  []string `json:"mcp_names,omitempty"`
-	Iteration int      `json:"iteration"`
-	Rate      string   `json:"rate"`
-	Model     string   `json:"model"`
-	Reasoning string   `json:"reasoning,omitempty"`
-	Age       string   `json:"age"`
-	Realtime  bool     `json:"realtime,omitempty"`
-	Voice     string   `json:"voice,omitempty"`
-	Provider  string   `json:"provider,omitempty"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name,omitempty"`
+	ParentID   string   `json:"parent_id,omitempty"`
+	Depth      int      `json:"depth"`
+	Directive  string   `json:"directive,omitempty"`
+	Tools      []string `json:"tools,omitempty"`
+	MCPNames   []string `json:"mcp_names,omitempty"`
+	Iteration  int      `json:"iteration"`
+	Rate       string   `json:"rate"`
+	NextWakeAt string   `json:"next_wake_at,omitempty"`
+	Model      string   `json:"model"`
+	Reasoning  string   `json:"reasoning,omitempty"`
+	Age        string   `json:"age"`
+	Realtime   bool     `json:"realtime,omitempty"`
+	Voice      string   `json:"voice,omitempty"`
+	Provider   string   `json:"provider,omitempty"`
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
@@ -214,14 +216,15 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	mainMCPs := append([]string(nil), status.MCPNames...)
 	// Always include main
 	out := []threadJSON{{
-		ID:        "main",
-		Directive: a.thinker.config.GetDirective(),
-		MCPNames:  mainMCPs,
-		Iteration: status.Iteration,
-		Rate:      status.Rate.String(),
-		Model:     status.Model.String(),
-		Reasoning: status.Reasoning.String(),
-		Age:       formatAge(time.Since(a.startTime)),
+		ID:         "main",
+		Directive:  a.thinker.config.GetDirective(),
+		MCPNames:   mainMCPs,
+		Iteration:  status.Iteration,
+		Rate:       status.Rate.String(),
+		NextWakeAt: formatNextWakeAt(status.NextWakeAt),
+		Model:      status.Model.String(),
+		Reasoning:  status.Reasoning.String(),
+		Age:        formatAge(time.Since(a.startTime)),
 	}}
 
 	// Recursively collect all threads (including sub-threads of leaders)
@@ -229,21 +232,22 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	collectThreads = func(tm *ThreadManager) {
 		for _, t := range tm.List() {
 			out = append(out, threadJSON{
-				ID:        t.ID,
-				Name:      t.Name,
-				ParentID:  t.ParentID,
-				Depth:     t.Depth,
-				Directive: t.Directive,
-				Tools:     t.Tools,
-				MCPNames:  t.MCPNames,
-				Iteration: t.Iteration,
-				Rate:      t.Rate.String(),
-				Model:     t.Model.String(),
-				Reasoning: t.Reasoning.String(),
-				Age:       formatAge(time.Since(t.Started)),
-				Realtime:  t.Realtime,
-				Voice:     t.Voice,
-				Provider:  t.Provider,
+				ID:         t.ID,
+				Name:       t.Name,
+				ParentID:   t.ParentID,
+				Depth:      t.Depth,
+				Directive:  t.Directive,
+				Tools:      t.Tools,
+				MCPNames:   t.MCPNames,
+				Iteration:  t.Iteration,
+				Rate:       t.Rate.String(),
+				NextWakeAt: formatNextWakeAt(t.NextWakeAt),
+				Model:      t.Model.String(),
+				Reasoning:  t.Reasoning.String(),
+				Age:        formatAge(time.Since(t.Started)),
+				Realtime:   t.Realtime,
+				Voice:      t.Voice,
+				Provider:   t.Provider,
 			})
 			// Recurse into children
 			if t.SubThreads > 0 {
@@ -259,6 +263,13 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	}
 	collectThreads(a.thinker.threads)
 	writeJSON(w, out)
+}
+
+func formatNextWakeAt(wake time.Time) string {
+	if wake.IsZero() {
+		return ""
+	}
+	return wake.UTC().Format(time.RFC3339Nano)
 }
 
 func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
