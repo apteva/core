@@ -238,6 +238,44 @@ func countActiveMCPTools(active map[string]bool) int {
 	return n
 }
 
+// recordPresentedTools snapshots the exact provider-visible tool names for
+// the current model request (or realtime session configuration). Dispatch
+// consults this snapshot rather than trying to reconstruct visibility from a
+// different subset of tool state.
+func (t *Thinker) recordPresentedTools(tools []NativeTool) {
+	if t == nil {
+		return
+	}
+	presented := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		presented[tool.Name] = true
+	}
+	t.presentedToolsMu.Lock()
+	t.presentedTools = presented
+	t.presentedToolsMu.Unlock()
+}
+
+// modelToolCallable applies the thread's effective tool set: durable/static
+// spawn grants remain callable, and dynamic tools are callable only when their
+// schemas were actually presented for the current request/session.
+func (t *Thinker) modelToolCallable(name string, fallback map[string]bool) bool {
+	if t == nil {
+		return false
+	}
+	if t.threadID != "main" && !t.allowNoSpawn && t.toolIndex != nil {
+		if entry, ok := t.toolIndex.Get(name); ok && entry.NoSpawn {
+			return false
+		}
+	}
+	if fallback[name] {
+		return true
+	}
+	t.presentedToolsMu.RLock()
+	allowed := t.presentedTools[name]
+	t.presentedToolsMu.RUnlock()
+	return allowed
+}
+
 // prepareNativeTools resolves the provider-neutral MCP loading policy into
 // the exact schema list for one model request. Always-loaded tools are merged
 // transiently, never inserted into activeTools, so search activation remains
@@ -276,6 +314,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 	}
 
 	tools := t.registry.NativeTools(t.toolAllowlist, active, t.systemThread)
+	t.recordPresentedTools(tools)
 	t.lastNativeToolCount = len(tools)
 	t.lastActiveMCPCount = countActiveMCPTools(active)
 	t.lastAlwaysMCPCount = t.toolIndex.AlwaysCount(allowNoSpawn)

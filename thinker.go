@@ -673,6 +673,7 @@ type Thinker struct {
 	onStop        func()
 	toolAllowlist map[string]bool // nil = all tools allowed (main thread)
 	systemThread  bool
+	allowNoSpawn  bool // privileged API/system-created thread with explicit no_spawn grants
 
 	// API event log — shared across all threads, owned by main thinker
 	apiLog    *[]APIEvent
@@ -715,6 +716,12 @@ type Thinker struct {
 	// surfaced — the recency key for evictActiveToolsLRU. Lazily
 	// initialised by touchActiveTool.
 	activeToolAge map[string]int
+	// presentedTools is the exact schema-name set supplied to the model for
+	// its current request/session configuration. Sub-thread dispatch uses
+	// this same set so a dynamically discovered or always-loaded tool cannot
+	// be visible but uncallable, while a guessed hidden name cannot execute.
+	presentedToolsMu sync.RWMutex
+	presentedTools   map[string]bool
 	// kickNextTurn, when true, causes the iteration loop to skip its
 	// pace sleep and re-think immediately on the next pass. Set by
 	// runSearchTools when it activates new tools so the agent can
@@ -736,6 +743,9 @@ type Thinker struct {
 	// rearming the loop indefinitely.
 	sendCorrectionUsed bool
 	sendCompletionUsed bool
+	// toolRejectionCorrectionUsed bounds the immediate repair turn for a
+	// model call to a tool that was not presented to this thread.
+	toolRejectionCorrectionUsed bool
 	// lastInboundForPreload carries the text of events drained on
 	// THIS iteration through to applyPreload's BM25 query. Set in
 	// Run() before think(); cleared after think() returns. Lets BM25
@@ -834,6 +844,18 @@ func (t *Thinker) resetSendTurnGuards() {
 	t.sendCompletionUsed = false
 }
 
+func (t *Thinker) scheduleToolRejectionCorrection() {
+	if t.toolRejectionCorrectionUsed {
+		return
+	}
+	t.toolRejectionCorrectionUsed = true
+	t.kickNextTurn = true
+}
+
+func (t *Thinker) resetToolRejectionTurnGuard() {
+	t.toolRejectionCorrectionUsed = false
+}
+
 func latestTurnContainsUserFacingRequest(messages []Message) bool {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role != "user" {
@@ -858,7 +880,8 @@ func sendFinalFailureResult(err error) string {
 }
 
 func inlineToolResultIsError(content string) bool {
-	return strings.HasPrefix(strings.TrimSpace(content), "error:")
+	trimmed := strings.TrimSpace(content)
+	return strings.HasPrefix(trimmed, "error:") || strings.HasPrefix(trimmed, `{"error":`)
 }
 
 func hasToolCallNamed(calls []toolCall, name string) bool {
@@ -1124,6 +1147,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	for _, pt := range persistedThreads {
 		parentID := pt.ParentID
 		ptReasoning, _ := parseReasoningLevel(pt.Reasoning)
+		allowNoSpawn := persistentThreadAllowsNoSpawn(pt, t.toolIndex)
 		// Skip persistent realtime threads on respawn when the feature
 		// is off. Without this, an instance that previously had
 		// realtime enabled would try to bring those threads back even
@@ -1134,35 +1158,37 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		}
 		if parentID == "" || parentID == "main" {
 			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-				ProviderName: pt.Provider,
-				ParentID:     "main",
-				Depth:        pt.Depth,
-				DeferRun:     true,
-				MCPNames:     pt.MCPNames,
-				Model:        pt.Model,
-				Reasoning:    ptReasoning,
-				Realtime:     pt.Realtime,
-				Conversation: pt.Conversation,
-				Voice:        pt.Voice,
-				System:       pt.System,
-				Pace:         pt.Pace,
+				ProviderName:  pt.Provider,
+				ParentID:      "main",
+				Depth:         pt.Depth,
+				DeferRun:      true,
+				MCPNames:      pt.MCPNames,
+				Model:         pt.Model,
+				Reasoning:     ptReasoning,
+				Realtime:      pt.Realtime,
+				Conversation:  pt.Conversation,
+				BypassNoSpawn: allowNoSpawn,
+				Voice:         pt.Voice,
+				System:        pt.System,
+				Pace:          pt.Pace,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
 			if mgr != nil {
 				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-					ProviderName: pt.Provider,
-					ParentID:     parentID,
-					Depth:        pt.Depth,
-					DeferRun:     true,
-					MCPNames:     pt.MCPNames,
-					Model:        pt.Model,
-					Reasoning:    ptReasoning,
-					Realtime:     pt.Realtime,
-					Conversation: pt.Conversation,
-					Voice:        pt.Voice,
-					System:       pt.System,
-					Pace:         pt.Pace,
+					ProviderName:  pt.Provider,
+					ParentID:      parentID,
+					Depth:         pt.Depth,
+					DeferRun:      true,
+					MCPNames:      pt.MCPNames,
+					Model:         pt.Model,
+					Reasoning:     ptReasoning,
+					Realtime:      pt.Realtime,
+					Conversation:  pt.Conversation,
+					BypassNoSpawn: allowNoSpawn,
+					Voice:         pt.Voice,
+					System:        pt.System,
+					Pace:          pt.Pace,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -2748,6 +2774,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
 		nativeTools = t.prepareNativeTools(provider.Name())
 	} else {
+		t.recordPresentedTools(nil)
 		t.lastNativeToolCount = 0
 		t.lastActiveMCPCount = 0
 		t.lastAlwaysMCPCount = 0

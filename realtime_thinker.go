@@ -71,13 +71,15 @@ func realtimeNativeTools(thinker *Thinker) []NativeTool {
 	if thinker.registry != nil {
 		tools = thinker.registry.NativeTools(thinker.toolAllowlist, thinker.activeTools, thinker.systemThread)
 	}
-	return append(tools, NativeTool{
+	tools = append(tools, NativeTool{
 		Name:        "interrupt",
 		Description: "Cancel your own in-flight speech immediately when the remaining utterance is stale. Takes no arguments.",
 		Parameters: map[string]any{
 			"type": "object", "properties": map[string]any{},
 		},
 	})
+	thinker.recordPresentedTools(tools)
+	return tools
 }
 
 func realtimeSafetyIdentifier(threadID string) string {
@@ -711,7 +713,7 @@ func (rt *RealtimeThinker) dispatchToolCall(event RealtimeEvent) {
 		Name: event.ToolName, Args: flattenJSONArgs(event.ToolArgs),
 		Raw: event.ToolName, NativeID: event.ToolCallID,
 	}
-	if rt.toolAllowlist != nil && !rt.toolAllowlist[call.Name] {
+	if !rt.modelToolCallable(call.Name, rt.toolAllowlist) {
 		rt.submitToolResult(session, call.NativeID, "tool is not available to this thread", true)
 		return
 	}

@@ -205,6 +205,7 @@ type Thread struct {
 	Realtime       *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
 	IsRealtime     bool
 	IsConversation bool
+	AllowNoSpawn   bool
 	Voice          string
 	ProviderName   string
 	Ephemeral      bool
@@ -484,6 +485,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		MCPNames:            opts.MCPNames,
 		IsRealtime:          opts.Realtime,
 		IsConversation:      opts.Conversation,
+		AllowNoSpawn:        opts.BypassNoSpawn,
 		Voice:               opts.Voice,
 		ProviderName:        opts.ProviderName,
 		Ephemeral:           opts.Ephemeral,
@@ -529,11 +531,23 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// attaching them via spawn(mcp="..."). Core has no opinion about
 	// which names are privileged — it only honors the flag.
 	mcpNames := opts.MCPNames
-	if !opts.BypassNoSpawn && len(mcpNames) > 0 && tm.parent.config != nil {
+	if !opts.BypassNoSpawn && len(mcpNames) > 0 {
 		noSpawn := map[string]bool{}
-		for _, sc := range tm.parent.config.GetMCPServers() {
-			if sc.NoSpawn {
-				noSpawn[sc.Name] = true
+		if tm.parent.config != nil {
+			for _, sc := range tm.parent.config.GetMCPServers() {
+				if sc.NoSpawn {
+					noSpawn[sc.Name] = true
+				}
+			}
+		}
+		if tm.parent.toolIndex != nil {
+			for _, name := range mcpNames {
+				for _, toolName := range tm.parent.toolIndex.ToolsForServer(name) {
+					if entry, ok := tm.parent.toolIndex.Get(toolName); ok && entry.NoSpawn {
+						noSpawn[name] = true
+						break
+					}
+				}
 			}
 		}
 		filtered := mcpNames[:0]
@@ -545,6 +559,19 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			filtered = append(filtered, n)
 		}
 		mcpNames = filtered
+	}
+	// Exact tool-name grants are another way to imply an MCP server. Strip
+	// no_spawn entries before prefix auto-detection so an agent-created
+	// worker cannot bypass the server-level filter by already knowing a tool
+	// name. Authenticated API-created threads set BypassNoSpawn and retain
+	// their explicit grants.
+	if !opts.BypassNoSpawn && tm.parent.toolIndex != nil {
+		for toolName := range toolSet {
+			if entry, ok := tm.parent.toolIndex.Get(toolName); ok && entry.NoSpawn {
+				delete(toolSet, toolName)
+				logMsg("SPAWN", fmt.Sprintf("%s: refusing no-spawn tool %q on sub-thread", id, toolName))
+			}
+		}
 	}
 	if len(mcpNames) == 0 && tm.parent.config != nil {
 		knownServers := map[string]bool{}
@@ -601,6 +628,11 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// server. Currently only populated by the privileged HTTP spawn path;
 	// the LLM-driven spawn tool uses mcps=[…] which feeds MCPNames above.
 	for _, tn := range opts.Tools {
+		if !opts.BypassNoSpawn && tm.parent.toolIndex != nil {
+			if entry, ok := tm.parent.toolIndex.Get(tn); ok && entry.NoSpawn {
+				continue
+			}
+		}
 		preloadActive[tn] = true
 		toolSet[tn] = true
 	}
@@ -653,6 +685,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		activeTools:            preloadActive,
 		directive:              directive,
 		systemThread:           isSystem,
+		allowNoSpawn:           opts.BypassNoSpawn,
 		unconsciousSafety:      tm.parent.unconsciousSafety,
 		rebuildPrompt: func(_ string) string {
 			cd := ""
@@ -1036,8 +1069,23 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			}
 		}
 
+		rejectedToolCall := false
 		for _, call := range calls {
-			if !thread.Tools[call.Name] {
+			if !t.modelToolCallable(call.Name, thread.Tools) {
+				rejectedToolCall = true
+				reason := call.Args["_reason"]
+				delete(call.Args, "_reason")
+				if t.telemetry != nil {
+					t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+						ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
+					})
+				}
+				emitResult(call, fmt.Sprintf(
+					"error: tool %q is not available to this thread in the current model turn; use an exposed tool or search_tools, then retry on the next turn",
+					call.Name,
+				))
+				toolNames = append(toolNames, call.Name)
+				t.scheduleToolRejectionCorrection()
 				continue
 			}
 			// Check if inline or registry tool
@@ -1272,7 +1320,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				// Sub-threads search the same index but with no_spawn
 				// filtering on — they must not discover or load gateway
 				// or channels tools, which only main is authorised for.
-				emitResult(call, runSearchTools(t, call.Args, false))
+				result := runSearchTools(t, call.Args, false)
+				emitResult(call, result)
+				if inlineToolResultIsError(result) {
+					rejectedToolCall = true
+					t.scheduleToolRejectionCorrection()
+				}
 				toolNames = append(toolNames, call.Raw)
 			case "pace":
 				result, err := applyPaceArgs(t, call.Args)
@@ -1339,6 +1392,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				executeTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
+		}
+		if !rejectedToolCall {
+			t.resetToolRejectionTurnGuard()
 		}
 
 		if doneMsg != nil {
@@ -1538,7 +1594,8 @@ func persistentThreadState(thread *Thread) PersistentThread {
 		ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
 		System: thread.System, Directive: thread.Directive,
 		Tools: toolSetToSlice(thread.Tools), MCPNames: append([]string(nil), thread.MCPNames...),
-		Provider: thread.ProviderName, Realtime: thread.IsRealtime, Conversation: thread.IsConversation, Voice: thread.Voice,
+		Provider: thread.ProviderName, Realtime: thread.IsRealtime, Conversation: thread.IsConversation,
+		AllowNoSpawn: thread.AllowNoSpawn, Voice: thread.Voice,
 	}
 	if thread.Thinker != nil {
 		// The published status is an immutable snapshot owned by the thinker
@@ -1565,6 +1622,32 @@ func persistentThreadState(thread *Thread) PersistentThread {
 		state.Provider = thread.Realtime.provider.Name()
 	}
 	return state
+}
+
+// persistentThreadAllowsNoSpawn preserves authenticated API-created
+// conversation threads written before AllowNoSpawn existed. The migration is
+// narrow: it only restores a no_spawn scope that is already explicitly named
+// in the durable record; it never grants access to additional hidden servers.
+func persistentThreadAllowsNoSpawn(thread PersistentThread, index *ToolIndex) bool {
+	if thread.AllowNoSpawn {
+		return true
+	}
+	if !thread.Conversation || index == nil {
+		return false
+	}
+	for _, toolName := range thread.Tools {
+		if entry, ok := index.Get(toolName); ok && entry.NoSpawn {
+			return true
+		}
+	}
+	for _, serverName := range thread.MCPNames {
+		for _, toolName := range index.ToolsForServer(serverName) {
+			if entry, ok := index.Get(toolName); ok && entry.NoSpawn {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PersistentState returns the effective durable representation of a live
