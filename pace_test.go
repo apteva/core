@@ -186,10 +186,19 @@ func TestRestoredWakeWaitsButInboxEventResumesEarly(t *testing.T) {
 	}
 	provider := newParkedAPIProvider()
 	thinker := NewThinker("", provider, cfg)
-	go thinker.Run()
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		thinker.Run()
+	}()
 	defer func() {
-		provider.Release()
 		thinker.Stop()
+		provider.Release()
+		select {
+		case <-runDone:
+		case <-time.After(2 * time.Second):
+			t.Error("thinker did not stop before test cleanup")
+		}
 	}()
 
 	select {
