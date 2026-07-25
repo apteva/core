@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"strings"
 )
 
@@ -82,6 +83,129 @@ const (
 	AudioG711ALaw AudioFormat = "g711_alaw"
 )
 
+const (
+	RealtimeTurnProfileDefault   = "default"
+	RealtimeTurnProfileTelephony = "telephony"
+
+	RealtimeSensitivityDefault = "default"
+	RealtimeSensitivityHigh    = "high"
+	RealtimeSensitivityLow     = "low"
+
+	RealtimeInterruptionDefault = "default"
+	RealtimeInterruptionAllow   = "interrupt"
+	RealtimeInterruptionDisable = "no_interruption"
+)
+
+// RealtimeTurnDetectionConfig is the provider-neutral turn-taking contract
+// carried by a realtime thread. Providers map the subset they support to
+// their native session fields. Profile values are durable intent; explicit
+// non-zero/non-default fields override the selected profile.
+//
+// The zero value preserves each provider's existing behavior.
+type RealtimeTurnDetectionConfig struct {
+	Profile           string `json:"profile,omitempty"`
+	StartSensitivity  string `json:"start_sensitivity,omitempty"`
+	PrefixPaddingMS   int    `json:"prefix_padding_ms,omitempty"`
+	EndSensitivity    string `json:"end_sensitivity,omitempty"`
+	SilenceDurationMS int    `json:"silence_duration_ms,omitempty"`
+	Interruption      string `json:"interruption,omitempty"`
+}
+
+func (c RealtimeTurnDetectionConfig) isZero() bool {
+	return c.Profile == "" && c.StartSensitivity == "" && c.PrefixPaddingMS == 0 &&
+		c.EndSensitivity == "" && c.SilenceDurationMS == 0 && c.Interruption == ""
+}
+
+func realtimeTurnDetectionValue(config *RealtimeTurnDetectionConfig) RealtimeTurnDetectionConfig {
+	if config == nil {
+		return RealtimeTurnDetectionConfig{}
+	}
+	return *config
+}
+
+func (c RealtimeTurnDetectionConfig) normalized() (RealtimeTurnDetectionConfig, error) {
+	c.Profile = strings.ToLower(strings.TrimSpace(c.Profile))
+	c.StartSensitivity = strings.ToLower(strings.TrimSpace(c.StartSensitivity))
+	c.EndSensitivity = strings.ToLower(strings.TrimSpace(c.EndSensitivity))
+	c.Interruption = strings.ToLower(strings.TrimSpace(c.Interruption))
+	if c.Profile == "" {
+		c.Profile = RealtimeTurnProfileDefault
+	}
+	switch c.Profile {
+	case RealtimeTurnProfileDefault, RealtimeTurnProfileTelephony:
+	default:
+		return RealtimeTurnDetectionConfig{}, fmt.Errorf("unsupported realtime turn-detection profile %q (use default or telephony)", c.Profile)
+	}
+	for label, value := range map[string]string{
+		"start_sensitivity": c.StartSensitivity,
+		"end_sensitivity":   c.EndSensitivity,
+	} {
+		switch value {
+		case "", RealtimeSensitivityDefault, RealtimeSensitivityHigh, RealtimeSensitivityLow:
+		default:
+			return RealtimeTurnDetectionConfig{}, fmt.Errorf("%s must be default, high, or low", label)
+		}
+	}
+	switch c.Interruption {
+	case "", RealtimeInterruptionDefault, RealtimeInterruptionAllow, RealtimeInterruptionDisable:
+	default:
+		return RealtimeTurnDetectionConfig{}, fmt.Errorf("interruption must be default, interrupt, or no_interruption")
+	}
+	if c.PrefixPaddingMS < 0 || c.PrefixPaddingMS > 60_000 {
+		return RealtimeTurnDetectionConfig{}, fmt.Errorf("prefix_padding_ms must be between 0 and 60000")
+	}
+	if c.SilenceDurationMS < 0 || c.SilenceDurationMS > 60_000 {
+		return RealtimeTurnDetectionConfig{}, fmt.Errorf("silence_duration_ms must be between 0 and 60000")
+	}
+	return c, nil
+}
+
+func (c RealtimeTurnDetectionConfig) resolved() RealtimeTurnDetectionConfig {
+	normalized, err := c.normalized()
+	if err != nil {
+		// Callers validate at the spawn/session boundary. Keeping this helper
+		// total makes telemetry and provider setup deterministic if a legacy
+		// in-memory caller bypasses that boundary.
+		normalized = RealtimeTurnDetectionConfig{Profile: RealtimeTurnProfileDefault}
+	}
+	if normalized.Profile == RealtimeTurnProfileTelephony {
+		if normalized.StartSensitivity == "" || normalized.StartSensitivity == RealtimeSensitivityDefault {
+			normalized.StartSensitivity = RealtimeSensitivityLow
+		}
+		if normalized.PrefixPaddingMS == 0 {
+			normalized.PrefixPaddingMS = 300
+		}
+		if normalized.EndSensitivity == "" || normalized.EndSensitivity == RealtimeSensitivityDefault {
+			normalized.EndSensitivity = RealtimeSensitivityLow
+		}
+		if normalized.SilenceDurationMS == 0 {
+			normalized.SilenceDurationMS = 750
+		}
+		if normalized.Interruption == "" || normalized.Interruption == RealtimeInterruptionDefault {
+			normalized.Interruption = RealtimeInterruptionAllow
+		}
+	}
+	return normalized
+}
+
+func (c RealtimeTurnDetectionConfig) telemetryData() map[string]any {
+	resolved := c.resolved()
+	valueOrDefault := func(value string) string {
+		if value == "" || value == RealtimeSensitivityDefault || value == RealtimeInterruptionDefault {
+			return "provider_default"
+		}
+		return value
+	}
+	return map[string]any{
+		"profile":             resolved.Profile,
+		"start_sensitivity":   valueOrDefault(resolved.StartSensitivity),
+		"prefix_padding_ms":   resolved.PrefixPaddingMS,
+		"end_sensitivity":     valueOrDefault(resolved.EndSensitivity),
+		"silence_duration_ms": resolved.SilenceDurationMS,
+		"interruption":        valueOrDefault(resolved.Interruption),
+	}
+}
+
 // RealtimeSessionOpts is the connect-time configuration for a
 // realtime session. Once the session is open, mutable fields can be
 // updated via UpdateInstructions / similar — opts itself is consumed
@@ -99,6 +223,7 @@ type RealtimeSessionOpts struct {
 	SafetyIdentifier   string // stable privacy-preserving end-user/session identifier
 	TranscribeInput    bool
 	TranscriptionModel string // empty = provider default
+	TurnDetection      RealtimeTurnDetectionConfig
 }
 
 // RealtimePricing supports dollars per one million tokens plus optional

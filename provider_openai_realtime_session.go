@@ -245,11 +245,26 @@ func buildSessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, 
 		outFmt = AudioPCM16
 	}
 
+	normalizedTurnDetection, err := opts.TurnDetection.normalized()
+	if err != nil {
+		return nil, fmt.Errorf("openai-realtime turn detection: %w", err)
+	}
+	resolvedTurnDetection := normalizedTurnDetection.resolved()
+	turnDetection := map[string]any{
+		"type": "server_vad", "create_response": true, "interrupt_response": true,
+	}
+	if resolvedTurnDetection.PrefixPaddingMS > 0 {
+		turnDetection["prefix_padding_ms"] = resolvedTurnDetection.PrefixPaddingMS
+	}
+	if resolvedTurnDetection.SilenceDurationMS > 0 {
+		turnDetection["silence_duration_ms"] = resolvedTurnDetection.SilenceDurationMS
+	}
+	if resolvedTurnDetection.Interruption == RealtimeInterruptionDisable {
+		turnDetection["interrupt_response"] = false
+	}
 	input := map[string]any{
-		"format": openAIAudioFormat(inFmt, opts.AudioInRate),
-		"turn_detection": map[string]any{
-			"type": "server_vad", "create_response": true, "interrupt_response": true,
-		},
+		"format":         openAIAudioFormat(inFmt, opts.AudioInRate),
+		"turn_detection": turnDetection,
 	}
 	if opts.TranscribeInput {
 		model := opts.TranscriptionModel

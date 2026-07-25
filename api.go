@@ -563,19 +563,20 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	var body struct {
-		Directive                  string   `json:"directive"`
-		DirectiveSuffix            string   `json:"directive_suffix"`
-		Tools                      []string `json:"tools"`
-		MCP                        []string `json:"mcp"`
-		Realtime                   bool     `json:"realtime,omitempty"`
-		Conversation               bool     `json:"conversation,omitempty"`
-		Ephemeral                  bool     `json:"ephemeral,omitempty"`
-		Voice                      string   `json:"voice,omitempty"`
-		ProviderName               string   `json:"provider,omitempty"`
-		Model                      string   `json:"model,omitempty"`
-		Reasoning                  string   `json:"reasoning,omitempty"`
-		InitialMessage             string   `json:"initial_message,omitempty"`
-		BridgeDisconnectTTLSeconds int      `json:"bridge_disconnect_ttl_seconds,omitempty"`
+		Directive                  string                      `json:"directive"`
+		DirectiveSuffix            string                      `json:"directive_suffix"`
+		Tools                      []string                    `json:"tools"`
+		MCP                        []string                    `json:"mcp"`
+		Realtime                   bool                        `json:"realtime,omitempty"`
+		Conversation               bool                        `json:"conversation,omitempty"`
+		Ephemeral                  bool                        `json:"ephemeral,omitempty"`
+		Voice                      string                      `json:"voice,omitempty"`
+		ProviderName               string                      `json:"provider,omitempty"`
+		Model                      string                      `json:"model,omitempty"`
+		Reasoning                  string                      `json:"reasoning,omitempty"`
+		InitialMessage             string                      `json:"initial_message,omitempty"`
+		BridgeDisconnectTTLSeconds int                         `json:"bridge_disconnect_ttl_seconds,omitempty"`
+		TurnDetection              RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -627,12 +628,25 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		Conversation:  body.Conversation,
 		Ephemeral:     body.Ephemeral,
 		Voice:         body.Voice,
+		TurnDetection: body.TurnDetection,
 		ProviderName:  body.ProviderName,
 		Model:         strings.ToLower(strings.TrimSpace(body.Model)),
 	}
 	if body.BridgeDisconnectTTLSeconds < 0 || body.BridgeDisconnectTTLSeconds > 3600 {
 		http.Error(w, "bridge_disconnect_ttl_seconds must be between 0 and 3600", http.StatusBadRequest)
 		return
+	}
+	if !body.Realtime && !body.TurnDetection.isZero() {
+		http.Error(w, "turn_detection requires realtime=true", http.StatusBadRequest)
+		return
+	}
+	if body.Realtime {
+		normalizedTurnDetection, err := body.TurnDetection.normalized()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		opts.TurnDetection = normalizedTurnDetection
 	}
 	if body.BridgeDisconnectTTLSeconds > 0 {
 		opts.BridgeDisconnectTTL = time.Duration(body.BridgeDisconnectTTLSeconds) * time.Second

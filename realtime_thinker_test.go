@@ -26,6 +26,7 @@ func TestRealtimePromptKeepsReasoningPrivateWithoutChangingNormalWorkers(t *test
 		"Spoken output contains only words intended for the caller",
 		"at most one brief, natural sentence",
 		"After sending work to main, do not speak again",
+		"Treat partial, garbled, overlapping, or low-confidence audio as uncertain",
 		"Do not use pace as a conversational wait mechanism",
 	} {
 		if !strings.Contains(realtime, required) {
@@ -145,7 +146,8 @@ func TestRealtimeOpenUsesFullCorePromptAndSelectedProfile(t *testing.T) {
 	thinker.agentReasoning = ReasoningHigh
 	session := newFakeRealtimeSession()
 	provider := &fakeRealtimeProvider{sessions: []*fakeRealtimeSession{session}}
-	rt, err := startRealtimeThinker(context.Background(), thinker, provider, "", nil, nil, nil)
+	turnDetection := RealtimeTurnDetectionConfig{Profile: RealtimeTurnProfileTelephony}
+	rt, err := startRealtimeThinker(context.Background(), thinker, provider, "", nil, nil, nil, turnDetection)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +164,96 @@ func TestRealtimeOpenUsesFullCorePromptAndSelectedProfile(t *testing.T) {
 	}
 	if !opts.TranscribeInput || opts.SafetyIdentifier == "" {
 		t.Fatalf("transcription/safety identifier missing: %#v", opts)
+	}
+	if opts.TurnDetection.Profile != RealtimeTurnProfileTelephony {
+		t.Fatalf("turn detection not forwarded: %#v", opts.TurnDetection)
+	}
+}
+
+func TestRealtimeSessionStartedTelemetryIncludesEffectiveTurnDetection(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	session := newFakeRealtimeSession()
+	provider := &fakeRealtimeProvider{sessions: []*fakeRealtimeSession{session}}
+	rt, err := startRealtimeThinker(
+		context.Background(), thinker, provider, "", nil, nil, nil,
+		RealtimeTurnDetectionConfig{Profile: RealtimeTurnProfileTelephony},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rt.Run()
+	}()
+	defer func() {
+		rt.cancel()
+		<-done
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		events, _ := thinker.telemetry.StoredEvents(0)
+		for _, event := range events {
+			if event.Type != "realtime.session_started" {
+				continue
+			}
+			var data map[string]any
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			turnDetection := data["turn_detection"].(map[string]any)
+			if turnDetection["profile"] != RealtimeTurnProfileTelephony ||
+				turnDetection["prefix_padding_ms"] != float64(300) ||
+				turnDetection["silence_duration_ms"] != float64(750) {
+				t.Fatalf("session telemetry = %#v", data)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("realtime.session_started telemetry was not emitted")
+}
+
+func TestMainSpawnForwardsAndPersistsRealtimeProfile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	thinker.config.path = configFile
+	thinker.config.RealtimeEnabled = true
+	realtimeProvider := &fakeRealtimeProvider{}
+	thinker.pool = &ProviderPool{
+		providers: map[string]LLMProvider{thinker.provider.Name(): thinker.provider},
+		order:     []string{thinker.provider.Name()}, default_: thinker.provider.Name(),
+		realtimeProviders: map[string]RealtimeProvider{
+			realtimeProvider.Name(): realtimeProvider,
+		},
+		realtimeOrder:   []string{realtimeProvider.Name()},
+		realtimeDefault: realtimeProvider.Name(),
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "spawn",
+		Args: map[string]string{
+			"id": "telephone-worker", "directive": "Answer telephone calls.",
+			"realtime": "true", "provider": realtimeProvider.Name(),
+			"realtime_profile": RealtimeTurnProfileTelephony,
+		},
+		NativeID: "spawn-telephone",
+	}}, nil)
+	if len(results) != 1 || results[0].IsError {
+		t.Fatalf("spawn result = %#v", results)
+	}
+	_, thread := thinker.threads.findManagedThread("telephone-worker")
+	if thread == nil || thread.Realtime == nil ||
+		thread.Realtime.opts.TurnDetection.Profile != RealtimeTurnProfileTelephony {
+		t.Fatalf("live realtime profile = %#v", thread)
+	}
+	stored, ok := persistentThreadByID(thinker.config.GetThreads(), "telephone-worker")
+	if !ok || stored.TurnDetection == nil ||
+		stored.TurnDetection.Profile != RealtimeTurnProfileTelephony {
+		t.Fatalf("persisted realtime profile = %#v", stored)
 	}
 }
 

@@ -1169,6 +1169,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				Conversation:  pt.Conversation,
 				BypassNoSpawn: allowNoSpawn,
 				Voice:         pt.Voice,
+				TurnDetection: realtimeTurnDetectionValue(pt.TurnDetection),
 				System:        pt.System,
 				Pace:          pt.Pace,
 			})
@@ -1187,6 +1188,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					Conversation:  pt.Conversation,
 					BypassNoSpawn: allowNoSpawn,
 					Voice:         pt.Voice,
+					TurnDetection: realtimeTurnDetectionValue(pt.TurnDetection),
 					System:        pt.System,
 					Pace:          pt.Pace,
 				})
@@ -1623,6 +1625,21 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				paused := parseTruthy(call.Args["paused"])
 				realtime := parseTruthy(call.Args["realtime"])
 				voice := call.Args["voice"]
+				turnDetection := RealtimeTurnDetectionConfig{Profile: call.Args["realtime_profile"]}
+				if !realtime && !turnDetection.isZero() {
+					addResult("error: realtime_profile requires realtime=true")
+					toolNames = append(toolNames, call.Raw)
+					continue
+				}
+				if realtime {
+					normalizedTurnDetection, err := turnDetection.normalized()
+					if err != nil {
+						addResult(fmt.Sprintf("error: %v", err))
+						toolNames = append(toolNames, call.Raw)
+						continue
+					}
+					turnDetection = normalizedTurnDetection
+				}
 				// Refuse realtime spawn cleanly when the feature gate is
 				// off OR no realtime provider is available. The model
 				// only sees realtime in the prompt when both are true,
@@ -1645,24 +1662,29 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v paused=%v realtime=%v voice=%q directive_len=%d",
 						id, tools, mcpNames, providerName, builtinTools, paused, realtime, voice, len(directive)))
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
-						MediaParts:   mediaParts,
-						ProviderName: providerName,
-						Model:        modelName,
-						Reasoning:    reasoning,
-						ParentID:     "main",
-						Depth:        0,
-						MCPNames:     mcpNames,
-						BuiltinTools: builtinTools,
-						Paused:       paused,
-						Realtime:     realtime,
-						Voice:        voice,
+						MediaParts:    mediaParts,
+						ProviderName:  providerName,
+						Model:         modelName,
+						Reasoning:     reasoning,
+						ParentID:      "main",
+						Depth:         0,
+						MCPNames:      mcpNames,
+						BuiltinTools:  builtinTools,
+						Paused:        paused,
+						Realtime:      realtime,
+						Voice:         voice,
+						TurnDetection: turnDetection,
 					})
 					if err != nil {
 						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
 						addResult(fmt.Sprintf("error: %v", err))
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
-						if err := t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Provider: providerName, Model: modelName, Reasoning: reasoning.String(), Realtime: realtime, Voice: voice}); err != nil {
+						var persistedTurnDetection *RealtimeTurnDetectionConfig
+						if realtime {
+							persistedTurnDetection = cloneRealtimeTurnDetectionConfig(&turnDetection)
+						}
+						if err := t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Provider: providerName, Model: modelName, Reasoning: reasoning.String(), Realtime: realtime, Voice: voice, TurnDetection: persistedTurnDetection}); err != nil {
 							t.threads.Kill(id)
 							addResult(fmt.Sprintf("error: persist spawned thread: %v", err))
 							toolNames = append(toolNames, call.Raw)

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -80,6 +81,11 @@ func (p *XAIRealtimeProvider) Open(ctx context.Context, opts RealtimeSessionOpts
 }
 
 func buildXAISessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, error) {
+	normalizedTurnDetection, err := opts.TurnDetection.normalized()
+	if err != nil {
+		return nil, fmt.Errorf("xai-realtime turn detection: %w", err)
+	}
+	resolvedTurnDetection := normalizedTurnDetection.resolved()
 	voice := strings.TrimSpace(opts.Voice)
 	if voice == "" {
 		voice = defaultVoice
@@ -102,10 +108,17 @@ func buildXAISessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byt
 		input["transcription"] = map[string]any{"model": model}
 	}
 
+	turnDetection := map[string]any{"type": "server_vad"}
+	if resolvedTurnDetection.PrefixPaddingMS > 0 {
+		turnDetection["prefix_padding_ms"] = resolvedTurnDetection.PrefixPaddingMS
+	}
+	if resolvedTurnDetection.SilenceDurationMS > 0 {
+		turnDetection["silence_duration_ms"] = resolvedTurnDetection.SilenceDurationMS
+	}
 	session := map[string]any{
 		"instructions":   opts.Instructions,
 		"voice":          voice,
-		"turn_detection": map[string]any{"type": "server_vad"},
+		"turn_detection": turnDetection,
 		"audio": map[string]any{
 			"input":  input,
 			"output": map[string]any{"format": openAIAudioFormat(outFmt, opts.AudioOutRate)},

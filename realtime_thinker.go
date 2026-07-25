@@ -95,6 +95,7 @@ func newRealtimeThinker(
 	audioIn <-chan []byte,
 	audioOut chan RealtimeAudioFrame,
 	audioControl chan<- string,
+	turnDetection ...RealtimeTurnDetectionConfig,
 ) *RealtimeThinker {
 	if voice == "" {
 		voice = provider.DefaultVoice()
@@ -108,6 +109,10 @@ func newRealtimeThinker(
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	var turnDetectionConfig RealtimeTurnDetectionConfig
+	if len(turnDetection) > 0 {
+		turnDetectionConfig = turnDetection[0]
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	rt := &RealtimeThinker{
@@ -137,6 +142,7 @@ func newRealtimeThinker(
 		SafetyIdentifier:   realtimeSafetyIdentifier(thinker.threadID),
 		TranscribeInput:    true,
 		TranscriptionModel: provider.DefaultTranscriptionModel(),
+		TurnDetection:      turnDetectionConfig,
 	}
 	return rt
 }
@@ -151,8 +157,9 @@ func startRealtimeThinker(
 	audioIn <-chan []byte,
 	audioOut chan RealtimeAudioFrame,
 	audioControl chan<- string,
+	turnDetection ...RealtimeTurnDetectionConfig,
 ) (*RealtimeThinker, error) {
-	rt := newRealtimeThinker(ctx, thinker, provider, voice, audioIn, audioOut, audioControl)
+	rt := newRealtimeThinker(ctx, thinker, provider, voice, audioIn, audioOut, audioControl, turnDetection...)
 	if err := rt.openSession(false); err != nil {
 		rt.cancel()
 		return nil, fmt.Errorf("realtime open: %w", err)
@@ -516,6 +523,7 @@ func (rt *RealtimeThinker) Run() {
 	logMsg("REALTIME", fmt.Sprintf("[%s] session up, model=%s voice=%s", rt.threadID, rt.opts.Model, rt.voice))
 	rt.emit("realtime.session_started", map[string]any{
 		"model": rt.opts.Model, "voice": rt.voice, "provider": rt.provider.Name(),
+		"turn_detection": rt.opts.TurnDetection.telemetryData(),
 	})
 	rt.setConversationState("listening", RealtimeEvent{})
 	reconnectDelay := realtimeReconnectMinDelay
@@ -533,7 +541,9 @@ func (rt *RealtimeThinker) Run() {
 				reconnectDelay = min(realtimeReconnectMaxDelay, reconnectDelay*2)
 				continue
 			}
-			rt.emit("realtime.reconnect", map[string]any{"success": true})
+			rt.emit("realtime.reconnect", map[string]any{
+				"success": true, "turn_detection": rt.opts.TurnDetection.telemetryData(),
+			})
 			reconnectDelay = realtimeReconnectMinDelay
 		}
 

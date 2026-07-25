@@ -22,22 +22,23 @@ type PersistentPaceState struct {
 }
 
 type PersistentThread struct {
-	ID           string               `json:"id"`
-	Name         string               `json:"name,omitempty"`      // human-readable label; empty = display as ID
-	ParentID     string               `json:"parent_id,omitempty"` // empty = child of main
-	Depth        int                  `json:"depth,omitempty"`     // 0 = main's direct child
-	System       bool                 `json:"system,omitempty"`    // system thread (can't be killed by LLM)
-	Directive    string               `json:"directive"`
-	Tools        []string             `json:"tools"`
-	MCPNames     []string             `json:"mcp_names,omitempty"`      // MCP servers to connect on respawn
-	Model        string               `json:"model,omitempty"`          // starting model tier: large, medium, small
-	Reasoning    string               `json:"reasoning,omitempty"`      // starting reasoning effort: auto, low, medium, high, ...
-	Provider     string               `json:"provider,omitempty"`       // provider selected for this thread
-	Realtime     bool                 `json:"realtime,omitempty"`       // spawn as a realtime (voice/audio) thread
-	Conversation bool                 `json:"conversation,omitempty"`   // user-facing conversation; no mandatory completion report to parent
-	AllowNoSpawn bool                 `json:"allow_no_spawn,omitempty"` // authenticated system/API grant for explicitly attached no_spawn MCPs
-	Voice        string               `json:"voice,omitempty"`          // realtime voice id (e.g. "marin"); empty = provider default
-	Pace         *PersistentPaceState `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
+	ID            string                       `json:"id"`
+	Name          string                       `json:"name,omitempty"`      // human-readable label; empty = display as ID
+	ParentID      string                       `json:"parent_id,omitempty"` // empty = child of main
+	Depth         int                          `json:"depth,omitempty"`     // 0 = main's direct child
+	System        bool                         `json:"system,omitempty"`    // system thread (can't be killed by LLM)
+	Directive     string                       `json:"directive"`
+	Tools         []string                     `json:"tools"`
+	MCPNames      []string                     `json:"mcp_names,omitempty"`      // MCP servers to connect on respawn
+	Model         string                       `json:"model,omitempty"`          // starting model tier: large, medium, small
+	Reasoning     string                       `json:"reasoning,omitempty"`      // starting reasoning effort: auto, low, medium, high, ...
+	Provider      string                       `json:"provider,omitempty"`       // provider selected for this thread
+	Realtime      bool                         `json:"realtime,omitempty"`       // spawn as a realtime (voice/audio) thread
+	Conversation  bool                         `json:"conversation,omitempty"`   // user-facing conversation; no mandatory completion report to parent
+	AllowNoSpawn  bool                         `json:"allow_no_spawn,omitempty"` // authenticated system/API grant for explicitly attached no_spawn MCPs
+	Voice         string                       `json:"voice,omitempty"`          // realtime voice id (e.g. "marin"); empty = provider default
+	TurnDetection *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"` // realtime VAD/turn-taking profile and overrides
+	Pace          *PersistentPaceState         `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
@@ -291,6 +292,14 @@ func clonePersistentPaceState(state *PersistentPaceState) *PersistentPaceState {
 	return &copy
 }
 
+func cloneRealtimeTurnDetectionConfig(config *RealtimeTurnDetectionConfig) *RealtimeTurnDetectionConfig {
+	if config == nil {
+		return nil
+	}
+	copy := *config
+	return &copy
+}
+
 func (c *Config) GetMainPace() *PersistentPaceState {
 	if c == nil {
 		return nil
@@ -381,6 +390,7 @@ func (c *Config) GetThreads() []PersistentThread {
 	copy(out, c.Threads)
 	for i := range out {
 		out[i].Pace = clonePersistentPaceState(out[i].Pace)
+		out[i].TurnDetection = cloneRealtimeTurnDetectionConfig(out[i].TurnDetection)
 	}
 	return out
 }

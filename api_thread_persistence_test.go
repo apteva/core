@@ -161,6 +161,109 @@ func TestAPICreatedThreadPersistsEffectiveStateAndRestores(t *testing.T) {
 	}
 }
 
+func TestAPIRealtimeTurnDetectionPersistsAndRestoresIntoSession(t *testing.T) {
+	api, thinker, textProvider := newPersistentThreadTestAPI(t)
+	realtimeProvider := &fakeRealtimeProvider{}
+	thinker.config.RealtimeEnabled = true
+	thinker.pool.realtimeProviders = map[string]RealtimeProvider{realtimeProvider.Name(): realtimeProvider}
+	thinker.pool.realtimeOrder = []string{realtimeProvider.Name()}
+	thinker.pool.realtimeDefault = realtimeProvider.Name()
+
+	w := postThreadForTest(t, api, "voice-persisted", map[string]any{
+		"directive":    "Handle telephone calls safely.",
+		"realtime":     true,
+		"conversation": true,
+		"provider":     realtimeProvider.Name(),
+		"turn_detection": map[string]any{
+			"profile": "telephony",
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("spawn status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	stored, ok := persistentThreadByID(thinker.config.GetThreads(), "voice-persisted")
+	if !ok || stored.TurnDetection == nil {
+		t.Fatalf("realtime turn detection was not persisted: %#v", stored)
+	}
+	if stored.TurnDetection.Profile != RealtimeTurnProfileTelephony {
+		t.Fatalf("stored turn detection = %#v", stored.TurnDetection)
+	}
+	realtimeProvider.mu.Lock()
+	if len(realtimeProvider.opens) != 1 ||
+		realtimeProvider.opens[0].TurnDetection.Profile != RealtimeTurnProfileTelephony {
+		t.Fatalf("live session did not receive profile: %#v", realtimeProvider.opens)
+	}
+	realtimeProvider.mu.Unlock()
+
+	reloaded := NewConfig()
+	if err := reloaded.LoadError(); err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	reloadedState, ok := persistentThreadByID(reloaded.GetThreads(), "voice-persisted")
+	if !ok || reloadedState.TurnDetection == nil ||
+		reloadedState.TurnDetection.Profile != RealtimeTurnProfileTelephony {
+		t.Fatalf("turn detection did not survive config reload: %#v", reloadedState)
+	}
+
+	restoredParent := newTestThinker()
+	defer restoredParent.Stop()
+	restoredParent.config = reloaded
+	restoredRealtimeProvider := &fakeRealtimeProvider{}
+	restoredParent.pool = &ProviderPool{
+		providers: map[string]LLMProvider{textProvider.Name(): textProvider},
+		order:     []string{textProvider.Name()}, default_: textProvider.Name(),
+		realtimeProviders: map[string]RealtimeProvider{
+			restoredRealtimeProvider.Name(): restoredRealtimeProvider,
+		},
+		realtimeOrder:   []string{restoredRealtimeProvider.Name()},
+		realtimeDefault: restoredRealtimeProvider.Name(),
+	}
+	if err := restoredParent.threads.SpawnWithOpts(
+		reloadedState.ID, reloadedState.Directive, reloadedState.Tools,
+		SpawnOpts{
+			Realtime: true, Conversation: reloadedState.Conversation, DeferRun: true,
+			ProviderName: restoredRealtimeProvider.Name(), Voice: reloadedState.Voice,
+			TurnDetection: realtimeTurnDetectionValue(reloadedState.TurnDetection),
+		},
+	); err != nil {
+		t.Fatalf("restore realtime thread: %v", err)
+	}
+	restoredThread := restoredParent.threads.threads[reloadedState.ID]
+	if restoredThread == nil || restoredThread.Realtime == nil ||
+		restoredThread.Realtime.opts.TurnDetection.Profile != RealtimeTurnProfileTelephony {
+		t.Fatalf("restored runtime lost turn detection: %#v", restoredThread)
+	}
+}
+
+func TestAPIRealtimeTurnDetectionRejectsInvalidOrNonRealtimeUse(t *testing.T) {
+	api, thinker, _ := newPersistentThreadTestAPI(t)
+	realtimeProvider := &fakeRealtimeProvider{}
+	thinker.config.RealtimeEnabled = true
+	thinker.pool.realtimeProviders = map[string]RealtimeProvider{realtimeProvider.Name(): realtimeProvider}
+	thinker.pool.realtimeOrder = []string{realtimeProvider.Name()}
+	thinker.pool.realtimeDefault = realtimeProvider.Name()
+
+	invalid := postThreadForTest(t, api, "voice-invalid", map[string]any{
+		"realtime":       true,
+		"provider":       realtimeProvider.Name(),
+		"turn_detection": map[string]any{"profile": "concert"},
+	})
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid profile status = %d, want 400: %s", invalid.Code, invalid.Body.String())
+	}
+	if findThinkerByID(thinker, "voice-invalid") != nil {
+		t.Fatal("invalid profile created a live thread")
+	}
+
+	nonRealtime := postThreadForTest(t, api, "text-invalid", map[string]any{
+		"turn_detection": map[string]any{"profile": "telephony"},
+	})
+	if nonRealtime.Code != http.StatusBadRequest {
+		t.Fatalf("non-realtime profile status = %d, want 400: %s", nonRealtime.Code, nonRealtime.Body.String())
+	}
+}
+
 func TestAPIEphemeralThreadNeverEntersPersistentConfig(t *testing.T) {
 	api, thinker, provider := newPersistentThreadTestAPI(t)
 	w := postThreadForTest(t, api, "chat-ephemeral", map[string]any{

@@ -141,13 +141,41 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 	if level := googleLiveThinkingLevel(opts.Reasoning); level != "" {
 		generation["thinkingConfig"] = map[string]any{"thinkingLevel": level}
 	}
+	normalizedTurnDetection, err := opts.TurnDetection.normalized()
+	if err != nil {
+		return nil, fmt.Errorf("google-realtime turn detection: %w", err)
+	}
+	turnDetection := normalizedTurnDetection.resolved()
+	automaticActivityDetection := map[string]any{"disabled": false}
+	switch turnDetection.StartSensitivity {
+	case RealtimeSensitivityHigh:
+		automaticActivityDetection["startOfSpeechSensitivity"] = "START_SENSITIVITY_HIGH"
+	case RealtimeSensitivityLow:
+		automaticActivityDetection["startOfSpeechSensitivity"] = "START_SENSITIVITY_LOW"
+	}
+	if turnDetection.PrefixPaddingMS > 0 {
+		automaticActivityDetection["prefixPaddingMs"] = turnDetection.PrefixPaddingMS
+	}
+	switch turnDetection.EndSensitivity {
+	case RealtimeSensitivityHigh:
+		automaticActivityDetection["endOfSpeechSensitivity"] = "END_SENSITIVITY_HIGH"
+	case RealtimeSensitivityLow:
+		automaticActivityDetection["endOfSpeechSensitivity"] = "END_SENSITIVITY_LOW"
+	}
+	if turnDetection.SilenceDurationMS > 0 {
+		automaticActivityDetection["silenceDurationMs"] = turnDetection.SilenceDurationMS
+	}
+	activityHandling := "START_OF_ACTIVITY_INTERRUPTS"
+	if turnDetection.Interruption == RealtimeInterruptionDisable {
+		activityHandling = "NO_INTERRUPTION"
+	}
 	setup := map[string]any{
 		"model":             "models/" + strings.TrimPrefix(model, "models/"),
 		"generationConfig":  generation,
 		"systemInstruction": map[string]any{"parts": []map[string]any{{"text": opts.Instructions}}},
 		"realtimeInputConfig": map[string]any{
-			"automaticActivityDetection": map[string]any{"disabled": false},
-			"activityHandling":           "START_OF_ACTIVITY_INTERRUPTS",
+			"automaticActivityDetection": automaticActivityDetection,
+			"activityHandling":           activityHandling,
 			"turnCoverage":               "TURN_INCLUDES_ONLY_ACTIVITY",
 		},
 		"contextWindowCompression": map[string]any{"slidingWindow": map[string]any{}},

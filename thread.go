@@ -128,6 +128,7 @@ const realtimeConversationPrompt = `
 - When noticeable reasoning or external work is needed and silence would feel broken, say at most one brief, natural sentence about the user-facing action, then work silently. Never announce a tool, function, API, thread, channel, or internal step.
 - Ask main only when deeper decisions, privileged backend tools, durable state, or consequential actions require it. Send main a concise structured request without exposing the delegation to the caller.
 - After sending work to main, do not speak again merely to report that it was sent. Wait silently for the reply. When main replies, express the current result naturally in your own words; never read internal messages aloud or speak a stale result after the conversation has moved on.
+- Treat partial, garbled, overlapping, or low-confidence audio as uncertain. Ask one concise clarification and do not infer critical details or take consequential action until they are explicitly confirmed.
 - Spoken audio is exclusively caller-facing. Private reasoning and internal coordination may appear in telemetry, but never in speech.`
 
 func formatThreadBasePrompt(canSpawn, realtime, conversation bool, id, parentLabel string) string {
@@ -168,27 +169,28 @@ const threadDirectivePersistencePrompt = `
 - For authority-based changes, copy the parent's durable intent without adding operational details they did not state. Patch only the relevant Markdown section, remove obsolete conflicts, and call evolve once for one authoritative instruction. If evolve rejects the arguments, correct them and retry once; a rejected call did not persist the instruction.`
 
 type ThreadInfo struct {
-	ID           string
-	Name         string // human-readable display label; empty = render id
-	System       bool   // platform-managed; hidden from and immutable by agent tools
-	ParentID     string // "main" or parent thread ID
-	Depth        int
-	Directive    string
-	Tools        []string
-	MCPNames     []string
-	Running      bool
-	Iteration    int
-	Rate         ThinkRate
-	NextWakeAt   time.Time
-	Model        ModelTier
-	Reasoning    ReasoningLevel
-	Provider     string // active provider name
-	Realtime     bool
-	Voice        string
-	Started      time.Time
-	ContextMsgs  int
-	ContextChars int
-	SubThreads   int // number of direct children
+	ID            string
+	Name          string // human-readable display label; empty = render id
+	System        bool   // platform-managed; hidden from and immutable by agent tools
+	ParentID      string // "main" or parent thread ID
+	Depth         int
+	Directive     string
+	Tools         []string
+	MCPNames      []string
+	Running       bool
+	Iteration     int
+	Rate          ThinkRate
+	NextWakeAt    time.Time
+	Model         ModelTier
+	Reasoning     ReasoningLevel
+	Provider      string // active provider name
+	Realtime      bool
+	Voice         string
+	TurnDetection RealtimeTurnDetectionConfig
+	Started       time.Time
+	ContextMsgs   int
+	ContextChars  int
+	SubThreads    int // number of direct children
 }
 
 type Thread struct {
@@ -207,6 +209,7 @@ type Thread struct {
 	IsConversation bool
 	AllowNoSpawn   bool
 	Voice          string
+	TurnDetection  RealtimeTurnDetectionConfig
 	ProviderName   string
 	Ephemeral      bool
 	audioIn        chan []byte
@@ -292,6 +295,10 @@ type SpawnOpts struct {
 	// Voice: realtime voice id (e.g. "alloy"). Empty = provider's
 	// default. Ignored when Realtime is false.
 	Voice string
+	// TurnDetection selects a provider-neutral realtime VAD/turn-taking
+	// profile plus optional per-thread overrides. The zero value preserves
+	// provider defaults.
+	TurnDetection RealtimeTurnDetectionConfig
 	// AudioIn: PCM audio chunks pushed by the caller (telephony
 	// bridge, browser WebRTC, mic source). The realtime thread reads
 	// these and forwards to session.SendAudio. nil = no inbound audio
@@ -376,6 +383,16 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				return fmt.Errorf("realtime spawn refused: no default realtime provider")
 			}
 		}
+	}
+	if !opts.Realtime && !opts.TurnDetection.isZero() {
+		return fmt.Errorf("realtime turn detection requires realtime=true")
+	}
+	if opts.Realtime {
+		normalizedTurnDetection, err := opts.TurnDetection.normalized()
+		if err != nil {
+			return err
+		}
+		opts.TurnDetection = normalizedTurnDetection
 	}
 
 	depth := opts.Depth
@@ -487,6 +504,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		IsConversation:      opts.Conversation,
 		AllowNoSpawn:        opts.BypassNoSpawn,
 		Voice:               opts.Voice,
+		TurnDetection:       opts.TurnDetection,
 		ProviderName:        opts.ProviderName,
 		Ephemeral:           opts.Ephemeral,
 		audioIn:             opts.AudioIn,
@@ -777,6 +795,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		thread.Realtime = newRealtimeThinker(
 			context.Background(), thinker, realtimeProvider, opts.Voice,
 			opts.AudioIn, opts.AudioOut, opts.AudioControl,
+			opts.TurnDetection,
 		)
 	}
 
@@ -822,6 +841,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				opts.AudioIn,
 				opts.AudioOut,
 				opts.AudioControl,
+				opts.TurnDetection,
 			)
 			if err != nil {
 				logMsg("REALTIME", fmt.Sprintf("[%s] open failed: %v", id, err))
@@ -1513,27 +1533,28 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			subCount = t.Children.Count()
 		}
 		infos = append(infos, ThreadInfo{
-			ID:           t.ID,
-			Name:         t.Name,
-			System:       t.System,
-			ParentID:     t.ParentID,
-			Depth:        t.Depth,
-			Directive:    t.Directive,
-			Tools:        toolSetToSlice(t.Tools),
-			Running:      true,
-			Iteration:    status.Iteration,
-			Rate:         status.Rate,
-			NextWakeAt:   status.NextWakeAt,
-			Model:        status.Model,
-			Reasoning:    status.Reasoning,
-			Provider:     providerName,
-			Realtime:     t.IsRealtime,
-			Voice:        t.Voice,
-			Started:      t.Started,
-			ContextMsgs:  status.ContextMsgs,
-			ContextChars: status.ContextChars,
-			MCPNames:     t.MCPNames,
-			SubThreads:   subCount,
+			ID:            t.ID,
+			Name:          t.Name,
+			System:        t.System,
+			ParentID:      t.ParentID,
+			Depth:         t.Depth,
+			Directive:     t.Directive,
+			Tools:         toolSetToSlice(t.Tools),
+			Running:       true,
+			Iteration:     status.Iteration,
+			Rate:          status.Rate,
+			NextWakeAt:    status.NextWakeAt,
+			Model:         status.Model,
+			Reasoning:     status.Reasoning,
+			Provider:      providerName,
+			Realtime:      t.IsRealtime,
+			Voice:         t.Voice,
+			TurnDetection: t.TurnDetection,
+			Started:       t.Started,
+			ContextMsgs:   status.ContextMsgs,
+			ContextChars:  status.ContextChars,
+			MCPNames:      t.MCPNames,
+			SubThreads:    subCount,
 		})
 	}
 	// Sort by ID for deterministic order
@@ -1596,6 +1617,9 @@ func persistentThreadState(thread *Thread) PersistentThread {
 		Tools: toolSetToSlice(thread.Tools), MCPNames: append([]string(nil), thread.MCPNames...),
 		Provider: thread.ProviderName, Realtime: thread.IsRealtime, Conversation: thread.IsConversation,
 		AllowNoSpawn: thread.AllowNoSpawn, Voice: thread.Voice,
+	}
+	if thread.IsRealtime && !thread.TurnDetection.isZero() {
+		state.TurnDetection = cloneRealtimeTurnDetectionConfig(&thread.TurnDetection)
 	}
 	if thread.Thinker != nil {
 		// The published status is an immutable snapshot owned by the thinker
