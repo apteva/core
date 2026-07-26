@@ -6,6 +6,38 @@ import (
 	"testing"
 )
 
+func TestRealtimeTurnDetectionExplicitDefaultsAreSemanticallyEmpty(t *testing.T) {
+	defaults := []RealtimeTurnDetectionConfig{
+		{},
+		{Profile: RealtimeTurnProfileDefault},
+		{
+			Profile:          " DEFAULT ",
+			StartSensitivity: " DEFAULT ",
+			EndSensitivity:   "default",
+			Interruption:     "default",
+		},
+	}
+	for _, config := range defaults {
+		if !config.isZero() {
+			t.Fatalf("explicit defaults should be semantically empty: %#v", config)
+		}
+	}
+
+	meaningful := []RealtimeTurnDetectionConfig{
+		{Profile: RealtimeTurnProfileTelephony},
+		{StartSensitivity: RealtimeSensitivityLow},
+		{PrefixPaddingMS: 1},
+		{EndSensitivity: RealtimeSensitivityHigh},
+		{SilenceDurationMS: 1},
+		{Interruption: RealtimeInterruptionDisable},
+	}
+	for _, config := range meaningful {
+		if config.isZero() {
+			t.Fatalf("meaningful realtime setting treated as empty: %#v", config)
+		}
+	}
+}
+
 func TestRealtimeTurnDetectionProfilesResolveDeterministically(t *testing.T) {
 	defaults, err := (RealtimeTurnDetectionConfig{}).normalized()
 	if err != nil {

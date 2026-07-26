@@ -864,6 +864,93 @@ func TestSendFailureCorrectionAndReportingTurnsAreBounded(t *testing.T) {
 	}
 }
 
+func TestMainSpawnDefaultRealtimeProfileCreatesOrdinaryWorkerWithoutRealtimeProvider(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	thinker.config.path = filepath.Join(t.TempDir(), "config.json")
+	if thinker.pool != nil {
+		t.Fatal("test requires no provider pool or realtime provider")
+	}
+
+	_, _, results := mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "spawn",
+		Args: map[string]string{
+			"id":               "crm-batch-worker",
+			"directive":        "Process the CRM conversation batch.",
+			"paused":           "true",
+			"realtime":         "false",
+			"realtime_profile": "default",
+		},
+		Raw:      "spawn",
+		NativeID: "spawn-default",
+	}}, nil)
+
+	if len(results) != 1 || results[0].IsError ||
+		!strings.Contains(results[0].Content, "thread crm-batch-worker spawned") {
+		t.Fatalf("spawn result = %+v", results)
+	}
+	thread := thinker.threads.threads["crm-batch-worker"]
+	if thread == nil {
+		t.Fatal("main did not create the worker")
+	}
+	if thread.IsRealtime || thread.Realtime != nil ||
+		thread.TurnDetection != (RealtimeTurnDetectionConfig{}) {
+		t.Fatalf("default spawn unexpectedly created realtime state: %#v", thread)
+	}
+	stored, ok := persistentThreadByID(thinker.config.GetThreads(), "crm-batch-worker")
+	if !ok {
+		t.Fatal("main-created worker was not persisted")
+	}
+	if stored.Realtime || stored.TurnDetection != nil {
+		t.Fatalf("main-created ordinary worker persisted realtime state: %#v", stored)
+	}
+}
+
+func TestMainSpawnFailureCorrectionAndReportingTurnsAreBounded(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	handler := mainToolHandler(thinker)
+	call := toolCall{
+		Name: "spawn",
+		Args: map[string]string{
+			"id":               "ordinary-worker",
+			"directive":        "Do ordinary work.",
+			"realtime":         "false",
+			"realtime_profile": "telephony",
+		},
+		Raw:      "spawn",
+		NativeID: "spawn-1",
+	}
+
+	_, _, first := handler(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn || len(first) != 1 || !first[0].IsError ||
+		!strings.Contains(first[0].Content, "retry once now") {
+		t.Fatalf("first spawn failure = kick:%v results:%+v", thinker.kickNextTurn, first)
+	}
+
+	thinker.kickNextTurn = false
+	call.NativeID = "spawn-2"
+	_, _, second := handler(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn || len(second) != 1 ||
+		!strings.Contains(second[0].Content, "do not call spawn again") {
+		t.Fatalf("second spawn failure = kick:%v results:%+v", thinker.kickNextTurn, second)
+	}
+
+	thinker.kickNextTurn = false
+	call.NativeID = "spawn-3"
+	handler(thinker, []toolCall{call}, nil)
+	if thinker.kickNextTurn {
+		t.Fatal("third consecutive spawn failure should not continue the retry loop")
+	}
+
+	handler(thinker, nil, nil)
+	call.NativeID = "spawn-later"
+	handler(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn {
+		t.Fatal("spawn correction guard did not reset after the workflow moved on")
+	}
+}
+
 func TestMainUpdateKicksNextTurn(t *testing.T) {
 	events := []APIEvent{}
 	bus := NewEventBus()

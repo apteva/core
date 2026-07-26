@@ -66,6 +66,61 @@ func TestThreadManager_SpawnDuplicate(t *testing.T) {
 	}
 }
 
+func TestThreadManagerDefaultRealtimeFieldsCreateOrdinaryThreadWithoutRealtimeProvider(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	if thinker.pool != nil {
+		t.Fatal("test requires no provider pool or realtime provider")
+	}
+
+	err := thinker.threads.SpawnWithOpts("ordinary-worker", "Do ordinary background work.", nil, SpawnOpts{
+		DeferRun: false,
+		Paused:   true,
+		Realtime: false,
+		TurnDetection: RealtimeTurnDetectionConfig{
+			Profile:          "default",
+			StartSensitivity: "default",
+			EndSensitivity:   "default",
+			Interruption:     "default",
+		},
+	})
+	if err != nil {
+		t.Fatalf("default-only realtime fields rejected ordinary spawn: %v", err)
+	}
+
+	thread := thinker.threads.threads["ordinary-worker"]
+	if thread == nil {
+		t.Fatal("ordinary worker was not created")
+	}
+	if thread.IsRealtime || thread.Realtime != nil {
+		t.Fatalf("ordinary worker became realtime: %#v", thread)
+	}
+	if thread.TurnDetection != (RealtimeTurnDetectionConfig{}) {
+		t.Fatalf("default-only realtime fields were not canonicalized away: %#v", thread.TurnDetection)
+	}
+	state, err := thinker.threads.PersistentState("ordinary-worker")
+	if err != nil {
+		t.Fatalf("persistent state: %v", err)
+	}
+	if state.Realtime || state.TurnDetection != nil {
+		t.Fatalf("ordinary worker persisted realtime state: %#v", state)
+	}
+
+	err = thinker.threads.SpawnWithOpts("invalid-worker", "Should fail.", nil, SpawnOpts{
+		DeferRun: true,
+		Realtime: false,
+		TurnDetection: RealtimeTurnDetectionConfig{
+			Profile: RealtimeTurnProfileTelephony,
+		},
+	})
+	if err == nil {
+		t.Fatal("non-default realtime profile was accepted without realtime=true")
+	}
+	if thinker.threads.threads["invalid-worker"] != nil {
+		t.Fatal("rejected non-realtime profile created a thread")
+	}
+}
+
 func TestThreadManager_SpawnWithModelAndReasoning(t *testing.T) {
 	thinker := newTestThinker()
 	defer thinker.Stop()

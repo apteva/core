@@ -264,6 +264,52 @@ func TestAPIRealtimeTurnDetectionRejectsInvalidOrNonRealtimeUse(t *testing.T) {
 	}
 }
 
+func TestAPIDefaultRealtimeFieldsCreateAndPersistOrdinaryThreadWithoutRealtimeProvider(t *testing.T) {
+	api, thinker, _ := newPersistentThreadTestAPI(t)
+	if thinker.pool.HasRealtimeProvider() {
+		t.Fatal("test requires no realtime provider")
+	}
+
+	w := postThreadForTest(t, api, "ordinary-defaults", map[string]any{
+		"directive": "Process this ordinary background job.",
+		"realtime":  false,
+		"turn_detection": map[string]any{
+			"profile":           "default",
+			"start_sensitivity": "default",
+			"end_sensitivity":   "default",
+			"interruption":      "default",
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("spawn status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	thread := thinker.threads.threads["ordinary-defaults"]
+	if thread == nil {
+		t.Fatal("ordinary API thread was not created")
+	}
+	if thread.IsRealtime || thread.Realtime != nil ||
+		thread.TurnDetection != (RealtimeTurnDetectionConfig{}) {
+		t.Fatalf("ordinary API thread retained realtime state: %#v", thread)
+	}
+	stored, ok := persistentThreadByID(thinker.config.GetThreads(), "ordinary-defaults")
+	if !ok {
+		t.Fatal("ordinary API thread was not persisted")
+	}
+	if stored.Realtime || stored.TurnDetection != nil {
+		t.Fatalf("ordinary API thread persisted realtime state: %#v", stored)
+	}
+
+	reloaded := NewConfig()
+	if err := reloaded.LoadError(); err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	reloadedState, ok := persistentThreadByID(reloaded.GetThreads(), "ordinary-defaults")
+	if !ok || reloadedState.Realtime || reloadedState.TurnDetection != nil {
+		t.Fatalf("reloaded ordinary thread gained realtime state: %#v", reloadedState)
+	}
+}
+
 func TestAPIEphemeralThreadNeverEntersPersistentConfig(t *testing.T) {
 	api, thinker, provider := newPersistentThreadTestAPI(t)
 	w := postThreadForTest(t, api, "chat-ephemeral", map[string]any{

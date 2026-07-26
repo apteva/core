@@ -393,6 +393,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			return err
 		}
 		opts.TurnDetection = normalizedTurnDetection
+	} else {
+		// Canonicalize explicit default-only realtime fields away. A normal
+		// thread must remain entirely independent of realtime-provider state.
+		opts.TurnDetection = RealtimeTurnDetectionConfig{}
 	}
 
 	depth := opts.Depth

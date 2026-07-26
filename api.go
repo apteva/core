@@ -647,6 +647,10 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 			return
 		}
 		opts.TurnDetection = normalizedTurnDetection
+	} else {
+		// Some API clients serialize optional defaults. They do not turn an
+		// otherwise ordinary thread into a realtime thread.
+		opts.TurnDetection = RealtimeTurnDetectionConfig{}
 	}
 	if body.BridgeDisconnectTTLSeconds > 0 {
 		opts.BridgeDisconnectTTL = time.Duration(body.BridgeDisconnectTTLSeconds) * time.Second

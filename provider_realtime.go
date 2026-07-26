@@ -112,8 +112,21 @@ type RealtimeTurnDetectionConfig struct {
 }
 
 func (c RealtimeTurnDetectionConfig) isZero() bool {
-	return c.Profile == "" && c.StartSensitivity == "" && c.PrefixPaddingMS == 0 &&
-		c.EndSensitivity == "" && c.SilenceDurationMS == 0 && c.Interruption == ""
+	profile := strings.ToLower(strings.TrimSpace(c.Profile))
+	startSensitivity := strings.ToLower(strings.TrimSpace(c.StartSensitivity))
+	endSensitivity := strings.ToLower(strings.TrimSpace(c.EndSensitivity))
+	interruption := strings.ToLower(strings.TrimSpace(c.Interruption))
+
+	// Explicit provider defaults are semantically the same as omitting turn
+	// detection altogether. Treating them as empty keeps clients and models
+	// that serialize optional defaults from accidentally opting a normal
+	// thread into realtime-only validation.
+	return (profile == "" || profile == RealtimeTurnProfileDefault) &&
+		(startSensitivity == "" || startSensitivity == RealtimeSensitivityDefault) &&
+		c.PrefixPaddingMS == 0 &&
+		(endSensitivity == "" || endSensitivity == RealtimeSensitivityDefault) &&
+		c.SilenceDurationMS == 0 &&
+		(interruption == "" || interruption == RealtimeInterruptionDefault)
 }
 
 func realtimeTurnDetectionValue(config *RealtimeTurnDetectionConfig) RealtimeTurnDetectionConfig {

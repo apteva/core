@@ -743,6 +743,12 @@ type Thinker struct {
 	// rearming the loop indefinitely.
 	sendCorrectionUsed bool
 	sendCompletionUsed bool
+	// spawnCorrectionUsed and spawnCompletionUsed give a model one immediate
+	// chance to repair rejected spawn arguments and one final turn to report a
+	// repeated failure. They prevent recoverable errors from sleeping for the
+	// normal cadence without permitting an unbounded retry loop.
+	spawnCorrectionUsed bool
+	spawnCompletionUsed bool
 	// toolRejectionCorrectionUsed bounds the immediate repair turn for a
 	// model call to a tool that was not presented to this thread.
 	toolRejectionCorrectionUsed bool
@@ -844,6 +850,29 @@ func (t *Thinker) resetSendTurnGuards() {
 	t.sendCompletionUsed = false
 }
 
+func (t *Thinker) scheduleSpawnCorrection() bool {
+	if !t.spawnCorrectionUsed {
+		t.spawnCorrectionUsed = true
+		t.kickNextTurn = true
+		return true
+	}
+	t.scheduleSpawnCompletion()
+	return false
+}
+
+func (t *Thinker) scheduleSpawnCompletion() {
+	if t.spawnCompletionUsed {
+		return
+	}
+	t.spawnCompletionUsed = true
+	t.kickNextTurn = true
+}
+
+func (t *Thinker) resetSpawnTurnGuards() {
+	t.spawnCorrectionUsed = false
+	t.spawnCompletionUsed = false
+}
+
 func (t *Thinker) scheduleToolRejectionCorrection() {
 	if t.toolRejectionCorrectionUsed {
 		return
@@ -877,6 +906,14 @@ func sendCorrectionResult(err error) string {
 
 func sendFinalFailureResult(err error) string {
 	return fmt.Sprintf("error: %v. The correction also failed; do not call send again for this message. Report the delivery failure before pacing", err)
+}
+
+func spawnCorrectionResult(err error) string {
+	return fmt.Sprintf("error: %v. Correct the spawn arguments and retry once now; do not claim the worker started", err)
+}
+
+func spawnFinalFailureResult(err error) string {
+	return fmt.Sprintf("error: %v. The correction also failed; do not call spawn again for this worker. Report the launch failure before pacing", err)
 }
 
 func inlineToolResultIsError(content string) bool {
@@ -1515,6 +1552,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		if !hasToolCallNamed(calls, "send") {
 			t.resetSendTurnGuards()
 		}
+		if !hasToolCallNamed(calls, "spawn") {
+			t.resetSpawnTurnGuards()
+		}
 		if len(calls) > 0 {
 			names := make([]string, len(calls))
 			for i, c := range calls {
@@ -1560,6 +1600,13 @@ func mainToolHandler(t *Thinker) ToolHandler {
 
 			switch call.Name {
 			case "spawn":
+				addSpawnFailure := func(err error) {
+					if t.scheduleSpawnCorrection() {
+						addResult(spawnCorrectionResult(err))
+						return
+					}
+					addResult(spawnFinalFailureResult(err))
+				}
 				id := call.Args["id"]
 				directive := call.Args["directive"]
 				if directive == "" {
@@ -1576,7 +1623,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				modelName := strings.ToLower(strings.TrimSpace(call.Args["model"]))
 				if modelName != "" {
 					if _, ok := modelNames[modelName]; !ok {
-						addResult(fmt.Sprintf("error: invalid model %q (use large, medium, or small)", modelName))
+						addSpawnFailure(fmt.Errorf("invalid model %q (use large, medium, or small)", modelName))
 						toolNames = append(toolNames, call.Raw)
 						continue
 					}
@@ -1585,7 +1632,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				if rawReasoning := reasoningArgValue(call.Args); rawReasoning != "" {
 					parsed, ok := parseReasoningLevel(rawReasoning)
 					if !ok {
-						addResult(fmt.Sprintf("error: invalid reasoning %q (use auto, none, minimal, low, medium, high, or xhigh)", rawReasoning))
+						addSpawnFailure(fmt.Errorf("invalid reasoning %q (use auto, none, minimal, low, medium, high, or xhigh)", rawReasoning))
 						toolNames = append(toolNames, call.Raw)
 						continue
 					}
@@ -1627,18 +1674,20 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				voice := call.Args["voice"]
 				turnDetection := RealtimeTurnDetectionConfig{Profile: call.Args["realtime_profile"]}
 				if !realtime && !turnDetection.isZero() {
-					addResult("error: realtime_profile requires realtime=true")
+					addSpawnFailure(fmt.Errorf("realtime_profile requires realtime=true"))
 					toolNames = append(toolNames, call.Raw)
 					continue
 				}
 				if realtime {
 					normalizedTurnDetection, err := turnDetection.normalized()
 					if err != nil {
-						addResult(fmt.Sprintf("error: %v", err))
+						addSpawnFailure(err)
 						toolNames = append(toolNames, call.Raw)
 						continue
 					}
 					turnDetection = normalizedTurnDetection
+				} else {
+					turnDetection = RealtimeTurnDetectionConfig{}
 				}
 				// Refuse realtime spawn cleanly when the feature gate is
 				// off OR no realtime provider is available. The model
@@ -1650,14 +1699,14 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					if t.config == nil || !t.config.RealtimeEnabledFlag() || t.pool == nil || !t.pool.HasRealtimeProvider() {
 						logMsg("SPAWN", fmt.Sprintf("reject realtime id=%q: feature off (enabled=%v has_provider=%v)",
 							id, t.config != nil && t.config.RealtimeEnabledFlag(), t.pool != nil && t.pool.HasRealtimeProvider()))
-						addResult("error: realtime threads are not enabled on this instance")
+						addSpawnFailure(fmt.Errorf("realtime threads are not enabled on this instance"))
 						toolNames = append(toolNames, call.Raw)
 						continue
 					}
 				}
 				if id == "" || directive == "" {
 					logMsg("SPAWN", fmt.Sprintf("skip: missing id=%q or directive_len=%d in LLM call", id, len(directive)))
-					addResult(fmt.Sprintf("error: spawn requires both id and directive (got id=%q, directive_len=%d)", id, len(directive)))
+					addSpawnFailure(fmt.Errorf("spawn requires both id and directive (got id=%q, directive_len=%d)", id, len(directive)))
 				} else {
 					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v paused=%v realtime=%v voice=%q directive_len=%d",
 						id, tools, mcpNames, providerName, builtinTools, paused, realtime, voice, len(directive)))
@@ -1677,16 +1726,16 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					})
 					if err != nil {
 						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
-						addResult(fmt.Sprintf("error: %v", err))
+						addSpawnFailure(err)
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
 						var persistedTurnDetection *RealtimeTurnDetectionConfig
-						if realtime {
+						if realtime && !turnDetection.isZero() {
 							persistedTurnDetection = cloneRealtimeTurnDetectionConfig(&turnDetection)
 						}
 						if err := t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Provider: providerName, Model: modelName, Reasoning: reasoning.String(), Realtime: realtime, Voice: voice, TurnDetection: persistedTurnDetection}); err != nil {
 							t.threads.Kill(id)
-							addResult(fmt.Sprintf("error: persist spawned thread: %v", err))
+							addSpawnFailure(fmt.Errorf("persist spawned thread: %w", err))
 							toolNames = append(toolNames, call.Raw)
 							continue
 						}
