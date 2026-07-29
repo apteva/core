@@ -104,7 +104,7 @@ Ne mentionnez jamais les outils, fonctions, API, MCP, identifiants internes, ins
 Ne décrivez pas vos opérations internes et n'appelez pas done ; gardez la conversation ouverte.`,
 			InitialMessage: "La personne vient d'être connectée à l'accueil téléphonique. Dites maintenant votre message d'accueil ; parlez en premier.",
 			CallerSteps: []receptionistCallerStep{
-				{Text: "Lundi prochain à seize heures, s'il vous plaît.", AvailabilityCalls: 1, BookingCalls: 0, ExpectedSpeechAny: []string{"DISPONIBLE", "RESERVER"}},
+				{Text: "Lundi prochain à seize heures, s'il vous plaît.", AvailabilityCalls: 1, BookingCalls: 0, ExpectedSpeechAny: []string{"DISPONIBLE", "RESERVER", "POSSIBL", "BLOQU"}},
 				{Text: "Oui, réservez ce créneau.", AvailabilityCalls: 1, BookingCalls: 1, ExpectedSpeechAny: []string{"16", "SEIZE"}},
 				{Text: "D'accord, merci.", AvailabilityCalls: 1, BookingCalls: 1, ExpectedSpeechAny: []string{"AUREVOIR"}},
 			},
@@ -263,7 +263,7 @@ func newReceptionistMCPServer(
 			tools := []map[string]any{
 				{
 					"name":        "internal_calendar_availability_v1",
-					"description": "Privately check the appointment calendar for a caller's requested day and time preference. Use before offering any time. Never expose internal identifiers.",
+					"description": "Privately check the appointment calendar after the caller selects exactly one valid day and one valid time or time preference. If the caller gives multiple options, an impossible value, or unclear input, clarify before calling; never fan out speculative queries. Use before offering any time. Never expose internal identifiers.",
 					"inputSchema": map[string]any{
 						"type":     "object",
 						"required": []string{"requested_day", "time_preference"},
@@ -866,6 +866,19 @@ func TestNaturalReceptionistSpeechAcceptsSchedulingParaphrases(t *testing.T) {
 	}
 	if err := validateNaturalReceptionistSpeech(turns, scenario); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFrenchAvailabilityStepAcceptsNaturalOfferParaphrases(t *testing.T) {
+	scenario, err := newReceptionistScenario("fr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoken := canonicalSpokenText(
+		"Un rappel est possible lundi prochain à seize heures. Souhaitez-vous que je bloque ce créneau ?",
+	)
+	if !containsAny(spoken, scenario.CallerSteps[0].ExpectedSpeechAny...) {
+		t.Fatalf("natural availability offer did not match %v", scenario.CallerSteps[0].ExpectedSpeechAny)
 	}
 }
 

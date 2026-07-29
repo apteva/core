@@ -328,7 +328,8 @@ func runRealtimeReceptionistDifficulty(
 		SpawnOpts{
 			Realtime: true, Conversation: true, Ephemeral: true,
 			ProviderName: providerName, Voice: voice, MCPNames: []string{"reception"},
-			AudioIn: audioIn, AudioOut: audioOut, AudioControl: audioControl,
+			Reasoning: ReasoningHigh,
+			AudioIn:   audioIn, AudioOut: audioOut, AudioControl: audioControl,
 			InitialMessage: initialMessage,
 		},
 	); err != nil {
