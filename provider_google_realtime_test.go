@@ -214,6 +214,12 @@ func TestGoogleRealtimeConfigurationChangeRequestsRenewalAfterTurn(t *testing.T)
 	session := newGoogleRealtimeTestSession()
 	tools := []NativeTool{{Name: "one", Parameters: map[string]any{"type": "object"}}}
 	session.configFingerprint = googleRealtimeConfigFingerprint("old", tools)
+	if got := session.PreviewConfigurationUpdate("old", tools); got != RealtimeConfigurationUnchanged {
+		t.Fatalf("identical preview = %q", got)
+	}
+	if got := session.PreviewConfigurationUpdate("new", tools); got != RealtimeConfigurationRestartRequired {
+		t.Fatalf("changed preview = %q", got)
+	}
 	if err := session.UpdateConfiguration("old", tools); err != nil {
 		t.Fatal(err)
 	}

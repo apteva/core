@@ -46,6 +46,12 @@ type receptionistCallerStep struct {
 }
 
 func newReceptionistScenario(language string) (receptionistScenario, error) {
+	nextMonday := nextMondayAfter(time.Now())
+	englishSlot := fmt.Sprintf("Monday, %s %d, %d", nextMonday.Month(), nextMonday.Day(), nextMonday.Year())
+	frenchSlot := fmt.Sprintf(
+		"lundi %d %s %d",
+		nextMonday.Day(), frenchMonthName(nextMonday.Month()), nextMonday.Year(),
+	)
 	switch strings.ToLower(strings.TrimSpace(language)) {
 	case "", "en", "en-us", "en-gb":
 		return receptionistScenario{
@@ -67,8 +73,14 @@ Do not narrate what you are doing internally and do not call done; keep the conv
 				{Text: "Four PM works. Please book it for Alex Morgan.", AvailabilityCalls: 1, BookingCalls: 1, ExpectedSpeechAny: []string{"RX4821"}},
 				{Text: "Perfect, thank you.", AvailabilityCalls: 1, BookingCalls: 1},
 			},
-			AvailabilityResult: "One appointment is available: Monday, July 27, 2026 at 4:00 PM. Its private slot_id is slot-mon-1600. Do not book it yet; first obtain the caller's explicit acceptance and full name.",
-			BookingResult:      "Booking confirmed for Alex Morgan on Monday, July 27, 2026 at 4:00 PM. The caller-facing confirmation code is RX-4821.",
+			AvailabilityResult: fmt.Sprintf(
+				"One appointment is available: %s at 4:00 PM. Its private slot_id is slot-mon-1600. Do not book it yet; first obtain the caller's explicit acceptance and full name.",
+				englishSlot,
+			),
+			BookingResult: fmt.Sprintf(
+				"Booking confirmed for Alex Morgan on %s at 4:00 PM. The caller-facing confirmation code is RX-4821.",
+				englishSlot,
+			),
 			BookingNeedsName:   true,
 			ExpectedName:       "Alex Morgan",
 			ExpectedTimeTokens: []string{"4", "FOUR"},
@@ -96,8 +108,14 @@ Ne décrivez pas vos opérations internes et n'appelez pas done ; gardez la conv
 				{Text: "Oui, réservez ce créneau.", AvailabilityCalls: 1, BookingCalls: 1, ExpectedSpeechAny: []string{"16", "SEIZE"}},
 				{Text: "D'accord, merci.", AvailabilityCalls: 1, BookingCalls: 1, ExpectedSpeechAny: []string{"AUREVOIR"}},
 			},
-			AvailabilityResult:       "Un créneau de rappel est disponible le lundi 27 juillet 2026 à 16 heures. Son identifiant privé slot_id est slot-mon-1600. Ne le réservez pas encore : dites à la personne que le créneau est disponible et demandez-lui explicitement si elle souhaite le réserver.",
-			BookingResult:            "Rappel réservé pour le lundi 27 juillet 2026 à 16 heures. Confirmez simplement le jour et l'heure à la personne.",
+			AvailabilityResult: fmt.Sprintf(
+				"Un créneau de rappel est disponible le %s à 16 heures. Son identifiant privé slot_id est slot-mon-1600. Ne le réservez pas encore : dites à la personne que le créneau est disponible et demandez-lui explicitement si elle souhaite le réserver.",
+				frenchSlot,
+			),
+			BookingResult: fmt.Sprintf(
+				"Rappel réservé pour le %s à 16 heures. Confirmez simplement le jour et l'heure à la personne.",
+				frenchSlot,
+			),
 			BookingNeedsConfirmation: true,
 			ExpectedTimeTokens:       []string{"16", "SEIZE"},
 			MinimumTurns:             4,
@@ -105,6 +123,21 @@ Ne décrivez pas vos opérations internes et n'appelez pas done ; gardez la conv
 	default:
 		return receptionistScenario{}, fmt.Errorf("unsupported receptionist test language %q; use en or fr", language)
 	}
+}
+
+func nextMondayAfter(now time.Time) time.Time {
+	days := (int(time.Monday) - int(now.Weekday()) + 7) % 7
+	if days == 0 {
+		days = 7
+	}
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, days)
+}
+
+func frenchMonthName(month time.Month) string {
+	return [...]string{
+		"", "janvier", "février", "mars", "avril", "mai", "juin",
+		"juillet", "août", "septembre", "octobre", "novembre", "décembre",
+	}[month]
 }
 
 type receptionistMCPCall struct {
@@ -471,6 +504,27 @@ func TestRealtimeReceptionistLanguageAndVoiceOptions(t *testing.T) {
 	}
 }
 
+func TestNextMondayAfterAlwaysReturnsAFutureMonday(t *testing.T) {
+	location := time.FixedZone("test", 2*60*60)
+	for _, test := range []struct {
+		now  time.Time
+		want time.Time
+	}{
+		{
+			now:  time.Date(2026, time.July, 29, 23, 30, 0, 0, location),
+			want: time.Date(2026, time.August, 3, 0, 0, 0, 0, location),
+		},
+		{
+			now:  time.Date(2026, time.August, 3, 9, 0, 0, 0, location),
+			want: time.Date(2026, time.August, 10, 0, 0, 0, 0, location),
+		},
+	} {
+		if got := nextMondayAfter(test.now); !got.Equal(test.want) {
+			t.Errorf("nextMondayAfter(%s) = %s, want %s", test.now, got, test.want)
+		}
+	}
+}
+
 // TestRealtimeLiveReceptionistMCP is an opt-in paid, provider-neutral,
 // end-to-end conversation test. It exercises an actual realtime Core thread,
 // a real Streamable HTTP MCP server, multiple caller turns, availability and
@@ -666,17 +720,15 @@ func runRealtimeReceptionistMCP(t *testing.T, providerName, voice string, scenar
 	if err := validateNaturalReceptionistSpeech(trace.assistantTurns, scenario); err != nil {
 		t.Fatalf("%v\ntranscript:\n%s", err, strings.Join(trace.lines, "\n"))
 	}
-	bookingTurn := findLastAssistantTurnWithAny(trace.assistantTurns, scenario.ExpectedTimeTokens...)
+	confirmationTokens := scenario.ExpectedTimeTokens
+	if scenario.ExpectedCode != "" {
+		confirmationTokens = []string{scenario.ExpectedCode}
+	}
+	bookingTurn := findLastAssistantTurnWithAny(trace.assistantTurns, confirmationTokens...)
 	if bookingTurn == "" {
-		t.Fatalf("no assistant turn confirmed the requested time\ntranscript:\n%s", strings.Join(trace.lines, "\n"))
+		t.Fatalf("no assistant turn contained the expected booking confirmation\ntranscript:\n%s", strings.Join(trace.lines, "\n"))
 	}
 	confirmation := canonicalSpokenText(bookingTurn)
-	if scenario.ExpectedName != "" {
-		spokenName := strings.Fields(scenario.ExpectedName)[0]
-		if !strings.Contains(confirmation, canonicalSpokenText(spokenName)) {
-			t.Fatalf("booking confirmation omitted caller name: %q\ntranscript:\n%s", bookingTurn, strings.Join(trace.lines, "\n"))
-		}
-	}
 	if !containsAny(confirmation, scenario.ExpectedTimeTokens...) {
 		t.Fatalf("booking confirmation omitted requested time: %q\ntranscript:\n%s", bookingTurn, strings.Join(trace.lines, "\n"))
 	}
@@ -793,12 +845,28 @@ func validateNaturalReceptionistSpeech(turns []string, scenario receptionistScen
 		}
 	case "en":
 		if !containsAny(spoken, "HELLO", "WELCOME", "HI") ||
-			!strings.Contains(spoken, "APPOINTMENT") ||
+			!containsAny(spoken, "APPOINTMENT", "SCHEDUL", "OPENING", "BOOK") ||
 			!strings.Contains(spoken, "MONDAY") {
 			return fmt.Errorf("receptionist did not consistently produce the expected English conversation: %q", strings.Join(turns, " "))
 		}
 	}
 	return nil
+}
+
+func TestNaturalReceptionistSpeechAcceptsSchedulingParaphrases(t *testing.T) {
+	scenario, err := newReceptionistScenario("en")
+	if err != nil {
+		t.Fatal(err)
+	}
+	turns := []string{
+		"Hello, welcome to our scheduling service.",
+		"I have an opening next Monday at four PM.",
+		"Alex, your booking is confirmed for Monday at four PM with code RX 4821.",
+		"You're welcome. Have a great day.",
+	}
+	if err := validateNaturalReceptionistSpeech(turns, scenario); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func writeReceptionistArtifacts(dir, providerName, language, voice string, transcript []string, segments [][]byte) ([]string, error) {

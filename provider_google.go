@@ -26,8 +26,12 @@ type GoogleModel struct {
 	MaxOutputTokens int
 }
 
-// Available Gemini models (March 2026)
+// Available Gemini models (July 2026).
 var geminiModels = map[string]GoogleModel{
+	// Gemini 3.6 series
+	"gemini-3.6-flash": {
+		ID: "gemini-3.6-flash", InputPer1M: 1.50, CachedPer1M: 0.15, OutputPer1M: 7.50, MaxOutputTokens: 65536,
+	},
 	// Gemini 3.1 series
 	"gemini-3.1-pro-preview": {
 		ID: "gemini-3.1-pro-preview", InputPer1M: 2.00, CachedPer1M: 0.20, OutputPer1M: 12.00, MaxOutputTokens: 65536,
@@ -50,6 +54,7 @@ var geminiModels = map[string]GoogleModel{
 
 // GeminiModelOrder defines the cycle order for model switching in the TUI.
 var GeminiModelOrder = []string{
+	"gemini-3.6-flash",
 	"gemini-3.1-pro-preview",
 	"gemini-3-flash-preview",
 	"gemini-3.1-flash-lite-preview",
@@ -67,11 +72,11 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 	return &GoogleProvider{
 		apiKey: apiKey,
 		models: map[ModelTier]string{
-			ModelLarge:  "gemini-3.1-pro-preview",
-			ModelMedium: "gemini-3.1-pro-preview",
-			ModelSmall:  "gemini-3.1-pro-preview",
+			ModelLarge:  "gemini-3.6-flash",
+			ModelMedium: "gemini-3.6-flash",
+			ModelSmall:  "gemini-3.6-flash",
 		},
-		activeModel: "gemini-3.1-pro-preview",
+		activeModel: "gemini-3.6-flash",
 	}
 }
 
@@ -97,8 +102,8 @@ func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
 	if m, ok := geminiModels[p.activeModel]; ok {
 		return m.InputPer1M, m.CachedPer1M, m.OutputPer1M
 	}
-	// Fallback to gemini-3.1-pro-preview pricing
-	return 2.00, 0.20, 12.00
+	// Fallback to the default Gemini 3.6 Flash pricing.
+	return 1.50, 0.15, 7.50
 }
 
 // SetModel updates the active model. Called from TUI model cycling.
@@ -106,6 +111,7 @@ func (p *GoogleProvider) SetModel(modelID string) {
 	if _, ok := geminiModels[modelID]; ok {
 		p.activeModel = modelID
 		p.models[ModelLarge] = modelID
+		p.models[ModelMedium] = modelID
 		p.models[ModelSmall] = modelID
 	}
 }

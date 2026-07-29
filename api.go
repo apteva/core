@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -410,7 +411,17 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "cannot kill main thread", http.StatusBadRequest)
 			return
 		}
-		a.thinker.threads.Kill(id)
+		terminalReason := strings.TrimSpace(r.URL.Query().Get("reason"))
+		if terminalReason == "" {
+			terminalReason = "stopped"
+		}
+		switch terminalReason {
+		case "caller_done", "carrier_error", "audio_disconnected", "server_shutdown", "stopped":
+		default:
+			http.Error(w, "invalid terminal reason", http.StatusBadRequest)
+			return
+		}
+		a.thinker.threads.KillWithReason(id, terminalReason)
 		if err := a.thinker.config.RemoveThread(id); err != nil {
 			http.Error(w, "persist thread removal: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -446,6 +457,7 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		DirectiveSuffix string   `json:"directive_suffix"`
 		Tools           []string `json:"tools,omitempty"`
 		Conversation    *bool    `json:"conversation,omitempty"`
+		RestartRealtime bool     `json:"restart_realtime,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -461,21 +473,42 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		}
 	}
 	if body.Conversation != nil {
-		if err := a.thinker.threads.SetConversation(id, *body.Conversation); err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		if err := a.thinker.threads.SetConversationWithOpts(id, *body.Conversation, ThreadUpdateOptions{RestartRealtime: body.RestartRealtime}); err != nil {
+			status := http.StatusNotFound
+			if errors.Is(err, ErrRealtimeConfigurationRestartRequired) {
+				status = http.StatusConflict
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 	}
-	if err := a.thinker.threads.Update(id, "", directive, body.Tools); err != nil {
+	result, err := a.thinker.threads.UpdateWithOpts(id, "", directive, body.Tools, ThreadUpdateOptions{RestartRealtime: body.RestartRealtime})
+	if err != nil {
 		// Update returns "thread not found" for unknown ids.
-		http.Error(w, err.Error(), http.StatusNotFound)
+		status := http.StatusNotFound
+		if errors.Is(err, ErrRealtimeConfigurationRestartRequired) {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	// Nudge the thread the same way the LLM-driven update tool does
 	// (thread.go) so it notices the change mid-conversation rather than
 	// silently swapping its system prompt on the next turn.
-	a.thinker.threads.Send(id, "[directive updated]")
-	writeJSON(w, map[string]string{"status": "updated", "id": id})
+	if result.DirectiveChanged {
+		a.thinker.threads.Send(id, "[directive updated]")
+	}
+	writeJSON(w, map[string]any{
+		"status": resultStatus(result.Changed, "updated", "unchanged"),
+		"id":     id, "realtime_restarted": result.RealtimeRestarted,
+	})
+}
+
+func resultStatus(changed bool, changedStatus, unchangedStatus string) string {
+	if changed {
+		return changedStatus
+	}
+	return unchangedStatus
 }
 
 // persistAPIThread reconciles an idempotent API spawn request with the live

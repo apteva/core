@@ -312,7 +312,8 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 		voiceList := strings.Join(pool.RealtimeNames(), ", ")
 		prompt += "\n\n[REALTIME THREADS]\n"
 		prompt += "- Spawn realtime=true for voice/audio conversations (live phone call, kiosk interaction, voice booking, etc.). The worker holds the WebSocket session and handles audio; you handle backend tools and decisions. Reach the worker via send(id,text) — it speaks your text aloud. The worker escalates via send(id=\"main\",text=...) and reports completion via done(text=...). Audio never crosses into your context — you only see what the worker explicitly relays.\n"
-		prompt += "- Scope tools tightly: give the realtime worker only the tools it needs to converse and act in the moment (telephony, channels). Keep state-owning tools (calendar, storage, billing) on yourself so the worker has to escalate decisions to you.\n"
+		prompt += "- The directive and tools shown for an active realtime thread are its already-applied configuration. Leave them alone unless a real durable change is required: never call update merely to restate its role, instructions, or tools. Use send for temporary call context. A provider that cannot apply a real change live requires the explicit restart_realtime=true option because reconnecting can interrupt speech.\n"
+		prompt += "- Scope tools tightly at creation. Give the realtime worker the tools it needs to complete safe in-conversation actions directly; retain privileged or cross-domain decisions with the appropriate owner. Ephemeral realtime workers cannot evolve their caller-owned session directive.\n"
 		prompt += fmt.Sprintf("- Available realtime providers: %s. Set provider=\"<name>\" when spawning; default is used otherwise. Voice via voice=\"<id>\" (e.g. voice=\"alloy\").\n", voiceList)
 		prompt += "- Example: spawn(id=\"call-clinic\", realtime=true, voice=\"alloy\", directive=\"Call Dr. Patel's office to book a cleaning. Escalate scheduling decisions to main. done() with the confirmed slot.\", tools=\"channels_telephony_place\")\n"
 	}
@@ -476,8 +477,20 @@ func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext string) s
 			if t.SubThreads > 0 {
 				subInfo = fmt.Sprintf(" [sub-threads: %d]", t.SubThreads)
 			}
-			sb.WriteString(fmt.Sprintf("- %s%s\n  directive: %s\n  tools: %s\n",
-				label, subInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", ")))
+			runtimeInfo := ""
+			if t.Realtime {
+				ownership := "persistent"
+				if t.Ephemeral {
+					ownership = "ephemeral"
+				}
+				bridge := "not connected"
+				if t.BridgeConnected {
+					bridge = "connected"
+				}
+				runtimeInfo = fmt.Sprintf(" [realtime; %s; audio bridge %s; listed configuration already applied]", ownership, bridge)
+			}
+			sb.WriteString(fmt.Sprintf("- %s%s%s\n  directive: %s\n  tools: %s\n",
+				label, subInfo, runtimeInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", ")))
 		}
 	}
 
@@ -1805,6 +1818,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					directive := ""
 					directiveSummary := ""
 					directiveChanged := false
+					updateResult := ThreadUpdateResult{}
 					applyErr := error(nil)
 					if directiveEditRequested {
 						currentDirective, err := t.threads.Directive(id)
@@ -1812,11 +1826,13 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							applyErr = err
 						} else {
 							directive, directiveSummary, applyErr = applyDirectiveEdit(currentDirective, call.Args)
-							directiveChanged = applyErr == nil
+							directiveChanged = applyErr == nil && directive != currentDirective
 						}
 					}
 					if applyErr == nil && (name != "" || directiveChanged || len(tools) > 0) {
-						applyErr = t.threads.Update(id, name, directive, tools)
+						updateResult, applyErr = t.threads.UpdateWithOpts(id, name, directive, tools, ThreadUpdateOptions{
+							RestartRealtime: parseTruthy(call.Args["restart_realtime"]),
+						})
 						if applyErr == nil && directiveChanged {
 							t.threads.Send(id, fmt.Sprintf("[directive updated] %s", directive))
 						}
@@ -1832,7 +1848,13 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					} else {
 						t.kickNextTurn = true
-						addResult(directiveEditToolResult(fmt.Sprintf("thread %s updated", id), directiveSummary))
+						status := fmt.Sprintf("thread %s updated", id)
+						if !updateResult.Changed && newID == "" {
+							status = fmt.Sprintf("thread %s already has that configuration; no update or realtime reconnect was needed", id)
+						} else if updateResult.RealtimeRestarted {
+							status += " with an explicitly requested realtime restart"
+						}
+						addResult(directiveEditToolResult(status, directiveSummary))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)

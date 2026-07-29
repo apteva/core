@@ -169,28 +169,30 @@ const threadDirectivePersistencePrompt = `
 - For authority-based changes, copy the parent's durable intent without adding operational details they did not state. Patch only the relevant Markdown section, remove obsolete conflicts, and call evolve once for one authoritative instruction. If evolve rejects the arguments, correct them and retry once; a rejected call did not persist the instruction.`
 
 type ThreadInfo struct {
-	ID            string
-	Name          string // human-readable display label; empty = render id
-	System        bool   // platform-managed; hidden from and immutable by agent tools
-	ParentID      string // "main" or parent thread ID
-	Depth         int
-	Directive     string
-	Tools         []string
-	MCPNames      []string
-	Running       bool
-	Iteration     int
-	Rate          ThinkRate
-	NextWakeAt    time.Time
-	Model         ModelTier
-	Reasoning     ReasoningLevel
-	Provider      string // active provider name
-	Realtime      bool
-	Voice         string
-	TurnDetection RealtimeTurnDetectionConfig
-	Started       time.Time
-	ContextMsgs   int
-	ContextChars  int
-	SubThreads    int // number of direct children
+	ID              string
+	Name            string // human-readable display label; empty = render id
+	System          bool   // platform-managed; hidden from and immutable by agent tools
+	ParentID        string // "main" or parent thread ID
+	Depth           int
+	Directive       string
+	Tools           []string
+	MCPNames        []string
+	Running         bool
+	Iteration       int
+	Rate            ThinkRate
+	NextWakeAt      time.Time
+	Model           ModelTier
+	Reasoning       ReasoningLevel
+	Provider        string // active provider name
+	Realtime        bool
+	Ephemeral       bool
+	BridgeConnected bool
+	Voice           string
+	TurnDetection   RealtimeTurnDetectionConfig
+	Started         time.Time
+	ContextMsgs     int
+	ContextChars    int
+	SubThreads      int // number of direct children
 }
 
 type Thread struct {
@@ -221,8 +223,9 @@ type Thread struct {
 	// realtime worker.
 	BridgeDisconnectTTL time.Duration
 	bridgeCleanupTimer  *time.Timer
+	bridgeConnected     bool
 	initialMessage      string
-	initialMessageSent  bool
+	promptBuilder       func(directive string, conversation bool) string
 	Parent              *Thinker
 	Children            *ThreadManager // non-nil if this thread can spawn (depth < MaxSpawnDepth)
 	Tools               map[string]bool
@@ -235,6 +238,18 @@ type ThreadManager struct {
 	mu      sync.RWMutex
 	threads map[string]*Thread
 	parent  *Thinker
+}
+
+func addManagedThreadBuiltins(toolSet map[string]bool, isSystem, suppressEvolve bool) {
+	if !isSystem {
+		toolSet["send"] = true
+		toolSet["done"] = true
+		toolSet["search_tools"] = true
+		if !suppressEvolve {
+			toolSet["evolve"] = true
+		}
+	}
+	toolSet["pace"] = true
 }
 
 func NewThreadManager(parent *Thinker) *ThreadManager {
@@ -437,20 +452,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	for _, t := range tools {
 		toolSet[strings.TrimSpace(t)] = true
 	}
-	if !isSystem {
-		toolSet["send"] = true
-		toolSet["done"] = true
-	}
-	toolSet["pace"] = true
-	if !isSystem {
-		toolSet["evolve"] = true
-		// search_tools is scaffolding for normal threads — they can
-		// discover MCP tools at runtime even if the spawner didn't
-		// list it explicitly. no_spawn filtering inside runSearchTools
-		// keeps sub-threads from seeing tools they can't call. System
-		// threads (unconscious) are tightly scoped and don't get it.
-		toolSet["search_tools"] = true
-	}
+	// Ephemeral realtime workers receive the normal execution and coordination
+	// tools, but not evolve: their directive is caller-owned live-session
+	// configuration, not durable policy for the worker to rewrite.
+	addManagedThreadBuiltins(toolSet, isSystem, opts.Ephemeral && opts.Realtime)
 	// Leaders get kill/update only if spawn was explicitly requested
 	if canSpawn && toolSet["spawn"] {
 		toolSet["kill"] = true
@@ -460,23 +465,6 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		delete(toolSet, "spawn")
 	}
 
-	// Build system prompt: use leader or worker template based on depth
-	parentLabel := parentID
-	if parentID == "main" {
-		parentLabel = "main coordinator"
-	}
-	basePrompt := formatThreadBasePrompt(canSpawn, opts.Realtime, opts.Conversation, id, parentLabel)
-	coreDocs := ""
-	if tm.parent.registry != nil {
-		// Same compact-vs-full trade-off as buildSystemPrompt: if the
-		// sub-thread's provider supports native tools, the schemas are
-		// already in tools[] and we skip duplicating them in prose.
-		if poolSupportsNativeTools(tm.parent.pool) {
-			coreDocs = "\n" + tm.parent.registry.CoreDocsSummary(false, isSystem)
-		} else {
-			coreDocs = "\n" + tm.parent.registry.CoreDocs(false, isSystem)
-		}
-	}
 	// Inject safety mode from parent config. Child-thread wording is a
 	// tighter version of the main-thread prompt: the child escalates to
 	// its PARENT (not the user directly).
@@ -490,11 +478,46 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	default: // ModeAutonomous
 		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. ACT, DON'T NARRATE — your parent only sees what you `send` or `done` with; prose between tool calls is not observed by anyone, so skip it. Take the next tool call, let the result guide the next."
 	}
-	threadSystemPrompt := basePrompt + threadDirectivePersistencePrompt + coreDocs + modeBlock
-	if opts.Realtime {
-		threadSystemPrompt += realtimeConversationPrompt
+	buildThreadPrompt := func(currentID, currentParentID, currentDirective string, conversation bool) string {
+		parentLabel := currentParentID
+		if parentLabel == "main" {
+			parentLabel = "main coordinator"
+		}
+		prompt := formatThreadBasePrompt(canSpawn, opts.Realtime, conversation, currentID, parentLabel)
+		if !(opts.Ephemeral && opts.Realtime) {
+			prompt += threadDirectivePersistencePrompt
+		}
+		if tm.parent.registry != nil {
+			// Same compact-vs-full trade-off as buildSystemPrompt: if the
+			// sub-thread's provider supports native tools, the schemas are
+			// already in tools[] and we skip duplicating them in prose.
+			if poolSupportsNativeTools(tm.parent.pool) {
+				prompt += "\n" + tm.parent.registry.CoreDocsSummary(false, isSystem)
+			} else {
+				prompt += "\n" + tm.parent.registry.CoreDocs(false, isSystem)
+			}
+		}
+		prompt += modeBlock
+		if opts.Realtime {
+			prompt += realtimeConversationPrompt
+		}
+		if canSpawn {
+			var mcpList []string
+			for _, cfg := range tm.parent.config.GetMCPServers() {
+				if !cfg.NoSpawn {
+					mcpList = append(mcpList, cfg.Name)
+				}
+			}
+			if len(mcpList) > 0 {
+				prompt += "\n\n[AVAILABLE MCP SERVERS — use mcps=[\"name\"] when spawning]\n"
+				for _, name := range mcpList {
+					prompt += "- " + name + "\n"
+				}
+			}
+		}
+		return prompt + "\n\n[DIRECTIVE]\n" + currentDirective
 	}
-	threadSystemPrompt += "\n\n[DIRECTIVE]\n" + directive
+	threadSystemPrompt := buildThreadPrompt(id, parentID, directive, opts.Conversation)
 
 	thread := &Thread{
 		ID:                  id,
@@ -520,6 +543,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		Tools:               toolSet,
 		Started:             time.Now(),
 		initialParts:        opts.MediaParts,
+	}
+	thread.promptBuilder = func(currentDirective string, conversation bool) string {
+		return buildThreadPrompt(thread.ID, thread.ParentID, currentDirective, conversation)
 	}
 
 	// Create a Thinker — same struct as main, shares the bus and provider pool
@@ -710,49 +736,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		allowNoSpawn:           opts.BypassNoSpawn,
 		unconsciousSafety:      tm.parent.unconsciousSafety,
 		rebuildPrompt: func(_ string) string {
-			cd := ""
-			if threadRegistry != nil {
-				if poolSupportsNativeTools(tm.parent.pool) {
-					cd = "\n" + threadRegistry.CoreDocsSummary(false, isSystem)
-				} else {
-					cd = "\n" + threadRegistry.CoreDocs(false, isSystem)
-				}
-			}
-			currentID := thread.ID
-			currentParentLabel := thread.ParentID
-			if currentParentLabel == "main" {
-				currentParentLabel = "main coordinator"
-			}
-			bp := formatThreadBasePrompt(canSpawn, thread.IsRealtime, thread.IsConversation, currentID, currentParentLabel)
-			prompt := bp + cd
-			if thread.IsRealtime {
-				prompt += realtimeConversationPrompt
-			}
-			// Active sub-threads + RAG-retrieved toolDocs USED to render
-			// here — they busted the cache every iteration. Both now ride
-			// in the per-turn user message via buildDynamicTurnContext
-			// (same path as main thread's Run loop), keeping leader
-			// messages[0] cache-stable.
-			// Show available MCP servers so leaders know what to attach
-			// when spawning. Servers flagged no_spawn (gateway, channels)
-			// are filtered out — sub-threads can't see or attach them.
-			if canSpawn {
-				var mcpList []string
-				for _, cfg := range tm.parent.config.GetMCPServers() {
-					if cfg.NoSpawn {
-						continue
-					}
-					mcpList = append(mcpList, cfg.Name)
-				}
-				if len(mcpList) > 0 {
-					prompt += "\n\n[AVAILABLE MCP SERVERS — use mcps=[\"name\"] when spawning]\n"
-					for _, name := range mcpList {
-						prompt += "- " + name + "\n"
-					}
-				}
-			}
-			prompt += "\n\n[DIRECTIVE]\n" + thread.Directive
-			return prompt
+			return thread.promptBuilder(thread.Directive, thread.IsConversation)
 		},
 	}
 	thinker.onStop = func() { tm.cleanupThread(thinker.threadID) }
@@ -801,6 +785,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			opts.AudioIn, opts.AudioOut, opts.AudioControl,
 			opts.TurnDetection,
 		)
+		thread.Realtime.setInitialMessage(thread.initialMessage)
 	}
 
 	tm.threads[id] = thread
@@ -858,6 +843,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				return fmt.Errorf("realtime open: %w", err)
 			}
 			thread.Realtime = rt
+			rt.setInitialMessage(thread.initialMessage)
 			go rt.Run()
 		} else {
 			go thinker.Run()
@@ -953,22 +939,11 @@ func (tm *ThreadManager) realtimeBridgeConnected(id string) {
 		thread.bridgeCleanupTimer.Stop()
 		thread.bridgeCleanupTimer = nil
 	}
-	message := ""
 	realtime := thread.Realtime
-	if realtime != nil && !thread.initialMessageSent && thread.initialMessage != "" {
-		thread.initialMessageSent = true
-		message = thread.initialMessage
-	}
+	thread.bridgeConnected = true
 	owner.mu.Unlock()
-	if message != "" {
-		if err := realtime.requestTextResponse(message); err != nil {
-			logMsg("REALTIME-AUDIO", fmt.Sprintf("initial response for thread=%s: %v", id, err))
-			owner.mu.Lock()
-			if current := owner.threads[id]; current == thread {
-				thread.initialMessageSent = false
-			}
-			owner.mu.Unlock()
-		}
+	if realtime != nil {
+		realtime.audioBridgeConnected()
 	}
 }
 
@@ -998,7 +973,17 @@ func (tm *ThreadManager) realtimeInputSpeechStarted(id string) {
 
 func (tm *ThreadManager) realtimeBridgeDisconnected(id string) {
 	owner, thread := tm.findManagedThread(id)
-	if thread == nil || owner == nil || thread.BridgeDisconnectTTL <= 0 {
+	if thread == nil || owner == nil {
+		return
+	}
+	owner.mu.Lock()
+	thread.bridgeConnected = false
+	realtime := thread.Realtime
+	owner.mu.Unlock()
+	if realtime != nil {
+		realtime.audioBridgeDisconnected()
+	}
+	if thread.BridgeDisconnectTTL <= 0 {
 		return
 	}
 	owner.mu.Lock()
@@ -1008,7 +993,7 @@ func (tm *ThreadManager) realtimeBridgeDisconnected(id string) {
 	ttl := thread.BridgeDisconnectTTL
 	thread.bridgeCleanupTimer = time.AfterFunc(ttl, func() {
 		logMsg("REALTIME-AUDIO", fmt.Sprintf("bridge grace expired for thread=%s; stopping", id))
-		owner.Kill(id)
+		owner.KillWithReason(id, "audio_disconnected")
 	})
 	owner.mu.Unlock()
 }
@@ -1305,6 +1290,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					directive := ""
 					directiveSummary := ""
 					directiveChanged := false
+					updateResult := ThreadUpdateResult{}
 					applyErr := error(nil)
 					if directiveEditRequested {
 						currentDirective, err := thread.Children.Directive(sid)
@@ -1312,11 +1298,13 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							applyErr = err
 						} else {
 							directive, directiveSummary, applyErr = applyDirectiveEdit(currentDirective, call.Args)
-							directiveChanged = applyErr == nil
+							directiveChanged = applyErr == nil && directive != currentDirective
 						}
 					}
 					if applyErr == nil && (name != "" || directiveChanged || len(updateTools) > 0) {
-						applyErr = thread.Children.Update(sid, name, directive, updateTools)
+						updateResult, applyErr = thread.Children.UpdateWithOpts(sid, name, directive, updateTools, ThreadUpdateOptions{
+							RestartRealtime: parseTruthy(call.Args["restart_realtime"]),
+						})
 						if applyErr == nil && directiveChanged {
 							thread.Children.Send(sid, fmt.Sprintf("[directive updated] %s", directive))
 						}
@@ -1332,7 +1320,13 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 					} else {
 						t.kickNextTurn = true
-						emitResult(call, directiveEditToolResult(fmt.Sprintf("thread %s updated", sid), directiveSummary))
+						status := fmt.Sprintf("thread %s updated", sid)
+						if !updateResult.Changed && newID == "" {
+							status = fmt.Sprintf("thread %s already has that configuration; no update or realtime reconnect was needed", sid)
+						} else if updateResult.RealtimeRestarted {
+							status += " with an explicitly requested realtime restart"
+						}
+						emitResult(call, directiveEditToolResult(status, directiveSummary))
 					}
 				}
 				toolNames = append(toolNames, call.Raw)
@@ -1430,6 +1424,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			} else {
 				thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
 			}
+			if thread.Realtime != nil {
+				thread.Realtime.setTerminalReason("caller_done")
+			}
 			t.Stop()
 		}
 
@@ -1438,11 +1435,18 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 }
 
 func (tm *ThreadManager) Kill(id string) {
+	tm.KillWithReason(id, "stopped")
+}
+
+func (tm *ThreadManager) KillWithReason(id, reason string) {
 	tm.mu.RLock()
 	thread, exists := tm.threads[id]
 	tm.mu.RUnlock()
 	if !exists {
 		return
+	}
+	if thread.Realtime != nil {
+		thread.Realtime.setTerminalReason(reason)
 	}
 	thread.Thinker.Stop()
 	// Wait briefly for cleanup
@@ -1467,7 +1471,7 @@ func (tm *ThreadManager) KillAll() {
 	}
 	tm.mu.RUnlock()
 	for _, id := range ids {
-		tm.Kill(id)
+		tm.KillWithReason(id, "server_shutdown")
 	}
 }
 
@@ -1537,28 +1541,30 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			subCount = t.Children.Count()
 		}
 		infos = append(infos, ThreadInfo{
-			ID:            t.ID,
-			Name:          t.Name,
-			System:        t.System,
-			ParentID:      t.ParentID,
-			Depth:         t.Depth,
-			Directive:     t.Directive,
-			Tools:         toolSetToSlice(t.Tools),
-			Running:       true,
-			Iteration:     status.Iteration,
-			Rate:          status.Rate,
-			NextWakeAt:    status.NextWakeAt,
-			Model:         status.Model,
-			Reasoning:     status.Reasoning,
-			Provider:      providerName,
-			Realtime:      t.IsRealtime,
-			Voice:         t.Voice,
-			TurnDetection: t.TurnDetection,
-			Started:       t.Started,
-			ContextMsgs:   status.ContextMsgs,
-			ContextChars:  status.ContextChars,
-			MCPNames:      t.MCPNames,
-			SubThreads:    subCount,
+			ID:              t.ID,
+			Name:            t.Name,
+			System:          t.System,
+			ParentID:        t.ParentID,
+			Depth:           t.Depth,
+			Directive:       t.Directive,
+			Tools:           toolSetToSlice(t.Tools),
+			Running:         true,
+			Iteration:       status.Iteration,
+			Rate:            status.Rate,
+			NextWakeAt:      status.NextWakeAt,
+			Model:           status.Model,
+			Reasoning:       status.Reasoning,
+			Provider:        providerName,
+			Realtime:        t.IsRealtime,
+			Ephemeral:       t.Ephemeral,
+			BridgeConnected: t.bridgeConnected,
+			Voice:           t.Voice,
+			TurnDetection:   t.TurnDetection,
+			Started:         t.Started,
+			ContextMsgs:     status.ContextMsgs,
+			ContextChars:    status.ContextChars,
+			MCPNames:        t.MCPNames,
+			SubThreads:      subCount,
 		})
 	}
 	// Sort by ID for deterministic order
@@ -1732,10 +1738,38 @@ func (tm *ThreadManager) SetEphemeral(id string, ephemeral bool) error {
 	return nil
 }
 
+type ThreadUpdateOptions struct {
+	RestartRealtime bool
+}
+
+type ThreadUpdateResult struct {
+	Changed           bool
+	NameChanged       bool
+	DirectiveChanged  bool
+	ToolsChanged      bool
+	RealtimeRestarted bool
+}
+
+func sameToolSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, enabled := range a {
+		if b[name] != enabled {
+			return false
+		}
+	}
+	return true
+}
+
 // SetConversation changes the reporting mode and rebuilds the system prompt
 // without touching session history. Persistence remains the caller's
 // responsibility so ephemeral API threads cannot leak into Config.Threads.
 func (tm *ThreadManager) SetConversation(id string, conversation bool) error {
+	return tm.SetConversationWithOpts(id, conversation, ThreadUpdateOptions{})
+}
+
+func (tm *ThreadManager) SetConversationWithOpts(id string, conversation bool, opts ThreadUpdateOptions) error {
 	tm.mu.Lock()
 	thread, exists := tm.threads[id]
 	if !exists {
@@ -1745,6 +1779,17 @@ func (tm *ThreadManager) SetConversation(id string, conversation bool) error {
 	if thread.IsConversation == conversation {
 		tm.mu.Unlock()
 		return nil
+	}
+	realtime := thread.Realtime
+	bridgeConnected := thread.bridgeConnected
+	if realtime != nil && thread.promptBuilder != nil {
+		nextPrompt := thread.promptBuilder(thread.Directive, conversation)
+		nextTools := realtimeNativeToolsFor(thread.Thinker, thread.Tools, false)
+		if realtime.configurationDisposition(nextPrompt, nextTools) == RealtimeConfigurationRestartRequired &&
+			bridgeConnected && !opts.RestartRealtime {
+			tm.mu.Unlock()
+			return fmt.Errorf("%w; pass restart_realtime=true to apply this intentional change", ErrRealtimeConfigurationRestartRequired)
+		}
 	}
 	if thread.Realtime != nil {
 		thread.Realtime.transcriptMu.Lock()
@@ -1757,56 +1802,85 @@ func (tm *ThreadManager) SetConversation(id string, conversation bool) error {
 	if thread.Realtime != nil {
 		thread.Realtime.transcriptMu.Unlock()
 	}
-	realtime := thread.Realtime
 	tm.mu.Unlock()
 	if realtime != nil {
-		realtime.refreshConfiguration()
+		if _, err := realtime.applyExternalConfigurationChange(opts.RestartRealtime || !bridgeConnected, "conversation_mode_update"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // Update changes a thread's directive and/or tools. Rebuilds the system prompt immediately.
 func (tm *ThreadManager) Update(id, name, directive string, tools []string) error {
+	_, err := tm.UpdateWithOpts(id, name, directive, tools, ThreadUpdateOptions{})
+	return err
+}
+
+func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []string, opts ThreadUpdateOptions) (ThreadUpdateResult, error) {
+	var result ThreadUpdateResult
 	tm.mu.Lock()
 	thread, exists := tm.threads[id]
-	defer tm.mu.Unlock()
 	if !exists {
-		return fmt.Errorf("thread %q not found", id)
+		tm.mu.Unlock()
+		return result, fmt.Errorf("thread %q not found", id)
 	}
 
 	nextName := thread.Name
 	if name != "" {
 		nextName = name
 	}
-	nameChanged := nextName != thread.Name
+	result.NameChanged = nextName != thread.Name
 	nextDirective := thread.Directive
 	if directive != "" {
 		nextDirective = directive
 	}
+	result.DirectiveChanged = nextDirective != thread.Directive
 	nextTools := thread.Tools
 	if len(tools) > 0 {
 		toolSet := make(map[string]bool)
 		for _, t := range tools {
-			toolSet[strings.TrimSpace(t)] = true
+			if name := strings.TrimSpace(t); name != "" {
+				toolSet[name] = true
+			}
 		}
-		// Always include builtins. (remember is intentionally absent — the
-		// tool is unregistered for now while memory is being redesigned.)
-		for _, b := range []string{"send", "done", "pace", "evolve"} {
-			toolSet[b] = true
+		addManagedThreadBuiltins(toolSet, thread.System, thread.Ephemeral && thread.IsRealtime)
+		if thread.Children != nil && toolSet["spawn"] {
+			toolSet["kill"] = true
+			toolSet["update"] = true
 		}
 		nextTools = toolSet
+	}
+	result.ToolsChanged = !sameToolSet(nextTools, thread.Tools)
+	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged
+	if !result.Changed {
+		tm.mu.Unlock()
+		return result, nil
+	}
+
+	realtime := thread.Realtime
+	bridgeConnected := thread.bridgeConnected
+	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged) && thread.promptBuilder != nil {
+		nextPrompt := thread.promptBuilder(nextDirective, thread.IsConversation)
+		nextNativeTools := realtimeNativeToolsFor(thread.Thinker, nextTools, false)
+		if realtime.configurationDisposition(nextPrompt, nextNativeTools) == RealtimeConfigurationRestartRequired &&
+			bridgeConnected && !opts.RestartRealtime {
+			tm.mu.Unlock()
+			return ThreadUpdateResult{}, fmt.Errorf("%w; the current directive and tools are already active, use send for one-call context or pass restart_realtime=true for an intentional live restart", ErrRealtimeConfigurationRestartRequired)
+		}
 	}
 
 	if !thread.Ephemeral {
 		persisted := persistentThreadState(thread)
 		persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
 		if err := tm.parent.config.SaveThread(persisted); err != nil {
-			return fmt.Errorf("persist thread update: %w", err)
+			tm.mu.Unlock()
+			return ThreadUpdateResult{}, fmt.Errorf("persist thread update: %w", err)
 		}
 	}
 
-	if thread.Realtime != nil {
-		thread.Realtime.transcriptMu.Lock()
+	if realtime != nil {
+		realtime.transcriptMu.Lock()
 	}
 	thread.Name = nextName
 	thread.Directive = nextDirective
@@ -1816,21 +1890,29 @@ func (tm *ThreadManager) Update(id, name, directive string, tools []string) erro
 		thread.Thinker.messages[0] = Message{Role: "system", Content: thread.Thinker.rebuildPrompt("")}
 	}
 	thread.Thinker.publishContextStatus()
-	if thread.Realtime != nil {
-		thread.Realtime.transcriptMu.Unlock()
-		thread.Realtime.refreshConfiguration()
+	if realtime != nil {
+		realtime.transcriptMu.Unlock()
+	}
+	tm.mu.Unlock()
+
+	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged) {
+		restarted, err := realtime.applyExternalConfigurationChange(opts.RestartRealtime || !bridgeConnected, "parent_configuration_update")
+		if err != nil {
+			return result, err
+		}
+		result.RealtimeRestarted = restarted
 	}
 
 	// Telemetry: name-only changes fire thread.renamed (id stays the
 	// same on both sides) so the dashboard can update its label without
 	// thinking the thread got recreated.
-	if nameChanged && tm.parent.telemetry != nil {
+	if result.NameChanged && tm.parent.telemetry != nil {
 		tm.parent.telemetry.Emit("thread.renamed", id, ThreadRenamedData{
 			OldID: id, NewID: id, Name: thread.Name, ParentID: thread.ParentID,
 		})
 	}
 
-	return nil
+	return result, nil
 }
 
 // Rename changes a thread's immutable id. Touches every reference:

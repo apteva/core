@@ -19,6 +19,8 @@ const (
 	realtimePCMBytesPerSecond = 24000 * 2
 )
 
+var ErrRealtimeConfigurationRestartRequired = errors.New("active realtime configuration change requires an explicit restart")
+
 // RealtimeThinker is the event-driven counterpart to Thinker. It deliberately
 // reuses Thinker's prompt, tool handler, execution gates, durable Session, bus,
 // and telemetry instead of maintaining a second, weaker agent runtime.
@@ -55,6 +57,18 @@ type RealtimeThinker struct {
 	state           string
 	statePhase      string
 
+	lifecycleMu                 sync.Mutex
+	sessionGeneration           int
+	bridgeConnected             bool
+	bridgeConnectedAt           time.Time
+	initialMessage              string
+	greetingRequestedGeneration int
+	assistantAudioEmitted       bool
+	firstAudioEmitted           bool
+	terminalReason              string
+	pendingReconnectReason      string
+	pendingReconnectPlanned     bool
+
 	toolBatchMu     sync.Mutex
 	toolBatches     map[string]*realtimeToolBatch
 	toolCallBatches map[string]string
@@ -66,10 +80,10 @@ type realtimeToolBatch struct {
 	responseDone bool
 }
 
-func realtimeNativeTools(thinker *Thinker) []NativeTool {
+func realtimeNativeToolsFor(thinker *Thinker, allowlist map[string]bool, record bool) []NativeTool {
 	var tools []NativeTool
 	if thinker.registry != nil {
-		tools = thinker.registry.NativeTools(thinker.toolAllowlist, thinker.activeTools, thinker.systemThread)
+		tools = thinker.registry.NativeTools(allowlist, thinker.activeTools, thinker.systemThread)
 	}
 	tools = append(tools, NativeTool{
 		Name:        "interrupt",
@@ -78,8 +92,14 @@ func realtimeNativeTools(thinker *Thinker) []NativeTool {
 			"type": "object", "properties": map[string]any{},
 		},
 	})
-	thinker.recordPresentedTools(tools)
+	if record {
+		thinker.recordPresentedTools(tools)
+	}
 	return tools
+}
+
+func realtimeNativeTools(thinker *Thinker) []NativeTool {
+	return realtimeNativeToolsFor(thinker, thinker.toolAllowlist, true)
 }
 
 func realtimeSafetyIdentifier(threadID string) string {
@@ -120,6 +140,7 @@ func newRealtimeThinker(
 		ctx: runCtx, cancel: cancel,
 		audioIn: audioIn, audioOut: audioOut, audioControl: audioControl,
 		toolBatches: map[string]*realtimeToolBatch{}, toolCallBatches: map[string]string{},
+		terminalReason: "server_shutdown",
 	}
 	reasoning := thinker.agentReasoning.String()
 	if reasoning == "" || reasoning == "auto" {
@@ -322,6 +343,14 @@ func (rt *RealtimeThinker) openSession(restore bool) error {
 		return fmt.Errorf("restore conversation: %w", err)
 	}
 	rt.replaceSession(session)
+	rt.lifecycleMu.Lock()
+	rt.sessionGeneration++
+	generation := rt.sessionGeneration
+	rt.lifecycleMu.Unlock()
+	rt.emit("realtime.session_opened", map[string]any{
+		"generation": generation, "restored": restore,
+	})
+	rt.requestInitialMessageIfNeeded()
 	return nil
 }
 
@@ -331,9 +360,150 @@ func (rt *RealtimeThinker) refreshConfiguration() {
 		return
 	}
 	instructions, tools := rt.configurationSnapshot()
+	disposition := rt.previewConfigurationUpdate(session, instructions, tools)
+	if disposition == RealtimeConfigurationUnchanged {
+		return
+	}
+	if disposition == RealtimeConfigurationRestartRequired {
+		rt.lifecycleMu.Lock()
+		rt.pendingReconnectReason = "self_configuration_update"
+		rt.pendingReconnectPlanned = true
+		rt.lifecycleMu.Unlock()
+		rt.emit("realtime.reconnect_planned", map[string]any{
+			"reason": "self_configuration_update", "planned": true,
+		})
+	}
 	if err := session.UpdateConfiguration(instructions, tools); err != nil {
 		logMsg("REALTIME", fmt.Sprintf("[%s] update configuration: %v", rt.threadID, err))
 	}
+}
+
+func (rt *RealtimeThinker) previewConfigurationUpdate(session RealtimeSession, instructions string, tools []NativeTool) RealtimeConfigurationDisposition {
+	if previewer, ok := session.(RealtimeConfigurationPreviewer); ok {
+		return previewer.PreviewConfigurationUpdate(instructions, tools)
+	}
+	return RealtimeConfigurationAppliedLive
+}
+
+func (rt *RealtimeThinker) configurationDisposition(instructions string, tools []NativeTool) RealtimeConfigurationDisposition {
+	session := rt.currentSession()
+	if session == nil {
+		return RealtimeConfigurationAppliedLive
+	}
+	return rt.previewConfigurationUpdate(session, instructions, tools)
+}
+
+// applyExternalConfigurationChange is used for parent/API updates after their
+// state transaction commits. Immutable providers are restarted only when the
+// caller explicitly permitted it (or before an audio bridge is connected).
+func (rt *RealtimeThinker) applyExternalConfigurationChange(allowRestart bool, reason string) (bool, error) {
+	session := rt.currentSession()
+	if session == nil {
+		return false, nil
+	}
+	instructions, tools := rt.configurationSnapshot()
+	disposition := rt.previewConfigurationUpdate(session, instructions, tools)
+	switch disposition {
+	case RealtimeConfigurationUnchanged:
+		return false, nil
+	case RealtimeConfigurationRestartRequired:
+		if !allowRestart {
+			return false, ErrRealtimeConfigurationRestartRequired
+		}
+		rt.emit("realtime.reconnect_planned", map[string]any{
+			"reason": reason, "planned": true,
+		})
+		rt.lifecycleMu.Lock()
+		rt.pendingReconnectReason = reason
+		rt.pendingReconnectPlanned = true
+		rt.lifecycleMu.Unlock()
+		rt.replaceSession(nil)
+		return true, nil
+	default:
+		if err := session.UpdateConfiguration(instructions, tools); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+}
+
+func (rt *RealtimeThinker) setInitialMessage(message string) {
+	rt.lifecycleMu.Lock()
+	rt.initialMessage = strings.TrimSpace(message)
+	rt.lifecycleMu.Unlock()
+}
+
+func (rt *RealtimeThinker) audioBridgeConnected() {
+	rt.lifecycleMu.Lock()
+	if !rt.bridgeConnected {
+		rt.bridgeConnected = true
+		rt.bridgeConnectedAt = time.Now()
+	}
+	rt.lifecycleMu.Unlock()
+	rt.requestInitialMessageIfNeeded()
+}
+
+func (rt *RealtimeThinker) audioBridgeDisconnected() {
+	rt.lifecycleMu.Lock()
+	rt.bridgeConnected = false
+	rt.lifecycleMu.Unlock()
+}
+
+func (rt *RealtimeThinker) requestInitialMessageIfNeeded() {
+	session := rt.currentSession()
+	if session == nil {
+		return
+	}
+	rt.lifecycleMu.Lock()
+	generation := rt.sessionGeneration
+	if generation == 0 {
+		generation = 1
+		rt.sessionGeneration = generation
+	}
+	message := rt.initialMessage
+	if !rt.bridgeConnected || message == "" || rt.assistantAudioEmitted ||
+		rt.greetingRequestedGeneration == generation {
+		rt.lifecycleMu.Unlock()
+		return
+	}
+	rt.greetingRequestedGeneration = generation
+	rt.lifecycleMu.Unlock()
+	if err := rt.requestTextResponse(message); err != nil {
+		rt.lifecycleMu.Lock()
+		if rt.greetingRequestedGeneration == generation {
+			rt.greetingRequestedGeneration = 0
+		}
+		rt.lifecycleMu.Unlock()
+		logMsg("REALTIME", fmt.Sprintf("[%s] initial response: %v", rt.threadID, err))
+	}
+}
+
+func (rt *RealtimeThinker) markAssistantAudioEmitted() {
+	rt.lifecycleMu.Lock()
+	rt.assistantAudioEmitted = true
+	if rt.firstAudioEmitted {
+		rt.lifecycleMu.Unlock()
+		return
+	}
+	rt.firstAudioEmitted = true
+	generation := rt.sessionGeneration
+	connectedAt := rt.bridgeConnectedAt
+	replayed := generation > 1 && rt.greetingRequestedGeneration == generation
+	rt.lifecycleMu.Unlock()
+	data := map[string]any{"generation": generation, "replayed_greeting": replayed}
+	if !connectedAt.IsZero() {
+		data["bridge_to_first_audio_ms"] = time.Since(connectedAt).Milliseconds()
+	}
+	rt.emit("realtime.first_audio", data)
+}
+
+func (rt *RealtimeThinker) setTerminalReason(reason string) {
+	if strings.TrimSpace(reason) == "" {
+		return
+	}
+	rt.lifecycleMu.Lock()
+	rt.terminalReason = reason
+	rt.lifecycleMu.Unlock()
 }
 
 func (rt *RealtimeThinker) emit(eventType string, data map[string]any) {
@@ -513,6 +683,13 @@ func (rt *RealtimeThinker) rendererPlaybackOverflow(itemID string) {
 // stop/cancellation ends the worker and invokes the normal cleanup path.
 func (rt *RealtimeThinker) Run() {
 	defer func() {
+		rt.lifecycleMu.Lock()
+		terminalReason := rt.terminalReason
+		generation := rt.sessionGeneration
+		rt.lifecycleMu.Unlock()
+		rt.emit("realtime.thread_ended", map[string]any{
+			"reason": terminalReason, "generation": generation,
+		})
 		rt.cancel()
 		rt.replaceSession(nil)
 		if rt.onStop != nil {
@@ -530,7 +707,18 @@ func (rt *RealtimeThinker) Run() {
 	for {
 		if rt.currentSession() == nil {
 			if err := rt.openSession(true); err != nil {
-				rt.emit("realtime.reconnect", map[string]any{"success": false, "error": err.Error(), "delay_ms": reconnectDelay.Milliseconds()})
+				rt.lifecycleMu.Lock()
+				nextGeneration := rt.sessionGeneration + 1
+				reconnectReason := rt.pendingReconnectReason
+				reconnectPlanned := rt.pendingReconnectPlanned
+				rt.lifecycleMu.Unlock()
+				if reconnectReason == "" {
+					reconnectReason = "provider_session_closed"
+				}
+				rt.emit("realtime.reconnect", map[string]any{
+					"success": false, "error": err.Error(), "delay_ms": reconnectDelay.Milliseconds(),
+					"reason": reconnectReason, "planned": reconnectPlanned, "generation": nextGeneration,
+				})
 				select {
 				case <-rt.quit:
 					return
@@ -541,8 +729,19 @@ func (rt *RealtimeThinker) Run() {
 				reconnectDelay = min(realtimeReconnectMaxDelay, reconnectDelay*2)
 				continue
 			}
+			rt.lifecycleMu.Lock()
+			generation := rt.sessionGeneration
+			reconnectReason := rt.pendingReconnectReason
+			reconnectPlanned := rt.pendingReconnectPlanned
+			rt.pendingReconnectReason = ""
+			rt.pendingReconnectPlanned = false
+			rt.lifecycleMu.Unlock()
+			if reconnectReason == "" {
+				reconnectReason = "provider_session_closed"
+			}
 			rt.emit("realtime.reconnect", map[string]any{
 				"success": true, "turn_detection": rt.opts.TurnDetection.telemetryData(),
+				"reason": reconnectReason, "planned": reconnectPlanned, "generation": generation,
 			})
 			reconnectDelay = realtimeReconnectMinDelay
 		}
@@ -553,6 +752,17 @@ func (rt *RealtimeThinker) Run() {
 		case event, ok := <-events:
 			if !ok {
 				logMsg("REALTIME", fmt.Sprintf("[%s] provider session closed; renewing", rt.threadID))
+				rt.lifecycleMu.Lock()
+				generation := rt.sessionGeneration
+				if rt.pendingReconnectReason == "" {
+					rt.pendingReconnectReason = "provider_session_closed"
+					rt.pendingReconnectPlanned = false
+				}
+				reconnectReason := rt.pendingReconnectReason
+				rt.lifecycleMu.Unlock()
+				rt.emit("realtime.session_closed", map[string]any{
+					"reason": reconnectReason, "generation": generation,
+				})
 				rt.replaceSession(nil)
 				continue
 			}
@@ -628,6 +838,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 			rt.outputMu.Unlock()
 			select {
 			case rt.audioOut <- frame:
+				rt.markAssistantAudioEmitted()
 			default:
 				rt.emit("realtime.audio_overflow", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "consumer_backpressure"})
 				rt.interruptPlayback("core_output_overflow", event.ItemID, true, true)
@@ -697,7 +908,14 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 
 	case RealtimeEventSessionEnded:
 		rt.setConversationState("disconnected", event)
-		rt.emit("realtime.session_ended", map[string]any{"dropped_audio_events": event.DroppedAudio})
+		rt.lifecycleMu.Lock()
+		generation := rt.sessionGeneration
+		rt.lifecycleMu.Unlock()
+		rt.emit("realtime.session_ended", map[string]any{
+			"dropped_audio_events": event.DroppedAudio,
+			"reason":               "provider_session_ended",
+			"generation":           generation,
+		})
 	}
 }
 

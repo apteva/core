@@ -340,6 +340,25 @@ type RealtimeSession interface {
 	Close() error
 }
 
+// RealtimeConfigurationDisposition describes how a live provider can apply a
+// changed system prompt or tool set. Sessions that do not implement
+// RealtimeConfigurationPreviewer retain the existing live-update behavior.
+// Providers with immutable setup (Gemini Live today) use RestartRequired so
+// Core can reject an accidental parent update before mutating the thread.
+type RealtimeConfigurationDisposition string
+
+const (
+	RealtimeConfigurationUnchanged       RealtimeConfigurationDisposition = "unchanged"
+	RealtimeConfigurationAppliedLive     RealtimeConfigurationDisposition = "applied_live"
+	RealtimeConfigurationRestartRequired RealtimeConfigurationDisposition = "restart_required"
+)
+
+// RealtimeConfigurationPreviewer is an optional provider capability. The
+// method must be side-effect free.
+type RealtimeConfigurationPreviewer interface {
+	PreviewConfigurationUpdate(instructions string, tools []NativeTool) RealtimeConfigurationDisposition
+}
+
 // RealtimeEventType discriminates the union of events a session can
 // emit. Receivers should switch on Type before reading fields.
 type RealtimeEventType string

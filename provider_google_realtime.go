@@ -733,6 +733,16 @@ func (s *googleRealtimeSession) UpdateConfiguration(instructions string, tools [
 	return nil
 }
 
+func (s *googleRealtimeSession) PreviewConfigurationUpdate(instructions string, tools []NativeTool) RealtimeConfigurationDisposition {
+	next := googleRealtimeConfigFingerprint(instructions, tools)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if next == s.configFingerprint {
+		return RealtimeConfigurationUnchanged
+	}
+	return RealtimeConfigurationRestartRequired
+}
+
 func (s *googleRealtimeSession) RestoreConversation(messages []Message) error {
 	turns := make([]map[string]any, 0, len(messages))
 	for _, message := range messages {

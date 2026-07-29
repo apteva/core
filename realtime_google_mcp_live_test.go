@@ -295,9 +295,39 @@ func stringValue(value any) string {
 func canonicalSpokenText(text string) string {
 	var out strings.Builder
 	for _, r := range strings.ToUpper(text) {
+		switch r {
+		case 'À', 'Á', 'Â', 'Ã', 'Ä', 'Å':
+			r = 'A'
+		case 'Ç':
+			r = 'C'
+		case 'È', 'É', 'Ê', 'Ë':
+			r = 'E'
+		case 'Ì', 'Í', 'Î', 'Ï':
+			r = 'I'
+		case 'Ñ':
+			r = 'N'
+		case 'Ò', 'Ó', 'Ô', 'Õ', 'Ö':
+			r = 'O'
+		case 'Ù', 'Ú', 'Û', 'Ü':
+			r = 'U'
+		case 'Ý', 'Ÿ':
+			r = 'Y'
+		case 'Œ':
+			out.WriteString("OE")
+			continue
+		case 'Æ':
+			out.WriteString("AE")
+			continue
+		}
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			out.WriteRune(r)
 		}
 	}
 	return out.String()
+}
+
+func TestCanonicalSpokenTextFoldsCommonLatinAccents(t *testing.T) {
+	if got := canonicalSpokenText("Précisez à quelle heure, s’il vous plaît."); got != "PRECISEZAQUELLEHEURESILVOUSPLAIT" {
+		t.Fatalf("canonical spoken text = %q", got)
+	}
 }
