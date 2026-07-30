@@ -35,7 +35,8 @@ BEHAVIOR:
 
 TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
-- pace sets your next automatic wake, persists until changed, is capped at 24h, and events wake you earlier. Timing is approximate.
+- [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
 - ` + directiveStateContract + `
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
@@ -75,7 +76,8 @@ BEHAVIOR:
 
 TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
-- pace sets your next automatic wake, persists until changed, is capped at 24h, and events wake you earlier. Timing is approximate.
+- [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
 - ` + directiveStateContract + `
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
@@ -87,7 +89,7 @@ const normalThreadReportingPrompt = `- Send your parent the final result when it
 - Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures in this thread. A persistent owner does not report every successful cycle unless its parent explicitly requested that result.
 - If you lead children, aggregate related activity before reporting upward instead of forwarding every event.`
 
-const normalThreadIdlePrompt = `- When current work is done and any result owed to your parent has been sent, sleep until needed again: pace(sleep="5m") or pace(sleep="1h") etc.`
+const normalThreadIdlePrompt = `- When current work is done and any result owed to your parent has been sent, decide whether you need another automatic wake. Use pace(sleep="5m") or pace(sleep="1h") to set one; use pace(clear_wake=true) to wait only for events.`
 
 const normalThreadReasoningPrompt = `- Think out loud — explain what you're doing and why. Never output empty thoughts.`
 
@@ -96,7 +98,9 @@ const normalThreadPacingPrompt = `PACING — this is critical:
 - Instead: call tools first, THEN in the next thought (after seeing results), set your pace.
 - Example flow: Thought 1: call list_files. Thought 2: process results, send report, pace(sleep="5m").
 - Set sleep duration based on need: "2s" when actively working, "5m" when monitoring, "1h" for deep idle.
-- Only use pace when you have NO pending tool calls and are ready to wait.`
+- Only use pace when you have NO pending tool calls and are ready to wait.
+- An event can wake you before an existing pending wake without changing it. Inspect [WAKE STATE]: preserve it by omitting a timing change, replace it with sleep/rate, or remove it with clear_wake=true.
+- A timer wake consumes its pending wake. Set another before idling if you want to wake automatically again.`
 
 const realtimeThreadReportingPrompt = `- Ordinary conversation turns are not worker tasks. Do not report every turn to your parent. Consult your parent only when deeper decisions, privileged backend tools, durable state, or consequential actions are required.`
 
@@ -114,7 +118,7 @@ const conversationThreadReportingPrompt = `- You are a user-facing conversation,
 - Use send to consult or hand durable work to your parent only when needed. That send wakes the target immediately; wait for its result.
 - After your parent replies and you deliver the caller-facing result, the turn is complete. Never send an acknowledgement, confirmation, or completion report back to parent.`
 
-const conversationThreadIdlePrompt = `- When the current user turn is complete, sleep until another event arrives. No parent completion report is required.`
+const conversationThreadIdlePrompt = `- When the current user turn is complete, normally wait only for another event. Clear any obsolete pending automatic wake with pace(clear_wake=true). No parent completion report is required.`
 
 const conversationThreadPacingPrompt = `CONVERSATION PACING:
 - Tool results and parent replies wake you automatically. Do not poll or short-sleep while waiting for them.
@@ -330,8 +334,8 @@ type SpawnOpts struct {
 	// BridgeDisconnectTTL asks core to stop this realtime thread if its audio
 	// bridge remains disconnected for the duration. Zero disables cleanup.
 	BridgeDisconnectTTL time.Duration
-	// Pace restores the runtime-owned cadence/deadline of a persistent thread.
-	// It is not exposed through spawn and never enters the thread directive.
+	// Pace restores the agent-owned pending wake of a persistent thread. It is
+	// not exposed through spawn and never enters the thread directive.
 	Pace *PersistentPaceState
 	// InitialMessage is sent to the realtime provider after the first audio
 	// bridge connects, then immediately requests a response.
@@ -713,6 +717,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		nextWakeAt:             initialWake,
 		resumeWakeAt:           initialWake,
 		paceDurable:            opts.Pace != nil,
+		wakeReason:             "startup",
 		model:                  initialModel,
 		agentModel:             initialModel,
 		agentReasoning:         initialReasoning,
@@ -1370,7 +1375,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 					} else if d == thread.Directive {
 						t.scheduleEvolveCompletion()
-						emitResult(call, "directive already current; no update was needed. Continue the task and reply to the requester before pacing")
+						emitResult(call, evolveCompletionToolResult("directive already current; no update was needed", ""))
 					} else {
 						var persistErr error
 						if !thread.Ephemeral {
@@ -1395,7 +1400,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							}
 							t.scheduleEvolveCompletion()
 							t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
-							emitResult(call, directiveEditToolResult("directive updated", summary))
+							emitResult(call, evolveCompletionToolResult("directive updated", summary))
 						}
 					}
 				}
@@ -1638,7 +1643,7 @@ func persistentThreadState(thread *Thread) PersistentThread {
 		status := thread.Thinker.status()
 		state.Model = status.Model.String()
 		state.Reasoning = status.Reasoning.String()
-		if !status.NextWakeAt.IsZero() {
+		if status.PaceDurable {
 			state.Pace = &PersistentPaceState{
 				Sleep:      formatPaceDuration(status.Sleep),
 				NextWakeAt: status.NextWakeAt,

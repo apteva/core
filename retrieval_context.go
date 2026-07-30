@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const ephemeralContextHeader = "[REQUEST CONTEXT SNAPSHOT — ephemeral; not durable conversation history or current user input; later snapshots supersede earlier ones]"
@@ -40,6 +41,22 @@ func renderEphemeralTurnContext(dynamicContext, now string, idle bool) string {
 		content += "\n\n" + idleText
 	}
 	return content
+}
+
+func appendWakeStateContext(dynamicContext, reason string, wake time.Time, fired bool) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "continuation"
+	}
+	pending := pendingWakeDescription(wake)
+	if fired {
+		pending = "none (timer fired)"
+	}
+	wakeState := "[WAKE STATE]\nreason: " + reason + "\npending_wake_at: " + pending
+	if strings.TrimSpace(dynamicContext) == "" {
+		return wakeState
+	}
+	return strings.TrimSpace(dynamicContext) + "\n\n" + wakeState
 }
 
 func ephemeralTurnContextSignature(dynamicContext string, idle bool) string {

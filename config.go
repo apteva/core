@@ -13,9 +13,10 @@ import (
 const configFile = "config.json"
 
 // PersistentPaceState is runtime scheduling state, not directive content.
-// Sleep preserves the thread's chosen cadence; NextWakeAt preserves the
-// pending timer across a process restart. Both remain capped by the runtime's
-// 24-hour maximum when restored.
+// Sleep records the duration used for the last timing decision; NextWakeAt is
+// the single agent-owned pending timer. A zero NextWakeAt means event-only
+// waiting. A future deadline remains capped by the runtime's 24-hour maximum
+// when restored.
 type PersistentPaceState struct {
 	Sleep      string    `json:"sleep,omitempty"`
 	NextWakeAt time.Time `json:"next_wake_at,omitempty"`

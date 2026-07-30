@@ -247,7 +247,9 @@ func TestMainEvolveKicksNextTurn(t *testing.T) {
 	if !thinker.kickNextTurn {
 		t.Fatal("kickNextTurn should be true after evolve")
 	}
-	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "directive updated" {
+	if len(results) != 1 || results[0].CallID != "call-1" ||
+		!strings.Contains(results[0].Content, "directive updated") ||
+		!strings.Contains(results[0].Content, "Evolution is complete for this instruction; do not call evolve again") {
 		t.Fatalf("unexpected tool results: %+v", results)
 	}
 }
@@ -286,6 +288,7 @@ func TestMainEvolveIdenticalEditIsNoOp(t *testing.T) {
 		t.Fatal("identical evolve rebuilt the system prompt")
 	}
 	if len(results) != 1 || !strings.Contains(results[0].Content, "directive already current") ||
+		!strings.Contains(results[0].Content, "Evolution is complete for this instruction; do not call evolve again") ||
 		!strings.Contains(results[0].Content, "reply to the requester before pacing") {
 		t.Fatalf("results = %+v", results)
 	}
@@ -355,7 +358,9 @@ func TestWorkerEvolveIdenticalEditIsNoOp(t *testing.T) {
 	if worker.Thinker.messages[0].Content != originalPrompt {
 		t.Fatal("identical worker evolve rebuilt the system prompt")
 	}
-	if len(results) != 1 || !strings.Contains(results[0].Content, "directive already current") {
+	if len(results) != 1 || !strings.Contains(results[0].Content, "directive already current") ||
+		!strings.Contains(results[0].Content, "Evolution is complete for this instruction; do not call evolve again") ||
+		!strings.Contains(results[0].Content, "reply to the requester before pacing") {
 		t.Fatalf("results = %+v", results)
 	}
 
@@ -531,7 +536,9 @@ func TestMainEvolveSectionPatch(t *testing.T) {
 	if !thinker.kickNextTurn {
 		t.Fatal("kickNextTurn should be true after evolve")
 	}
-	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "directive updated" {
+	if len(results) != 1 || results[0].CallID != "call-1" ||
+		!strings.Contains(results[0].Content, "directive updated") ||
+		!strings.Contains(results[0].Content, "Evolution is complete for this instruction; do not call evolve again") {
 		t.Fatalf("unexpected tool results: %+v", results)
 	}
 }
@@ -564,7 +571,9 @@ func TestMainEvolveReportsRedundantSectionHeading(t *testing.T) {
 	if got := thinker.config.GetDirective(); got != "# Goals\n- Ship\n- Keep tests green" {
 		t.Fatalf("directive:\n%s", got)
 	}
-	if len(results) != 1 || !strings.Contains(results[0].Content, `directive updated; warning: removed 1 redundant "Goals" heading(s)`) {
+	if len(results) != 1 ||
+		!strings.Contains(results[0].Content, `directive updated; warning: removed 1 redundant "Goals" heading(s)`) ||
+		!strings.Contains(results[0].Content, "Evolution is complete for this instruction; do not call evolve again") {
 		t.Fatalf("unexpected tool results: %+v", results)
 	}
 }
@@ -627,7 +636,9 @@ func TestMainEvolveSectionRename(t *testing.T) {
 	if !thinker.kickNextTurn {
 		t.Fatal("kickNextTurn should be true after evolve")
 	}
-	if len(results) != 1 || results[0].CallID != "call-1" || results[0].Content != "directive updated" {
+	if len(results) != 1 || results[0].CallID != "call-1" ||
+		!strings.Contains(results[0].Content, "directive updated") ||
+		!strings.Contains(results[0].Content, "Evolution is complete for this instruction; do not call evolve again") {
 		t.Fatalf("unexpected tool results: %+v", results)
 	}
 }

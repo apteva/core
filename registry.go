@@ -90,20 +90,21 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Core tools — always in prompt
 	tr.Register(&ToolDef{
 		Name:        "pace",
-		Description: "Set this thread's next automatic wake and optional model/provider profile. Sleep and the pending wake survive restarts until changed, and events wake the thread sooner.",
+		Description: "pace sets your next automatic wake. Set, replace, inspect, or clear that one pending wake, with optional model/provider changes. Timing settings and the pending wake survive restarts, and Core never advances it on its own: events may wake the thread early without changing it, and a timer wake is consumed after the agent processes it.",
 		Syntax:      `[[pace sleep="5m" model="small" reasoning="low" provider="anthropic"]]`,
-		Rules:       `sleep accepts ms, s, m, or h and is capped at 24h; do not use d or w. For longer cadences, sleep 24h and reassess using the fresh [CURRENT TIME]. No scheduler or waiting thread is required. Call pace again only when the desired wake or model profile changes.`,
+		Rules:       `sleep accepts ms, s, m, or h and is capped at 24h; do not use d or w. sleep or rate sets/replaces the pending wake from the current time. clear_wake=true removes it and cannot be combined with sleep or rate. A model/provider-only call preserves the pending wake; pace() reports it unchanged. After a timer wake, call pace if you want another automatic wake. For longer responsibilities, schedule at most 24h and reassess using the fresh [CURRENT TIME]. No scheduler or waiting thread is required.`,
 		Core:        true,
-		// All fields optional — pace() with no args continues current state.
+		// All fields optional — pace() with no args reports current state.
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"sleep":     map[string]any{"type": "string", "description": "Duration using ms, s, m, or h, capped at 24h. Mutually exclusive with rate."},
-				"rate":      map[string]any{"type": "string", "description": "Named alias: \"fast\" (2s), \"normal\" (10s), \"slow\" (30s), \"sleep\" (2m)."},
-				"model":     map[string]any{"type": "string", "description": "Model tier: \"large\", \"medium\", \"small\"."},
-				"reasoning": map[string]any{"type": "string", "description": "Reasoning effort: \"auto\", \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\". Alias: thinking."},
-				"thinking":  map[string]any{"type": "string", "description": "Alias for reasoning effort."},
-				"provider":  map[string]any{"type": "string", "description": "LLM provider name (optional)."},
+				"sleep":      map[string]any{"type": "string", "description": "Duration using ms, s, m, or h, capped at 24h. Mutually exclusive with rate and clear_wake."},
+				"rate":       map[string]any{"type": "string", "description": "Named alias: \"fast\" (2s), \"normal\" (10s), \"slow\" (30s), \"sleep\" (2m). Mutually exclusive with sleep and clear_wake."},
+				"clear_wake": map[string]any{"type": "boolean", "description": "Remove the pending automatic wake and wait only for events. Mutually exclusive with sleep and rate."},
+				"model":      map[string]any{"type": "string", "description": "Model tier: \"large\", \"medium\", \"small\"."},
+				"reasoning":  map[string]any{"type": "string", "description": "Reasoning effort: \"auto\", \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\". Alias: thinking."},
+				"thinking":   map[string]any{"type": "string", "description": "Alias for reasoning effort."},
+				"provider":   map[string]any{"type": "string", "description": "LLM provider name (optional)."},
 			},
 		},
 	})

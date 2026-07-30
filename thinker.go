@@ -229,7 +229,8 @@ ROLE AND LOOP:
 
 TIME, STATE, AND RECURRENCE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
-- pace sets your next automatic wake, persists until changed, is capped at 24h, and any event wakes you earlier. For longer cadences, sleep 24h and reassess on the next wake.
+- [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
 - ` + directiveStateContract + `
 - ` + recurringDirectiveContract + `
 - Decide what is due from current time plus execution history. Main may own a small number of lightweight, closely related recurring responsibilities.
@@ -618,34 +619,40 @@ type APIEvent struct {
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 type Thinker struct {
-	apiKey         string
-	pool           *ProviderPool // all available providers (shared across threads)
-	provider       LLMProvider   // current active provider for this thinker
-	messages       []Message
-	bus            *EventBus
-	sub            *Subscription
-	pause          chan bool
-	quit           chan struct{}
-	runMu          sync.Mutex
-	runContextMu   sync.Mutex
-	runCancel      context.CancelFunc
-	stopOnce       sync.Once
-	iteration      int
-	paused         bool
-	llmActive      atomic.Bool
-	rate           ThinkRate
-	agentRate      ThinkRate
-	agentSleep     time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
-	nextWakeAt     time.Time     // pending runtime timer persisted by pace
-	resumeWakeAt   time.Time     // one-shot startup gate restored from config
-	paceDurable    bool          // true after an explicit or restored pace
-	persistPace    func(PersistentPaceState) error
-	model          ModelTier
-	agentModel     ModelTier
-	agentReasoning ReasoningLevel
-	memory         *MemoryStore
-	session        *Session
-	toolResultMu   sync.Mutex
+	apiKey       string
+	pool         *ProviderPool // all available providers (shared across threads)
+	provider     LLMProvider   // current active provider for this thinker
+	messages     []Message
+	bus          *EventBus
+	sub          *Subscription
+	pause        chan bool
+	quit         chan struct{}
+	runMu        sync.Mutex
+	runContextMu sync.Mutex
+	runCancel    context.CancelFunc
+	stopOnce     sync.Once
+	iteration    int
+	paused       bool
+	llmActive    atomic.Bool
+	rate         ThinkRate
+	agentRate    ThinkRate
+	agentSleep   time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
+	nextWakeAt   time.Time     // one pending agent-owned timer persisted by pace
+	resumeWakeAt time.Time     // one-shot startup gate restored from config
+	paceDurable  bool          // true after an explicit or restored pace
+	paceRevision uint64        // increments only when the agent replaces or clears its pending wake
+	wakeReason   string        // reason supplied to the next request-context snapshot
+	// wakeDeadlineFired remains true while the model processes a timer wake.
+	// The expired deadline stays persisted until that turn completes so a
+	// crash re-delivers rather than silently loses scheduled work.
+	wakeDeadlineFired bool
+	persistPace       func(PersistentPaceState) error
+	model             ModelTier
+	agentModel        ModelTier
+	agentReasoning    ReasoningLevel
+	memory            *MemoryStore
+	session           *Session
+	toolResultMu      sync.Mutex
 	// Successful provider calls age tool results. Large results are projected
 	// to bounded previews only after a short full-content retention window.
 	toolResultAge  map[string]int
@@ -980,6 +987,7 @@ type thinkerRuntimeStatus struct {
 	LLMActive      bool
 	Sleep          time.Duration
 	NextWakeAt     time.Time
+	PaceDurable    bool
 	ProviderModels map[ModelTier]string
 	MCPNames       []string
 }
@@ -1016,6 +1024,7 @@ func (t *Thinker) publishRuntimeStatus() {
 		LLMActive:      t.llmActive.Load(),
 		Sleep:          t.agentSleep,
 		NextWakeAt:     t.nextWakeAt,
+		PaceDurable:    t.paceDurable,
 		ProviderModels: providerModels,
 		MCPNames:       mcpNames,
 	})
@@ -1114,6 +1123,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		nextWakeAt:             mainWake,
 		resumeWakeAt:           mainWake,
 		paceDurable:            mainPace != nil,
+		wakeReason:             "startup",
 		agentReasoning:         ReasoningAuto,
 		memory:                 NewMemoryStore(apiKey),
 		session:                NewSession(".", "main"),
@@ -1917,7 +1927,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					} else if d == currentDirective {
 						t.scheduleEvolveCompletion()
-						addResult("directive already current; no update was needed. Continue the task and reply to the requester before pacing")
+						addResult(evolveCompletionToolResult("directive already current; no update was needed", ""))
 					} else {
 						if err := t.config.SetDirective(d); err != nil {
 							addResult(fmt.Sprintf("error: persist directive: %v", err))
@@ -1931,7 +1941,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							if t.telemetry != nil {
 								t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
 							}
-							addResult(directiveEditToolResult("directive updated", summary))
+							addResult(evolveCompletionToolResult("directive updated", summary))
 						}
 					}
 				}
@@ -2093,14 +2103,34 @@ func mainToolHandler(t *Thinker) ToolHandler {
 	}
 }
 
-// waitForRestoredWake preserves an explicitly paced deadline across process
-// restarts. It is a one-shot startup gate: normal Run-loop sleeps continue to
-// use the existing interruptible timer. Inbox events still wake the thread
-// early, matching the ordinary pace contract.
+// waitForRestoredWake restores the agent's single pending wake exactly. An
+// early event resumes the thread without consuming or moving that deadline. A
+// durable state with no deadline is event-only and therefore remains dormant
+// until an event arrives.
 func (t *Thinker) waitForRestoredWake() bool {
 	wake := t.resumeWakeAt
 	t.resumeWakeAt = time.Time{}
-	if wake.IsZero() || !wake.After(time.Now()) {
+	if wake.IsZero() {
+		if !t.paceDurable {
+			t.wakeReason = "startup"
+			return true
+		}
+		logMsg("RUN", fmt.Sprintf("[%s] restored event-only wait", t.threadID))
+		select {
+		case <-t.sub.Wake:
+			t.wakeReason = "event"
+			return true
+		case paused := <-t.pause:
+			t.paused = paused
+			t.wakeReason = "resume"
+			return true
+		case <-t.quit:
+			return false
+		}
+	}
+	if !wake.After(time.Now()) {
+		t.wakeDeadlineFired = true
+		t.wakeReason = "timer"
 		return true
 	}
 
@@ -2114,23 +2144,19 @@ func (t *Thinker) waitForRestoredWake() bool {
 
 	select {
 	case <-timer.C:
+		t.wakeDeadlineFired = true
+		t.wakeReason = "timer"
 		logMsg("RUN", fmt.Sprintf("[%s] restored timer expired", t.threadID))
 		return true
 	case <-t.sub.Wake:
-		// The event itself remains on the bus and is drained by the first
-		// iteration. Clear the old future deadline so a second crash during
-		// that iteration cannot put the event back to sleep.
-		t.nextWakeAt = time.Time{}
-		t.publishRuntimeStatus()
-		if t.persistPace != nil {
-			if err := t.persistPace(paceState(t.agentSleep, time.Time{})); err != nil {
-				logMsg("PACE", fmt.Sprintf("[%s] clear restored wake: %v", t.threadID, err))
-			}
-		}
+		// The event remains on the bus for the first iteration. The pending
+		// timer is deliberately untouched.
+		t.wakeReason = "event"
 		logMsg("RUN", fmt.Sprintf("[%s] restored timer interrupted by event", t.threadID))
 		return true
 	case paused := <-t.pause:
 		t.paused = paused
+		t.wakeReason = "resume"
 		return true
 	case <-t.quit:
 		return false
@@ -2232,6 +2258,15 @@ func (t *Thinker) Run() {
 			default:
 			}
 		}
+
+		// A deadline may become due just before an event/resume iteration
+		// starts. Deliver both facts in one model turn rather than running a
+		// redundant second iteration. Keep the expired timestamp until the
+		// turn completes so a crash re-delivers the scheduled work.
+		if delay, armed := pendingWakeDelay(t.nextWakeAt, time.Now()); armed && delay == 0 {
+			t.wakeDeadlineFired = true
+		}
+		paceRevisionAtStart := t.paceRevision
 
 		t.iteration++
 		t.publishRuntimeStatus()
@@ -2335,6 +2370,22 @@ func (t *Thinker) Run() {
 		}
 		t.publishRuntimeStatus()
 
+		turnWakeReason := t.wakeReason
+		switch {
+		case t.wakeDeadlineFired && hasExternalEvent:
+			turnWakeReason = "timer+event"
+		case t.wakeDeadlineFired && len(toolResults) > 0:
+			turnWakeReason = "timer+tool_result"
+		case t.wakeDeadlineFired:
+			turnWakeReason = "timer"
+		case hasExternalEvent:
+			turnWakeReason = "event"
+		case len(toolResults) > 0:
+			turnWakeReason = "tool_result"
+		case strings.TrimSpace(turnWakeReason) == "":
+			turnWakeReason = "continuation"
+		}
+
 		// Durable event history stays minute-granular. Request-only context
 		// receives a fresh UTC timestamp, including on timer-only wake-ups.
 		now := time.Now().Format("2006-01-02 15:04")
@@ -2413,6 +2464,7 @@ func (t *Thinker) Run() {
 			activeThreads = t.threads.ListAgentVisible()
 		}
 		dynCtx := buildDynamicTurnContext(activeThreads, recallContext)
+		dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
 		requestMessages := t.requestContext.prepare(
 			t.messages,
 			dynCtx,
@@ -2679,6 +2731,12 @@ func (t *Thinker) Run() {
 			sleepDur = t.rate.Delay()
 		}
 
+		// A fired one-shot wake is part of this turn's input. Consume it after
+		// all model-selected tools (including a replacement pace call) have
+		// run, but before publishing turn completion so observers, runtime
+		// status, and persisted state agree at that boundary.
+		t.completeFiredWake(paceRevisionAtStart)
+
 		// Thread count (0 if no thread manager)
 		threadCount := 0
 		if t.threads != nil {
@@ -2761,7 +2819,15 @@ func (t *Thinker) Run() {
 		if t.threadID == "unconscious" && t.unconsciousSafety != nil {
 			t.unconsciousSafety.recordCycle(time.Now(), fileSize("history/main.jsonl"))
 		}
-		if !t.executionGate(ExecutionPhaseIterationDone, ExecutionGate{Summary: fmt.Sprintf("Iteration done; sleeping %s", sleepSummary(sleepDur))}) {
+		waitSummary := "waiting for an event; no automatic wake is pending"
+		if delay, armed := pendingWakeDelay(t.nextWakeAt, time.Now()); armed {
+			if delay == 0 {
+				waitSummary = "scheduled wake is due"
+			} else {
+				waitSummary = fmt.Sprintf("next automatic wake in %s at %s", sleepSummary(delay), pendingWakeDescription(t.nextWakeAt))
+			}
+		}
+		if !t.executionGate(ExecutionPhaseIterationDone, ExecutionGate{Summary: "Iteration done; " + waitSummary}) {
 			return
 		}
 
@@ -2777,37 +2843,80 @@ func (t *Thinker) Run() {
 		// of waiting a multi-minute pace tick after a tool discovery.
 		if t.kickNextTurn {
 			t.kickNextTurn = false
+			t.wakeReason = "continuation"
 			logMsg("RUN", fmt.Sprintf("[%s] kick: skipping pace sleep, re-thinking immediately", t.threadID))
 			continue
 		}
 
-		// Interruptible sleep — wakes on new event, quit, or pause
-		logMsg("RUN", fmt.Sprintf("[%s] sleeping %s", t.threadID, formatSleep(sleepDur)))
-		if !t.executionGate(ExecutionPhaseSleepBefore, ExecutionGate{Summary: fmt.Sprintf("Sleeping %s", sleepSummary(sleepDur))}) {
+		// Core owns no recurrence policy. It waits for the agent's one pending
+		// wake, using only the remaining duration, or waits event-only when the
+		// agent left no timer.
+		delay, armed := pendingWakeDelay(t.nextWakeAt, time.Now())
+		if armed && delay == 0 {
+			t.wakeDeadlineFired = true
+			t.wakeReason = "timer"
+			logMsg("RUN", fmt.Sprintf("[%s] woke: pending timer already due", t.threadID))
+			continue
+		}
+
+		sleepGateSummary := "Waiting for an event; no automatic wake is pending"
+		if armed {
+			sleepGateSummary = fmt.Sprintf("Waiting %s until %s", sleepSummary(delay), pendingWakeDescription(t.nextWakeAt))
+			logMsg("RUN", fmt.Sprintf("[%s] sleeping %s until %s", t.threadID, formatSleep(delay), pendingWakeDescription(t.nextWakeAt)))
+		} else {
+			logMsg("RUN", fmt.Sprintf("[%s] waiting for event; no automatic wake pending", t.threadID))
+		}
+		if !t.executionGate(ExecutionPhaseSleepBefore, ExecutionGate{Summary: sleepGateSummary}) {
 			return
 		}
-		t.refreshPersistentWakeForSleep(sleepDur)
+
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if armed {
+			timer = time.NewTimer(delay)
+			timerC = timer.C
+		}
 		select {
-		case <-time.After(sleepDur):
+		case <-timerC:
+			t.wakeDeadlineFired = true
+			t.wakeReason = "timer"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
 		case <-t.sub.Wake:
+			t.wakeReason = "event"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: event received", t.threadID))
 		case p := <-t.pause:
 			t.paused = p
-			logMsg("RUN", fmt.Sprintf("[%s] paused=%v during sleep", t.threadID, t.paused))
+			t.wakeReason = "resume"
+			logMsg("RUN", fmt.Sprintf("[%s] paused=%v during wait", t.threadID, t.paused))
 			if t.paused {
-				// Block until unpaused or quit
+				// Preserve the pending timer while paused. A resume or event
+				// returns to the loop, whose due check handles any deadline
+				// crossed during the pause.
 				select {
 				case p = <-t.pause:
 					t.paused = p
+					t.wakeReason = "resume"
 					logMsg("RUN", fmt.Sprintf("[%s] resumed", t.threadID))
+				case <-t.sub.Wake:
+					t.paused = false
+					t.wakeReason = "event"
+					logMsg("RUN", fmt.Sprintf("[%s] resumed by event", t.threadID))
 				case <-t.quit:
+					if timer != nil {
+						timer.Stop()
+					}
 					return
 				}
 			}
 		case <-t.quit:
+			if timer != nil {
+				timer.Stop()
+			}
 			logMsg("RUN", fmt.Sprintf("[%s] woke: quit signal", t.threadID))
 			return
+		}
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 }

@@ -111,9 +111,11 @@ func registerSearchTool(r *ToolRegistry) {
 			"Use when you need a capability you don't currently have visible — file upload, " +
 			"posting to a channel, fetching from an integration, etc. Returns up to k matches " +
 			"with name + summary; their full schemas become available for you to call on the " +
-			"next turn. Call multiple search_tools in parallel if you need several capabilities.",
+			"next turn. Use search_tools only in a discovery-only turn: you may call multiple " +
+			"search_tools in parallel, but do not call any other tool until you have received " +
+			"the search results on the next turn.",
 		Syntax: `[[search_tools query="upload file" k="5"]]`,
-		Rules:  `query is required; k defaults to 5 and caps at 20. Loaded tools persist for the rest of this thread's conversation (subject to compaction). Schemas appear on the next thinking turn — you cannot call a discovered tool in the same turn you searched for it.`,
+		Rules:  `query is required; k defaults to 5 and caps at 20. Loaded tools persist for the rest of this thread's conversation (subject to compaction). Schemas appear on the next thinking turn — call only search_tools during discovery, then wait for that turn before calling any execution, reporting, messaging, pacing, or completion tool.`,
 		Core:   true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -370,6 +372,11 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	if t.toolIndex == nil {
 		return `{"error":"tool index not initialised — no MCPs attached"}`
 	}
+	// A valid search always owes the model one continuation. With hits, that
+	// turn exposes the newly activated schemas; without hits, it lets the
+	// model process the bounded diagnostic note and choose another path.
+	// This wake is independent of (and does not move) the pending pace timer.
+	t.kickNextTurn = true
 	hits := t.toolIndex.Search(query, k, allowNoSpawn)
 	res := searchToolsResult{Query: query}
 	for _, h := range hits {
@@ -382,13 +389,6 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 			Name: h.Name, Server: h.Server, Summary: summary,
 		})
 		res.Loaded = append(res.Loaded, h.Name)
-	}
-	// Tell the iteration loop to skip its pace sleep on the next pass —
-	// the agent just discovered tools, and the doc contract says the
-	// schemas appear "next turn". That next turn should fire as soon as
-	// possible, not after the configured pace tick (which can be minutes).
-	if len(hits) > 0 {
-		t.kickNextTurn = true
 	}
 	if len(res.Hits) == 0 {
 		// Tell the LLM what *is* attached so it can refine the query or

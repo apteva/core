@@ -103,37 +103,46 @@ func paceState(sleep time.Duration, wake time.Time) PersistentPaceState {
 	}
 }
 
-// refreshPersistentWakeForSleep advances a durable cadence when a new sleep
-// cycle begins without another pace call. The model is intentionally told not
-// to repeat an unchanged pace call; without this refresh, only the first
-// pending deadline would survive a restart. Default, never-explicitly-paced
-// loops do not persist on every short sleep.
-func (t *Thinker) refreshPersistentWakeForSleep(sleep time.Duration) {
-	if t == nil || !t.paceDurable || t.persistPace == nil {
+// pendingWakeDelay returns the remaining delay for the single agent-owned
+// pending wake. A non-zero past deadline is still armed and returns zero so
+// the run loop can deliver the timer wake immediately.
+func pendingWakeDelay(wake, now time.Time) (time.Duration, bool) {
+	if wake.IsZero() {
+		return 0, false
+	}
+	if !wake.After(now) {
+		return 0, true
+	}
+	return wake.Sub(now), true
+}
+
+func pendingWakeDescription(wake time.Time) string {
+	if wake.IsZero() {
+		return "none"
+	}
+	return wake.UTC().Format(time.RFC3339Nano)
+}
+
+// completeFiredWake consumes a one-shot timer after the model has received the
+// wake. If the model called pace with a timing argument during that turn, the
+// replacement deadline wins and is left untouched.
+func (t *Thinker) completeFiredWake(revisionAtStart uint64) {
+	if t == nil || !t.wakeDeadlineFired {
 		return
 	}
-	if sleep <= 0 {
-		sleep = t.agentRate.Delay()
+	t.wakeDeadlineFired = false
+	if t.paceRevision != revisionAtStart {
+		return
 	}
-	if sleep > maxSleep {
-		sleep = maxSleep
-	}
-	wake := time.Now().Add(sleep)
-	// applyPaceArgs already persisted this cycle. Avoid a redundant config
-	// write for sub-second processing differences after that tool call.
-	if !t.nextWakeAt.IsZero() {
-		delta := wake.Sub(t.nextWakeAt)
-		if delta > -time.Second && delta < time.Second {
-			return
-		}
-	}
-	previous := t.nextWakeAt
-	t.nextWakeAt = wake
+	t.nextWakeAt = time.Time{}
 	t.publishRuntimeStatus()
-	if err := t.persistPace(paceState(sleep, wake)); err != nil {
-		t.nextWakeAt = previous
-		t.publishRuntimeStatus()
-		logMsg("PACE", fmt.Sprintf("[%s] refresh pending wake: %v", t.threadID, err))
+	if t.persistPace != nil {
+		if err := t.persistPace(paceState(t.agentSleep, time.Time{})); err != nil {
+			// Runtime must not repeatedly redeliver a wake the agent already
+			// processed. Keeping the persisted expired deadline is safer on a
+			// crash (at-least-once delivery) than silently skipping the work.
+			logMsg("PACE", fmt.Sprintf("[%s] consume fired wake: %v", t.threadID, err))
+		}
 	}
 }
 
@@ -148,16 +157,38 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 	previousProvider := t.provider
 	previousWake := t.nextWakeAt
 	previousDurable := t.paceDurable
+	previousRevision := t.paceRevision
+	previousFired := t.wakeDeadlineFired
 
 	nextSleep := t.agentSleep
 	nextRate := t.agentRate
 	nextModel := t.agentModel
 	nextReasoning := t.agentReasoning
 	nextProvider := t.provider
+	nextWake := t.nextWakeAt
+	nextRevision := t.paceRevision
+	nextFired := t.wakeDeadlineFired
+
+	rawSleep := strings.TrimSpace(args["sleep"])
+	rawRate := strings.TrimSpace(args["rate"])
+	clearWake := parseTruthy(args["clear_wake"])
+	if rawSleep != "" && rawRate != "" {
+		return "", fmt.Errorf("sleep and rate are mutually exclusive")
+	}
+	if clearWake && (rawSleep != "" || rawRate != "") {
+		return "", fmt.Errorf("clear_wake cannot be combined with sleep or rate")
+	}
 
 	var parts []string
-	if raw := strings.TrimSpace(args["sleep"]); raw != "" {
-		parsed, err := parseSleepDurationDetailed(raw)
+	now := time.Now()
+	switch {
+	case clearWake:
+		nextWake = time.Time{}
+		nextFired = false
+		nextRevision++
+		parts = append(parts, "cleared pending wake")
+	case rawSleep != "":
+		parsed, err := parseSleepDurationDetailed(rawSleep)
 		if err != nil {
 			return "", err
 		}
@@ -168,12 +199,26 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 			sleepPart += " (" + parsed.clamped + ")"
 		}
 		parts = append(parts, sleepPart)
-	} else if r, ok := rateNames[args["rate"]]; ok {
+		nextWake = now.Add(parsed.duration)
+		nextFired = false
+		nextRevision++
+	case rawRate != "":
+		r, ok := rateNames[rawRate]
+		if !ok {
+			return "", fmt.Errorf("invalid rate %q (use fast, normal, slow, or sleep)", rawRate)
+		}
 		nextRate = r
-		if d, ok2 := rateAliases[args["rate"]]; ok2 {
+		if d, ok2 := rateAliases[rawRate]; ok2 {
 			nextSleep = d
 		}
-		parts = append(parts, "rate="+args["rate"])
+		parts = append(parts, "rate="+rawRate)
+		effectiveSleep := nextSleep
+		if effectiveSleep <= 0 {
+			effectiveSleep = nextRate.Delay()
+		}
+		nextWake = now.Add(effectiveSleep)
+		nextFired = false
+		nextRevision++
 	}
 
 	if m, ok := modelNames[args["model"]]; ok {
@@ -200,15 +245,13 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 	t.agentModel = nextModel
 	t.agentReasoning = nextReasoning
 	t.provider = nextProvider
-	effectiveSleep := nextSleep
-	if effectiveSleep <= 0 {
-		effectiveSleep = nextRate.Delay()
-	}
-	t.nextWakeAt = time.Now().Add(effectiveSleep)
+	t.nextWakeAt = nextWake
 	t.paceDurable = true
+	t.paceRevision = nextRevision
+	t.wakeDeadlineFired = nextFired
 	t.publishRuntimeStatus()
 	if t.persistPace != nil {
-		if err := t.persistPace(paceState(effectiveSleep, t.nextWakeAt)); err != nil {
+		if err := t.persistPace(paceState(nextSleep, nextWake)); err != nil {
 			t.agentSleep = previousSleep
 			t.agentRate = previousRate
 			t.agentModel = previousModel
@@ -216,12 +259,22 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 			t.provider = previousProvider
 			t.nextWakeAt = previousWake
 			t.paceDurable = previousDurable
+			t.paceRevision = previousRevision
+			t.wakeDeadlineFired = previousFired
 			t.publishRuntimeStatus()
 			return "", fmt.Errorf("persist pace: %w", err)
 		}
 	}
-	if len(parts) == 0 {
-		return "ok", nil
+	if clearWake {
+		return strings.Join(parts, " "), nil
 	}
+	if rawSleep != "" || rawRate != "" {
+		parts = append(parts, "next_wake_at="+pendingWakeDescription(nextWake))
+		return "set " + strings.Join(parts, " "), nil
+	}
+	if len(parts) == 0 {
+		return "pending_wake_at=" + pendingWakeDescription(nextWake), nil
+	}
+	parts = append(parts, "pending_wake_at="+pendingWakeDescription(nextWake))
 	return "set " + strings.Join(parts, " "), nil
 }

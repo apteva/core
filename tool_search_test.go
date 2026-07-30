@@ -98,6 +98,9 @@ func TestRunSearchTools_EmptyResultNote(t *testing.T) {
 	if !strings.Contains(res.Note, "storage") {
 		t.Errorf("note should mention attached servers, got %q", res.Note)
 	}
+	if !th.kickNextTurn {
+		t.Error("valid empty search must schedule one continuation to process its result")
+	}
 }
 
 func TestRunSearchTools_MissingQuery(t *testing.T) {

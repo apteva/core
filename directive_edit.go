@@ -191,6 +191,11 @@ func directiveEditToolResult(result, summary string) string {
 	return result
 }
 
+func evolveCompletionToolResult(result, summary string) string {
+	return directiveEditToolResult(result, summary) +
+		". Evolution is complete for this instruction; do not call evolve again. Continue the original task and reply to the requester before pacing."
+}
+
 func redundantHeadingWarnings(section string, count int) []string {
 	if count == 0 {
 		return nil
