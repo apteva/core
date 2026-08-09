@@ -238,7 +238,7 @@ func prepareComputerScreenshotTail(messages []Message) []Message {
 // steady-state target: main/lead threads trigger above 120 and return to 80;
 // workers trigger above 24 and return to 16. The caller owns the intentional
 // cache-epoch reset caused by a successful checkpoint.
-func checkpointHistoryWindow(messages []Message, maxHistory int) ([]Message, int) {
+func checkpointHistoryWindow(messages []Message, maxHistory int, protectedToolCallIDs map[string]bool) ([]Message, int) {
 	if len(messages) <= 1 || maxHistory <= 0 {
 		return messages, 0
 	}
@@ -262,7 +262,11 @@ func checkpointHistoryWindow(messages []Message, maxHistory int) ([]Message, int
 	next := make([]Message, 0, 1+len(messages)-start)
 	next = append(next, messages[0])
 	next = append(next, messages[start:]...)
-	next = append(next[:1], sanitizeToolPairs(next[1:])...)
+	// Checkpointing runs immediately after tool dispatch. Preserve native calls
+	// whose asynchronous results are still in flight (or were dispatched this
+	// turn and have a result waiting on the event bus); the normal pre-model
+	// sanitizer will remove them later if they genuinely remain orphaned.
+	next = append(next[:1], sanitizeToolPairs(next[1:], protectedToolCallIDs)...)
 	dropped := len(messages) - len(next)
 	if dropped <= 0 {
 		return messages, 0

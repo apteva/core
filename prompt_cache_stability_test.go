@@ -128,11 +128,11 @@ func TestCheckpointHistoryWindowUsesHysteresis(t *testing.T) {
 	for i := 0; i < 120; i++ {
 		messages = append(messages, Message{Role: "user", Content: "message"})
 	}
-	if got, dropped := checkpointHistoryWindow(messages, maxHistoryMain); dropped != 0 || len(got) != len(messages) {
+	if got, dropped := checkpointHistoryWindow(messages, maxHistoryMain, nil); dropped != 0 || len(got) != len(messages) {
 		t.Fatalf("checkpoint triggered at upper boundary: dropped=%d len=%d", dropped, len(got))
 	}
 	messages = append(messages, Message{Role: "user", Content: "trigger"})
-	got, dropped := checkpointHistoryWindow(messages, maxHistoryMain)
+	got, dropped := checkpointHistoryWindow(messages, maxHistoryMain, nil)
 	if dropped == 0 {
 		t.Fatal("checkpoint did not trigger above upper boundary")
 	}
@@ -141,6 +141,71 @@ func TestCheckpointHistoryWindowUsesHysteresis(t *testing.T) {
 	}
 	if got[0].Role != "system" || got[len(got)-1].Content != "trigger" {
 		t.Fatalf("checkpoint lost system/latest messages: first=%+v last=%+v", got[0], got[len(got)-1])
+	}
+}
+
+func TestCheckpointHistoryWindowPreservesProtectedToolCallUntilResultArrives(t *testing.T) {
+	const callID = "call-pending-at-checkpoint"
+	messages := []Message{{Role: "system", Content: "system"}}
+	for i := 0; i < 120; i++ {
+		messages = append(messages, Message{Role: "user", Content: "old message"})
+	}
+	messages = append(messages, Message{
+		Role:      "assistant",
+		ToolCalls: []NativeToolCall{{ID: callID, Name: "tasks_list"}},
+	})
+
+	got, dropped := checkpointHistoryWindow(messages, maxHistoryMain, map[string]bool{callID: true})
+	if dropped == 0 {
+		t.Fatal("checkpoint did not trigger")
+	}
+	if calls := got[len(got)-1].ToolCalls; len(calls) != 1 || calls[0].ID != callID {
+		t.Fatalf("checkpoint removed protected tool call: %+v", got[len(got)-1])
+	}
+
+	got = append(got, Message{Role: "user", ToolResults: []ToolResult{{CallID: callID, ToolName: "tasks_list", Content: "ok"}}})
+	thinker := &Thinker{messages: got}
+	before := len(thinker.messages)
+	thinker.sanitizeConversationMessages()
+	if len(thinker.messages) != before {
+		t.Fatalf("valid later result was sanitized: before=%d after=%d", before, len(thinker.messages))
+	}
+	if thinker.promptCacheEpoch != 0 {
+		t.Fatalf("valid pair reset prompt cache: epoch=%d reason=%q", thinker.promptCacheEpoch, thinker.promptCacheResetReason)
+	}
+}
+
+func TestCheckpointHistoryWindowRemovesUnprotectedOrphan(t *testing.T) {
+	const callID = "call-genuinely-orphaned"
+	messages := []Message{{Role: "system", Content: "system"}}
+	for i := 0; i < 120; i++ {
+		messages = append(messages, Message{Role: "user", Content: "old message"})
+	}
+	messages = append(messages, Message{
+		Role:      "assistant",
+		ToolCalls: []NativeToolCall{{ID: callID, Name: "tasks_list"}},
+	})
+
+	got, dropped := checkpointHistoryWindow(messages, maxHistoryMain, nil)
+	if dropped == 0 {
+		t.Fatal("checkpoint did not trigger")
+	}
+	if calls := got[len(got)-1].ToolCalls; len(calls) != 0 {
+		t.Fatalf("checkpoint retained genuinely orphaned tool call: %+v", calls)
+	}
+}
+
+func TestCheckpointProtectionIncludesPendingAndCurrentTurnCalls(t *testing.T) {
+	thinker := &Thinker{}
+	thinker.pendingTools.Store("call-still-pending", "tasks_list")
+	protected := thinker.toolCallIDsProtectedFromSanitization([]toolCall{
+		{Name: "channels_send", NativeID: "call-result-already-queued"},
+	})
+
+	for _, id := range []string{"call-still-pending", "call-result-already-queued"} {
+		if !protected[id] {
+			t.Fatalf("tool call %q was not protected: %+v", id, protected)
+		}
 	}
 }
 

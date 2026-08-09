@@ -613,6 +613,7 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 				InputSchema: tool.InputSchema,
 				MCP:         true, // hidden until activated; old MainAccess flag is gone
 				MCPServer:   cfg.Name,
+				MCPApp:      cfg.URL != "" && isAptevaAppMCPURL(cfg.URL),
 				WakeOnResult: normalizeWakeOnResultPolicy(
 					func() any {
 						if tool.Meta == nil {

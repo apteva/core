@@ -520,7 +520,10 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 					s.mu.Lock()
 					s.turnOutputSinceTool = true
 					s.mu.Unlock()
-					s.emitAudio(RealtimeEvent{Type: RealtimeEventAudioOut, Audio: pcm, ItemID: responseID})
+					s.emitAudio(RealtimeEvent{
+						Type: RealtimeEventAudioOut, Audio: pcm,
+						ResponseID: responseID, ItemID: responseID,
+					})
 				}
 			}
 		}
@@ -529,7 +532,10 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 			s.inputTranscript = appendGoogleTranscript(s.inputTranscript, content.InputTranscription.Text)
 			partial := s.inputTranscript
 			s.mu.Unlock()
-			s.emitAudio(RealtimeEvent{Type: RealtimeEventTranscriptInput, Transcript: partial})
+			s.emitAudio(RealtimeEvent{
+				Type: RealtimeEventTranscriptInput, Transcript: partial,
+				ResponseID: responseID, ItemID: responseID,
+			})
 		}
 		if content.OutputTranscription != nil && content.OutputTranscription.Text != "" {
 			s.mu.Lock()
@@ -537,7 +543,10 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 			partial := s.outputTranscript
 			s.turnOutputSinceTool = true
 			s.mu.Unlock()
-			s.emitAudio(RealtimeEvent{Type: RealtimeEventTranscriptOutput, Transcript: partial})
+			s.emitAudio(RealtimeEvent{
+				Type: RealtimeEventTranscriptOutput, Transcript: partial,
+				ResponseID: responseID, ItemID: responseID,
+			})
 		}
 		if content.TurnComplete {
 			s.finishTurn()
@@ -574,13 +583,20 @@ func (s *googleRealtimeSession) finishTurn() {
 	s.restartAfterTurn = false
 	s.turnOutputSinceTool = false
 	s.mu.Unlock()
+	responseID := s.finishResponseID()
 	if input != "" {
-		s.emitControl(RealtimeEvent{Type: RealtimeEventTranscriptInput, Transcript: input, Final: true})
+		s.emitControl(RealtimeEvent{
+			Type: RealtimeEventTranscriptInput, Transcript: input, Final: true,
+			ResponseID: responseID, ItemID: responseID,
+		})
 	}
 	if output != "" {
-		s.emitControl(RealtimeEvent{Type: RealtimeEventTranscriptOutput, Transcript: output, Final: true})
+		s.emitControl(RealtimeEvent{
+			Type: RealtimeEventTranscriptOutput, Transcript: output, Final: true,
+			ResponseID: responseID, ItemID: responseID,
+		})
 	}
-	s.emitControl(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: s.finishResponseID(), Usage: usage})
+	s.emitControl(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: responseID, Usage: usage})
 	if restart {
 		_ = s.Close()
 	}

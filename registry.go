@@ -46,6 +46,7 @@ type ToolDef struct {
 	SystemOnly  bool                                      // only for system threads (unconscious)
 	MCP         bool                                      // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
 	MCPServer   string                                    // name of the MCP server that provides this tool
+	MCPApp      bool                                      // routed through Apteva's authenticated app MCP gateway
 	Handler     func(args map[string]string) ToolResponse // nil = handled inline by tool handler
 	InputSchema map[string]any                            // JSON Schema for native tool calling (nil = auto-generated from Syntax)
 	// WakeOnResult controls whether an async tool result wakes the thinker.

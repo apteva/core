@@ -2707,7 +2707,8 @@ func (t *Thinker) Run() {
 		if maxHist <= 0 {
 			maxHist = maxHistoryMain // fallback
 		}
-		if checkpointed, dropped := checkpointHistoryWindow(t.messages, maxHist); dropped > 0 {
+		protectedToolCallIDs := t.toolCallIDsProtectedFromSanitization(calls)
+		if checkpointed, dropped := checkpointHistoryWindow(t.messages, maxHist, protectedToolCallIDs); dropped > 0 {
 			t.messages = checkpointed
 			t.advancePromptCacheEpoch("history_checkpoint", true, map[string]any{
 				"dropped_messages":  dropped,
@@ -2940,17 +2941,32 @@ func (t *Thinker) sanitizeConversationMessages() {
 		return
 	}
 	before := len(t.messages)
-	pending := map[string]bool{}
-	t.pendingTools.Range(func(k, v any) bool {
-		if id, ok := k.(string); ok {
-			pending[id] = true
-		}
-		return true
-	})
+	pending := t.toolCallIDsProtectedFromSanitization(nil)
 	t.messages = append(t.messages[:1], sanitizeToolPairs(t.messages[1:], pending)...)
 	if len(t.messages) != before {
 		t.resetPromptCache("tool_pair_sanitized")
 	}
+}
+
+// toolCallIDsProtectedFromSanitization returns asynchronous tool calls whose
+// history entries must survive orphan cleanup. extra contains calls dispatched
+// in the current turn. Keeping those IDs as well as pendingTools closes the
+// narrow interval after a fast result is published but before the event bus is
+// drained into conversation history.
+func (t *Thinker) toolCallIDsProtectedFromSanitization(extra []toolCall) map[string]bool {
+	protected := map[string]bool{}
+	t.pendingTools.Range(func(k, v any) bool {
+		if id, ok := k.(string); ok {
+			protected[id] = true
+		}
+		return true
+	})
+	for _, call := range extra {
+		if call.NativeID != "" {
+			protected[call.NativeID] = true
+		}
+	}
+	return protected
 }
 
 func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMProvider, messages []Message) (ChatResponse, error) {

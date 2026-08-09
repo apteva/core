@@ -130,6 +130,10 @@ func TestGoogleRealtimeTranslatesAudioTranscriptsInterruptionAndUsage(t *testing
 		t.Fatalf("output final = %#v", events[4])
 	}
 	done := events[5]
+	if events[0].ResponseID == "" || events[0].ItemID != events[0].ResponseID ||
+		events[4].ResponseID != events[0].ResponseID || done.ResponseID != events[0].ResponseID {
+		t.Fatalf("response correlation = audio=%#v transcript=%#v done=%#v", events[0], events[4], done)
+	}
 	if done.Type != RealtimeEventResponseDone || done.Usage.TextInputTokens != 3 || done.Usage.AudioInputTokens != 10 || done.Usage.TextOutputTokens != 3 || done.Usage.AudioOutputTokens != 5 {
 		t.Fatalf("done = %#v", done)
 	}

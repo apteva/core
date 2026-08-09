@@ -13,11 +13,15 @@ import (
 )
 
 const (
-	realtimeReconnectMinDelay = time.Second
-	realtimeReconnectMaxDelay = 30 * time.Second
-	realtimeRestoreMessages   = 32
-	realtimePCMBytesPerSecond = 24000 * 2
+	realtimeReconnectMinDelay  = time.Second
+	realtimeReconnectMaxDelay  = 30 * time.Second
+	realtimeRestoreMessages    = 32
+	realtimePCMBytesPerSecond  = 24000 * 2
+	realtimeToolMarkupTailSize = 2048
 )
+
+const realtimeToolMarkupRecoveryPrompt = `[INTERNAL RECOVERY]
+Your previous response exposed textual tool-call syntax. It was suppressed and no action was taken from that text. If the action is still needed, invoke the registered tool through a structured tool call. Otherwise, briefly explain that the action could not be completed. Never speak tool names, call syntax, JSON, identifiers, or arguments, and never claim success without a successful tool result.`
 
 var ErrRealtimeConfigurationRestartRequired = errors.New("active realtime configuration change requires an explicit restart")
 
@@ -72,6 +76,11 @@ type RealtimeThinker struct {
 	toolBatchMu     sync.Mutex
 	toolBatches     map[string]*realtimeToolBatch
 	toolCallBatches map[string]string
+
+	toolMarkupMu           sync.Mutex
+	toolMarkupTails        map[string]string
+	toolMarkupSuppressed   map[string]bool
+	toolMarkupRecoveryUsed bool
 }
 
 type realtimeToolBatch struct {
@@ -140,6 +149,7 @@ func newRealtimeThinker(
 		ctx: runCtx, cancel: cancel,
 		audioIn: audioIn, audioOut: audioOut, audioControl: audioControl,
 		toolBatches: map[string]*realtimeToolBatch{}, toolCallBatches: map[string]string{},
+		toolMarkupTails: map[string]string{}, toolMarkupSuppressed: map[string]bool{},
 		terminalReason: "server_shutdown",
 	}
 	reasoning := thinker.agentReasoning.String()
@@ -580,6 +590,156 @@ func (rt *RealtimeThinker) responseFinished(session RealtimeSession) {
 	}
 }
 
+func realtimeToolMarkupResponseKey(event RealtimeEvent) string {
+	if strings.TrimSpace(event.ResponseID) != "" {
+		return strings.TrimSpace(event.ResponseID)
+	}
+	if strings.TrimSpace(event.ItemID) != "" {
+		return strings.TrimSpace(event.ItemID)
+	}
+	return "current"
+}
+
+func boundedRealtimeToolMarkupTail(text string) string {
+	if len(text) <= realtimeToolMarkupTailSize {
+		return text
+	}
+	return strings.ToValidUTF8(text[len(text)-realtimeToolMarkupTailSize:], "")
+}
+
+func detectRealtimeToolMarkup(text string, tools []NativeTool) (toolName, pattern string, found bool) {
+	lower := strings.ToLower(text)
+	if marker := strings.Index(lower, "callto:"); marker >= 0 {
+		after := lower[marker+len("callto:"):]
+		for _, tool := range tools {
+			name := strings.ToLower(strings.TrimSpace(tool.Name))
+			if name != "" && strings.Contains(after, name) {
+				return tool.Name, "callto", true
+			}
+		}
+		return "", "callto", true
+	}
+	for _, tool := range tools {
+		name := strings.ToLower(strings.TrimSpace(tool.Name))
+		if name == "" {
+			continue
+		}
+		for remaining := lower; ; {
+			index := strings.Index(remaining, name)
+			if index < 0 {
+				break
+			}
+			after := strings.TrimSpace(remaining[index+len(name):])
+			if strings.HasPrefix(after, "{") || strings.HasPrefix(after, "(") || strings.HasPrefix(after, "[") {
+				return tool.Name, "registered_tool_with_arguments", true
+			}
+			remaining = remaining[index+len(name):]
+		}
+	}
+	return "", "", false
+}
+
+func (rt *RealtimeThinker) realtimeToolSchemas() []NativeTool {
+	rt.transcriptMu.Lock()
+	defer rt.transcriptMu.Unlock()
+	return append([]NativeTool(nil), rt.opts.Tools...)
+}
+
+func (rt *RealtimeThinker) resetToolMarkupTurn() {
+	rt.toolMarkupMu.Lock()
+	rt.toolMarkupTails = map[string]string{}
+	rt.toolMarkupSuppressed = map[string]bool{}
+	rt.toolMarkupRecoveryUsed = false
+	rt.toolMarkupMu.Unlock()
+}
+
+func (rt *RealtimeThinker) finishToolMarkupResponse(responseID string) {
+	key := strings.TrimSpace(responseID)
+	if key == "" {
+		key = "current"
+	}
+	rt.toolMarkupMu.Lock()
+	delete(rt.toolMarkupTails, key)
+	delete(rt.toolMarkupSuppressed, key)
+	rt.toolMarkupMu.Unlock()
+}
+
+func (rt *RealtimeThinker) toolMarkupResponseSuppressed(event RealtimeEvent) bool {
+	key := realtimeToolMarkupResponseKey(event)
+	rt.toolMarkupMu.Lock()
+	suppressed := rt.toolMarkupSuppressed[key]
+	rt.toolMarkupMu.Unlock()
+	return suppressed
+}
+
+func (rt *RealtimeThinker) queueToolMarkupRecovery(session RealtimeSession) error {
+	if session == nil {
+		return errors.New("realtime session unavailable")
+	}
+	if err := session.SendText("system", realtimeToolMarkupRecoveryPrompt); err != nil {
+		return err
+	}
+	// The current provider response must finish before the corrective response
+	// starts. Reusing responsePending preserves the normal single-response
+	// ordering and prevents a recovery request from racing in-flight audio.
+	rt.responseMu.Lock()
+	rt.responsePending = true
+	rt.responseMu.Unlock()
+	return nil
+}
+
+func (rt *RealtimeThinker) suppressLeakedToolMarkup(event RealtimeEvent) bool {
+	if strings.TrimSpace(event.Transcript) == "" {
+		return false
+	}
+	key := realtimeToolMarkupResponseKey(event)
+	tools := rt.realtimeToolSchemas()
+
+	rt.toolMarkupMu.Lock()
+	if rt.toolMarkupSuppressed[key] {
+		rt.toolMarkupMu.Unlock()
+		return true
+	}
+	combined := rt.toolMarkupTails[key] + event.Transcript
+	rt.toolMarkupTails[key] = boundedRealtimeToolMarkupTail(combined)
+	toolName, pattern, leaked := detectRealtimeToolMarkup(combined, tools)
+	if !leaked {
+		if event.Final {
+			delete(rt.toolMarkupTails, key)
+			rt.toolMarkupRecoveryUsed = false
+		}
+		rt.toolMarkupMu.Unlock()
+		return false
+	}
+	rt.toolMarkupSuppressed[key] = true
+	delete(rt.toolMarkupTails, key)
+	retry := !rt.toolMarkupRecoveryUsed
+	if retry {
+		rt.toolMarkupRecoveryUsed = true
+	}
+	rt.toolMarkupMu.Unlock()
+
+	interrupted := rt.interruptPlayback("provider_tool_markup_leaked", "", true, true)
+	recoveryRequested := false
+	if retry {
+		if err := rt.queueToolMarkupRecovery(rt.currentSession()); err != nil {
+			rt.emit("realtime.tool_markup_recovery_error", map[string]any{
+				"provider": rt.provider.Name(), "response_id": event.ResponseID, "error": err.Error(),
+			})
+		} else {
+			recoveryRequested = true
+		}
+	}
+	sum := sha256.Sum256([]byte(combined))
+	rt.emit("realtime.tool_markup_leaked", map[string]any{
+		"provider": rt.provider.Name(), "response_id": event.ResponseID, "item_id": event.ItemID,
+		"tool": toolName, "pattern": pattern, "transcript_bytes": len(combined),
+		"transcript_sha256": hex.EncodeToString(sum[:]), "audio_interrupted": interrupted,
+		"recovery_requested": recoveryRequested,
+	})
+	return true
+}
+
 func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int) {
 	if itemID == "" || audioEndMS < 0 {
 		return
@@ -816,6 +976,13 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		if rt.paused {
 			return
 		}
+		if rt.toolMarkupResponseSuppressed(event) {
+			rt.emit("realtime.audio_drop", map[string]any{
+				"direction": "output", "bytes": len(event.Audio), "reason": "provider_tool_markup_leaked",
+				"response_id": event.ResponseID, "item_id": event.ItemID,
+			})
+			return
+		}
 		if rt.audioOut != nil {
 			rt.outputMu.Lock()
 			if rt.suppressOutput && (event.ItemID == "" || event.ItemID == rt.interruptedItem) {
@@ -852,12 +1019,16 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.interruptPlayback("provider_speech_started", "", false, false)
 
 	case RealtimeEventTranscriptOutput:
+		if rt.suppressLeakedToolMarkup(event) {
+			return
+		}
 		if event.Final && strings.TrimSpace(event.Transcript) != "" {
 			rt.appendTranscript("assistant", event.Transcript)
 		}
 
 	case RealtimeEventTranscriptInput:
 		if event.Final && strings.TrimSpace(event.Transcript) != "" {
+			rt.resetToolMarkupTurn()
 			rt.appendTranscript("user", event.Transcript)
 			rt.setConversationState("thinking", event)
 		}
@@ -884,6 +1055,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 	case RealtimeEventResponseDone:
 		hadToolBatch := rt.completeToolResponse(event.ResponseID)
 		rt.responseFinished(rt.currentSession())
+		rt.finishToolMarkupResponse(event.ResponseID)
 		if !hadToolBatch {
 			rt.setConversationState("listening", event)
 		}

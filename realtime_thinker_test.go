@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,8 @@ func TestRealtimePromptKeepsReasoningPrivateWithoutChangingNormalWorkers(t *test
 	for _, required := range []string{
 		"Reason privately",
 		"Spoken output contains only words intended for the caller",
+		"Invoke registered tools only through structured tool calls",
+		"Never claim that an action succeeded until its tool result confirms success",
 		"at most one brief, natural sentence",
 		"After sending work to main, do not speak again",
 		"Treat partial, garbled, overlapping, or low-confidence audio as uncertain",
@@ -32,6 +35,27 @@ func TestRealtimePromptKeepsReasoningPrivateWithoutChangingNormalWorkers(t *test
 		if !strings.Contains(realtime, required) {
 			t.Fatalf("realtime prompt missing %q:\n%s", required, realtime)
 		}
+	}
+}
+
+func TestDetectRealtimeToolMarkupRequiresCallSyntax(t *testing.T) {
+	tools := []NativeTool{{Name: "flexylead-bookings_create_booking"}, {Name: "interrupt"}}
+	for _, test := range []struct {
+		name, text, tool, pattern string
+		found                     bool
+	}{
+		{name: "callto registered", text: `callto:flexylead-bookings_create_booking{"slot":"one"}`, tool: "flexylead-bookings_create_booking", pattern: "callto", found: true},
+		{name: "callto unknown", text: `callto:invented_tool{"x":1}`, pattern: "callto", found: true},
+		{name: "registered serialized", text: `flexylead-bookings_create_booking {"slot":"one"}`, tool: "flexylead-bookings_create_booking", pattern: "registered_tool_with_arguments", found: true},
+		{name: "ordinary word", text: "Please do not interrupt the caller.", found: false},
+		{name: "bare tool name", text: "The internal name is flexylead-bookings_create_booking.", found: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tool, pattern, found := detectRealtimeToolMarkup(test.text, tools)
+			if tool != test.tool || pattern != test.pattern || found != test.found {
+				t.Fatalf("detect(%q) = tool=%q pattern=%q found=%v", test.text, tool, pattern, found)
+			}
+		})
 	}
 }
 
@@ -113,6 +137,157 @@ type fakeRealtimeProvider struct {
 	mu       sync.Mutex
 	sessions []*fakeRealtimeSession
 	opens    []RealtimeSessionOpts
+}
+
+func TestRealtimeToolMarkupGuardSuppressesAudioAndAllowsStructuredRetry(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	toolName := "flexylead-bookings_create_booking"
+	thinker.registry = NewToolRegistry("test")
+	thinker.toolAllowlist = map[string]bool{toolName: true}
+	thinker.recordPresentedTools([]NativeTool{{Name: toolName}})
+	session := newFakeRealtimeSession()
+	audioOut := make(chan RealtimeAudioFrame, 4)
+	audioControl := make(chan string, 2)
+	rt := newRealtimeThinker(context.Background(), thinker, &fakeRealtimeProvider{}, "", nil, audioOut, audioControl)
+	defer rt.cancel()
+	rt.replaceSession(session)
+	rt.opts.Tools = []NativeTool{{Name: toolName}}
+
+	structuredCalls := 0
+	rt.handleTools = func(_ *Thinker, calls []toolCall, _ []string) ([]string, []string, []ToolResult) {
+		structuredCalls += len(calls)
+		return nil, []string{calls[0].Name}, []ToolResult{{
+			CallID: calls[0].NativeID, ToolName: calls[0].Name, Content: `{"booked":true}`,
+		}}
+	}
+	if err := rt.requestProviderResponse(session); err != nil {
+		t.Fatal(err)
+	}
+
+	rt.handleSessionEvent(RealtimeEvent{
+		Type: RealtimeEventAudioOut, ResponseID: "response-1", ItemID: "response-1", Audio: []byte{1, 2, 3, 4},
+	})
+	if len(audioOut) != 1 {
+		t.Fatalf("audio queued before leak = %d, want 1", len(audioOut))
+	}
+	rt.handleSessionEvent(RealtimeEvent{
+		Type: RealtimeEventTranscriptOutput, ResponseID: "response-1", ItemID: "response-1", Transcript: "call",
+	})
+	rt.handleSessionEvent(RealtimeEvent{
+		Type: RealtimeEventTranscriptOutput, ResponseID: "response-1", ItemID: "response-1",
+		Transcript: "to:" + toolName + `{"slot_id":"one"}`,
+	})
+	if structuredCalls != 0 {
+		t.Fatalf("textual pseudo-call executed %d tools", structuredCalls)
+	}
+	if len(audioOut) != 0 {
+		t.Fatalf("queued leaked audio was not drained: %d frames", len(audioOut))
+	}
+	select {
+	case control := <-audioControl:
+		if control != "interrupt" {
+			t.Fatalf("audio control = %q", control)
+		}
+	default:
+		t.Fatal("renderer was not interrupted")
+	}
+	session.mu.Lock()
+	if session.interrupts != 1 || len(session.texts) != 1 || session.texts[0].Role != "system" ||
+		!strings.Contains(session.texts[0].Content, "structured tool call") {
+		t.Fatalf("recovery session state: interrupts=%d texts=%#v", session.interrupts, session.texts)
+	}
+	if session.responses != 1 {
+		t.Fatalf("recovery raced current response: responses=%d, want 1", session.responses)
+	}
+	session.mu.Unlock()
+
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: "response-1"})
+	session.mu.Lock()
+	if session.responses != 2 {
+		t.Fatalf("queued recovery responses=%d, want 2", session.responses)
+	}
+	session.mu.Unlock()
+
+	rt.handleSessionEvent(RealtimeEvent{
+		Type: RealtimeEventToolCall, ResponseID: "response-2", ToolCallID: "booking-call-1",
+		ToolName: toolName, ToolArgs: `{"slot_id":"one"}`,
+	})
+	if structuredCalls != 1 {
+		t.Fatalf("structured retry calls=%d, want 1", structuredCalls)
+	}
+	session.mu.Lock()
+	if len(session.toolResults) != 1 || session.toolResults[0].callID != "booking-call-1" || session.toolResults[0].isError {
+		t.Fatalf("structured tool results=%#v", session.toolResults)
+	}
+	session.mu.Unlock()
+	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: "response-2"})
+	rt.handleSessionEvent(RealtimeEvent{
+		Type: RealtimeEventTranscriptOutput, ResponseID: "response-3", ItemID: "response-3",
+		Transcript: "Votre rappel est confirmé.", Final: true,
+	})
+
+	rt.transcriptMu.Lock()
+	for _, message := range rt.messages {
+		if strings.Contains(strings.ToLower(message.Content), "callto:") || strings.Contains(message.Content, toolName) {
+			rt.transcriptMu.Unlock()
+			t.Fatalf("leaked markup entered transcript: %#v", rt.messages)
+		}
+	}
+	if got := rt.messages[len(rt.messages)-1].Content; got != "Votre rappel est confirmé." {
+		rt.transcriptMu.Unlock()
+		t.Fatalf("clean completion missing from transcript: %q", got)
+	}
+	rt.transcriptMu.Unlock()
+
+	events, _ := thinker.telemetry.StoredEvents(0)
+	markupEvents := 0
+	for _, event := range events {
+		if event.Type != "realtime.tool_markup_leaked" {
+			continue
+		}
+		markupEvents++
+		var data map[string]any
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		if data["tool"] != toolName || data["pattern"] != "callto" || data["recovery_requested"] != true {
+			t.Fatalf("markup telemetry=%#v", data)
+		}
+	}
+	if markupEvents != 1 {
+		t.Fatalf("markup telemetry events=%d, want 1", markupEvents)
+	}
+}
+
+func TestRealtimeToolMarkupGuardRetriesOnlyOncePerCallerTurn(t *testing.T) {
+	thinker := newTestThinker()
+	defer thinker.Stop()
+	toolName := "flexylead-bookings_create_booking"
+	session := newFakeRealtimeSession()
+	rt := newRealtimeThinker(context.Background(), thinker, &fakeRealtimeProvider{}, "", nil, nil, nil)
+	defer rt.cancel()
+	rt.replaceSession(session)
+	rt.opts.Tools = []NativeTool{{Name: toolName}}
+	if err := rt.requestProviderResponse(session); err != nil {
+		t.Fatal(err)
+	}
+
+	for index, responseID := range []string{"response-1", "response-2"} {
+		rt.handleSessionEvent(RealtimeEvent{
+			Type: RealtimeEventTranscriptOutput, ResponseID: responseID, ItemID: responseID,
+			Transcript: "callto:" + toolName + `{"attempt":` + fmt.Sprint(index+1) + `}`,
+		})
+		rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: responseID})
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if len(session.texts) != 1 {
+		t.Fatalf("recovery prompts=%d, want exactly 1", len(session.texts))
+	}
+	if session.responses != 2 {
+		t.Fatalf("provider responses=%d, want initial plus one recovery", session.responses)
+	}
 }
 
 func (p *fakeRealtimeProvider) Name() string { return "fake-realtime" }

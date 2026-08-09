@@ -199,17 +199,22 @@ func toolDispatchArgs(t *Thinker, call toolCall) map[string]string {
 		return call.Args
 	}
 	def := t.registry.Get(call.Name)
-	if def == nil || !def.MCP || def.MCPServer != "channels" {
+	if def == nil || !def.MCP || (!def.MCPApp && def.MCPServer != "channels") {
 		return call.Args
 	}
-	// The Channels MCP uses this opaque runtime value to route an answer back
-	// to the durable Apteva conversation that triggered this thinker. It is
-	// injected after telemetry and absent from the model-visible schema.
+	// Apteva app MCPs receive the current opaque thread id through the trusted
+	// gateway. It is injected after telemetry and absent from the model-visible
+	// schema, so the model cannot forge its caller identity.
 	out := make(map[string]string, len(call.Args)+1)
 	for key, value := range call.Args {
 		out[key] = value
 	}
-	out["_apteva_caller_context"] = t.threadID
+	out["_apteva_caller_thread"] = t.threadID
+	// Compatibility for the built-in Channels MCP while it still routes the
+	// legacy hidden argument directly instead of the generic caller header.
+	if def.MCPServer == "channels" {
+		out["_apteva_caller_context"] = t.threadID
+	}
 	return out
 }
 
