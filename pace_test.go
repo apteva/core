@@ -696,6 +696,64 @@ func TestEventProcessingThatCrossesDeadlineImmediatelyDeliversTimerWake(t *testi
 	}
 }
 
+func TestDueTimerAndTaskEventAreDeliveredInOneTurn(t *testing.T) {
+	t.Chdir(t.TempDir())
+	pendingWake := time.Now().Add(-time.Millisecond).UTC()
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: "# Role\nHandle the directive timer and every ready task independently.",
+		Mode:      ModeAutonomous,
+	}
+	if err := cfg.SetMainPace(PersistentPaceState{Sleep: "1h", NextWakeAt: pendingWake}); err != nil {
+		t.Fatal(err)
+	}
+	provider := newPacingTestProvider(1)
+	thinker := NewThinker("", provider, cfg)
+	observer := thinker.bus.SubscribeAll("pace-same-time-task-observer", 16)
+	defer thinker.bus.Unsubscribe(observer.ID)
+	thinker.Inject(`{"type":"task.ready","task_id":"task-race","title":"Seeded same-time task"}`)
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		thinker.Run()
+	}()
+	defer func() {
+		thinker.Stop()
+		provider.release(1)
+		select {
+		case <-runDone:
+		case <-time.After(2 * time.Second):
+			t.Error("thinker did not stop")
+		}
+	}()
+
+	select {
+	case call := <-provider.started:
+		if call != 1 {
+			t.Fatalf("combined call = %d", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("combined timer and task event did not wake thinker")
+	}
+	requestText := messagesText(provider.request(1))
+	for _, want := range []string{
+		"reason: timer+event",
+		"pending_wake_at: none (timer fired)",
+		`"type":"task.ready"`,
+		`"task_id":"task-race"`,
+	} {
+		if !strings.Contains(requestText, want) {
+			t.Fatalf("combined request missing %q:\n%s", want, requestText)
+		}
+	}
+	provider.release(1)
+	waitForPacingThinkDone(t, observer, "main")
+	if state := cfg.GetMainPace(); state == nil || !state.NextWakeAt.IsZero() {
+		t.Fatalf("combined turn did not consume timer: %#v", state)
+	}
+}
+
 func TestPersistentWorkerEarlyEventPreservesItsOwnPendingWake(t *testing.T) {
 	t.Chdir(t.TempDir())
 	pendingWake := time.Now().Add(time.Hour).UTC()
