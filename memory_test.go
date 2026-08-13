@@ -720,6 +720,69 @@ func TestBuildContext_IsDeterministicForCacheReuse(t *testing.T) {
 	}
 }
 
+func TestAutomaticRecallContextUsesSignalAndTotalBudget(t *testing.T) {
+	ms := &MemoryStore{}
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	matches := []MemoryRecallMatch{
+		{Record: MemoryRecord{ID: "primary", TS: now, Content: "PRIMARY\n" + strings.Repeat("p", 12_000), Tags: []string{"patreon"}, Weight: 0.95}, Signal: 0.9, Score: 0.85},
+		{Record: MemoryRecord{ID: "computer", TS: now, Content: "COMPUTER\n" + strings.Repeat("c", 8_000), Tags: []string{"computer"}, Weight: 0.9}, Signal: 0.8, Score: 0.72},
+		{Record: MemoryRecord{ID: "large-third", TS: now, Content: "THIRD\n" + strings.Repeat("x", 8_000), Tags: []string{"channels"}, Weight: 0.9}, Signal: 0.7, Score: 0.63},
+		{Record: MemoryRecord{ID: "weak", TS: now, Content: "WEAK", Tags: []string{"tasks"}, Weight: 0.9}, Signal: 0.19, Score: 0.17},
+	}
+	selected, context := ms.BuildAutomaticRecallContext(matches)
+	if len(context) > automaticMemoryRecallMaxChars {
+		t.Fatalf("automatic context chars = %d, limit = %d", len(context), automaticMemoryRecallMaxChars)
+	}
+	if len(selected) != 2 || selected[0].Record.ID != "primary" || selected[1].Record.ID != "computer" {
+		t.Fatalf("selected matches = %+v", selected)
+	}
+	for _, want := range []string{"PRIMARY", "COMPUTER"} {
+		if !strings.Contains(context, want) {
+			t.Fatalf("context missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"THIRD", "WEAK"} {
+		if strings.Contains(context, unwanted) {
+			t.Fatalf("context contains %q despite budget/signal filtering", unwanted)
+		}
+	}
+}
+
+func TestAutomaticRecallContextBoundsOneOversizedRecord(t *testing.T) {
+	ms := &MemoryStore{}
+	record := MemoryRecord{
+		ID: "oversized", TS: time.Now().UTC(), Weight: 1,
+		Content: "HEAD\n" + strings.Repeat("middle", 10_000) + "\nTAIL",
+	}
+	selected, context := ms.BuildAutomaticRecallContext([]MemoryRecallMatch{{Record: record, Signal: 1, Score: 1}})
+	if len(selected) != 1 || len(context) > automaticMemoryRecallMaxChars {
+		t.Fatalf("selected=%d context_chars=%d limit=%d", len(selected), len(context), automaticMemoryRecallMaxChars)
+	}
+	for _, want := range []string{"HEAD", "TAIL", "memory content bounded by core"} {
+		if !strings.Contains(context, want) {
+			t.Fatalf("bounded context missing %q", want)
+		}
+	}
+}
+
+func TestMemoryGenerationChangesOnlyAfterSuccessfulAppend(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ms := NewMemoryStore("")
+	initial := ms.Generation()
+	if _, err := ms.Remember("generation sentinel", []string{"test"}, 0.8); err != nil {
+		t.Fatal(err)
+	}
+	if got := ms.Generation(); got != initial+1 {
+		t.Fatalf("generation after remember = %d, want %d", got, initial+1)
+	}
+	if err := ms.Drop("missing", "must fail"); err == nil {
+		t.Fatal("missing memory drop unexpectedly succeeded")
+	}
+	if got := ms.Generation(); got != initial+1 {
+		t.Fatalf("failed mutation changed generation to %d", got)
+	}
+}
+
 // ---- helpers ----------------------------------------------------------
 
 func contains(s []string, v string) bool {

@@ -654,11 +654,13 @@ type Thinker struct {
 	toolResultMu      sync.Mutex
 	// Successful provider calls age tool results. Large results are projected
 	// to bounded previews only after a short full-content retention window.
-	toolResultAge  map[string]int
-	requestContext ephemeralTurnContextState
-	threads        *ThreadManager
-	config         *Config
-	registry       *ToolRegistry
+	toolResultAge        map[string]int
+	toolResultHistorical map[string]bool
+	requestContext       ephemeralTurnContextState
+	memoryRecall         memoryRecallCycleState
+	threads              *ThreadManager
+	config               *Config
+	registry             *ToolRegistry
 
 	maxHistory int // max messages in context window (varies by role)
 
@@ -1130,6 +1132,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		memory:                 NewMemoryStore(apiKey),
 		session:                NewSession(".", "main"),
 		toolResultAge:          map[string]int{},
+		toolResultHistorical:   map[string]bool{},
 		apiLog:                 &[]APIEvent{},
 		apiMu:                  &sync.RWMutex{},
 		apiNotify:              make(chan struct{}, 1),
@@ -2459,54 +2462,77 @@ func (t *Thinker) Run() {
 
 		t.sanitizeConversationMessages()
 
-		// Recall uses the current event, otherwise the latest durable task,
-		// otherwise the standing directive. It never queries generated assistant
-		// filler or a previously injected context block.
-		memQuery, querySource := recallQueryForTurn(consumed, t.messages, t.directive)
-		var recallContext string
-		var recallMatches []MemoryRecallMatch
-		memoryCandidates := 0
-		if t.memory != nil && t.memory.Count() > 0 && memQuery != "" {
-			memoryCandidates = len(t.memory.Active())
-			recallMatches = t.memory.RecallMatches(memQuery, 5)
-			recalled := make([]MemoryRecord, len(recallMatches))
-			for i, match := range recallMatches {
-				recalled[i] = match.Record
-			}
-			recallContext = t.memory.BuildContext(recalled)
+		// Automatic recall starts a new retrieval cycle only when the thread's
+		// external context changes. Tool results, retries, and immediate
+		// continuations reuse the exact selected memory block.
+		memoryGeneration := uint64(0)
+		if t.memory != nil {
+			memoryGeneration = t.memory.Generation()
 		}
+		recallRefreshReason := t.memoryRecall.refreshReason(
+			memoryGeneration,
+			t.directive,
+			hasExternalEvent,
+			t.wakeDeadlineFired,
+			turnWakeReason == "resume",
+		)
+		recallRefreshed := recallRefreshReason != ""
+		if recallRefreshed {
+			// Query the current event, otherwise the latest durable user context,
+			// otherwise the standing directive. Generated assistant filler and
+			// previously injected request context are never retrieval queries.
+			memQuery, querySource := recallQueryForTurn(consumed, t.messages, t.directive)
+			memoryCandidates := 0
+			var recallMatches []MemoryRecallMatch
+			var recallContext string
+			if t.memory != nil && t.memory.Count() > 0 && memQuery != "" {
+				memoryCandidates = len(t.memory.Active())
+				ranked := t.memory.RecallMatches(memQuery, automaticMemoryRecallMaxRecords)
+				recallMatches, recallContext = t.memory.BuildAutomaticRecallContext(ranked)
+			}
+			t.memoryRecall.set(
+				memoryGeneration, t.directive, recallContext, querySource,
+				memoryCandidates, recallMatches,
+			)
+			if t.telemetry != nil && memoryCandidates > 0 {
+				matches := make([]map[string]any, 0, len(recallMatches))
+				for _, match := range recallMatches {
+					matches = append(matches, map[string]any{
+						"id": match.Record.ID, "score": match.Score, "signal": match.Signal,
+					})
+				}
+				t.telemetry.Emit("memory.recall", t.threadID, map[string]any{
+					"query_source":   querySource,
+					"refresh_reason": recallRefreshReason,
+					"context_hash":   t.memoryRecall.contextHash,
+					"candidates":     memoryCandidates,
+					"accepted":       len(recallMatches),
+					"matches":        matches,
+					"chars":          len(recallContext),
+					"tokens_est":     (len(recallContext) + 3) / 4,
+					"ephemeral":      true,
+				})
+			}
+		}
+		recallContext := t.memoryRecall.context
 		var activeThreads []ThreadInfo
 		if t.threads != nil {
 			activeThreads = t.threads.ListAgentVisible()
 		}
+		// Keep one current request-only context snapshot. A new external/wake or
+		// retrieval change replaces it; tool-result continuations retain it at
+		// the same anchor so selected memory remains visible without duplication.
 		dynCtx := buildDynamicTurnContext(activeThreads, recallContext)
 		dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
+		refreshRequestContext := recallRefreshed || hasExternalEvent || (!hadEvents && len(toolResults) == 0)
 		requestMessages := t.requestContext.prepare(
 			t.messages,
 			dynCtx,
 			nowUTC,
 			!hadEvents && len(toolResults) == 0,
-			hasExternalEvent || (!hadEvents && len(toolResults) == 0),
+			refreshRequestContext,
 		)
 		requestMessages = t.prepareToolResultRequest(requestMessages)
-		if t.telemetry != nil && memoryCandidates > 0 {
-			matches := make([]map[string]any, 0, len(recallMatches))
-			for _, match := range recallMatches {
-				matches = append(matches, map[string]any{
-					"id": match.Record.ID, "score": match.Score, "signal": match.Signal,
-				})
-			}
-			t.telemetry.Emit("memory.recall", t.threadID, map[string]any{
-				"query_source": querySource,
-				"candidates":   memoryCandidates,
-				"accepted":     len(recallMatches),
-				"matches":      matches,
-				"chars":        len(recallContext),
-				"tokens_est":   (len(recallContext) + 3) / 4,
-				"ephemeral":    true,
-			})
-		}
-
 		// messages[0] is no longer rewritten per-iteration. It only
 		// changes when the directive, mode, or static config (MCPs,
 		// providers) does — handled at the call sites of buildSystemPrompt.
@@ -2526,6 +2552,10 @@ func (t *Thinker) Run() {
 
 		if shouldCompactBeforeLLM(t.modelID(), requestMessages) {
 			t.compactForContextPressure("pre_llm", TokenUsage{}, emptyLLMResponses)
+			// Compaction resets request-only snapshots. Reattach the current
+			// retrieval-cycle memory exactly once to the new provider prefix.
+			dynCtx = buildDynamicTurnContext(activeThreads, recallContext)
+			dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
 			requestMessages = t.requestContext.prepare(
 				t.messages,
 				dynCtx,
@@ -2726,11 +2756,23 @@ func (t *Thinker) Run() {
 		protectedToolCallIDs := t.toolCallIDsProtectedFromSanitization(calls)
 		if checkpointed, dropped := checkpointHistoryWindow(t.messages, maxHist, protectedToolCallIDs); dropped > 0 {
 			t.messages = checkpointed
+			projectedResults := t.commitMatureToolResults(t.messages)
 			t.advancePromptCacheEpoch("history_checkpoint", true, map[string]any{
 				"dropped_messages":  dropped,
 				"retained_messages": len(t.messages),
 				"history_target":    maxHist,
+				"results_projected": projectedResults,
 			})
+		} else if stats := t.matureToolResultStats(t.messages); toolResultProjectionBatchReady(stats) {
+			projectedResults := t.commitMatureToolResults(t.messages)
+			if projectedResults > 0 {
+				t.advancePromptCacheEpoch("tool_result_retention_checkpoint", false, map[string]any{
+					"results_projected": projectedResults,
+					"mature_chars":      stats.chars,
+					"oldest_age":        stats.maxAge,
+					"retention_calls":   toolResultFullRetentionCalls,
+				})
+			}
 		}
 
 		t.compactSessionIfNeeded()

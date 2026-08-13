@@ -125,7 +125,7 @@ func TestPrepareComputerScreenshotTailDoesNotMutateHistory(t *testing.T) {
 
 func TestCheckpointHistoryWindowUsesHysteresis(t *testing.T) {
 	messages := []Message{{Role: "system", Content: "system"}}
-	for i := 0; i < 120; i++ {
+	for i := 0; i < 200; i++ {
 		messages = append(messages, Message{Role: "user", Content: "message"})
 	}
 	if got, dropped := checkpointHistoryWindow(messages, maxHistoryMain, nil); dropped != 0 || len(got) != len(messages) {
@@ -136,8 +136,8 @@ func TestCheckpointHistoryWindowUsesHysteresis(t *testing.T) {
 	if dropped == 0 {
 		t.Fatal("checkpoint did not trigger above upper boundary")
 	}
-	if len(got) != 81 {
-		t.Fatalf("checkpoint retained %d messages, want system + 80", len(got))
+	if len(got) != 101 {
+		t.Fatalf("checkpoint retained %d messages, want system + 100", len(got))
 	}
 	if got[0].Role != "system" || got[len(got)-1].Content != "trigger" {
 		t.Fatalf("checkpoint lost system/latest messages: first=%+v last=%+v", got[0], got[len(got)-1])
@@ -147,7 +147,7 @@ func TestCheckpointHistoryWindowUsesHysteresis(t *testing.T) {
 func TestCheckpointHistoryWindowPreservesProtectedToolCallUntilResultArrives(t *testing.T) {
 	const callID = "call-pending-at-checkpoint"
 	messages := []Message{{Role: "system", Content: "system"}}
-	for i := 0; i < 120; i++ {
+	for i := 0; i < 200; i++ {
 		messages = append(messages, Message{Role: "user", Content: "old message"})
 	}
 	messages = append(messages, Message{
@@ -178,7 +178,7 @@ func TestCheckpointHistoryWindowPreservesProtectedToolCallUntilResultArrives(t *
 func TestCheckpointHistoryWindowRemovesUnprotectedOrphan(t *testing.T) {
 	const callID = "call-genuinely-orphaned"
 	messages := []Message{{Role: "system", Content: "system"}}
-	for i := 0; i < 120; i++ {
+	for i := 0; i < 200; i++ {
 		messages = append(messages, Message{Role: "user", Content: "old message"})
 	}
 	messages = append(messages, Message{

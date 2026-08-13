@@ -130,10 +130,10 @@ func TestCodexPendingToolSurvivesHistoryCheckpointSmoke(t *testing.T) {
 		},
 	})
 
-	// A worker checkpoints above 24 retained history messages. Alternating
+	// A worker checkpoints above 40 retained history messages. Alternating
 	// completed turns keep this realistic while ensuring the forced async call
 	// is the newest assistant message at the boundary.
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 20; i++ {
 		thinker.messages = append(thinker.messages,
 			Message{Role: "user", Content: "Historical completed request."},
 			Message{Role: "assistant", Content: "Historical request completed."},

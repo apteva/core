@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -135,7 +136,7 @@ func TestRestartMigratesLegacyLargeResultOutOfConversationJSONL(t *testing.T) {
 	}
 }
 
-func TestLargeToolResultStaysFullUntilRetentionExpires(t *testing.T) {
+func TestLargeToolResultStaysFullUntilBatchedRetentionCheckpoint(t *testing.T) {
 	baseDir := t.TempDir()
 	thinker := &Thinker{
 		threadID:      "main",
@@ -168,11 +169,27 @@ func TestLargeToolResultStaysFullUntilRetentionExpires(t *testing.T) {
 		}
 	}
 	thinker.markToolResultsConsumed(thinker.messages)
+	mature := thinker.prepareToolResultRequest(thinker.messages)
+	if mature[2].ToolResults[0].Content != payload || mature[2].ToolResults[0].ContentIsPreview {
+		t.Fatal("a single mature result was projected before a batch checkpoint")
+	}
+	if thinker.promptCacheEpoch != initialEpoch {
+		t.Fatalf("maturity alone reset prompt cache: epoch=%d reason=%q", thinker.promptCacheEpoch, thinker.promptCacheResetReason)
+	}
+	for thinker.matureToolResultStats(thinker.messages).maxAge < toolResultProjectionMaxAge {
+		thinker.markToolResultsConsumed(thinker.messages)
+	}
+	stats := thinker.matureToolResultStats(thinker.messages)
+	if !toolResultProjectionBatchReady(stats) {
+		t.Fatalf("aged result did not make a block checkpoint ready: %+v", stats)
+	}
+	projected := thinker.commitMatureToolResults(thinker.messages)
+	thinker.advancePromptCacheEpoch("tool_result_retention_checkpoint", false, map[string]any{"results_projected": projected})
 	aged := thinker.prepareToolResultRequest(thinker.messages)
 	if strings.Contains(aged[2].ToolResults[0].Content, "MIDDLE_ONLY_ARCHIVE_SENTINEL") || len(aged[2].ToolResults[0].Content) > historicalToolResultPerResultChars || !aged[2].ToolResults[0].ContentIsPreview {
 		t.Fatalf("old large result was not bounded: %+v", aged[2].ToolResults[0])
 	}
-	if thinker.promptCacheEpoch != initialEpoch+1 || thinker.promptCacheResetReason != "tool_result_retention_expired" {
+	if thinker.promptCacheEpoch != initialEpoch+1 || thinker.promptCacheResetReason != "tool_result_retention_checkpoint" {
 		t.Fatalf("retention pruning did not record an intentional cache epoch: epoch=%d reason=%q", thinker.promptCacheEpoch, thinker.promptCacheResetReason)
 	}
 }
@@ -192,6 +209,9 @@ func TestHistoricalToolResultTotalLimit(t *testing.T) {
 	for i := 0; i < toolResultFullRetentionCalls; i++ {
 		thinker.markToolResultsConsumed(thinker.messages)
 	}
+	if committed := thinker.commitMatureToolResults(thinker.messages); committed != 50 {
+		t.Fatalf("committed historical results = %d, want 50", committed)
+	}
 	request := thinker.prepareToolResultRequest(thinker.messages)
 	total := 0
 	for _, message := range request {
@@ -204,6 +224,67 @@ func TestHistoricalToolResultTotalLimit(t *testing.T) {
 	}
 	if total > historicalToolResultTotalChars {
 		t.Fatalf("historical total = %d, limit = %d", total, historicalToolResultTotalChars)
+	}
+}
+
+func TestLongToolWorkflowBatchesProjectionAndCacheResets(t *testing.T) {
+	thinker := &Thinker{
+		threadID:               "worker",
+		messages:               []Message{{Role: "system", Content: "stable"}},
+		toolResultAge:          map[string]int{},
+		toolResultHistorical:   map[string]bool{},
+		promptCacheResetReason: "startup",
+	}
+	resetCounts := map[string]int{}
+	for step := 0; step < 40; step++ {
+		// The provider successfully consumed the request that existed before
+		// this step's new observation arrived.
+		thinker.markToolResultsConsumed(thinker.messages)
+		callID := fmt.Sprintf("computer-%02d", step)
+		thinker.messages = append(thinker.messages,
+			Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: callID, Name: "computer_use"}}},
+			Message{Role: "user", ToolResults: []ToolResult{{
+				CallID: callID, ToolName: "computer_use",
+				Content: strings.Repeat(fmt.Sprintf("state-%02d ", step), 2400),
+			}}},
+		)
+		latest := thinker.prepareToolResultRequest(thinker.messages)
+		lastResult := latest[len(latest)-1].ToolResults[0]
+		if lastResult.ContentIsPreview {
+			t.Fatalf("step %d: newest result was not full for its first consuming call", step)
+		}
+
+		if checkpointed, dropped := checkpointHistoryWindow(thinker.messages, maxHistoryWorker, nil); dropped > 0 {
+			thinker.messages = checkpointed
+			thinker.commitMatureToolResults(thinker.messages)
+			thinker.advancePromptCacheEpoch("history_checkpoint", true, nil)
+			resetCounts["history_checkpoint"]++
+		} else if stats := thinker.matureToolResultStats(thinker.messages); toolResultProjectionBatchReady(stats) {
+			if committed := thinker.commitMatureToolResults(thinker.messages); committed == 0 {
+				t.Fatal("ready projection batch committed no results")
+			}
+			thinker.advancePromptCacheEpoch("tool_result_retention_checkpoint", false, nil)
+			resetCounts["tool_result_retention_checkpoint"]++
+		}
+	}
+	if resetCounts["history_checkpoint"] == 0 {
+		t.Fatal("long workflow never checkpointed history")
+	}
+	totalResets := resetCounts["history_checkpoint"] + resetCounts["tool_result_retention_checkpoint"]
+	if totalResets >= 12 {
+		t.Fatalf("40-step workflow reset cache %d times; resets=%v", totalResets, resetCounts)
+	}
+	if thinker.promptCacheResetReason == "tool_result_retention_expired" {
+		t.Fatal("legacy rolling reset reason survived")
+	}
+
+	request := thinker.prepareToolResultRequest(thinker.messages)
+	for _, message := range request {
+		for _, result := range message.ToolResults {
+			if thinker.toolResultIsHistorical(result) && len(result.Content) > historicalToolResultPerResultChars {
+				t.Fatalf("historical result remained unbounded: %d chars", len(result.Content))
+			}
+		}
 	}
 }
 

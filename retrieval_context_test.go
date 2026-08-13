@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -70,12 +71,15 @@ func TestEphemeralTurnContextAlwaysIncludesCurrentUTC(t *testing.T) {
 	base := []Message{{Role: "system", Content: "stable"}}
 	first := state.prepare(base, "", "2026-07-13T12:03:00Z", true, true)
 	second := state.prepare(base, "", "2026-07-14T12:03:00Z", true, true)
-	if len(second) != len(first)+1 || !reflect.DeepEqual(first, second[:len(first)]) {
-		t.Fatalf("timer wake rewrote the previous request: first=%+v second=%+v", first, second)
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("timer wake accumulated request context: first=%+v second=%+v", first, second)
 	}
 	latest := second[len(second)-1].Content
 	if first[1].Content == latest || !strings.Contains(latest, "2026-07-14T12:03:00Z") {
 		t.Fatalf("timer wake reused stale time: first=%q latest=%q", first[1].Content, latest)
+	}
+	if strings.Contains(latest, "2026-07-13T12:03:00Z") {
+		t.Fatalf("timer wake retained superseded time: %q", latest)
 	}
 }
 
@@ -105,22 +109,29 @@ func TestEphemeralTurnContextStatePreservesAppendOnlyPrefix(t *testing.T) {
 	}
 }
 
-func TestEphemeralTurnContextNewSemanticTurnAppendsSnapshot(t *testing.T) {
+func TestEphemeralTurnContextNewSemanticTurnReplacesSnapshot(t *testing.T) {
 	state := ephemeralTurnContextState{}
 	durable := []Message{{Role: "system", Content: "stable"}, {Role: "user", Content: "first task"}}
 	first := state.prepare(durable, "[ACTIVE THREADS]\n- worker-a", "2026-07-10T14:00:00Z", false, true)
+	if len(first) != len(durable)+1 || strings.Count(first[len(first)-1].Content, ephemeralContextHeader) != 1 {
+		t.Fatalf("initial request context = %+v", first)
+	}
 
 	durable = append(durable,
 		Message{Role: "assistant", Content: "first answer"},
 		Message{Role: "user", Content: "second task"},
 	)
 	second := state.prepare(durable, "[ACTIVE THREADS]\n- worker-b", "2026-07-10T14:05:00Z", false, true)
-	if len(second) <= len(first) || !reflect.DeepEqual(first, second[:len(first)]) {
-		t.Fatalf("new semantic turn rewrote the prior request:\nfirst=%+v\nsecond=%+v", first, second)
+	if len(second) != len(durable)+1 {
+		t.Fatalf("new semantic turn accumulated context: durable=%d second=%+v", len(durable), second)
 	}
 	latest := second[len(second)-1]
 	if !latest.RequestContext || !strings.Contains(latest.Content, "worker-b") || !strings.Contains(latest.Content, "14:05:00Z") {
 		t.Fatalf("latest context snapshot = %+v", latest)
+	}
+	serialized, _ := json.Marshal(second)
+	if strings.Contains(string(serialized), "worker-a") || strings.Count(string(serialized), ephemeralContextHeader) != 1 {
+		t.Fatalf("superseded request context survived replacement: %s", serialized)
 	}
 }
 
@@ -131,7 +142,7 @@ func TestRecallQueryPriorityNeverUsesAssistantFiller(t *testing.T) {
 		{Role: "assistant", Content: "I'll wait for follow-up."},
 	}
 	query, source := recallQueryForTurn(nil, messages, "Monitor deployments")
-	if source != "active_task" || !strings.Contains(query, "storage uploads") {
+	if source != "latest_user_context" || !strings.Contains(query, "storage uploads") {
 		t.Fatalf("query=%q source=%q", query, source)
 	}
 	if strings.Contains(query, "wait for follow-up") {
@@ -146,6 +157,32 @@ func TestRecallQueryPriorityNeverUsesAssistantFiller(t *testing.T) {
 	query, source = recallQueryForTurn(nil, []Message{{Role: "system", Content: "system"}}, "Monitor deployments")
 	if source != "directive" || query != "Monitor deployments" {
 		t.Fatalf("directive query=%q source=%q", query, source)
+	}
+}
+
+func TestMemoryRecallCycleRefreshesOnlyForExternalContextChanges(t *testing.T) {
+	var state memoryRecallCycleState
+	if got := state.refreshReason(0, "directive", false, false, false); got != "thread_start" {
+		t.Fatalf("initial refresh reason = %q", got)
+	}
+	state.set(0, "directive", "memory block", "directive", 1, nil)
+	if got := state.refreshReason(0, "directive", false, false, false); got != "" {
+		t.Fatalf("internal continuation refreshed memory: %q", got)
+	}
+	if got := state.refreshReason(0, "directive", true, false, false); got != "external_event" {
+		t.Fatalf("external event refresh reason = %q", got)
+	}
+	if got := state.refreshReason(0, "directive", false, true, false); got != "timer" {
+		t.Fatalf("timer refresh reason = %q", got)
+	}
+	if got := state.refreshReason(0, "directive", false, false, true); got != "resume" {
+		t.Fatalf("resume refresh reason = %q", got)
+	}
+	if got := state.refreshReason(1, "directive", false, false, false); got != "memory_changed" {
+		t.Fatalf("memory mutation refresh reason = %q", got)
+	}
+	if got := state.refreshReason(0, "updated directive", false, false, false); got != "directive_changed" {
+		t.Fatalf("directive refresh reason = %q", got)
 	}
 }
 
@@ -259,6 +296,185 @@ type retrievalCaptureProvider struct {
 	called   chan struct{}
 }
 
+type retrievalToolCycleProvider struct {
+	mu       sync.Mutex
+	requests [][]Message
+	called   chan struct{}
+	calls    int
+}
+
+func (p *retrievalToolCycleProvider) Chat(_ context.Context, messages []Message, _ string, _ []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
+	p.mu.Lock()
+	p.calls++
+	callNumber := p.calls
+	p.requests = append(p.requests, cloneMessages(messages))
+	p.mu.Unlock()
+	select {
+	case p.called <- struct{}{}:
+	default:
+	}
+	if callNumber <= 8 {
+		return ChatResponse{ToolCalls: []NativeToolCall{{
+			ID:   fmt.Sprintf("observe-%d", callNumber),
+			Name: "cycle_observe",
+			Args: map[string]string{"step": fmt.Sprint(callNumber)},
+		}}}, nil
+	}
+	return ChatResponse{ToolCalls: []NativeToolCall{{
+		ID:   fmt.Sprintf("pace-%d", callNumber),
+		Name: "pace",
+		Args: map[string]string{"sleep": "1h", "_reason": "The observation cycle is complete"},
+	}}}, nil
+}
+
+func (p *retrievalToolCycleProvider) Models() map[ModelTier]string {
+	return map[ModelTier]string{ModelLarge: "capture", ModelMedium: "capture", ModelSmall: "capture"}
+}
+func (p *retrievalToolCycleProvider) Name() string { return "retrieval-tool-cycle" }
+func (p *retrievalToolCycleProvider) CostPer1M() (float64, float64, float64) {
+	return 0, 0, 0
+}
+func (p *retrievalToolCycleProvider) SupportsNativeTools() bool            { return true }
+func (p *retrievalToolCycleProvider) AvailableBuiltinTools() []BuiltinTool { return nil }
+func (p *retrievalToolCycleProvider) SetBuiltinTools([]string)             {}
+func (p *retrievalToolCycleProvider) WithBuiltins([]string) LLMProvider    { return p }
+
+func (p *retrievalToolCycleProvider) capturedRequests() [][]Message {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([][]Message, len(p.requests))
+	for i := range p.requests {
+		out[i] = cloneMessages(p.requests[i])
+	}
+	return out
+}
+
+func TestThinkerReusesBoundedMemoryAcrossToolResultContinuations(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OLLAMA_HOST", "")
+	t.Chdir(t.TempDir())
+
+	provider := &retrievalToolCycleProvider{called: make(chan struct{}, 16)}
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: "Use relevant operating guidance to complete external requests directly.",
+		Mode:      ModeAutonomous,
+	}
+	thinker := NewThinker("", provider, cfg)
+	defer thinker.Stop()
+	thinker.paused = true
+	thinker.maxHistory = maxHistoryWorker
+
+	relevant := []struct {
+		id      string
+		content string
+		tags    []string
+	}{
+		{"skill_patreon", "PATREON_SKILL_SENTINEL\n" + strings.Repeat("Patreon publishing procedure and existing draft guidance. ", 130), []string{"skill", "patreon", "publishing"}},
+		{"skill_computer", "COMPUTER_SKILL_SENTINEL\n" + strings.Repeat("Computer browser observation and action procedure. ", 130), []string{"skill", "computer", "browser"}},
+	}
+	for _, rec := range relevant {
+		if _, err := thinker.memory.RememberWithID(rec.id, rec.content, rec.tags, 0.95); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		content := fmt.Sprintf("DISTRACTOR_%d\n", i) + strings.Repeat("Payroll tax kitchen inventory unrelated archive. ", 100)
+		if _, err := thinker.memory.RememberWithID(fmt.Sprintf("skill_distractor_%d", i), content, []string{"skill", "unrelated"}, 0.9); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	thinker.registry.Register(&ToolDef{
+		Name:        "cycle_observe",
+		Description: "Return the next deterministic observation in the current workflow.",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"step": map[string]any{"type": "string"}},
+			"required":   []string{"step"},
+		},
+		Handler: func(args map[string]string) ToolResponse {
+			return ToolResponse{Text: "observation step " + args["step"] + " complete\n" + strings.Repeat("state ", 3000)}
+		},
+	})
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		thinker.Run()
+	}()
+	thinker.InjectConsole("Use the Patreon and Computer browser guidance to process the existing publishing draft through several observation steps.")
+	for i := 0; i < 9; i++ {
+		select {
+		case <-provider.called:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for provider call %d", i+1)
+		}
+	}
+
+	requests := provider.capturedRequests()
+	if len(requests) < 9 {
+		t.Fatalf("captured requests = %d", len(requests))
+	}
+	for i, request := range requests[:9] {
+		serialized, _ := json.Marshal(request)
+		body := string(serialized)
+		if strings.Count(body, "[memories — surfaced") != 1 {
+			t.Fatalf("request %d did not retain exactly one memory snapshot", i+1)
+		}
+		for _, sentinel := range []string{"PATREON_SKILL_SENTINEL", "COMPUTER_SKILL_SENTINEL"} {
+			if !strings.Contains(body, sentinel) {
+				t.Fatalf("request %d lost %s", i+1, sentinel)
+			}
+		}
+		if strings.Contains(body, "DISTRACTOR_") {
+			t.Fatalf("request %d included an unrelated skill", i+1)
+		}
+	}
+
+	events, _ := thinker.telemetry.StoredEvents(0)
+	recalls := 0
+	for _, event := range events {
+		if event.Type == "memory.recall" {
+			recalls++
+			if !strings.Contains(string(event.Data), `"refresh_reason":"external_event"`) {
+				t.Fatalf("unexpected recall telemetry: %s", event.Data)
+			}
+		}
+		if event.Type == "llm.prompt_cache_reset" && strings.Contains(string(event.Data), "tool_result_retention_expired") {
+			t.Fatalf("rolling tool-result cache reset survived: %s", event.Data)
+		}
+	}
+	if recalls != 1 {
+		t.Fatalf("automatic recalls = %d, want one for the external wake", recalls)
+	}
+
+	thinker.InjectConsole("Start a separate external follow-up using the current memory.")
+	select {
+	case <-provider.called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for second external cycle")
+	}
+	events, _ = thinker.telemetry.StoredEvents(0)
+	recalls = 0
+	for _, event := range events {
+		if event.Type == "memory.recall" {
+			recalls++
+		}
+	}
+	if recalls != 2 {
+		t.Fatalf("recalls after a second external wake = %d, want 2", recalls)
+	}
+
+	thinker.Stop()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("thinker did not stop")
+	}
+}
+
 func (p *retrievalCaptureProvider) Chat(_ context.Context, messages []Message, _ string, _ []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
 	copyMessages := append([]Message(nil), messages...)
 	p.mu.Lock()
@@ -270,7 +486,7 @@ func (p *retrievalCaptureProvider) Chat(_ context.Context, messages []Message, _
 	default:
 	}
 	sleep := "1ms"
-	if callNumber >= 4 {
+	if callNumber >= 8 {
 		sleep = "1h"
 	}
 	return ChatResponse{
@@ -293,7 +509,7 @@ func (p *retrievalCaptureProvider) AvailableBuiltinTools() []BuiltinTool   { ret
 func (p *retrievalCaptureProvider) SetBuiltinTools([]string)               {}
 func (p *retrievalCaptureProvider) WithBuiltins([]string) LLMProvider      { return p }
 
-func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
+func TestThinkerRecallIsEphemeralAndReplacedAcrossManyTurns(t *testing.T) {
 	t.Chdir(t.TempDir())
 	provider := &retrievalCaptureProvider{called: make(chan struct{}, 8)}
 	cfg := &Config{
@@ -308,7 +524,7 @@ func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
 	defer thinker.Stop()
 	go thinker.Run()
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 8; i++ {
 		select {
 		case <-provider.called:
 		case <-time.After(5 * time.Second):
@@ -321,20 +537,22 @@ func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
 	provider.mu.Lock()
 	requests := append([][]Message(nil), provider.requests...)
 	provider.mu.Unlock()
-	if len(requests) < 4 {
+	if len(requests) < 8 {
 		t.Fatalf("captured %d requests", len(requests))
 	}
-	for i, request := range requests[:4] {
+	for i, request := range requests[:8] {
 		markers := 0
+		requestContexts := 0
 		foundIndex := -1
 		for j, message := range request {
 			markers += strings.Count(message.Content, "[memories — surfaced")
 			if message.RequestContext && strings.HasPrefix(message.Content, ephemeralContextHeader) {
+				requestContexts++
 				foundIndex = j
 			}
 		}
-		if markers != i+1 {
-			t.Fatalf("request %d has %d memory snapshots, want %d append-only snapshots", i+1, markers, i+1)
+		if markers != 1 || requestContexts != 1 {
+			t.Fatalf("request %d has memory_blocks=%d request_contexts=%d, want exactly one current snapshot", i+1, markers, requestContexts)
 		}
 		if foundIndex < 0 || !strings.HasPrefix(request[foundIndex].Content, ephemeralContextHeader) {
 			t.Fatalf("request %d is missing marked ephemeral context: %+v", i+1, request)
@@ -342,8 +560,8 @@ func TestThinkerRecallIsEphemeralAcrossTurns(t *testing.T) {
 		if !strings.Contains(request[foundIndex].Content, "[CURRENT TIME]\nUTC: ") {
 			t.Fatalf("request %d lacks current time: %q", i+1, request[foundIndex].Content)
 		}
-		if i > 0 && !reflect.DeepEqual(requests[i-1], request[:len(requests[i-1])]) {
-			t.Fatalf("request %d rewrote the prior provider prefix:\nprevious=%+v\ncurrent=%+v", i+1, requests[i-1], request)
+		if strings.Contains(request[0].Content, "[memories — surfaced") {
+			t.Fatalf("request %d rewrote memory into the system prompt: %q", i+1, request[0].Content)
 		}
 	}
 	history, err := os.ReadFile(filepath.Join("history", "main.jsonl"))

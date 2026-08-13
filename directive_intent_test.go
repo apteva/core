@@ -105,6 +105,46 @@ func TestDelegationToolDescriptionsUseOwnershipBoundary(t *testing.T) {
 	}
 }
 
+func TestSpawnToolRequiresFocusedSelfContainedDirective(t *testing.T) {
+	spawn := NewToolRegistry("test").Get("spawn")
+	if spawn == nil {
+		t.Fatal("spawn tool missing")
+	}
+	for _, want := range []string{
+		"compact, self-contained worker directive",
+		"objective",
+		"non-negotiable constraints",
+		"exact scope",
+		"success criteria",
+		"stop conditions",
+		"constraints before operational detail",
+		"omit unrelated parent context",
+	} {
+		if !strings.Contains(spawn.Description, want) {
+			t.Fatalf("spawn description missing %q: %s", want, spawn.Description)
+		}
+	}
+
+	if !strings.Contains(spawn.Rules, "containing only the worker's objective") ||
+		!strings.Contains(spawn.Rules, "omit unrelated parent context") {
+		t.Fatalf("spawn rules do not preserve the focused-directive contract: %s", spawn.Rules)
+	}
+	properties, ok := spawn.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("spawn properties schema = %#v", spawn.InputSchema["properties"])
+	}
+	directive, ok := properties["directive"].(map[string]any)
+	if !ok {
+		t.Fatalf("spawn directive schema = %#v", properties["directive"])
+	}
+	description, _ := directive["description"].(string)
+	for _, want := range []string{"non-negotiable constraints first", "stop conditions", "Omit unrelated parent context"} {
+		if !strings.Contains(description, want) {
+			t.Fatalf("spawn directive parameter missing %q: %s", want, description)
+		}
+	}
+}
+
 func TestPaceToolDocumentsAutonomousDailyWakeContract(t *testing.T) {
 	registry := NewToolRegistry("test")
 	tools := registry.NativeTools(map[string]bool{"pace": true}, nil)

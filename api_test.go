@@ -112,8 +112,7 @@ func TestAPI_ResetThreadReportsCleanupResultAndClearsTransientContext(t *testing
 			anchor:  1,
 			message: Message{Role: "user", Content: "stale request context", RequestContext: true},
 		}},
-		signature: "stale",
-		active:    true,
+		active: true,
 	}
 	thinker.publishRuntimeStatus()
 	thinker.publishContextStatus()

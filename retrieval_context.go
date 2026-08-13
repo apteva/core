@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const ephemeralContextHeader = "[REQUEST CONTEXT SNAPSHOT — ephemeral; not durable conversation history or current user input; later snapshots supersede earlier ones]"
+const ephemeralContextHeader = "[REQUEST CONTEXT SNAPSHOT — ephemeral; not durable conversation history or current user input; this current snapshot replaces prior request context]"
 
 var legacyEventHeaderRE = regexp.MustCompile(`(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] Events:\s*$`)
 
@@ -16,15 +16,59 @@ type ephemeralTurnContextSnapshot struct {
 	message Message
 }
 
-// ephemeralTurnContextState keeps every request-only turn snapshot at the
-// position where the provider first saw it. A later semantic turn appends a
-// new snapshot instead of removing or repositioning the old one. This makes
-// normal provider requests append-only while keeping retrieval context out of
-// durable conversation history and the session journal.
+// ephemeralTurnContextState keeps exactly one request-only context snapshot.
+// It stays anchored while tool results and correction turns continue the same
+// wake, then is replaced at the durable tail when a new external/wake context
+// begins. This keeps the current retrieval available without accumulating
+// superseded memory blocks in provider requests or durable history.
 type ephemeralTurnContextState struct {
 	snapshots []ephemeralTurnContextSnapshot
-	signature string
 	active    bool
+}
+
+// memoryRecallCycleState holds one automatic-retrieval result across the
+// internal continuations caused by tool results, retries, and correction
+// turns. A new external wake (event, timer, or resume) starts a fresh cycle.
+// There is intentionally no task abstraction here.
+type memoryRecallCycleState struct {
+	initialized     bool
+	storeGeneration uint64
+	directive       string
+	context         string
+	matches         []MemoryRecallMatch
+	candidates      int
+	querySource     string
+	contextHash     string
+}
+
+func (s *memoryRecallCycleState) refreshReason(storeGeneration uint64, directive string, hasExternalEvent, timerWake, resumeWake bool) string {
+	switch {
+	case hasExternalEvent:
+		return "external_event"
+	case timerWake:
+		return "timer"
+	case resumeWake:
+		return "resume"
+	case !s.initialized:
+		return "thread_start"
+	case s.storeGeneration != storeGeneration:
+		return "memory_changed"
+	case s.directive != directive:
+		return "directive_changed"
+	default:
+		return ""
+	}
+}
+
+func (s *memoryRecallCycleState) set(storeGeneration uint64, directive, context, querySource string, candidates int, matches []MemoryRecallMatch) {
+	s.initialized = true
+	s.storeGeneration = storeGeneration
+	s.directive = directive
+	s.context = context
+	s.matches = append(s.matches[:0], matches...)
+	s.candidates = candidates
+	s.querySource = querySource
+	s.contextHash = promptCacheShortHash([]byte(context))
 }
 
 func (s *ephemeralTurnContextState) reset() {
@@ -59,10 +103,6 @@ func appendWakeStateContext(dynamicContext, reason string, wake time.Time, fired
 	return strings.TrimSpace(dynamicContext) + "\n\n" + wakeState
 }
 
-func ephemeralTurnContextSignature(dynamicContext string, idle bool) string {
-	return strings.TrimSpace(dynamicContext) + fmt.Sprintf("\x00idle=%t", idle)
-}
-
 func (s *ephemeralTurnContextState) prepare(messages []Message, dynamicContext, now string, idle, forceNew bool) []Message {
 	content := renderEphemeralTurnContext(dynamicContext, now, idle)
 	if content == "" {
@@ -70,7 +110,6 @@ func (s *ephemeralTurnContextState) prepare(messages []Message, dynamicContext, 
 		return messages
 	}
 
-	signature := ephemeralTurnContextSignature(dynamicContext, idle)
 	for _, snapshot := range s.snapshots {
 		if snapshot.anchor < 0 || snapshot.anchor > len(messages) {
 			s.reset()
@@ -78,12 +117,11 @@ func (s *ephemeralTurnContextState) prepare(messages []Message, dynamicContext, 
 			break
 		}
 	}
-	if forceNew || !s.active || s.signature != signature {
-		s.snapshots = append(s.snapshots, ephemeralTurnContextSnapshot{
+	if forceNew || !s.active {
+		s.snapshots = []ephemeralTurnContextSnapshot{{
 			anchor:  len(messages),
 			message: Message{Role: "user", Content: content, RequestContext: true},
-		})
-		s.signature = signature
+		}}
 		s.active = true
 	}
 
@@ -132,7 +170,7 @@ func recallQueryForTurn(consumed []string, messages []Message, directive string)
 		if strings.Contains(cleaned, "(no events)") || strings.Contains(cleaned, "(no new events;") {
 			continue
 		}
-		return cleaned, "active_task"
+		return cleaned, "latest_user_context"
 	}
 
 	if strings.TrimSpace(directive) != "" {

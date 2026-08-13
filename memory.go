@@ -47,6 +47,13 @@ const (
 	memoryFile      = "memory.jsonl"
 	legacyMemoryBak = "memory.jsonl.legacy.bak"
 
+	// Automatic recall is request context, not a bulk memory export. Keep the
+	// selected records useful and bounded; full records remain in the journal
+	// and explicit memory search remains unchanged.
+	automaticMemoryRecallMaxRecords = 5
+	automaticMemoryRecallMaxChars   = 24 * 1024
+	automaticMemoryRecallMinSignal  = 0.20
+
 	// Default decay half-life: a memory's effective weight halves
 	// every this many days unless reinforced. 90 days = a memory
 	// from 6 months ago contributes 1/4 of its original weight.
@@ -147,6 +154,7 @@ type MemoryStore struct {
 	byID        map[string]int // id → index in records
 	active      map[string]MemoryRecord
 	activeOrder []string
+	generation  uint64            // increments whenever records are appended
 	backend     *embeddingBackend // nil → no embeddings, lexical-only
 	path        string
 }
@@ -414,6 +422,18 @@ func (ms *MemoryStore) Count() int {
 	return len(ms.active)
 }
 
+// Generation identifies the current in-process memory view. Threads use it
+// to keep one retrieval snapshot across internal continuations while still
+// noticing memories written by another thread.
+func (ms *MemoryStore) Generation() uint64 {
+	if ms == nil {
+		return 0
+	}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.generation
+}
+
 // All returns every record in insertion order, including tombstones
 // and superseded entries. Used by the dashboard memory panel for
 // debugging / audit.
@@ -461,6 +481,7 @@ func (ms *MemoryStore) appendRecords(records ...MemoryRecord) error {
 		}
 		ms.applyActiveRecordLocked(rec)
 	}
+	ms.generation++
 	return nil
 }
 
@@ -844,16 +865,85 @@ func (ms *MemoryStore) BuildContext(records []MemoryRecord) string {
 	var buf bytes.Buffer
 	buf.WriteString("[memories — surfaced because they may be relevant; check the dates, do not treat as the user's current input]\n")
 	for _, r := range records {
-		tagStr := ""
-		if len(r.Tags) > 0 {
-			tags := append([]string(nil), r.Tags...)
-			sort.Strings(tags)
-			tagStr = " [" + strings.Join(tags, ",") + "]"
-		}
-		buf.WriteString(fmt.Sprintf("- (remembered %s, w=%.2f)%s %s\n",
-			r.TS.UTC().Format("2006-01-02"), r.Weight, tagStr, r.Content))
+		buf.WriteString(renderMemoryContextEntry(r))
 	}
 	return buf.String()
+}
+
+// BuildAutomaticRecallContext filters and renders the ranked matches used by
+// the automatic per-cycle memory injection. It keeps whole records whenever
+// possible so procedural guidance is not silently cut in half. Only an
+// individually oversized first record is deterministically excerpted.
+func (ms *MemoryStore) BuildAutomaticRecallContext(matches []MemoryRecallMatch) ([]MemoryRecallMatch, string) {
+	if len(matches) == 0 {
+		return nil, ""
+	}
+	const header = "[memories — surfaced because they may be relevant; check the dates, do not treat as the user's current input]\n"
+	selected := make([]MemoryRecallMatch, 0, len(matches))
+	used := len(header)
+	for _, match := range matches {
+		if match.Signal < automaticMemoryRecallMinSignal {
+			continue
+		}
+		entry := renderMemoryContextEntry(match.Record)
+		if used+len(entry) <= automaticMemoryRecallMaxChars {
+			selected = append(selected, match)
+			used += len(entry)
+			continue
+		}
+		if len(selected) > 0 {
+			continue
+		}
+
+		// A single record can exceed the whole automatic-recall budget. Keep
+		// a deterministic head/tail excerpt rather than letting one memory
+		// make every model request unbounded.
+		bounded := match
+		overhead := len(renderMemoryContextEntry(MemoryRecord{
+			TS: match.Record.TS, Tags: match.Record.Tags, Weight: match.Record.Weight,
+		}))
+		available := automaticMemoryRecallMaxChars - len(header) - overhead
+		bounded.Record.Content = boundedMemoryContent(match.Record.Content, available)
+		entry = renderMemoryContextEntry(bounded.Record)
+		selected = append(selected, bounded)
+		used += len(entry)
+	}
+	if len(selected) == 0 {
+		return nil, ""
+	}
+	records := make([]MemoryRecord, len(selected))
+	for i, match := range selected {
+		records[i] = match.Record
+	}
+	return selected, ms.BuildContext(records)
+}
+
+func renderMemoryContextEntry(r MemoryRecord) string {
+	tagStr := ""
+	if len(r.Tags) > 0 {
+		tags := append([]string(nil), r.Tags...)
+		sort.Strings(tags)
+		tagStr = " [" + strings.Join(tags, ",") + "]"
+	}
+	return fmt.Sprintf("- (remembered %s, w=%.2f)%s %s\n",
+		r.TS.UTC().Format("2006-01-02"), r.Weight, tagStr, r.Content)
+}
+
+func boundedMemoryContent(content string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(content) <= maxBytes {
+		return content
+	}
+	marker := "\n... [memory content bounded by core] ...\n"
+	if len(marker) >= maxBytes {
+		return validToolResultPrefix(content, maxBytes)
+	}
+	available := maxBytes - len(marker)
+	head := available * 3 / 4
+	tail := available - head
+	return validToolResultPrefix(content, head) + marker + validToolResultSuffix(content, tail)
 }
 
 // embed calls the active embedding backend. Public so the tool-RAG

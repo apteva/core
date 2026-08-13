@@ -234,23 +234,17 @@ func prepareComputerScreenshotTail(messages []Message) []Message {
 }
 
 // checkpointHistoryWindow trims history in occasional blocks instead of
-// deleting one oldest message on nearly every turn. maxHistory remains the
-// steady-state target: main/lead threads trigger above 120 and return to 80;
-// workers trigger above 24 and return to 16. The caller owns the intentional
-// cache-epoch reset caused by a successful checkpoint.
+// deleting one oldest message on nearly every turn. maxHistory is the retained
+// target: main/lead threads trigger above 200 and return to 100; workers trigger
+// above 40 and return to 20. Large historical tool payloads have an independent
+// aggregate bound, so allowing this wider message window does not restore
+// unbounded results. The caller owns the one cache reset per checkpoint.
 func checkpointHistoryWindow(messages []Message, maxHistory int, protectedToolCallIDs map[string]bool) ([]Message, int) {
 	if len(messages) <= 1 || maxHistory <= 0 {
 		return messages, 0
 	}
-	margin := maxHistory / 5
-	if margin < 4 {
-		margin = 4
-	}
-	upper := maxHistory + margin
-	target := maxHistory - margin
-	if target < 1 {
-		target = 1
-	}
+	upper := maxHistory * 2
+	target := maxHistory
 	if len(messages)-1 <= upper {
 		return messages, 0
 	}

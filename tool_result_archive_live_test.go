@@ -77,6 +77,11 @@ func runLiveLargeToolResultRetention(t *testing.T, provider LLMProvider) {
 	for i := 0; i < toolResultFullRetentionCalls; i++ {
 		thinker.markToolResultsConsumed(thinker.messages)
 	}
+	// Production commits mature results at an aggregate retention/history
+	// checkpoint instead of rewriting one result per model turn.
+	if committed := thinker.commitMatureToolResults(thinker.messages); committed != 1 {
+		t.Fatalf("%s committed mature results=%d, want 1", provider.Name(), committed)
+	}
 	agedMessages := append(cloneMessages(thinker.messages), Message{
 		Role:    "user",
 		Content: "If the old tool result is now explicitly marked as truncated by core, reply exactly BOUNDED_HISTORY_OK.",

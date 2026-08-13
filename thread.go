@@ -713,6 +713,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		memory:                 tm.parent.memory,
 		session:                NewSession(".", id),
 		toolResultAge:          map[string]int{},
+		toolResultHistorical:   map[string]bool{},
 		threadID:               id,
 		apiLog:                 tm.parent.apiLog,
 		apiMu:                  tm.parent.apiMu,

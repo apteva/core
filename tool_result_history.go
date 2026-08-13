@@ -5,6 +5,12 @@ import "fmt"
 const (
 	largeToolResultThresholdBytes = 16 << 10
 	toolResultFullRetentionCalls  = 3
+
+	// Mature results are projected as one block instead of turning a rolling
+	// browser workflow into one prompt-cache reset per action.
+	toolResultProjectionBatchSize  = 12
+	toolResultProjectionBatchChars = 512 << 10
+	toolResultProjectionMaxAge     = 16
 )
 
 func toolResultKey(result ToolResult) string {
@@ -47,9 +53,16 @@ func (t *Thinker) archiveToolResultMessage(message Message) Message {
 	if t.toolResultAge == nil {
 		t.toolResultAge = make(map[string]int)
 	}
+	if t.toolResultHistorical == nil {
+		t.toolResultHistorical = make(map[string]bool)
+	}
 	for _, result := range message.ToolResults {
 		if key := toolResultKey(result); key != "" {
 			delete(t.toolResultAge, key)
+			delete(t.toolResultHistorical, key)
+			if result.ContentIsPreview {
+				t.toolResultHistorical[key] = true
+			}
 		}
 	}
 	t.toolResultMu.Unlock()
@@ -57,14 +70,17 @@ func (t *Thinker) archiveToolResultMessage(message Message) Message {
 }
 
 // markToolResultsConsumed advances an internal retention clock once per
-// successful provider request. Crossing the boundary is an intentional,
-// infrequent prefix rewrite, so it also advances the cache epoch.
+// successful provider request. Crossing the maturity boundary only makes a
+// result eligible for the next block projection; it does not rewrite an old
+// request or rotate the prompt-cache epoch by itself.
 func (t *Thinker) markToolResultsConsumed(messages []Message) {
 	seen := make(map[string]bool)
-	expired := 0
 	t.toolResultMu.Lock()
 	if t.toolResultAge == nil {
 		t.toolResultAge = make(map[string]int)
+	}
+	if t.toolResultHistorical == nil {
+		t.toolResultHistorical = make(map[string]bool)
 	}
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
@@ -74,26 +90,15 @@ func (t *Thinker) markToolResultsConsumed(messages []Message) {
 			}
 			seen[key] = true
 			if result.ContentIsPreview {
-				t.toolResultAge[key] = toolResultFullRetentionCalls
+				t.toolResultHistorical[key] = true
 				continue
 			}
-			age := t.toolResultAge[key]
-			if age < toolResultFullRetentionCalls {
-				age++
-				t.toolResultAge[key] = age
-				if age == toolResultFullRetentionCalls && shouldArchiveToolResult(result) {
-					expired++
-				}
+			if !t.toolResultHistorical[key] {
+				t.toolResultAge[key]++
 			}
 		}
 	}
 	t.toolResultMu.Unlock()
-	if expired > 0 {
-		t.advancePromptCacheEpoch("tool_result_retention_expired", false, map[string]any{
-			"results_expired": expired,
-			"retention_calls": toolResultFullRetentionCalls,
-		})
-	}
 }
 
 func (t *Thinker) markLoadedToolResultsHistorical(messages []Message) {
@@ -102,10 +107,14 @@ func (t *Thinker) markLoadedToolResultsHistorical(messages []Message) {
 	if t.toolResultAge == nil {
 		t.toolResultAge = make(map[string]int)
 	}
+	if t.toolResultHistorical == nil {
+		t.toolResultHistorical = make(map[string]bool)
+	}
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
 			if key := toolResultKey(result); key != "" {
 				t.toolResultAge[key] = toolResultFullRetentionCalls
+				t.toolResultHistorical[key] = true
 			}
 		}
 	}
@@ -121,7 +130,73 @@ func (t *Thinker) toolResultIsHistorical(result ToolResult) bool {
 	}
 	t.toolResultMu.Lock()
 	defer t.toolResultMu.Unlock()
-	return t.toolResultAge[key] >= toolResultFullRetentionCalls
+	return t.toolResultHistorical[key]
+}
+
+type toolResultProjectionStats struct {
+	count  int
+	chars  int
+	maxAge int
+}
+
+func (t *Thinker) matureToolResultStats(messages []Message) toolResultProjectionStats {
+	var stats toolResultProjectionStats
+	seen := make(map[string]bool)
+	t.toolResultMu.Lock()
+	defer t.toolResultMu.Unlock()
+	for _, message := range messages {
+		for _, result := range message.ToolResults {
+			key := toolResultKey(result)
+			if key == "" || seen[key] || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
+				continue
+			}
+			seen[key] = true
+			age := t.toolResultAge[key]
+			if age < toolResultFullRetentionCalls {
+				continue
+			}
+			stats.count++
+			stats.chars += len(result.Content)
+			if age > stats.maxAge {
+				stats.maxAge = age
+			}
+		}
+	}
+	return stats
+}
+
+func toolResultProjectionBatchReady(stats toolResultProjectionStats) bool {
+	return stats.count >= toolResultProjectionBatchSize ||
+		stats.chars >= toolResultProjectionBatchChars ||
+		stats.maxAge >= toolResultProjectionMaxAge
+}
+
+// commitMatureToolResults switches every eligible retained result to the
+// provider-only bounded projection in one operation. The durable archive and
+// in-memory full payload remain untouched.
+func (t *Thinker) commitMatureToolResults(messages []Message) int {
+	committed := 0
+	seen := make(map[string]bool)
+	t.toolResultMu.Lock()
+	defer t.toolResultMu.Unlock()
+	if t.toolResultHistorical == nil {
+		t.toolResultHistorical = make(map[string]bool)
+	}
+	for _, message := range messages {
+		for _, result := range message.ToolResults {
+			key := toolResultKey(result)
+			if key == "" || seen[key] || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
+				continue
+			}
+			seen[key] = true
+			if t.toolResultAge[key] < toolResultFullRetentionCalls {
+				continue
+			}
+			t.toolResultHistorical[key] = true
+			committed++
+		}
+	}
+	return committed
 }
 
 // prepareHistoricalToolResults leaves recent results byte-for-byte unchanged.
