@@ -104,12 +104,11 @@ func persistentThreadByID(threads []PersistentThread, id string) (PersistentThre
 func TestAPICreatedThreadPersistsEffectiveStateAndRestores(t *testing.T) {
 	api, thinker, provider := newPersistentThreadTestAPI(t)
 	w := postThreadForTest(t, api, "chat-persisted", map[string]any{
-		"directive":    "Handle this durable CRM conversation.",
-		"tools":        []string{"crm_lookup_contact"},
-		"mcp":          []string{"crm"},
-		"model":        "medium",
-		"reasoning":    "low",
-		"conversation": true,
+		"directive": "Handle this durable CRM conversation.",
+		"tools":     []string{"crm_lookup_contact"},
+		"mcp":       []string{"crm"},
+		"model":     "medium",
+		"reasoning": "low",
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("spawn status = %d, want 200: %s", w.Code, w.Body.String())
@@ -125,8 +124,8 @@ func TestAPICreatedThreadPersistsEffectiveStateAndRestores(t *testing.T) {
 	if stored.Provider != provider.Name() || stored.Model != "medium" || stored.Reasoning != "low" {
 		t.Fatalf("stored effective provider profile mismatch: %#v", stored)
 	}
-	if !stored.Conversation || !slices.Equal(stored.MCPNames, []string{"crm"}) {
-		t.Fatalf("stored conversation/MCP state mismatch: %#v", stored)
+	if !slices.Equal(stored.MCPNames, []string{"crm"}) {
+		t.Fatalf("stored MCP state mismatch: %#v", stored)
 	}
 	for _, want := range []string{"crm_lookup_contact", "send", "done", "pace", "evolve", "search_tools"} {
 		if !slices.Contains(stored.Tools, want) {
@@ -153,7 +152,7 @@ func TestAPICreatedThreadPersistsEffectiveStateAndRestores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restored state: %v", err)
 	}
-	if restored.Directive != stored.Directive || restored.Provider != stored.Provider || restored.Model != stored.Model || restored.Reasoning != stored.Reasoning || restored.Conversation != stored.Conversation {
+	if restored.Directive != stored.Directive || restored.Provider != stored.Provider || restored.Model != stored.Model || restored.Reasoning != stored.Reasoning {
 		t.Fatalf("restored effective state changed:\n stored=%#v\nrestored=%#v", stored, restored)
 	}
 	if !slices.Equal(restored.MCPNames, stored.MCPNames) || !slices.Equal(restored.Tools, stored.Tools) {
@@ -170,10 +169,9 @@ func TestAPIRealtimeTurnDetectionPersistsAndRestoresIntoSession(t *testing.T) {
 	thinker.pool.realtimeDefault = realtimeProvider.Name()
 
 	w := postThreadForTest(t, api, "voice-persisted", map[string]any{
-		"directive":    "Handle telephone calls safely.",
-		"realtime":     true,
-		"conversation": true,
-		"provider":     realtimeProvider.Name(),
+		"directive": "Handle telephone calls safely.",
+		"realtime":  true,
+		"provider":  realtimeProvider.Name(),
 		"turn_detection": map[string]any{
 			"profile": "telephony",
 		},
@@ -222,7 +220,7 @@ func TestAPIRealtimeTurnDetectionPersistsAndRestoresIntoSession(t *testing.T) {
 	if err := restoredParent.threads.SpawnWithOpts(
 		reloadedState.ID, reloadedState.Directive, reloadedState.Tools,
 		SpawnOpts{
-			Realtime: true, Conversation: reloadedState.Conversation, DeferRun: true,
+			Realtime: true, DeferRun: true,
 			ProviderName: restoredRealtimeProvider.Name(), Voice: reloadedState.Voice,
 			TurnDetection: realtimeTurnDetectionValue(reloadedState.TurnDetection),
 		},
@@ -313,9 +311,8 @@ func TestAPIDefaultRealtimeFieldsCreateAndPersistOrdinaryThreadWithoutRealtimePr
 func TestAPIEphemeralThreadNeverEntersPersistentConfig(t *testing.T) {
 	api, thinker, provider := newPersistentThreadTestAPI(t)
 	w := postThreadForTest(t, api, "chat-ephemeral", map[string]any{
-		"directive":    "Temporary conversation.",
-		"conversation": true,
-		"ephemeral":    true,
+		"directive": "Temporary event-driven thread.",
+		"ephemeral": true,
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("spawn status = %d, want 200: %s", w.Code, w.Body.String())
@@ -326,8 +323,7 @@ func TestAPIEphemeralThreadNeverEntersPersistentConfig(t *testing.T) {
 	waitForParkedAPIProvider(t, provider)
 
 	update, _ := json.Marshal(map[string]any{
-		"directive":    "Updated temporary conversation.",
-		"conversation": true,
+		"directive": "Updated temporary event-driven thread.",
 	})
 	req := httptest.NewRequest(http.MethodPut, "/threads/chat-ephemeral", bytes.NewReader(update))
 	updated := httptest.NewRecorder()
@@ -356,8 +352,7 @@ func TestAPIEphemeralThreadNeverEntersPersistentConfig(t *testing.T) {
 	}
 
 	w = postThreadForTest(t, api, "chat-ephemeral", map[string]any{
-		"conversation": true,
-		"ephemeral":    true,
+		"ephemeral": true,
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("idempotent repost status = %d, want 200: %s", w.Code, w.Body.String())
@@ -384,6 +379,8 @@ func TestAPIExistingUnpersistedThreadIsBackfilled(t *testing.T) {
 	}
 	waitForParkedAPIProvider(t, provider)
 
+	// Older server versions may still send the removed field during a rolling
+	// upgrade. It is an inert unknown field and must not block normal backfill.
 	w := postThreadForTest(t, api, "legacy-live", map[string]any{"conversation": true})
 	if w.Code != http.StatusOK {
 		t.Fatalf("backfill status = %d, want 200: %s", w.Code, w.Body.String())
@@ -395,9 +392,9 @@ func TestAPIExistingUnpersistedThreadIsBackfilled(t *testing.T) {
 	if response["status"] != "exists" {
 		t.Fatalf("status = %v, want exists", response["status"])
 	}
-	stored, ok := persistentThreadByID(thinker.config.GetThreads(), "legacy-live")
-	if !ok || !stored.Conversation {
-		t.Fatalf("existing live thread was not backfilled/upgraded: %#v", thinker.config.GetThreads())
+	_, ok := persistentThreadByID(thinker.config.GetThreads(), "legacy-live")
+	if !ok {
+		t.Fatalf("existing live thread was not backfilled: %#v", thinker.config.GetThreads())
 	}
 }
 

@@ -22,6 +22,17 @@ type PersistentPaceState struct {
 	NextWakeAt time.Time `json:"next_wake_at,omitempty"`
 }
 
+// PersistentThreadEvent is an idempotent API-created inbox event. Pending
+// entries retain their payload so they can be replayed after a crash;
+// consumed entries retain only ID+hash as the bounded deduplication ledger.
+type PersistentThreadEvent struct {
+	ID       string        `json:"id"`
+	Hash     string        `json:"hash"`
+	Text     string        `json:"text,omitempty"`
+	Parts    []ContentPart `json:"parts,omitempty"`
+	Consumed bool          `json:"consumed,omitempty"`
+}
+
 type PersistentThread struct {
 	ID            string                       `json:"id"`
 	Name          string                       `json:"name,omitempty"`      // human-readable label; empty = display as ID
@@ -35,11 +46,11 @@ type PersistentThread struct {
 	Reasoning     string                       `json:"reasoning,omitempty"`      // starting reasoning effort: auto, low, medium, high, ...
 	Provider      string                       `json:"provider,omitempty"`       // provider selected for this thread
 	Realtime      bool                         `json:"realtime,omitempty"`       // spawn as a realtime (voice/audio) thread
-	Conversation  bool                         `json:"conversation,omitempty"`   // user-facing conversation; no mandatory completion report to parent
 	AllowNoSpawn  bool                         `json:"allow_no_spawn,omitempty"` // authenticated system/API grant for explicitly attached no_spawn MCPs
 	Voice         string                       `json:"voice,omitempty"`          // realtime voice id (e.g. "marin"); empty = provider default
 	TurnDetection *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"` // realtime VAD/turn-taking profile and overrides
 	Pace          *PersistentPaceState         `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
+	Events        []PersistentThreadEvent      `json:"events,omitempty"`         // pending inbox payloads + bounded consumed-ID ledger
 }
 
 // RunMode controls the agent's safety behavior via system prompt guidance.
@@ -392,6 +403,7 @@ func (c *Config) GetThreads() []PersistentThread {
 	for i := range out {
 		out[i].Pace = clonePersistentPaceState(out[i].Pace)
 		out[i].TurnDetection = cloneRealtimeTurnDetectionConfig(out[i].TurnDetection)
+		out[i].Events = clonePersistentThreadEvents(out[i].Events)
 	}
 	return out
 }

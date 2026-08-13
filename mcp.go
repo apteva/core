@@ -184,7 +184,7 @@ type MCPServerConfig struct {
 	// flag when registering those entries. The privileged HTTP spawn
 	// path (POST /threads/{id}) sets SpawnOpts.BypassNoSpawn to
 	// punch through this filter for system-initiated workers
-	// (channelchat's chat-handling thread needs `channels`).
+	// (an authenticated platform thread may need a protected server).
 	NoSpawn bool `json:"no_spawn,omitempty"`
 }
 

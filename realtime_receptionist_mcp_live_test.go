@@ -623,7 +623,6 @@ func runRealtimeReceptionistMCP(t *testing.T, providerName, voice string, scenar
 		[]string{receptionAvailabilityTool, receptionBookingTool},
 		SpawnOpts{
 			Realtime:       true,
-			Conversation:   true,
 			Ephemeral:      true,
 			ProviderName:   providerName,
 			Voice:          voice,

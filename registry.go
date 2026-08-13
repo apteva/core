@@ -134,7 +134,7 @@ func (tr *ToolRegistry) registerDefaults() {
 		Name:        "done",
 		Description: "Permanently terminate this thread. Send a final message and shut down.",
 		Syntax:      `[[done message="Final result"]]`,
-		Rules:       `PERMANENTLY kills this thread. A one-shot worker should call done after reporting any final result owed to its parent. Persistent or conversational threads should remain active after ordinary replies.`,
+		Rules:       `PERMANENTLY kills this thread. A one-shot worker should call done after reporting any final result owed to its parent. Persistent event-driven threads should remain active after ordinary replies.`,
 		Core:        true,
 		InputSchema: map[string]any{
 			"type": "object",

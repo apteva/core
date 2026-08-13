@@ -226,6 +226,7 @@ func cloneMessages(in []Message) []Message {
 		out[i].Parts = cloneContentParts(m.Parts)
 		out[i].ToolCalls = cloneToolCalls(m.ToolCalls)
 		out[i].ToolResults = cloneToolResults(m.ToolResults)
+		out[i].EventIDs = append([]string(nil), m.EventIDs...)
 	}
 	return out
 }

@@ -11,12 +11,12 @@ import (
 )
 
 func TestRealtimePromptKeepsReasoningPrivateWithoutChangingNormalWorkers(t *testing.T) {
-	normal := formatThreadBasePrompt(false, false, false, "worker", "main coordinator")
+	normal := formatThreadBasePrompt(false, false, "worker", "main coordinator")
 	if !strings.Contains(normal, "Think out loud") || strings.Contains(normal, "LIVE TURN-TAKING") {
 		t.Fatalf("normal worker prompt changed unexpectedly:\n%s", normal)
 	}
 
-	realtime := formatThreadBasePrompt(false, true, false, "voice", "main coordinator") + realtimeConversationPrompt
+	realtime := formatThreadBasePrompt(false, true, "voice", "main coordinator") + realtimeConversationPrompt
 	for _, forbidden := range []string{"Think out loud", "You MUST report results", "pace(sleep=\"5m\")"} {
 		if strings.Contains(realtime, forbidden) {
 			t.Fatalf("realtime prompt contains %q:\n%s", forbidden, realtime)

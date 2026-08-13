@@ -68,6 +68,10 @@ type Message struct {
 	ToolCalls     []NativeToolCall       `json:"tool_calls,omitempty"`     // assistant messages: structured tool calls
 	ToolResults   []ToolResult           `json:"tool_results,omitempty"`   // user messages: results for prior tool calls
 	ProviderState *ProviderResponseState `json:"provider_state,omitempty"` // opaque state for exact provider replay
+	// EventIDs records durable API inbox events represented by this user
+	// message. Providers never receive these identifiers; the session journal
+	// uses them to reconcile an accepted event across process restarts.
+	EventIDs []string `json:"-"`
 	// RequestContext marks transient retrieval context. It is carried only in
 	// the prepared provider request and is never written to session history.
 	RequestContext bool `json:"-"`

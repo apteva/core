@@ -37,6 +37,7 @@ type SessionEntry struct {
 	ToolResults   []ToolResult           `json:"tool_results,omitempty"`
 	Reasoning     string                 `json:"reasoning,omitempty"`
 	ProviderState *ProviderResponseState `json:"provider_state,omitempty"`
+	EventIDs      []string               `json:"event_ids,omitempty"`
 	Summary       string                 `json:"summary,omitempty"`        // for _compacted entries
 	OrigCount     int                    `json:"original_count,omitempty"` // how many messages were compacted
 	TokensIn      int                    `json:"tokens_in,omitempty"`
@@ -256,11 +257,41 @@ func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) er
 		ToolResults:   msg.ToolResults,
 		Reasoning:     msg.Reasoning,
 		ProviderState: msg.ProviderState,
+		EventIDs:      append([]string(nil), msg.EventIDs...),
 		TokensIn:      usage.PromptTokens,
 		TokensOut:     usage.CompletionTokens,
 		Iteration:     iteration,
 	}
 	return s.Append(entry)
+}
+
+// EventIDs returns durable API inbox IDs already represented in the session.
+// It is used only during thread restoration to close the crash window between
+// appending the user message and marking its inbox record consumed.
+func (s *Session) EventIDs() map[string]bool {
+	ids := map[string]bool{}
+	if s == nil {
+		return ids
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.Open(s.path)
+	if err != nil {
+		return ids
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxSessionEntryBytes)
+	for scanner.Scan() {
+		var entry SessionEntry
+		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
+			continue
+		}
+		for _, id := range entry.EventIDs {
+			ids[id] = true
+		}
+	}
+	return ids
 }
 
 // LoadTail reads the last n messages from the history file and converts them to Messages.
@@ -333,6 +364,7 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 			ToolResults:   e.ToolResults,
 			Reasoning:     e.Reasoning,
 			ProviderState: e.ProviderState,
+			EventIDs:      append([]string(nil), e.EventIDs...),
 		}
 		// Normalize role: "tool_result" → "user" with ToolResults
 		if e.Role == "tool_result" {

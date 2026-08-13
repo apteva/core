@@ -438,9 +438,8 @@ func (a *APIServer) threadAction(w http.ResponseWriter, r *http.Request) {
 
 // updateThread handles PUT /threads/{id} — change a live sub-thread's
 // directive (and optionally tools) WITHOUT killing it, so its session
-// (conversation history) survives. The chat-handling thread uses this
-// so an edit to the agent's directive reaches the live chat thread on
-// the next message rather than waiting for a server restart.
+// (conversation history) survives. This lets an authenticated caller update
+// a durable event-driven thread without waiting for a process restart.
 //
 // Directive precedence mirrors spawnThread exactly so PUT and POST
 // produce byte-identical system prompts:
@@ -456,7 +455,6 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		Directive       string   `json:"directive"`
 		DirectiveSuffix string   `json:"directive_suffix"`
 		Tools           []string `json:"tools,omitempty"`
-		Conversation    *bool    `json:"conversation,omitempty"`
 		RestartRealtime bool     `json:"restart_realtime,omitempty"`
 	}
 	if r.ContentLength > 0 {
@@ -470,16 +468,6 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		directive = a.thinker.config.GetDirective()
 		if body.DirectiveSuffix != "" {
 			directive = directive + body.DirectiveSuffix
-		}
-	}
-	if body.Conversation != nil {
-		if err := a.thinker.threads.SetConversationWithOpts(id, *body.Conversation, ThreadUpdateOptions{RestartRealtime: body.RestartRealtime}); err != nil {
-			status := http.StatusNotFound
-			if errors.Is(err, ErrRealtimeConfigurationRestartRequired) {
-				status = http.StatusConflict
-			}
-			http.Error(w, err.Error(), status)
-			return
 		}
 	}
 	result, err := a.thinker.threads.UpdateWithOpts(id, "", directive, body.Tools, ThreadUpdateOptions{RestartRealtime: body.RestartRealtime})
@@ -511,31 +499,126 @@ func resultStatus(changed bool, changedStatus, unchangedStatus string) string {
 	return unchangedStatus
 }
 
+const (
+	maxThreadEventsPerRequest  = 100
+	maxThreadEventIDBytes      = 256
+	maxThreadEventMessageBytes = 16 << 20
+)
+
+type apiThreadEventRequest struct {
+	ID         string          `json:"id"`
+	Message    json.RawMessage `json:"message"`
+	Type       json.RawMessage `json:"type,omitempty"`
+	From       json.RawMessage `json:"from,omitempty"`
+	To         json.RawMessage `json:"to,omitempty"`
+	ToolResult json.RawMessage `json:"tool_result,omitempty"`
+}
+
+func parseAPIEventMessage(raw json.RawMessage) (string, []ContentPart, error) {
+	if len(raw) == 0 || len(raw) > maxThreadEventMessageBytes {
+		return "", nil, fmt.Errorf("message must be present and no larger than %d bytes", maxThreadEventMessageBytes)
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if strings.TrimSpace(text) == "" {
+			return "", nil, fmt.Errorf("message required")
+		}
+		return text, nil, nil
+	}
+	var parts []ContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", nil, fmt.Errorf("message must be a string or array of content parts")
+	}
+	if len(parts) == 0 || len(parts) > 32 {
+		return "", nil, fmt.Errorf("message content parts must contain between 1 and 32 items")
+	}
+	var textParts []string
+	for i, part := range parts {
+		switch part.Type {
+		case "text":
+			if strings.TrimSpace(part.Text) == "" {
+				return "", nil, fmt.Errorf("message part %d: text required", i)
+			}
+			textParts = append(textParts, part.Text)
+		case "image_url":
+			if part.ImageURL == nil || strings.TrimSpace(part.ImageURL.URL) == "" {
+				return "", nil, fmt.Errorf("message part %d: image_url.url required", i)
+			}
+		case "input_audio":
+			if part.InputAudio == nil || strings.TrimSpace(part.InputAudio.Data) == "" || strings.TrimSpace(part.InputAudio.Format) == "" {
+				return "", nil, fmt.Errorf("message part %d: input_audio data and format required", i)
+			}
+		case "audio_url":
+			if part.AudioURL == nil || strings.TrimSpace(part.AudioURL.URL) == "" {
+				return "", nil, fmt.Errorf("message part %d: audio_url.url required", i)
+			}
+		default:
+			return "", nil, fmt.Errorf("message part %d: unsupported type %q", i, part.Type)
+		}
+	}
+	return strings.Join(textParts, "\n"), cloneContentParts(parts), nil
+}
+
+func normalizeAPIThreadEvents(requests []apiThreadEventRequest) ([]PersistentThreadEvent, error) {
+	if len(requests) > maxThreadEventsPerRequest {
+		return nil, fmt.Errorf("events may contain at most %d items", maxThreadEventsPerRequest)
+	}
+	events := make([]PersistentThreadEvent, 0, len(requests))
+	for i, request := range requests {
+		if len(request.Type) > 0 || len(request.From) > 0 || len(request.To) > 0 || len(request.ToolResult) > 0 {
+			return nil, fmt.Errorf("events[%d] may contain only id and message; event type, routing, sender, and tool results are internal", i)
+		}
+		id := strings.TrimSpace(request.ID)
+		if id == "" {
+			return nil, fmt.Errorf("events[%d].id required", i)
+		}
+		if len(id) > maxThreadEventIDBytes || strings.ContainsAny(id, "\r\n\x00") {
+			return nil, fmt.Errorf("events[%d].id must be at most %d bytes and contain no control separators", i, maxThreadEventIDBytes)
+		}
+		text, parts, err := parseAPIEventMessage(request.Message)
+		if err != nil {
+			return nil, fmt.Errorf("events[%d]: %w", i, err)
+		}
+		events = append(events, PersistentThreadEvent{
+			ID: id, Hash: threadEventHash(text, parts), Text: text, Parts: parts,
+		})
+	}
+	return events, nil
+}
+
+func threadEventsResponse(result ThreadEventQueueResult) map[string]any {
+	accepted := result.Accepted
+	duplicates := result.Duplicate
+	if accepted == nil {
+		accepted = []string{}
+	}
+	if duplicates == nil {
+		duplicates = []string{}
+	}
+	return map[string]any{"accepted": accepted, "duplicates": duplicates}
+}
+
+func writeThreadEventQueueError(w http.ResponseWriter, err error) {
+	var conflict *ThreadEventConflictError
+	var validation *ThreadEventValidationError
+	switch {
+	case errors.As(err, &conflict):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.As(err, &validation):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
 // persistAPIThread reconciles an idempotent API spawn request with the live
 // thread's durable state. Existing non-ephemeral threads are always backfilled,
 // which repairs threads created by older cores that returned "created" without
-// saving Config.Threads. A request may upgrade an existing thread to
-// conversation mode, but never demotes one.
-func (a *APIServer) persistAPIThread(id string, conversationRequested, ephemeralRequested bool) error {
-	before, err := a.thinker.threads.PersistentState(id)
-	if err != nil {
-		return err
-	}
+// saving Config.Threads.
+func (a *APIServer) persistAPIThread(id string, ephemeralRequested bool) error {
 	wasEphemeral, err := a.thinker.threads.EphemeralState(id)
 	if err != nil {
 		return err
-	}
-
-	conversationChanged := conversationRequested && !before.Conversation
-	if conversationChanged {
-		if err := a.thinker.threads.SetConversation(id, true); err != nil {
-			return err
-		}
-	}
-	rollbackConversation := func() {
-		if conversationChanged {
-			_ = a.thinker.threads.SetConversation(id, before.Conversation)
-		}
 	}
 
 	// Existing durable threads remain durable even if an idempotent repost
@@ -547,17 +630,14 @@ func (a *APIServer) persistAPIThread(id string, conversationRequested, ephemeral
 	}
 	state, err := a.thinker.threads.PersistentState(id)
 	if err != nil {
-		rollbackConversation()
 		return err
 	}
 	if err := a.thinker.config.SaveThread(state); err != nil {
-		rollbackConversation()
 		return fmt.Errorf("persist thread: %w", err)
 	}
 	if wasEphemeral && !ephemeralRequested {
 		if err := a.thinker.threads.SetEphemeral(id, false); err != nil {
 			removeErr := a.thinker.config.RemoveThread(id)
-			rollbackConversation()
 			if removeErr != nil {
 				return fmt.Errorf("promote live thread: %v (rollback persistence: %w)", err, removeErr)
 			}
@@ -579,10 +659,9 @@ func (a *APIServer) rollbackAPICreatedThread(id string) {
 }
 
 // spawnThread handles POST /threads/{id}. Idempotent: if the thread
-// already exists, returns its current state with status="exists". A
-// conversation request still upgrades an existing thread's reporting mode;
-// if not, spawns a new one with the given
-// directive + tools + mcp and returns status="created". Missing
+// already exists, returns its current state with status="exists". Otherwise it
+// spawns a new one with the given directive + tools + mcp and returns
+// status="created". Missing
 // fields fall back to inherit-from-main: directive=main's directive,
 // tools=[] (spawnInternal supplies the safe baseline: send, done,
 // pace, evolve), mcp=[].
@@ -601,13 +680,13 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		Tools                      []string                    `json:"tools"`
 		MCP                        []string                    `json:"mcp"`
 		Realtime                   bool                        `json:"realtime,omitempty"`
-		Conversation               bool                        `json:"conversation,omitempty"`
 		Ephemeral                  bool                        `json:"ephemeral,omitempty"`
 		Voice                      string                      `json:"voice,omitempty"`
 		ProviderName               string                      `json:"provider,omitempty"`
 		Model                      string                      `json:"model,omitempty"`
 		Reasoning                  string                      `json:"reasoning,omitempty"`
 		InitialMessage             string                      `json:"initial_message,omitempty"`
+		Events                     []apiThreadEventRequest     `json:"events,omitempty"`
 		BridgeDisconnectTTLSeconds int                         `json:"bridge_disconnect_ttl_seconds,omitempty"`
 		TurnDetection              RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`
 	}
@@ -617,20 +696,34 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 			return
 		}
 	}
+	normalizedEvents, err := normalizeAPIThreadEvents(body.Events)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	if t := findThinkerByID(a.thinker, id); t != nil {
 		// The server may lose its in-memory spawn cache while core keeps the
-		// thread alive. Preserve POST idempotency, restore the conversation
-		// reporting contract, and backfill a missing durable record.
-		if err := a.persistAPIThread(id, body.Conversation, body.Ephemeral); err != nil {
+		// thread alive. Preserve POST idempotency and backfill a missing
+		// durable record.
+		if err := a.persistAPIThread(id, body.Ephemeral); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, map[string]any{
+		eventResult, err := a.thinker.threads.QueueEvents(id, normalizedEvents)
+		if err != nil {
+			writeThreadEventQueueError(w, err)
+			return
+		}
+		resp := map[string]any{
 			"status":    "exists",
 			"id":        id,
 			"iteration": t.status().Iteration,
-		})
+		}
+		if body.Events != nil {
+			resp["events"] = threadEventsResponse(eventResult)
+		}
+		writeJSON(w, resp)
 		return
 	}
 
@@ -649,21 +742,20 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	}
 	// API-initiated spawns are privileged: the caller authenticated
 	// with the core API key, so this is the system itself asking for
-	// a sub-thread (e.g. channelchat's chat-handling thread needs the
-	// `channels` MCP, which is no_spawn-flagged to keep LLM-driven
-	// spawn tool calls from grabbing it). BypassNoSpawn lets the
-	// requested MCPs through; the LLM's spawn-tool path doesn't set
+	// a sub-thread. BypassNoSpawn lets explicitly requested MCPs through even
+	// when they are no_spawn-flagged to keep LLM-driven spawn tool calls from
+	// grabbing them. The LLM's spawn-tool path doesn't set
 	// this, so in-agent workers still can't escalate.
 	opts := SpawnOpts{
 		MCPNames:      body.MCP,
 		BypassNoSpawn: true,
 		Realtime:      body.Realtime,
-		Conversation:  body.Conversation,
 		Ephemeral:     body.Ephemeral,
 		Voice:         body.Voice,
 		TurnDetection: body.TurnDetection,
 		ProviderName:  body.ProviderName,
 		Model:         strings.ToLower(strings.TrimSpace(body.Model)),
+		DeferRun:      true,
 	}
 	if body.BridgeDisconnectTTLSeconds < 0 || body.BridgeDisconnectTTLSeconds > 3600 {
 		http.Error(w, "bridge_disconnect_ttl_seconds must be between 0 and 3600", http.StatusBadRequest)
@@ -730,19 +822,34 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		// success — the caller's intent (a live thread by this name)
 		// is satisfied.
 		if strings.Contains(err.Error(), "already exists") {
-			if err := a.persistAPIThread(id, body.Conversation, body.Ephemeral); err != nil {
+			if err := a.persistAPIThread(id, body.Ephemeral); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			writeJSON(w, map[string]any{"status": "exists", "id": id})
+			eventResult, queueErr := a.thinker.threads.QueueEvents(id, normalizedEvents)
+			if queueErr != nil {
+				writeThreadEventQueueError(w, queueErr)
+				return
+			}
+			resp := map[string]any{"status": "exists", "id": id}
+			if body.Events != nil {
+				resp["events"] = threadEventsResponse(eventResult)
+			}
+			writeJSON(w, resp)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := a.persistAPIThread(id, body.Conversation, body.Ephemeral); err != nil {
+	if err := a.persistAPIThread(id, body.Ephemeral); err != nil {
 		a.rollbackAPICreatedThread(id)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	eventResult, err := a.thinker.threads.QueueEvents(id, normalizedEvents)
+	if err != nil {
+		a.rollbackAPICreatedThread(id)
+		writeThreadEventQueueError(w, err)
 		return
 	}
 	// Publish a bridge token only after a persistent thread has crossed its
@@ -752,7 +859,15 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	if body.Realtime {
 		audioToken = registerAudioBridge(id, opts.AudioIn, opts.AudioOut, opts.AudioControl)
 	}
+	if err := a.thinker.threads.Start(id); err != nil {
+		a.rollbackAPICreatedThread(id)
+		http.Error(w, "start thread: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	resp := map[string]any{"status": "created", "id": id}
+	if body.Events != nil {
+		resp["events"] = threadEventsResponse(eventResult)
+	}
 	if body.Realtime {
 		resp["audio_token"] = audioToken
 		resp["format"] = map[string]any{"encoding": "pcm16", "sample_rate": 24000, "channels": 1}
@@ -912,27 +1027,11 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse message: string or []ContentPart
-	var text string
-	var parts []ContentPart
-
-	if err := json.Unmarshal(body.Message, &text); err != nil {
-		// Try array of content parts
-		if err := json.Unmarshal(body.Message, &parts); err != nil {
-			http.Error(w, "message must be a string or array of content parts", http.StatusBadRequest)
-			return
-		}
-		// Extract text from parts for the event bus
-		for _, p := range parts {
-			if p.Type == "text" {
-				text = p.Text
-				break
-			}
-		}
-	}
-
-	if text == "" && len(parts) == 0 {
-		http.Error(w, "message required", http.StatusBadRequest)
+	// Parse exactly the same safe text/multimodal envelope accepted by the
+	// thread-creation events field.
+	text, parts, err := parseAPIEventMessage(body.Message)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -954,8 +1053,8 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	// handles:
 	//   - a caller that addresses threads by name without first calling
 	//     POST /threads/{id} (slack/email channels, ad-hoc scripts).
-	//   - post-restart recovery: a persisted thread id (e.g. channelchat's
-	//     stored chat-<id>) survives in the caller's DB but core's
+	//   - post-restart recovery: a persisted thread id survives in the caller's
+	//     data store but core's
 	//     in-memory thread tree is empty after restart.
 	// The "already exists" race is handled the same way as in
 	// spawnThread — treat as success.
@@ -972,7 +1071,7 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 			created = true
 			logMsg("API", fmt.Sprintf("lazy-spawned thread %q for inbound event", threadID))
 		}
-		if err := a.persistAPIThread(threadID, false, false); err != nil {
+		if err := a.persistAPIThread(threadID, false); err != nil {
 			if created {
 				a.rollbackAPICreatedThread(threadID)
 			}

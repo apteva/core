@@ -823,28 +823,27 @@ func TestWorkerSendReceiptKicksAndDeliversToMain(t *testing.T) {
 	}
 }
 
-func TestConversationSendToMainUsesAuthoritativeRelayEnvelope(t *testing.T) {
+func TestAPIStyleThreadSendToMainRemainsOrdinaryThreadMessage(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
-	if err := thinker.threads.SpawnWithOpts("chat-test", "Relay owner requests.", nil, SpawnOpts{
-		DeferRun:     true,
-		Conversation: true,
+	if err := thinker.threads.SpawnWithOpts("chat-test", "Relay requests.", nil, SpawnOpts{
+		DeferRun: true,
 	}); err != nil {
-		t.Fatalf("spawn conversation: %v", err)
+		t.Fatalf("spawn API-style thread: %v", err)
 	}
 	thinker.drainEventTexts()
-	conversation := thinker.threads.threads["chat-test"]
+	thread := thinker.threads.threads["chat-test"]
 
-	_, _, results := threadToolHandler(conversation, thinker.threads)(conversation.Thinker, []toolCall{{
+	_, _, results := threadToolHandler(thread, thinker.threads)(thread.Thinker, []toolCall{{
 		Name:     "send",
 		Args:     map[string]string{"id": "main", "message": "From now on, run the daily check-in at 10:00 UTC."},
 		Raw:      "send",
 		NativeID: "send-conversation",
 	}}, nil)
 	if len(results) != 1 || results[0].IsError {
-		t.Fatalf("conversation send result = %+v", results)
+		t.Fatalf("thread send result = %+v", results)
 	}
-	if got := thinker.drainEventTexts(); len(got) != 1 || got[0] != "[from-conversation:chat-test] From now on, run the daily check-in at 10:00 UTC." {
+	if got := thinker.drainEventTexts(); len(got) != 1 || got[0] != "[from:chat-test] From now on, run the daily check-in at 10:00 UTC." {
 		t.Fatalf("main inbox = %v", got)
 	}
 }

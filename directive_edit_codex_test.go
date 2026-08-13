@@ -201,14 +201,14 @@ func runAlreadyCurrentEvolveStillRepliesSmoke(t *testing.T, provider LLMProvider
 	cfg := &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive, Mode: ModeAutonomous}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
-	if err := thinker.threads.SpawnWithOpts("chat-test", "# Role\nRelay confirmations to the operator.", []string{"send", "pace"}, SpawnOpts{DeferRun: true, Conversation: true}); err != nil {
-		t.Fatalf("spawn waiting conversation thread: %v", err)
+	if err := thinker.threads.SpawnWithOpts("chat-test", "# Role\nRelay confirmations to the operator.", []string{"send", "pace"}, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn waiting reply thread: %v", err)
 	}
 	thinker.bus.Publish(Event{
 		Type: EventInbox,
 		From: "chat-test",
 		To:   "main",
-		Text: `[from-conversation:chat-test] The operator asked for the existing daily 09:00 UTC notification policy. Confirm the durable configuration back to me with send(id="chat-test", message="...") before going idle; the user is waiting.`,
+		Text: `[console] The operator asked for the existing daily 09:00 UTC notification policy. Confirm the durable configuration back to chat-test with send(id="chat-test", message="...") before going idle; the user is waiting.`,
 	})
 	started := time.Now()
 	go thinker.Run()

@@ -20,6 +20,10 @@ const (
 
 // Event is the single message type flowing through the system.
 type Event struct {
+	// ID is an optional caller-supplied durable inbox identifier. It is used
+	// only for idempotent API delivery and is never interpreted as an internal
+	// event type or exposed to the model.
+	ID   string
 	Type string // one of the Event* constants
 	From string // source: "main", thread ID, "tui", "api", "tool:name"
 	To   string // target subscriber ID; "" = broadcast

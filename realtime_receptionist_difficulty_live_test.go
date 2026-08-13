@@ -326,7 +326,7 @@ func runRealtimeReceptionistDifficulty(
 		directive,
 		allowedTools,
 		SpawnOpts{
-			Realtime: true, Conversation: true, Ephemeral: true,
+			Realtime: true, Ephemeral: true,
 			ProviderName: providerName, Voice: voice, MCPNames: []string{"reception"},
 			Reasoning: ReasoningHigh,
 			AudioIn:   audioIn, AudioOut: audioOut, AudioControl: audioControl,

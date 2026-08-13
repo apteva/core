@@ -49,9 +49,9 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 		"chat-test",
 		"# Role\nHandle a user conversation. Hand durable work to main and wait for main's actual reply before confirming completion.",
 		[]string{"send", "pace"},
-		SpawnOpts{DeferRun: true, Conversation: true},
+		SpawnOpts{DeferRun: true},
 	); err != nil {
-		t.Fatalf("spawn conversation thread: %v", err)
+		t.Fatalf("spawn user-facing event thread: %v", err)
 	}
 	thinker.drainEventTexts() // discard the thread-started event on main
 	worker := thinker.threads.threads["chat-test"]
@@ -135,7 +135,7 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 				t.Fatalf("send calls=%d, want exactly one", sendCalls)
 			}
 			mainEvents := thinker.drainEventTexts()
-			if len(mainEvents) != 1 || !strings.Contains(mainEvents[0], "[from-conversation:chat-test]") ||
+			if len(mainEvents) != 1 || !strings.Contains(mainEvents[0], "[from:chat-test]") ||
 				!strings.Contains(mainEvents[0], "durable daily check-in") {
 				t.Fatalf("main inbox = %v", mainEvents)
 			}

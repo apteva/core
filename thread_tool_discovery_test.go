@@ -392,17 +392,17 @@ func TestPrivilegedAPIStyleThreadKeepsExplicitNoSpawnGrant(t *testing.T) {
 		true, &MCPToolLoadingConfig{Default: ToolLoadAlways},
 	)
 	if err := fixture.parent.threads.SpawnWithOpts(
-		"privileged-conversation", "Handle an authenticated conversation.", nil,
+		"privileged-api-thread", "Handle authenticated API events.", nil,
 		SpawnOpts{
-			DeferRun: true, Conversation: true,
+			DeferRun: true,
 			MCPNames: []string{"channels"}, BypassNoSpawn: true,
 		},
 	); err != nil {
-		t.Fatalf("spawn privileged conversation: %v", err)
+		t.Fatalf("spawn privileged API thread: %v", err)
 	}
-	thread := fixture.parent.threads.threads["privileged-conversation"]
+	thread := fixture.parent.threads.threads["privileged-api-thread"]
 	if thread == nil {
-		t.Fatal("privileged conversation missing")
+		t.Fatal("privileged API thread missing")
 	}
 	presented := nativeToolNames(thread.Thinker.prepareNativeTools("openai-codex"))
 	if !presented[toolName] {
@@ -424,11 +424,11 @@ func TestPrivilegedAPIStyleThreadKeepsExplicitNoSpawnGrant(t *testing.T) {
 	if err := fixture.parent.threads.SpawnWithOpts(
 		"privileged-restored", persisted.Directive, persisted.Tools,
 		SpawnOpts{
-			DeferRun: true, Conversation: persisted.Conversation,
+			DeferRun: true,
 			MCPNames: persisted.MCPNames, BypassNoSpawn: persisted.AllowNoSpawn,
 		},
 	); err != nil {
-		t.Fatalf("restore privileged conversation: %v", err)
+		t.Fatalf("restore privileged API thread: %v", err)
 	}
 	restored := fixture.parent.threads.threads["privileged-restored"]
 	if !nativeToolNames(restored.Thinker.prepareNativeTools("openai-codex"))[toolName] {
@@ -441,38 +441,6 @@ func TestPrivilegedAPIStyleThreadKeepsExplicitNoSpawnGrant(t *testing.T) {
 	restoredResult := waitForWorkerToolResult(t, restored.Thinker, "restored-privileged-call")
 	if restoredResult.IsError || fixture.calls.Load() != 2 {
 		t.Fatalf("restored privileged result=%+v calls=%d", restoredResult, fixture.calls.Load())
-	}
-}
-
-func TestLegacyConversationNoSpawnGrantRestoresOnlyNamedScope(t *testing.T) {
-	index := NewToolIndex()
-	index.Add("channels", []mcpToolDef{{
-		Name: "send", Description: "Send a conversation reply.",
-	}}, true)
-	index.Add("crm", []mcpToolDef{{
-		Name: "lookup", Description: "Look up a contact.",
-	}}, false)
-
-	legacyConversation := PersistentThread{
-		Conversation: true,
-		Tools:        []string{"channels_send"},
-		MCPNames:     []string{"channels"},
-	}
-	if !persistentThreadAllowsNoSpawn(legacyConversation, index) {
-		t.Fatal("legacy API conversation lost its explicitly persisted no_spawn scope")
-	}
-	ordinaryWorker := legacyConversation
-	ordinaryWorker.Conversation = false
-	if persistentThreadAllowsNoSpawn(ordinaryWorker, index) {
-		t.Fatal("ordinary worker inherited the legacy conversation migration")
-	}
-	ordinaryConversation := PersistentThread{
-		Conversation: true,
-		Tools:        []string{"crm_lookup"},
-		MCPNames:     []string{"crm"},
-	}
-	if persistentThreadAllowsNoSpawn(ordinaryConversation, index) {
-		t.Fatal("conversation without a named no_spawn scope was over-granted")
 	}
 }
 

@@ -1218,6 +1218,27 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	}
 	if err := rt.requestTextResponse(note); err != nil {
 		logMsg("REALTIME", fmt.Sprintf("[%s] inject text: %v", rt.threadID, err))
+		return
+	}
+	if event.ID != "" {
+		message := Message{Role: "user", Content: note, EventIDs: []string{event.ID}}
+		rt.transcriptMu.Lock()
+		rt.messages = append(rt.messages, message)
+		rt.publishContextStatus()
+		rt.transcriptMu.Unlock()
+		persisted := rt.Thinker.session == nil
+		if rt.Thinker.session != nil {
+			if err := rt.Thinker.session.AppendMessage(message, rt.iteration, TokenUsage{}); err != nil {
+				logMsg("SESSION", fmt.Sprintf("[%s] persist realtime inbox event: %v", rt.threadID, err))
+			} else {
+				persisted = true
+			}
+		}
+		if persisted && rt.Thinker.ackInboxEvents != nil {
+			if err := rt.Thinker.ackInboxEvents([]string{event.ID}); err != nil {
+				logMsg("SESSION", fmt.Sprintf("[%s] acknowledge realtime inbox event: %v", rt.threadID, err))
+			}
+		}
 	}
 }
 

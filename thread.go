@@ -113,17 +113,6 @@ const realtimeThreadPacingPrompt = `LIVE TURN-TAKING:
 - The live session listens automatically after each response. Do not use pace as a conversational wait mechanism.
 - If the caller interrupts, stop the stale utterance and address the new input.`
 
-const conversationThreadReportingPrompt = `- You are a user-facing conversation, not a one-shot worker. The generic worker requirement to send a final completion report to parent does not apply.
-- If the conversation-specific directive requires a visible acknowledgement before a durable parent handoff, deliver that acknowledgement first and wait for its receipt. It is user-facing progress, not a parent report.
-- Use send to consult or hand durable work to your parent only when needed. That send wakes the target immediately; wait for its result.
-- After your parent replies and you deliver the caller-facing result, the turn is complete. Never send an acknowledgement, confirmation, or completion report back to parent.`
-
-const conversationThreadIdlePrompt = `- When the current user turn is complete, normally wait only for another event. Clear any obsolete pending automatic wake with pace(clear_wake=true). No parent completion report is required.`
-
-const conversationThreadPacingPrompt = `CONVERSATION PACING:
-- Tool results and parent replies wake you automatically. Do not poll or short-sleep while waiting for them.
-- Use pace only when no work or reply is pending and you are ready for the next user message.`
-
 const realtimeConversationPrompt = `
 
 [REALTIME CONVERSATION]
@@ -136,7 +125,7 @@ const realtimeConversationPrompt = `
 - Treat partial, garbled, overlapping, or low-confidence audio as uncertain. Ask one concise clarification and do not infer critical details or take consequential action until they are explicitly confirmed.
 - Spoken audio is exclusively caller-facing. Private reasoning and internal coordination may appear in telemetry, but never in speech.`
 
-func formatThreadBasePrompt(canSpawn, realtime, conversation bool, id, parentLabel string) string {
+func formatThreadBasePrompt(canSpawn, realtime bool, id, parentLabel string) string {
 	template := baseThreadPromptTemplate
 	if canSpawn {
 		template = leaderThreadPromptTemplate
@@ -151,10 +140,6 @@ func formatThreadBasePrompt(canSpawn, realtime, conversation bool, id, parentLab
 		idle = realtimeThreadIdlePrompt
 		reasoning = realtimeThreadReasoningPrompt
 		pacing = realtimeThreadPacingPrompt
-	} else if conversation {
-		reporting = conversationThreadReportingPrompt
-		idle = conversationThreadIdlePrompt
-		pacing = conversationThreadPacingPrompt
 	}
 	prompt = strings.ReplaceAll(prompt, "{{REPORTING}}", reporting)
 	prompt = strings.ReplaceAll(prompt, "{{IDLE}}", idle)
@@ -206,22 +191,21 @@ type Thread struct {
 	System bool   // platform-managed thread, not an agent-addressable worker
 	// Name can be edited via update without touching parent_id
 	// references or session storage. Empty means "use ID for display".
-	ParentID       string   // "main" or parent thread ID
-	Depth          int      // 0 = child of main, 1 = grandchild, etc.
-	Directive      string   // original directive before tool docs
-	MCPNames       []string // MCP server names this thread connected to
-	Thinker        *Thinker
-	Realtime       *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
-	IsRealtime     bool
-	IsConversation bool
-	AllowNoSpawn   bool
-	Voice          string
-	TurnDetection  RealtimeTurnDetectionConfig
-	ProviderName   string
-	Ephemeral      bool
-	audioIn        chan []byte
-	audioOut       chan RealtimeAudioFrame
-	audioControl   chan string
+	ParentID      string   // "main" or parent thread ID
+	Depth         int      // 0 = child of main, 1 = grandchild, etc.
+	Directive     string   // original directive before tool docs
+	MCPNames      []string // MCP server names this thread connected to
+	Thinker       *Thinker
+	Realtime      *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
+	IsRealtime    bool
+	AllowNoSpawn  bool
+	Voice         string
+	TurnDetection RealtimeTurnDetectionConfig
+	ProviderName  string
+	Ephemeral     bool
+	audioIn       chan []byte
+	audioOut      chan RealtimeAudioFrame
+	audioControl  chan string
 	// BridgeDisconnectTTL is set only for caller-owned realtime sessions
 	// (the dashboard currently uses it). A zero value preserves the existing
 	// sidecar/telephony behaviour: losing the audio bridge does not kill the
@@ -230,13 +214,16 @@ type Thread struct {
 	bridgeCleanupTimer  *time.Timer
 	bridgeConnected     bool
 	initialMessage      string
-	promptBuilder       func(directive string, conversation bool) string
+	promptBuilder       func(directive string) string
 	Parent              *Thinker
 	Children            *ThreadManager // non-nil if this thread can spawn (depth < MaxSpawnDepth)
 	Tools               map[string]bool
 	Started             time.Time
 	initialParts        []ContentPart // media to inject before first Run()
-	doneForever         bool          // true if thread called done (permanent termination)
+	inboxMu             sync.Mutex
+	inboxEvents         []PersistentThreadEvent
+	runStarted          bool
+	doneForever         bool // true if thread called done (permanent termination)
 }
 
 type ThreadManager struct {
@@ -271,9 +258,10 @@ type SpawnOpts struct {
 	Model           string // starting model tier (empty = default large)
 	Reasoning       ReasoningLevel
 	InitialMessages []string
-	ParentID        string   // "main" or parent thread ID (empty = "main")
-	Depth           int      // depth in the spawn tree (0 = child of main)
-	MCPNames        []string // MCP servers whose tools preload into the child's activeTools at boot
+	Events          []PersistentThreadEvent // durable API inbox state restored before Run
+	ParentID        string                  // "main" or parent thread ID (empty = "main")
+	Depth           int                     // depth in the spawn tree (0 = child of main)
+	MCPNames        []string                // MCP servers whose tools preload into the child's activeTools at boot
 	// Tools, when set, preloads specific tool names (across any server)
 	// into the child's activeTools at boot. Complements MCPNames:
 	// MCPNames = "give me everything from these servers", Tools =
@@ -286,7 +274,6 @@ type SpawnOpts struct {
 	DeferRun     bool     // if true, don't start Run() — call StartAll() later
 	System       bool     // true for platform-owned system threads such as unconscious
 	Ephemeral    bool     // temporary caller-owned thread; cleanup also removes session history
-	Conversation bool     // user-facing conversation; no mandatory completion report to parent
 	// Paused: if true, the thread spawns in paused state. Run() loop
 	// blocks at the top of its first iteration until either an inbox
 	// event arrives (an explicit `send` from the leader) OR the
@@ -300,8 +287,7 @@ type SpawnOpts struct {
 	// BypassNoSpawn skips the no_spawn MCP filter. Set by the
 	// authenticated HTTP spawn endpoint (POST /threads/{id}) where
 	// the caller has the core API key — the system itself is asking
-	// for a privileged sub-thread (e.g. channelchat's chat thread
-	// needs the `channels` MCP to reply to users). The LLM-driven
+	// for a privileged sub-thread. The LLM-driven
 	// spawn tool path never sets this, so an in-agent worker still
 	// can't escalate by attaching a no_spawn MCP.
 	BypassNoSpawn bool
@@ -483,12 +469,12 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	default: // ModeAutonomous
 		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. ACT, DON'T NARRATE — your parent only sees what you `send` or `done` with; prose between tool calls is not observed by anyone, so skip it. Take the next tool call, let the result guide the next."
 	}
-	buildThreadPrompt := func(currentID, currentParentID, currentDirective string, conversation bool) string {
+	buildThreadPrompt := func(currentID, currentParentID, currentDirective string) string {
 		parentLabel := currentParentID
 		if parentLabel == "main" {
 			parentLabel = "main coordinator"
 		}
-		prompt := formatThreadBasePrompt(canSpawn, opts.Realtime, conversation, currentID, parentLabel)
+		prompt := formatThreadBasePrompt(canSpawn, opts.Realtime, currentID, parentLabel)
 		if !(opts.Ephemeral && opts.Realtime) {
 			prompt += threadDirectivePersistencePrompt
 		}
@@ -522,7 +508,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		}
 		return prompt + "\n\n[DIRECTIVE]\n" + currentDirective
 	}
-	threadSystemPrompt := buildThreadPrompt(id, parentID, directive, opts.Conversation)
+	threadSystemPrompt := buildThreadPrompt(id, parentID, directive)
 
 	thread := &Thread{
 		ID:                  id,
@@ -533,7 +519,6 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		Directive:           directive,
 		MCPNames:            opts.MCPNames,
 		IsRealtime:          opts.Realtime,
-		IsConversation:      opts.Conversation,
 		AllowNoSpawn:        opts.BypassNoSpawn,
 		Voice:               opts.Voice,
 		TurnDetection:       opts.TurnDetection,
@@ -544,13 +529,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		audioControl:        opts.AudioControl,
 		BridgeDisconnectTTL: opts.BridgeDisconnectTTL,
 		initialMessage:      strings.TrimSpace(opts.InitialMessage),
+		inboxEvents:         clonePersistentThreadEvents(opts.Events),
 		Parent:              tm.parent,
 		Tools:               toolSet,
 		Started:             time.Now(),
 		initialParts:        opts.MediaParts,
 	}
-	thread.promptBuilder = func(currentDirective string, conversation bool) string {
-		return buildThreadPrompt(thread.ID, thread.ParentID, currentDirective, conversation)
+	thread.promptBuilder = func(currentDirective string) string {
+		return buildThreadPrompt(thread.ID, thread.ParentID, currentDirective)
 	}
 
 	// Create a Thinker — same struct as main, shares the bus and provider pool
@@ -742,7 +728,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		allowNoSpawn:           opts.BypassNoSpawn,
 		unconsciousSafety:      tm.parent.unconsciousSafety,
 		rebuildPrompt: func(_ string) string {
-			return thread.promptBuilder(thread.Directive, thread.IsConversation)
+			return thread.promptBuilder(thread.Directive)
 		},
 	}
 	thinker.onStop = func() { tm.cleanupThread(thinker.threadID) }
@@ -778,7 +764,11 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		}
 		thinker.messages = append(thinker.messages, saved...)
 		thinker.markLoadedToolResultsHistorical(saved)
+		thread.reconcileInboxEvents(saved)
 		logMsg("THREAD", fmt.Sprintf("%s loaded %d messages from history (%d compacted summaries)", id, len(saved), len(summaries)))
+	}
+	if thread.hasPendingInboxEvents() {
+		thread.reconcileInboxEventIDs(thinker.session.EventIDs())
 	}
 	thinker.publishRuntimeStatus()
 	thinker.publishContextStatus()
@@ -795,11 +785,15 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 
 	tm.threads[id] = thread
+	thinker.ackInboxEvents = func(ids []string) error {
+		return tm.markEventsConsumed(id, ids)
+	}
 
 	// Inject initial messages before starting so first thought picks them up
 	for _, msg := range opts.InitialMessages {
 		tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: msg})
 	}
+	publishThreadInboxEvents(tm.parent.bus, id, thread.pendingInboxEvents())
 
 	// Inject initial media parts if provided (before Run starts)
 	if thread.initialParts != nil {
@@ -816,6 +810,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// Paused workers start their goroutine but block at the top of
 	// Run() until an inbox event arrives or PauseAll(false) wakes them.
 	if !opts.DeferRun {
+		thread.runStarted = true
 		if opts.Paused {
 			thinker.paused = true
 			logMsg("SPAWN", fmt.Sprintf("starting Run() PAUSED for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
@@ -1039,17 +1034,9 @@ func (thread *Thread) resolveSend(tm *ThreadManager, tagged string, targetID str
 }
 
 // tagThreadMessage preserves the source's runtime identity in the envelope.
-// A conversation thread is a trusted, platform-created relay for the owner,
-// so messages it hands to main need a distinct marker from ordinary worker
-// reports. The marker is only applied while routing to main; conversation
-// messages sent elsewhere remain ordinary thread messages.
-func (thread *Thread) tagThreadMessage(targetID, msg string) string {
-	targetsMain := targetID == "main" ||
-		(targetID == "parent" && thread.ParentID == "main") ||
-		(targetID == thread.ParentID && thread.ParentID == "main")
-	if thread.IsConversation && targetsMain {
-		return fmt.Sprintf("[from-conversation:%s] %s", thread.ID, msg)
-	}
+// Every thread uses the same ordinary source marker; API-created threads do
+// not gain owner authority merely because of how a caller uses them.
+func (thread *Thread) tagThreadMessage(msg string) string {
 	return fmt.Sprintf("[from:%s] %s", thread.ID, msg)
 }
 
@@ -1139,7 +1126,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						emitResult(call, sendFinalFailureResult(err))
 					}
 				} else {
-					tagged := thread.tagThreadMessage(id, msg)
+					tagged := thread.tagThreadMessage(msg)
 					mediaParts := parseMediaURLs(mediaStr)
 					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q media=%d", thread.ID, id, msg, len(mediaParts)))
 					if err := thread.resolveSend(tm, tagged, id, mediaParts); err != nil {
@@ -1612,9 +1599,17 @@ func (tm *ThreadManager) Directive(id string) (string, error) {
 // StartAll starts Run() on all threads (and their children) that were spawned with DeferRun.
 // Used after batch-respawning persisted threads so parents see their children before thinking.
 func (tm *ThreadManager) StartAll() {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
+	tm.mu.Lock()
+	threads := make([]*Thread, 0, len(tm.threads))
 	for _, thread := range tm.threads {
+		if thread.runStarted {
+			continue
+		}
+		thread.runStarted = true
+		threads = append(threads, thread)
+	}
+	tm.mu.Unlock()
+	for _, thread := range threads {
 		if thread.Realtime != nil {
 			go thread.Realtime.Run()
 		} else {
@@ -1626,12 +1621,51 @@ func (tm *ThreadManager) StartAll() {
 	}
 }
 
-func persistentThreadState(thread *Thread) PersistentThread {
+// Start starts exactly one thread that was created with DeferRun. It is
+// idempotent and is used by the API after configuration and inbox events have
+// crossed their persistence boundary.
+func (tm *ThreadManager) Start(id string) error {
+	owner, _ := tm.findManagedThread(id)
+	if owner == nil {
+		return fmt.Errorf("thread %q not found", id)
+	}
+	owner.mu.Lock()
+	thread := owner.threads[id]
+	if thread == nil {
+		owner.mu.Unlock()
+		return fmt.Errorf("thread %q not found", id)
+	}
+	if thread.runStarted {
+		owner.mu.Unlock()
+		return nil
+	}
+	thread.runStarted = true
+	owner.mu.Unlock()
+	if thread.Realtime != nil {
+		// Match the established POST semantics: validate credentials/session
+		// synchronously before reporting that the thread started. Persisted
+		// batch restoration continues to use StartAll and reconnects in Run.
+		if thread.Realtime.currentSession() == nil {
+			if err := thread.Realtime.openSession(false); err != nil {
+				owner.mu.Lock()
+				thread.runStarted = false
+				owner.mu.Unlock()
+				return fmt.Errorf("realtime open: %w", err)
+			}
+		}
+		go thread.Realtime.Run()
+	} else {
+		go thread.Thinker.Run()
+	}
+	return nil
+}
+
+func persistentThreadStateBase(thread *Thread) PersistentThread {
 	state := PersistentThread{
 		ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
 		System: thread.System, Directive: thread.Directive,
 		Tools: toolSetToSlice(thread.Tools), MCPNames: append([]string(nil), thread.MCPNames...),
-		Provider: thread.ProviderName, Realtime: thread.IsRealtime, Conversation: thread.IsConversation,
+		Provider: thread.ProviderName, Realtime: thread.IsRealtime,
 		AllowNoSpawn: thread.AllowNoSpawn, Voice: thread.Voice,
 	}
 	if thread.IsRealtime && !thread.TurnDetection.isZero() {
@@ -1664,30 +1698,12 @@ func persistentThreadState(thread *Thread) PersistentThread {
 	return state
 }
 
-// persistentThreadAllowsNoSpawn preserves authenticated API-created
-// conversation threads written before AllowNoSpawn existed. The migration is
-// narrow: it only restores a no_spawn scope that is already explicitly named
-// in the durable record; it never grants access to additional hidden servers.
-func persistentThreadAllowsNoSpawn(thread PersistentThread, index *ToolIndex) bool {
-	if thread.AllowNoSpawn {
-		return true
-	}
-	if !thread.Conversation || index == nil {
-		return false
-	}
-	for _, toolName := range thread.Tools {
-		if entry, ok := index.Get(toolName); ok && entry.NoSpawn {
-			return true
-		}
-	}
-	for _, serverName := range thread.MCPNames {
-		for _, toolName := range index.ToolsForServer(serverName) {
-			if entry, ok := index.Get(toolName); ok && entry.NoSpawn {
-				return true
-			}
-		}
-	}
-	return false
+func persistentThreadState(thread *Thread) PersistentThread {
+	state := persistentThreadStateBase(thread)
+	thread.inboxMu.Lock()
+	state.Events = clonePersistentThreadEvents(thread.inboxEvents)
+	thread.inboxMu.Unlock()
+	return state
 }
 
 // PersistentState returns the effective durable representation of a live
@@ -1768,55 +1784,6 @@ func sameToolSet(a, b map[string]bool) bool {
 	return true
 }
 
-// SetConversation changes the reporting mode and rebuilds the system prompt
-// without touching session history. Persistence remains the caller's
-// responsibility so ephemeral API threads cannot leak into Config.Threads.
-func (tm *ThreadManager) SetConversation(id string, conversation bool) error {
-	return tm.SetConversationWithOpts(id, conversation, ThreadUpdateOptions{})
-}
-
-func (tm *ThreadManager) SetConversationWithOpts(id string, conversation bool, opts ThreadUpdateOptions) error {
-	tm.mu.Lock()
-	thread, exists := tm.threads[id]
-	if !exists {
-		tm.mu.Unlock()
-		return fmt.Errorf("thread %q not found", id)
-	}
-	if thread.IsConversation == conversation {
-		tm.mu.Unlock()
-		return nil
-	}
-	realtime := thread.Realtime
-	bridgeConnected := thread.bridgeConnected
-	if realtime != nil && thread.promptBuilder != nil {
-		nextPrompt := thread.promptBuilder(thread.Directive, conversation)
-		nextTools := realtimeNativeToolsFor(thread.Thinker, thread.Tools, false)
-		if realtime.configurationDisposition(nextPrompt, nextTools) == RealtimeConfigurationRestartRequired &&
-			bridgeConnected && !opts.RestartRealtime {
-			tm.mu.Unlock()
-			return fmt.Errorf("%w; pass restart_realtime=true to apply this intentional change", ErrRealtimeConfigurationRestartRequired)
-		}
-	}
-	if thread.Realtime != nil {
-		thread.Realtime.transcriptMu.Lock()
-	}
-	thread.IsConversation = conversation
-	if thread.Thinker != nil && thread.Thinker.rebuildPrompt != nil && len(thread.Thinker.messages) > 0 {
-		thread.Thinker.messages[0] = Message{Role: "system", Content: thread.Thinker.rebuildPrompt("")}
-		thread.Thinker.publishContextStatus()
-	}
-	if thread.Realtime != nil {
-		thread.Realtime.transcriptMu.Unlock()
-	}
-	tm.mu.Unlock()
-	if realtime != nil {
-		if _, err := realtime.applyExternalConfigurationChange(opts.RestartRealtime || !bridgeConnected, "conversation_mode_update"); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Update changes a thread's directive and/or tools. Rebuilds the system prompt immediately.
 func (tm *ThreadManager) Update(id, name, directive string, tools []string) error {
 	_, err := tm.UpdateWithOpts(id, name, directive, tools, ThreadUpdateOptions{})
@@ -1867,7 +1834,7 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 	realtime := thread.Realtime
 	bridgeConnected := thread.bridgeConnected
 	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged) && thread.promptBuilder != nil {
-		nextPrompt := thread.promptBuilder(nextDirective, thread.IsConversation)
+		nextPrompt := thread.promptBuilder(nextDirective)
 		nextNativeTools := realtimeNativeToolsFor(thread.Thinker, nextTools, false)
 		if realtime.configurationDisposition(nextPrompt, nextNativeTools) == RealtimeConfigurationRestartRequired &&
 			bridgeConnected && !opts.RestartRealtime {

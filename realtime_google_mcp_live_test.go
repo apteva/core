@@ -192,7 +192,6 @@ Never invent the marker, expose tool mechanics, or call done. Keep the live conv
 		[]string{"liveprobe_lookup_code"},
 		SpawnOpts{
 			Realtime:       true,
-			Conversation:   true,
 			Ephemeral:      true,
 			ProviderName:   "google-realtime",
 			MCPNames:       []string{"liveprobe"},
