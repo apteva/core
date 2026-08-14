@@ -243,7 +243,8 @@ OWNERSHIP AND DELEGATION:
 - For multiple independent work units, assign the units to focused owners instead of executing the first unit on main.
 - For batches of independent repeated work, especially tool-heavy or waiting/polling work, coordinate focused workers. Consolidate closely related continuing responsibilities under one owner instead of creating one thread per schedule.
 - One-shot workers should own one clear unit of work, use the smallest required tool set, report the result to their parent, then call done. Persistent workers remain active.
-- tools= lists which tools the worker can use. ALWAYS include EVERY tool the worker needs to carry out its directive; do not use empty tools for a worker that needs specific visible tools. A missing tool = worker reports failure and can't act. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
+- tools= is a hard exact capability grant. ALWAYS include EVERY exact tool the worker needs; a missing tool cannot be discovered or called unless its server is explicitly granted through mcp=. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
+- mcp= grants a complete server discovery scope. Use it only when the worker may discover/use that server's broader surface; naming one exact tool in tools= never grants its sibling tools.
 - Capability alone does not determine ownership: do not keep work on main merely because main can complete it. Keep only the very-small-work fast path local.
 - directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
@@ -343,7 +344,7 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 			prompt += "Always and automatic MCP tools are already in your tool list. Explicitly deferred tools require search_tools. Never search for a tool that is already visible.\n\n"
 		} else {
 			prompt += "Always-loaded MCP tools are already in your tool list. Automatic and deferred tools require search_tools unless preloaded for the current task. Never search for a tool that is already visible. Repeat uses stay loaded.\n"
-			prompt += "When spawning a worker that should boot hot with a server's full surface: spawn(id=\"ops\", directive=\"Manage inventory\", mcps=\"store\", tools=\"\")\n\n"
+			prompt += "When a worker may discover/use a server's full surface, grant that scope explicitly: spawn(id=\"ops\", directive=\"Manage inventory\", mcps=\"store\", tools=\"\"). For least privilege, prefer exact tools= grants.\n\n"
 		}
 		for _, info := range mcpCatalog {
 			autoCount := info.AutoCount
@@ -692,7 +693,15 @@ type Thinker struct {
 	handleTools   ToolHandler
 	rebuildPrompt func(toolDocs string) string // rebuild system prompt with current tool docs
 	onStop        func()
+	// toolAllowlist is the exact capability grant for a worker. It contains
+	// the tools requested at spawn plus Core's managed scaffolding. It is a
+	// hard authorization boundary: discovery may load schemas only from this
+	// set or from an explicitly granted MCP scope below.
 	toolAllowlist map[string]bool // nil = all tools allowed (main thread)
+	// toolMCPScopes contains server names explicitly granted through mcp=.
+	// A scoped worker may discover tools from these servers; an exact tools=
+	// grant never implies a whole-server scope.
+	toolMCPScopes map[string]bool
 	systemThread  bool
 	allowNoSpawn  bool // privileged API/system-created thread with explicit no_spawn grants
 

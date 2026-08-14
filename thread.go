@@ -261,11 +261,11 @@ type SpawnOpts struct {
 	Events          []PersistentThreadEvent // durable API inbox state restored before Run
 	ParentID        string                  // "main" or parent thread ID (empty = "main")
 	Depth           int                     // depth in the spawn tree (0 = child of main)
-	MCPNames        []string                // MCP servers whose tools preload into the child's activeTools at boot
-	// Tools, when set, preloads specific tool names (across any server)
-	// into the child's activeTools at boot. Complements MCPNames:
-	// MCPNames = "give me everything from these servers", Tools =
-	// "give me exactly these names". Both are additive. Used by the
+	MCPNames        []string                // MCP server capability scopes; eligible tools follow loading policy
+	// Tools, when set, grants and preloads specific tool names (across any
+	// server). Complements MCPNames: MCPNames authorizes discovery across
+	// those servers, while Tools authorizes exactly those names. Both are
+	// additive. Used by the
 	// privileged HTTP spawn endpoint (POST /threads/{id}) for system
 	// callers that know which tools they need; the LLM-driven spawn
 	// tool path leaves this nil and uses mcps=[…] instead.
@@ -560,9 +560,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	initialReasoning := normalizeReasoningLevel(opts.Reasoning)
 
-	// Build thread-local registry: core tools + allowed local tools + MCP tools
-	// Auto-detect MCP server names from tool prefixes if not explicitly set.
-	// e.g. tools="store_get_inventory,web" → auto-detects "store" as MCP server needed.
+	// Build thread-local registry: core tools + exact local/MCP grants and
+	// explicit MCP discovery scopes. Exact tools never imply a whole-server
+	// capability: tools="store_get_inventory" grants only that tool, while
+	// mcp="store" grants the server scope.
 	//
 	// Strip any MCP whose config carries no_spawn=true. The host marks
 	// infrastructure-level servers (gateways, outbound bridges) with
@@ -599,11 +600,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		}
 		mcpNames = filtered
 	}
-	// Exact tool-name grants are another way to imply an MCP server. Strip
-	// no_spawn entries before prefix auto-detection so an agent-created
-	// worker cannot bypass the server-level filter by already knowing a tool
-	// name. Authenticated API-created threads set BypassNoSpawn and retain
-	// their explicit grants.
+	// Strip exact no_spawn grants for ordinary agent-created workers.
+	// Authenticated API-created threads set BypassNoSpawn and retain their
+	// explicit grants. Exact grants do not expand to a whole MCP server.
 	if !opts.BypassNoSpawn && tm.parent.toolIndex != nil {
 		for toolName := range toolSet {
 			if entry, ok := tm.parent.toolIndex.Get(toolName); ok && entry.NoSpawn {
@@ -612,33 +611,13 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			}
 		}
 	}
-	if len(mcpNames) == 0 && tm.parent.config != nil {
-		knownServers := map[string]bool{}
-		for _, sc := range tm.parent.config.GetMCPServers() {
-			knownServers[sc.Name] = true
-		}
-		// Also check parent's mcpCatalog
-		for _, info := range tm.parent.mcpCatalog {
-			knownServers[info.Name] = true
-		}
-		detected := map[string]bool{}
-		for toolName := range toolSet {
-			// Check if tool name has a known MCP server prefix (e.g. "store_get_inventory" → "store")
-			for srv := range knownServers {
-				if strings.HasPrefix(toolName, srv+"_") {
-					detected[srv] = true
-					break
-				}
-			}
-		}
-		for srv := range detected {
-			mcpNames = append(mcpNames, srv)
-		}
-	}
-	// Store the effective set after no_spawn filtering and tool-prefix
-	// detection. Persistence snapshots must reproduce what the live thread
-	// actually received, not merely the raw MCP names from the request.
+	// Store the effective MCP scopes after no_spawn filtering. Persistence
+	// snapshots must reproduce what the live thread actually received.
 	thread.MCPNames = append([]string(nil), mcpNames...)
+	threadMCPScopes := make(map[string]bool, len(mcpNames))
+	for _, name := range mcpNames {
+		threadMCPScopes[name] = true
+	}
 
 	// Sub-threads share the main registry and the live MCP connections
 	// it points at. Previous design opened a fresh connection per
@@ -649,19 +628,12 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	threadAllowlist := toolSet
 	var threadMCPServers []MCPConn // intentionally empty — main owns the live set
 
-	// Expand MCPNames into the child's initial activeTools so the
-	// thread boots hot with those servers' tools visible. Skipped
-	// silently for any name not in the index (e.g. typo, or
-	// connect-time failure earlier).
+	// MCPNames authorize discovery across the listed servers. Loading policy
+	// decides which scoped schemas are immediately present: always/eager tools
+	// arrive through the normal baseline, relevant automatic tools through
+	// BM25 preload, and deferred tools through search_tools. Exact SpawnOpts
+	// tools below are the only names force-preloaded here.
 	preloadActive := map[string]bool{}
-	if len(mcpNames) > 0 && tm.parent.toolIndex != nil {
-		for _, mcpName := range mcpNames {
-			for _, tn := range tm.parent.toolIndex.ToolsForServer(mcpName) {
-				preloadActive[tn] = true
-				toolSet[tn] = true // surface to allowlist/spawn-tracking
-			}
-		}
-	}
 	// Explicit per-tool preload (SpawnOpts.Tools) lets a caller hand-pick
 	// individual tool names across any server, without listing the whole
 	// server. Currently only populated by the privileged HTTP spawn path;
@@ -720,6 +692,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		apiNotify:              tm.parent.apiNotify,
 		registry:               threadRegistry,
 		toolAllowlist:          threadAllowlist,
+		toolMCPScopes:          threadMCPScopes,
 		config:                 tm.parent.config,
 		mcpServers:             threadMCPServers,
 		toolIndex:              tm.parent.toolIndex,
@@ -877,13 +850,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// Telemetry: thread.spawn
 	if tm.parent.telemetry != nil {
 		tm.parent.telemetry.Emit("thread.spawn", id, ThreadSpawnData{
-			ParentID:  parentID,
-			Directive: directive,
-			Tools:     tools,
-			MCP:       append([]string(nil), thread.MCPNames...),
-			Realtime:  thread.IsRealtime,
-			Voice:     thread.Voice,
-			Provider:  thread.ProviderName,
+			ParentID:       parentID,
+			Directive:      directive,
+			Tools:          append([]string(nil), toolList...),
+			RequestedTools: append([]string(nil), tools...),
+			MCP:            append([]string(nil), thread.MCPNames...),
+			Realtime:       thread.IsRealtime,
+			Voice:          thread.Voice,
+			Provider:       thread.ProviderName,
 		})
 	}
 

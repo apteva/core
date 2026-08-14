@@ -98,6 +98,71 @@ func mockToolMCP(t *testing.T, toolName, toolDesc string) (*httptest.Server, *at
 	return srv, &calls
 }
 
+// mockMultiToolMCP is the multi-tool variant used by capability-scope tests.
+// Counters are keyed by the local MCP tool name (before Core prefixes it with
+// the server name).
+func mockMultiToolMCP(t *testing.T, tools []mcpToolDef) (*httptest.Server, map[string]*atomic.Int64) {
+	t.Helper()
+	calls := make(map[string]*atomic.Int64, len(tools))
+	for _, tool := range tools {
+		calls[tool.Name] = &atomic.Int64{}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			ID     any             `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if req.ID == nil {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		var result any
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{
+				"protocolVersion": "2025-03-26",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]string{"name": "mock-multi", "version": "1.0"},
+			}
+		case "tools/list":
+			listed := make([]map[string]any, 0, len(tools))
+			for _, tool := range tools {
+				listed = append(listed, map[string]any{
+					"name": tool.Name, "description": tool.Description, "inputSchema": tool.InputSchema,
+				})
+			}
+			result = map[string]any{"tools": listed}
+		case "tools/call":
+			var params struct {
+				Name string `json:"name"`
+			}
+			_ = json.Unmarshal(req.Params, &params)
+			if counter := calls[params.Name]; counter != nil {
+				counter.Add(1)
+			}
+			result = map[string]any{
+				"content": []map[string]any{{"type": "text", "text": "MOCK_" + params.Name + "_OK"}},
+			}
+		default:
+			result = map[string]any{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+	})
+	return httptest.NewServer(mux), calls
+}
+
 // toolCallObserver watches the bus for EventThinkDone and records,
 // per thread, which tools were called. Caller stops it via the
 // returned func (which also waits for the goroutine to drain).

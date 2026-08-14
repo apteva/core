@@ -107,15 +107,15 @@ func poolUsesEagerTools(pool *ProviderPool, toolCount int) bool {
 func registerSearchTool(r *ToolRegistry) {
 	r.Register(&ToolDef{
 		Name: "search_tools",
-		Description: "Search for MCP tools by keyword and load their schemas into your context. " +
+		Description: "Search within this thread's explicitly granted MCP server scopes and load matching tool schemas into your context. " +
 			"Use when you need a capability you don't currently have visible — file upload, " +
 			"posting to a channel, fetching from an integration, etc. Returns up to k matches " +
 			"with name + summary; their full schemas become available for you to call on the " +
-			"next turn. Use search_tools only in a discovery-only turn: you may call multiple " +
+			"next turn. It cannot expand tools= exact grants or reach ungranted servers. Use search_tools only in a discovery-only turn: you may call multiple " +
 			"search_tools in parallel, but do not call any other tool until you have received " +
 			"the search results on the next turn.",
 		Syntax: `[[search_tools query="upload file" k="5"]]`,
-		Rules:  `query is required; k defaults to 5 and caps at 20. Loaded tools persist for the rest of this thread's conversation (subject to compaction). Schemas appear on the next thinking turn — call only search_tools during discovery, then wait for that turn before calling any execution, reporting, messaging, pacing, or completion tool.`,
+		Rules:  `query is required; k defaults to 5 and caps at 20. Search never widens this thread's spawn capabilities. Loaded tools persist for the rest of this thread's conversation (subject to compaction). Schemas appear on the next thinking turn — call only search_tools during discovery, then wait for that turn before calling any execution, reporting, messaging, pacing, or completion tool.`,
 		Core:   true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -208,10 +208,89 @@ func (t *Thinker) applyPreload(k int, extraQuery string) {
 	if query == "" {
 		return
 	}
-	allowNoSpawn := t.threadID == "main"
-	for _, h := range t.toolIndex.Search(query, k, allowNoSpawn) {
+	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
+	for _, h := range t.searchAuthorizedTools(query, k, allowNoSpawn) {
 		t.touchActiveTool(h.Name)
 	}
+}
+
+// toolAuthorized is the common hard capability predicate for model schema
+// exposure, discovery/preloading, and execution. Main has the complete
+// attached surface. Workers get Core/exact tools from toolAllowlist plus MCP
+// tools belonging to servers explicitly granted through mcp=.
+func (t *Thinker) toolAuthorized(name string) bool {
+	if t == nil {
+		return false
+	}
+	if t.toolAllowlist == nil {
+		return true
+	}
+	if t.toolAllowlist[name] {
+		// Exact grants remain subject to the server's no_spawn boundary unless
+		// this is an authenticated platform-created thread. This also protects
+		// runtime update paths that modify a worker's exact tool list.
+		if t.toolIndex != nil {
+			if entry, ok := t.toolIndex.Get(name); ok && entry.NoSpawn && !t.allowNoSpawn {
+				return false
+			}
+		}
+		return true
+	}
+	if t.toolIndex == nil {
+		return false
+	}
+	entry, ok := t.toolIndex.Get(name)
+	if !ok || !t.toolMCPScopes[entry.Server] {
+		return false
+	}
+	return t.allowNoSpawn || !entry.NoSpawn
+}
+
+func (t *Thinker) searchAuthorizedTools(query string, k int, allowNoSpawn bool) []IndexEntry {
+	if t == nil || t.toolIndex == nil || k <= 0 {
+		return nil
+	}
+	// Rank the complete authorized candidate set before applying k. Filtering
+	// only the global top-k could hide a lower-ranked granted result behind
+	// higher-ranked tools that belong to other workers' scopes.
+	hits := t.toolIndex.Search(query, t.toolIndex.Count(), allowNoSpawn)
+	out := make([]IndexEntry, 0, k)
+	for _, hit := range hits {
+		if !t.toolAuthorized(hit.Name) {
+			continue
+		}
+		out = append(out, hit)
+		if len(out) == k {
+			break
+		}
+	}
+	return out
+}
+
+func (t *Thinker) authorizedActiveTools(active map[string]bool) map[string]bool {
+	if t == nil || t.toolAllowlist == nil {
+		return active
+	}
+	filtered := make(map[string]bool, len(active))
+	for name, enabled := range active {
+		if enabled && t.toolAuthorized(name) {
+			filtered[name] = true
+		}
+	}
+	return filtered
+}
+
+func (t *Thinker) authorizedToolAllowlist(allowlist map[string]bool) map[string]bool {
+	if t == nil || allowlist == nil {
+		return allowlist
+	}
+	filtered := make(map[string]bool, len(allowlist))
+	for name, enabled := range allowlist {
+		if enabled && t.toolAuthorized(name) {
+			filtered[name] = true
+		}
+	}
+	return filtered
 }
 
 // touchActiveTool marks a tool active and refreshes its recency to
@@ -220,6 +299,9 @@ func (t *Thinker) applyPreload(k int, extraQuery string) {
 // evictActiveToolsLRU has a consistent recency key. Lazily inits both
 // maps so bare test thinkers don't need to.
 func (t *Thinker) touchActiveTool(name string) {
+	if !t.toolAuthorized(name) {
+		return
+	}
 	if t.activeTools == nil {
 		t.activeTools = map[string]bool{}
 	}
@@ -264,10 +346,8 @@ func (t *Thinker) modelToolCallable(name string, fallback map[string]bool) bool 
 	if t == nil {
 		return false
 	}
-	if t.threadID != "main" && !t.allowNoSpawn && t.toolIndex != nil {
-		if entry, ok := t.toolIndex.Get(name); ok && entry.NoSpawn {
-			return false
-		}
+	if !t.toolAuthorized(name) {
+		return false
 	}
 	if fallback[name] {
 		return true
@@ -299,8 +379,8 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 		t.evictActiveToolsLRU(activeToolsCap)
 	}
 
-	allowNoSpawn := t.threadID == "main"
-	active := t.activeTools
+	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
+	active := t.authorizedActiveTools(t.activeTools)
 	baseline := t.toolIndex.BaselineNames(eager, allowNoSpawn)
 	if len(baseline) > 0 {
 		merged := make(map[string]bool, len(t.activeTools)+len(baseline))
@@ -310,12 +390,14 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 			}
 		}
 		for _, name := range baseline {
-			merged[name] = true
+			if t.toolAuthorized(name) {
+				merged[name] = true
+			}
 		}
 		active = merged
 	}
 
-	tools := t.registry.NativeTools(t.toolAllowlist, active, t.systemThread)
+	tools := t.registry.NativeTools(t.authorizedToolAllowlist(t.toolAllowlist), active, t.systemThread)
 	t.recordPresentedTools(tools)
 	t.lastNativeToolCount = len(tools)
 	t.lastActiveMCPCount = countActiveMCPTools(active)
@@ -377,7 +459,7 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	// model process the bounded diagnostic note and choose another path.
 	// This wake is independent of (and does not move) the pending pace timer.
 	t.kickNextTurn = true
-	hits := t.toolIndex.Search(query, k, allowNoSpawn)
+	hits := t.searchAuthorizedTools(query, k, allowNoSpawn)
 	res := searchToolsResult{Query: query}
 	for _, h := range hits {
 		t.touchActiveTool(h.Name)
@@ -397,9 +479,9 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 		servers := t.toolIndex.Servers()
 		var visible []string
 		for _, s := range servers {
-			// Reuse Search to honour the no_spawn filter — we don't want
-			// a sub-thread learning that `apteva-server` exists.
-			if hits := t.toolIndex.Search(s, 1, allowNoSpawn); len(hits) > 0 {
+			// Reuse capability-scoped search so a worker cannot infer server
+			// names outside its exact grants or explicit MCP scopes.
+			if hits := t.searchAuthorizedTools(s, 1, allowNoSpawn); len(hits) > 0 {
 				visible = append(visible, s)
 			}
 		}

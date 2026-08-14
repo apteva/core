@@ -19,6 +19,7 @@ func newWorkerToolDiscoveryFixture(
 	server, localName, description string,
 	noSpawn bool,
 	loading *MCPToolLoadingConfig,
+	mcpScopes ...string,
 ) workerToolDiscoveryFixture {
 	t.Helper()
 	t.Setenv("APTEVA_TOOL_SEARCH", "on")
@@ -61,7 +62,7 @@ func newWorkerToolDiscoveryFixture(
 
 	if err := parent.threads.SpawnWithOpts(
 		"worker", "Wait for an explicit task.", nil,
-		SpawnOpts{DeferRun: true},
+		SpawnOpts{DeferRun: true, MCPNames: mcpScopes},
 	); err != nil {
 		t.Fatalf("spawn worker: %v", err)
 	}
@@ -103,7 +104,7 @@ func TestWorkerSearchToolsActivatesAndExecutesOnSameWorker(t *testing.T) {
 	fixture := newWorkerToolDiscoveryFixture(
 		t, "catalog", "op_4471",
 		"Submit a completed compliance form to the records system.",
-		false, nil,
+		false, nil, "catalog",
 	)
 	worker := fixture.thread.Thinker
 	handler := threadToolHandler(fixture.thread, fixture.parent.threads)
@@ -150,12 +151,97 @@ func TestWorkerSearchToolsActivatesAndExecutesOnSameWorker(t *testing.T) {
 	}
 }
 
+func TestWorkerExactToolGrantCannotDiscoverOrExecuteSiblingTool(t *testing.T) {
+	t.Setenv("APTEVA_TOOL_SEARCH", "on")
+	parent := newTestThinkerFull()
+	parent.registry = NewToolRegistry("test")
+	parent.toolIndex = NewToolIndex()
+	parent.telemetry = NewTelemetry()
+	t.Cleanup(func() {
+		parent.threads.KillAll()
+		parent.telemetry.Stop()
+		parent.Stop()
+	})
+
+	tools := []mcpToolDef{
+		{Name: "get", Description: "Get one durable task by identifier.", InputSchema: map[string]any{"type": "object"}},
+		{Name: "list", Description: "List all durable tasks.", InputSchema: map[string]any{"type": "object"}},
+	}
+	var getCalls, listCalls atomic.Int64
+	for _, item := range tools {
+		item := item
+		counter := &getCalls
+		if item.Name == "list" {
+			counter = &listCalls
+		}
+		parent.registry.Register(&ToolDef{
+			Name: "tasks_" + item.Name, Description: item.Description,
+			InputSchema: item.InputSchema, MCP: true, MCPServer: "tasks",
+			Handler: func(map[string]string) ToolResponse {
+				counter.Add(1)
+				return ToolResponse{Text: strings.ToUpper(item.Name) + "_OK"}
+			},
+		})
+	}
+	parent.toolIndex.Add("tasks", tools, false, &MCPToolLoadingConfig{Default: ToolLoadDeferred})
+
+	if err := parent.threads.SpawnWithOpts(
+		"strict-worker", "Read exactly one assigned task.", []string{"tasks_get"},
+		SpawnOpts{DeferRun: true, ParentID: "main"},
+	); err != nil {
+		t.Fatalf("spawn strict worker: %v", err)
+	}
+	thread := parent.threads.threads["strict-worker"]
+	worker := thread.Thinker
+	if !thread.Tools["tasks_get"] || thread.Tools["tasks_list"] || len(thread.MCPNames) != 0 {
+		t.Fatalf("exact grant expanded unexpectedly: tools=%v mcp=%v", thread.Tools, thread.MCPNames)
+	}
+	worker.directive = ""
+	worker.lastInboundForPreload = "List every durable task in the workspace."
+	presented := nativeToolNames(worker.prepareNativeTools("openai-codex"))
+	if !presented["tasks_get"] || presented["tasks_list"] || worker.activeTools["tasks_list"] {
+		t.Fatalf("automatic preload escaped strict scope: schemas=%v active=%v", presented, worker.activeTools)
+	}
+
+	handler := threadToolHandler(thread, parent.threads)
+	_, _, searchResults := handler(worker, []toolCall{{
+		Name: "search_tools", Args: map[string]string{"query": "list all durable tasks"},
+		Raw: "search_tools", NativeID: "search-sibling",
+	}}, nil)
+	if len(searchResults) != 1 || strings.Contains(searchResults[0].Content, "tasks_list") || worker.activeTools["tasks_list"] {
+		t.Fatalf("sibling leaked through discovery: result=%+v active=%v", searchResults, worker.activeTools)
+	}
+
+	// Even stale or accidentally activated state must not bypass the hard
+	// capability boundary at schema construction or dispatch.
+	worker.activeTools["tasks_list"] = true
+	presented = nativeToolNames(worker.prepareNativeTools("openai-codex"))
+	if presented["tasks_list"] || worker.modelToolCallable("tasks_list", thread.Tools) {
+		t.Fatalf("stale activation bypassed exact grant: schemas=%v", presented)
+	}
+	_, _, rejected := handler(worker, []toolCall{{
+		Name: "tasks_list", Raw: "tasks_list", NativeID: "call-sibling",
+	}}, nil)
+	if len(rejected) != 1 || !rejected[0].IsError || listCalls.Load() != 0 {
+		t.Fatalf("sibling dispatch was not rejected: result=%+v calls=%d", rejected, listCalls.Load())
+	}
+
+	handler(worker, []toolCall{{
+		Name: "tasks_get", Args: map[string]string{"task_id": "task-1"},
+		Raw: "tasks_get", NativeID: "call-granted",
+	}}, nil)
+	granted := waitForWorkerToolResult(t, worker, "call-granted")
+	if granted.IsError || getCalls.Load() != 1 {
+		t.Fatalf("exact granted tool failed: result=%+v calls=%d", granted, getCalls.Load())
+	}
+}
+
 func TestWorkerEventPreloadActivatesAndExecutesTool(t *testing.T) {
 	const toolName = "billing_upload_invoice_pdf"
 	fixture := newWorkerToolDiscoveryFixture(
 		t, "billing", "upload_invoice_pdf",
 		"Upload an invoice PDF document to the billing folder.",
-		false, nil,
+		false, nil, "billing",
 	)
 	worker := fixture.thread.Thinker
 	worker.directive = ""
@@ -179,7 +265,7 @@ func TestWorkerAlwaysLoadedToolExecutesWithoutPollutingActiveTools(t *testing.T)
 	const toolName = "crm_lookup_contact"
 	fixture := newWorkerToolDiscoveryFixture(
 		t, "crm", "lookup_contact", "Look up a CRM contact.",
-		false, &MCPToolLoadingConfig{Default: ToolLoadAlways},
+		false, &MCPToolLoadingConfig{Default: ToolLoadAlways}, "crm",
 	)
 	worker := fixture.thread.Thinker
 	presented := nativeToolNames(worker.prepareNativeTools("openai-codex"))
@@ -330,6 +416,15 @@ func TestWorkerNoSpawnToolCannotBeDiscoveredOrExecuted(t *testing.T) {
 	if fixture.calls.Load() != 0 {
 		t.Fatalf("no_spawn tool executed %d times", fixture.calls.Load())
 	}
+	// A later tool-list update must not bypass no_spawn merely by inserting
+	// the exact name into the worker allowlist.
+	worker.toolAllowlist[toolName] = true
+	worker.activeTools[toolName] = true
+	if nativeToolNames(worker.prepareNativeTools("openai-codex"))[toolName] || worker.modelToolCallable(toolName, worker.toolAllowlist) {
+		t.Fatalf("runtime exact grant bypassed no_spawn")
+	}
+	delete(worker.toolAllowlist, toolName)
+	delete(worker.activeTools, toolName)
 
 	if err := fixture.parent.threads.SpawnWithOpts(
 		"explicit-no-spawn", "Try an explicitly named privileged tool.",
@@ -447,7 +542,7 @@ func TestPrivilegedAPIStyleThreadKeepsExplicitNoSpawnGrant(t *testing.T) {
 func TestRealtimeToolSnapshotIncludesWorkerDiscovery(t *testing.T) {
 	fixture := newWorkerToolDiscoveryFixture(
 		t, "calendar", "availability", "Check callback availability.",
-		false, nil,
+		false, nil, "calendar",
 	)
 	worker := fixture.thread.Thinker
 	worker.activeTools["calendar_availability"] = true

@@ -533,13 +533,14 @@ type LLMErrorData struct {
 }
 
 type ThreadSpawnData struct {
-	ParentID  string   `json:"parent_id"`
-	Directive string   `json:"directive"`
-	Tools     []string `json:"tools"`
-	MCP       []string `json:"mcp,omitempty"`
-	Realtime  bool     `json:"realtime,omitempty"`
-	Voice     string   `json:"voice,omitempty"`
-	Provider  string   `json:"provider,omitempty"`
+	ParentID       string   `json:"parent_id"`
+	Directive      string   `json:"directive"`
+	Tools          []string `json:"tools"` // effective exact grants, including managed scaffolding
+	RequestedTools []string `json:"requested_tools,omitempty"`
+	MCP            []string `json:"mcp,omitempty"` // whole-server discovery scopes
+	Realtime       bool     `json:"realtime,omitempty"`
+	Voice          string   `json:"voice,omitempty"`
+	Provider       string   `json:"provider,omitempty"`
 }
 
 type ThreadDoneData struct {

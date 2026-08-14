@@ -10,26 +10,25 @@ import (
 	"testing"
 )
 
-// TestSpawn_WithMCP_RegistersToolsPrefixed verifies spawn → activeTools
-// preload wiring in isolation. In the post-refactor model the parent
-// owns the MCP connection and the index; sub-thread spawn with
-// MCPNames=[...] preloads the child's activeTools so the schemas
-// appear in its tool list from turn 1 without the child making its
-// own connection.
+// TestSpawn_WithMCP_RegistersToolsPrefixed verifies spawn → MCP capability
+// scope wiring in isolation. The parent owns the connection and index;
+// MCPNames=[...] authorizes that server's tools, while normal loading policy
+// determines which schemas appear in a turn.
 //
-//   1. Parent connects an HTTP MCP "catalog-mcp" and registers its
-//      tools into the registry + index (mirrors what main startup
-//      does in production).
-//   2. We spawn a sub-thread with MCPNames=["catalog-mcp"] and
-//      tools=["send"].
-//   3. Post-spawn we assert:
-//      - The shared registry has both prefixed tools (catalog-mcp_*).
-//      - The child's activeTools contains both names.
-//      - The shared registry dispatches them correctly.
+//  1. Parent connects an HTTP MCP "catalog-mcp" and registers its
+//     tools into the registry + index (mirrors what main startup
+//     does in production).
+//  2. We spawn a sub-thread with MCPNames=["catalog-mcp"] and
+//     tools=["send"].
+//  3. Post-spawn we assert:
+//     - The shared registry has both prefixed tools (catalog-mcp_*).
+//     - The child's model-visible tools contain both names in eager mode.
+//     - The shared registry dispatches them correctly.
 //
 // No Fireworks, no subprocesses — a single httptest.Server and the
 // real connectAndRegisterMCP path.
 func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
+	t.Setenv("APTEVA_TOOL_SEARCH", "off")
 	var callsReceived atomic.Int64
 
 	// Minimal MCP Streamable-HTTP server: initialize + tools/list +
@@ -138,11 +137,16 @@ func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
 		t.Fatal("thread not in manager")
 	}
 
-	// MCPNames preload should land each tool in the child's activeTools.
+	// The explicit MCP scope authorizes both tools; eager loading presents
+	// them without mutating the sticky discovery set.
+	presented := nativeToolNames(thread.Thinker.prepareNativeTools("openai-codex"))
 	for _, want := range []string{"catalog-mcp_ping", "catalog-mcp_echo"} {
-		if !thread.Thinker.activeTools[want] {
-			t.Errorf("activeTools missing %q; have: %v", want, keys(thread.Thinker.activeTools))
+		if !presented[want] {
+			t.Errorf("scoped tool missing %q; have: %v", want, presented)
 		}
+	}
+	if len(thread.Thinker.activeTools) != 0 {
+		t.Fatalf("eager baseline polluted activeTools: %v", thread.Thinker.activeTools)
 	}
 	if !thread.Tools["send"] {
 		t.Errorf("thread.Tools missing send; have: %v", keys(thread.Tools))
