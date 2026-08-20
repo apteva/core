@@ -216,6 +216,23 @@ func (tr *ToolRegistry) registerDefaults() {
 		},
 	})
 	tr.Register(&ToolDef{
+		Name:        "list_threads",
+		Description: "Search your complete descendant thread hierarchy by id, name, directive text, tool, or MCP scope. [ACTIVE THREADS] lists the complete hierarchy inline while the team is small and says so explicitly; once the team outgrows that, it becomes a partial summary and this tool is the complete searchable view. Use broad relevant keywords before spawning to look for an existing owner — absence from a partial [ACTIVE THREADS] block is not evidence a thread does not exist. Exact phrases rank first; otherwise results are ranked by keyword overlap. A zero-match search is not proof that no semantically related owner exists.",
+		Syntax:      `list_threads(filter="billing", limit="25")`,
+		Rules:       fmt.Sprintf(`filter: optional case-insensitive search across thread id, display name, directive text, granted tool names, and MCP scope names. Exact phrases rank first; otherwise whitespace/punctuation-separated keywords use OR matching and rank by number of matches. Omit to list everything. A zero-match result means only that those terms did not match; broaden them or list all when ownership is still uncertain. scope: "tree" (default) includes all descendants; "children" restricts to direct children. limit: max results per call, default %d, capped at %d — larger values are silently reduced, so page instead of asking for more. offset: skip this many matches, for paging through a large result. Ordering is deterministic for stable paging. When [ACTIVE THREADS] says it is the complete hierarchy, you do not need this tool.`, listThreadsDefaultLimit, listThreadsMaxLimit),
+		Core:        true,
+		MainOnly:    true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"filter": map[string]any{"type": "string", "description": "Case-insensitive substring matched against id, name, directive, tool names, and MCP scopes. Omit to list all."},
+				"scope":  map[string]any{"type": "string", "description": "\"tree\" (default) to include descendants, or \"children\" for direct children only."},
+				"limit":  map[string]any{"type": "string", "description": fmt.Sprintf("Max results, default %d, capped at %d.", listThreadsDefaultLimit, listThreadsMaxLimit)},
+				"offset": map[string]any{"type": "string", "description": "Skip this many matches, for paging."},
+			},
+		},
+	})
+	tr.Register(&ToolDef{
 		Name:        "kill",
 		Description: "Stop a thread immediately and remove it from persistent config.",
 		Syntax:      `[[kill id="name"]]`,

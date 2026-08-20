@@ -160,6 +160,24 @@ func TestRecallQueryPriorityNeverUsesAssistantFiller(t *testing.T) {
 	}
 }
 
+func TestRecallQueriesAlwaysIncludeDirectiveWithExternalContext(t *testing.T) {
+	queries, source := recallQueriesForTurn(
+		[]string{"[from:main] Begin now and use the shared guidance."},
+		[]Message{{Role: "system", Content: "worker"}},
+		"Inspect Patreon drafts and follow the Patreon scheduling procedure.",
+	)
+	if source != "event+directive" {
+		t.Fatalf("source = %q, want event+directive", source)
+	}
+	want := []string{
+		"[from:main] Begin now and use the shared guidance.",
+		"Inspect Patreon drafts and follow the Patreon scheduling procedure.",
+	}
+	if !reflect.DeepEqual(queries, want) {
+		t.Fatalf("queries = %#v, want %#v", queries, want)
+	}
+}
+
 func TestMemoryRecallCycleRefreshesOnlyForExternalContextChanges(t *testing.T) {
 	var state memoryRecallCycleState
 	if got := state.refreshReason(0, "directive", false, false, false); got != "thread_start" {
@@ -294,6 +312,7 @@ type retrievalCaptureProvider struct {
 	mu       sync.Mutex
 	requests [][]Message
 	called   chan struct{}
+	sleep    string
 }
 
 type retrievalToolCycleProvider struct {
@@ -485,9 +504,12 @@ func (p *retrievalCaptureProvider) Chat(_ context.Context, messages []Message, _
 	case p.called <- struct{}{}:
 	default:
 	}
-	sleep := "1ms"
-	if callNumber >= 8 {
-		sleep = "1h"
+	sleep := p.sleep
+	if sleep == "" {
+		sleep = "1ms"
+		if callNumber >= 8 {
+			sleep = "1h"
+		}
 	}
 	return ChatResponse{
 		Text: "Continuing standing work.",
@@ -508,6 +530,97 @@ func (p *retrievalCaptureProvider) SupportsNativeTools() bool              { ret
 func (p *retrievalCaptureProvider) AvailableBuiltinTools() []BuiltinTool   { return nil }
 func (p *retrievalCaptureProvider) SetBuiltinTools([]string)               {}
 func (p *retrievalCaptureProvider) WithBuiltins([]string) LLMProvider      { return p }
+
+func TestSpawnedWorkerRecallUsesDirectiveAlongsideVagueParentEvent(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OLLAMA_HOST", "")
+	t.Chdir(t.TempDir())
+
+	provider := &retrievalCaptureProvider{called: make(chan struct{}, 1), sleep: "1h"}
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: "Coordinate bounded workers.",
+		Mode:      ModeAutonomous,
+	}
+	parent := NewThinker("", provider, cfg)
+	defer parent.Stop()
+	defer parent.threads.KillAll()
+
+	const skillID = "skill_53_0"
+	const sentinel = "PATREON_ATTACHED_SKILL_SENTINEL"
+	skill := "# Patreon scheduling and analytics\n\n" + sentinel + "\n" +
+		"Inspect previous Friday Patreon posts, determine the correct membership tiers, open Earnings when MRR is required, edit only the named existing draft, schedule it for the requested time, and never publish it immediately. " +
+		strings.Repeat("Follow the authoritative Patreon operating procedure and verify every publishing state before continuing. ", 150)
+	if _, err := parent.memory.RememberWithID(skillID, skill, []string{
+		"skill", "skill:patreon", "skill-id:53", "skill-source:app", "skill-hash:abc123",
+	}, 0.85); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := parent.memory.RememberWithID(
+			fmt.Sprintf("skill_unrelated_%d", i),
+			fmt.Sprintf("UNRELATED_SKILL_%d\n", i)+strings.Repeat("CRM contacts opportunities pipelines email reporting. ", 80),
+			[]string{"skill", "crm", "reporting"},
+			0.85,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	workerDirective := strings.Join([]string{
+		"Inspect previous Friday Patreon posts and determine the correct tiers.",
+		"Edit only draft 166563499 and schedule it without publishing immediately.",
+		"Use the shared operating guidance rather than reconstructing its procedure.",
+	}, " ")
+	if err := parent.threads.SpawnWithOpts(
+		"patreon-worker", workerDirective, []string{"pace"},
+		SpawnOpts{DeferRun: true, ParentID: "main"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	worker := parent.threads.threads["patreon-worker"]
+	if worker == nil {
+		t.Fatal("spawned worker missing")
+	}
+	worker.Thinker.Inject("[from:main] Begin now and use the shared guidance.")
+	go worker.Thinker.Run()
+
+	select {
+	case <-provider.called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for worker model request")
+	}
+
+	provider.mu.Lock()
+	requests := append([][]Message(nil), provider.requests...)
+	provider.mu.Unlock()
+	if len(requests) == 0 {
+		t.Fatal("worker model request was not captured")
+	}
+	encoded, _ := json.Marshal(requests[0])
+	body := string(encoded)
+	if !strings.Contains(body, sentinel) {
+		t.Fatalf("worker request omitted the directive-relevant attached skill: %s", body)
+	}
+	if strings.Contains(body, "UNRELATED_SKILL_") {
+		t.Fatalf("worker request included an unrelated skill: %s", body)
+	}
+
+	events, _ := parent.telemetry.StoredEvents(0)
+	foundCombinedRecall := false
+	for _, event := range events {
+		if event.ThreadID == "patreon-worker" && event.Type == "memory.recall" &&
+			strings.Contains(string(event.Data), `"query_source":"event+directive"`) &&
+			strings.Contains(string(event.Data), skillID) {
+			foundCombinedRecall = true
+			break
+		}
+	}
+	if !foundCombinedRecall {
+		t.Fatal("missing combined event+directive recall telemetry for attached skill")
+	}
+}
 
 func TestThinkerRecallIsEphemeralAndReplacedAcrossManyTurns(t *testing.T) {
 	t.Chdir(t.TempDir())

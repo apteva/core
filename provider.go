@@ -24,17 +24,62 @@ type ProviderResponseState struct {
 	Items    []json.RawMessage `json:"items,omitempty"`
 }
 
+// Connection-pool sizing for LLM provider calls. Every thread in the instance
+// shares llmHTTPClient, so these bound the socket cost of the whole fleet
+// against a single provider host.
+const (
+	// defaultLLMMaxIdleConnsPerHost is the pooled keep-alive count per host.
+	// Go's own default for a hand-built Transport is
+	// http.DefaultMaxIdleConnsPerHost (2) — far below the concurrency a
+	// multi-thread instance generates, which means nearly every request pays
+	// a fresh TCP + TLS handshake.
+	defaultLLMMaxIdleConnsPerHost = 64
+	// defaultLLMMaxIdleConns is the pool total across all hosts. It must be
+	// at least the per-host value or it silently becomes the real limit.
+	defaultLLMMaxIdleConns = 256
+	// defaultLLMMaxConnsPerHost caps connections per host including those in
+	// use. Unlike the idle limits this one BLOCKS: once reached, further
+	// requests wait for a free connection instead of opening another socket.
+	// That makes it the instance's real concurrency knob against a provider,
+	// and the backstop against file-descriptor exhaustion. 0 = unlimited.
+	defaultLLMMaxConnsPerHost = 256
+	// defaultLLMIdleConnTimeout matches http.DefaultTransport. A hand-built
+	// Transport leaves this zero, meaning idle connections are retained
+	// forever.
+	defaultLLMIdleConnTimeout = 90 * time.Second
+)
+
+// newLLMTransport builds the shared provider transport.
+//
+// ForceAttemptHTTP2 is required, not optional: net/http disables automatic
+// HTTP/2 negotiation whenever a custom DialContext, Dial, DialTLS, or
+// TLSClientConfig is set, and this transport sets DialContext for the dial
+// timeout. Without the flag every provider call falls back to HTTP/1.1, where
+// concurrent requests cannot share a connection at all — N in-flight requests
+// require N sockets no matter how the pool is sized. With HTTP/2 they
+// multiplex over a handful.
+func newLLMTransport() *http.Transport {
+	return &http.Transport{
+		ResponseHeaderTimeout: llmResponseHeaderTimeout(),
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          llmMaxIdleConns(),
+		MaxIdleConnsPerHost:   llmMaxIdleConnsPerHost(),
+		MaxConnsPerHost:       llmMaxConnsPerHost(),
+		IdleConnTimeout:       defaultLLMIdleConnTimeout,
+	}
+}
+
 // llmHTTPClient is a shared HTTP client for all LLM provider calls.
 // It uses a response header timeout to catch dead provider requests but no
 // overall timeout since streaming responses can legitimately take minutes.
 var llmHTTPClient = &http.Client{
-	Transport: &http.Transport{
-		ResponseHeaderTimeout: llmResponseHeaderTimeout(),
-		DialContext: (&net.Dialer{
-			Timeout: 10 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second,
-	},
+	Transport: newLLMTransport(),
 }
 
 func llmResponseHeaderTimeout() time.Duration {
@@ -44,6 +89,36 @@ func llmResponseHeaderTimeout() time.Duration {
 		}
 	}
 	return 180 * time.Second
+}
+
+// envPositiveInt reads a strictly-positive integer override, falling back to
+// def for unset, unparseable, or non-positive values.
+func envPositiveInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func llmMaxIdleConnsPerHost() int {
+	return envPositiveInt("APTEVA_LLM_MAX_IDLE_CONNS_PER_HOST", defaultLLMMaxIdleConnsPerHost)
+}
+
+func llmMaxIdleConns() int {
+	return envPositiveInt("APTEVA_LLM_MAX_IDLE_CONNS", defaultLLMMaxIdleConns)
+}
+
+// llmMaxConnsPerHost accepts 0 explicitly, unlike the idle limits, because 0
+// is a meaningful value here: it restores unlimited connections per host.
+func llmMaxConnsPerHost() int {
+	if v := os.Getenv("APTEVA_LLM_MAX_CONNS_PER_HOST"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultLLMMaxConnsPerHost
 }
 
 // streamIdleTimeout is how long we wait between bytes on a streaming

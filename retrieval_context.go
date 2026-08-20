@@ -179,6 +179,33 @@ func recallQueryForTurn(consumed []string, messages []Message, directive string)
 	return "", "none"
 }
 
+// recallQueriesForTurn returns the independent inputs to automatic memory
+// relevance. The standing directive always defines the thread's durable
+// memory scope; current external context supplements it but never replaces it.
+// The strings stay separate so long directives cannot dilute a strong event
+// match (or vice versa) inside lexical or embedding retrieval.
+func recallQueriesForTurn(consumed []string, messages []Message, directive string) (queries []string, source string) {
+	current, currentSource := recallQueryForTurn(consumed, messages, "")
+	if strings.TrimSpace(current) != "" {
+		queries = append(queries, current)
+	}
+	directive = strings.TrimSpace(directive)
+	if directive != "" && directive != strings.TrimSpace(current) {
+		queries = append(queries, directive)
+	}
+
+	switch {
+	case currentSource != "none" && directive != "":
+		return queries, currentSource + "+directive"
+	case currentSource != "none":
+		return queries, currentSource
+	case directive != "":
+		return queries, "directive"
+	default:
+		return nil, "none"
+	}
+}
+
 // stripLegacyDynamicContext removes request-only blocks written by older core
 // versions. A combined entry keeps its real Events block; a synthetic-only
 // entry is dropped by callers.

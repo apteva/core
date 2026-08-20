@@ -171,7 +171,9 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 	if thread == nil {
 		t.Fatal("live worker missing")
 	}
-	thread.Thinker.InjectConsole("Run the recalled Patreon browser validation procedure now and complete every required observation step.")
+	// Keep the wake deliberately vague: the worker's standing directive must
+	// remain part of RAG relevance instead of being replaced by this event.
+	thread.Thinker.InjectConsole("Begin now and use the shared operating guidance.")
 	go thread.Thinker.Run()
 
 	deadline := time.Now().Add(6 * time.Minute)
@@ -197,7 +199,18 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 	completedCalls := toolCalls
 	toolMu.Unlock()
 	if !sawFinal || completedCalls != steps {
-		t.Fatalf("live workflow incomplete: final=%v successful_tool_calls=%d/%d", sawFinal, completedCalls, steps)
+		requests := provider.capturedRequests()
+		events, _ := parent.telemetry.StoredEvents(0)
+		for _, event := range events {
+			if event.ThreadID != threadID {
+				continue
+			}
+			switch event.Type {
+			case "memory.recall", "llm.error", "llm.done":
+				t.Logf("%s: %s", event.Type, event.Data)
+			}
+		}
+		t.Fatalf("live workflow incomplete: final=%v successful_tool_calls=%d/%d model_requests=%d", sawFinal, completedCalls, steps, len(requests))
 	}
 
 	events, _ := parent.telemetry.StoredEvents(0)

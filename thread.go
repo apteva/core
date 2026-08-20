@@ -60,6 +60,7 @@ SPAWNING SUB-THREADS:
 - Consolidate closely related continuing responsibilities under one focused owner instead of creating one thread per schedule.
 - Use kill(id="...") to stop a sub-thread.
 - Use update(id="..." directive="..." tools="...") to change a sub-thread's directive or tools.
+- Use list_threads(filter="...") to search your complete descendant hierarchy by id, name, directive, tool, or MCP scope. [ACTIVE THREADS] states whether the hierarchy is complete; when it says "partial view", it is NOT proof a thread is missing — search broadly before spawning.
 - Your sub-threads report to YOU, not to main. You coordinate your team.
 - The "directive" must be PLAIN NATURAL LANGUAGE. Never put tool call syntax in directives.
 - NEVER spawn a replacement for a thread that already exists. Threads sleep — silence is normal, not a crash.
@@ -451,6 +452,12 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if canSpawn && toolSet["spawn"] {
 		toolSet["kill"] = true
 		toolSet["update"] = true
+		// A leader's roster is its OWN children, so a leader with a large
+		// team hits the same digest threshold main does and needs the same
+		// escape hatch. MainOnly on the ToolDef keeps it out of worker
+		// prompt docs and out of AllToolNames; wire visibility is this
+		// allowlist, exactly as for kill/update.
+		toolSet["list_threads"] = true
 	} else {
 		// Not a leader — remove spawn even if canSpawn by depth
 		delete(toolSet, "spawn")
@@ -1068,7 +1075,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			// Check if inline or registry tool
 			isInline := true
 			switch call.Name {
-			case "send", "spawn", "kill", "update", "evolve", "remember", "pace", "done", "search_tools":
+			case "send", "spawn", "kill", "update", "list_threads", "evolve", "remember", "pace", "done", "search_tools":
 				// inline
 			default:
 				isInline = false // executeTool handles _reason and telemetry
@@ -1217,6 +1224,10 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 					}
 				}
+				toolNames = append(toolNames, call.Raw)
+			case "list_threads":
+				t.kickNextTurn = true
+				emitResult(call, runListThreads(thread.Children, call.Args))
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
 				sid := call.Args["id"]
@@ -1555,6 +1566,47 @@ func (tm *ThreadManager) ListAgentVisible() []ThreadInfo {
 	return visible
 }
 
+// ListTree returns this manager's threads plus every descendant, depth-first.
+//
+// List covers only direct children — SubThreads is a count, not a recursion.
+// Searching for an existing owner before spawning must see grandchildren too,
+// or the check produces false negatives and therefore duplicate spawns.
+//
+// Lock discipline mirrors threadExistsInTree: snapshot child manager pointers
+// under a short RLock, then recurse with no lock held. Recursing under tm.mu
+// deadlocks against spawnInternal's write lock.
+func (tm *ThreadManager) ListTree() []ThreadInfo {
+	out := tm.List() // acquires and releases tm.mu internally
+
+	tm.mu.RLock()
+	children := make([]*ThreadManager, 0, len(tm.threads))
+	for _, t := range tm.threads {
+		if t.Children != nil {
+			children = append(children, t.Children)
+		}
+	}
+	tm.mu.RUnlock()
+
+	for _, child := range children {
+		out = append(out, child.ListTree()...)
+	}
+	return out
+}
+
+// ListTreeAgentVisible is ListTree without system threads, sorted by id so
+// pagination through it is stable across calls.
+func (tm *ThreadManager) ListTreeAgentVisible() []ThreadInfo {
+	all := tm.ListTree()
+	visible := all[:0]
+	for _, info := range all {
+		if !info.System {
+			visible = append(visible, info)
+		}
+	}
+	sort.Slice(visible, func(i, j int) bool { return visible[i].ID < visible[j].ID })
+	return visible
+}
+
 func (tm *ThreadManager) Count() int {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
@@ -1796,6 +1848,7 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 		if thread.Children != nil && toolSet["spawn"] {
 			toolSet["kill"] = true
 			toolSet["update"] = true
+			toolSet["list_threads"] = true
 		}
 		nextTools = toolSet
 	}

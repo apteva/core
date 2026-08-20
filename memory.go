@@ -743,10 +743,61 @@ type MemoryRecallMatch struct {
 
 // RecallMatches is Recall with score metadata and content deduplication.
 func (ms *MemoryStore) RecallMatches(query string, n int) []MemoryRecallMatch {
+	return ms.RecallMatchesForContexts([]string{query}, n)
+}
+
+// RecallMatchesForContexts ranks memories against each independent piece of
+// the thread's effective context (for example its standing directive and its
+// current external input). Scores are combined per record instead of joining
+// the texts into one long query, which would dilute a strong match from either
+// source. A record relevant to both contexts ranks above one relevant to only
+// one, while the normal record limit and content deduplication still apply.
+func (ms *MemoryStore) RecallMatchesForContexts(queries []string, n int) []MemoryRecallMatch {
 	if n <= 0 {
 		n = 5
 	}
-	scored := ms.scoreActive(query, scoreOpts{useEmbedding: ms.backend != nil, applyDecay: true})
+	type combinedMatch struct {
+		record MemoryRecord
+		signal float64
+		factor float64
+	}
+	combined := make(map[string]combinedMatch)
+	seenQueries := make(map[string]struct{}, len(queries))
+	for _, query := range queries {
+		query = strings.TrimSpace(query)
+		if query == "" {
+			continue
+		}
+		if _, duplicate := seenQueries[query]; duplicate {
+			continue
+		}
+		seenQueries[query] = struct{}{}
+		for _, item := range ms.scoreActive(query, scoreOpts{useEmbedding: ms.backend != nil, applyDecay: true}) {
+			current := combined[item.rec.ID]
+			current.record = item.rec
+			// Probabilistic union keeps the result in [0,1], preserves a
+			// single-query score, and rewards evidence from both contexts.
+			current.signal = 1 - (1-current.signal)*(1-item.signal)
+			if item.signal > 0 {
+				current.factor = item.score / item.signal // weight * decay
+			}
+			combined[item.rec.ID] = current
+		}
+	}
+	scored := make([]scoredRec, 0, len(combined))
+	for _, item := range combined {
+		scored = append(scored, scoredRec{
+			rec:    item.record,
+			signal: item.signal,
+			score:  item.signal * item.factor,
+		})
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].score == scored[j].score {
+			return scored[i].rec.ID < scored[j].rec.ID
+		}
+		return scored[i].score > scored[j].score
+	})
 	out := make([]MemoryRecallMatch, 0, min(n, len(scored)))
 	seenContent := make(map[string]struct{}, len(scored))
 	for _, item := range scored {
@@ -802,7 +853,7 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 			queryEmb = emb
 		}
 	}
-	queryTokens := meaningfulMemoryTokens(tokenize(query))
+	queryTokenSets := recallQueryTokenSets(query)
 	now := time.Now().UTC()
 
 	out := make([]scoredRec, 0, len(active))
@@ -817,7 +868,7 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 				signal = 0
 			}
 		} else {
-			signal = lexicalScore(queryTokens, r)
+			signal = lexicalScore(queryTokenSets, r)
 		}
 		if signal <= 0 || (usedEmbedding && signal < minEmbeddingRecallSimilarity) {
 			continue
@@ -1063,13 +1114,59 @@ func tokenize(s string) map[string]int {
 	return out
 }
 
-// lexicalScore is the no-embeddings fallback. Counts the share of
-// query tokens that appear in the record's content + tags. Range
-// [0, 1]. Not BM25 — we don't have a corpus statistic — but it's
-// cheap, deterministic, and correlates well enough with relevance
-// for the small per-instance memory sizes we care about.
-func lexicalScore(queryTokens map[string]int, r MemoryRecord) float64 {
-	if len(queryTokens) == 0 {
+// recallQueryTokenSets retains both the complete context and its logical
+// lines/sentences. A standing directive often contains several independent
+// responsibilities; scoring only the complete text can dilute a strong local
+// match below the recall threshold. Segmenting is lexical-only and local: an
+// embedding backend still receives one request per independent context.
+func recallQueryTokenSets(query string) []map[string]int {
+	var sets []map[string]int
+	seen := make(map[string]struct{})
+	add := func(text string, minTokenCount int) {
+		tokens := meaningfulMemoryTokens(tokenize(text))
+		tokenCount := 0
+		for _, count := range tokens {
+			tokenCount += count
+		}
+		if tokenCount < minTokenCount {
+			return
+		}
+		keys := make([]string, 0, len(tokens))
+		for token := range tokens {
+			keys = append(keys, token)
+		}
+		sort.Strings(keys)
+		var signature strings.Builder
+		for _, token := range keys {
+			fmt.Fprintf(&signature, "%s:%d;", token, tokens[token])
+		}
+		if _, duplicate := seen[signature.String()]; duplicate {
+			return
+		}
+		seen[signature.String()] = struct{}{}
+		sets = append(sets, tokens)
+	}
+	add(query, 1)
+	for _, segment := range strings.FieldsFunc(query, func(r rune) bool {
+		switch r {
+		case '\n', '\r', '.', '?', '!', ';':
+			return true
+		default:
+			return false
+		}
+	}) {
+		// Ignore structural headings and terse generic fragments. The full
+		// query remains available, so genuinely short requests still work.
+		add(segment, 3)
+	}
+	return sets
+}
+
+// lexicalScore is the no-embeddings fallback. It counts the share of tokens
+// from the strongest complete-context or logical-segment match that occur in
+// the record's content + tags. Range [0, 1].
+func lexicalScore(queryTokenSets []map[string]int, r MemoryRecord) float64 {
+	if len(queryTokenSets) == 0 {
 		return 0
 	}
 	doc := r.Content
@@ -1077,22 +1174,28 @@ func lexicalScore(queryTokens map[string]int, r MemoryRecord) float64 {
 		doc += " " + strings.Join(r.Tags, " ")
 	}
 	docTokens := tokenize(doc)
-	hits := 0
-	total := 0
-	for q, qcount := range queryTokens {
-		total += qcount
-		if dc, ok := docTokens[q]; ok {
-			if dc < qcount {
-				hits += dc
-			} else {
-				hits += qcount
+	best := 0.0
+	for _, queryTokens := range queryTokenSets {
+		hits := 0
+		total := 0
+		for q, qcount := range queryTokens {
+			total += qcount
+			if dc, ok := docTokens[q]; ok {
+				if dc < qcount {
+					hits += dc
+				} else {
+					hits += qcount
+				}
+			}
+		}
+		if total > 0 {
+			score := float64(hits) / float64(total)
+			if score > best {
+				best = score
 			}
 		}
 	}
-	if total == 0 {
-		return 0
-	}
-	return float64(hits) / float64(total)
+	return best
 }
 
 var memoryRecallStopwords = map[string]struct{}{

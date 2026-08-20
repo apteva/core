@@ -239,6 +239,7 @@ TIME, STATE, AND RECURRENCE:
 
 OWNERSHIP AND DELEGATION:
 - Before spawning, check [ACTIVE THREADS]. Prefer an existing thread when it already owns the relevant domain or operational state; communicate with that known owner directly.
+- [ACTIVE THREADS] states whether it is the complete hierarchy. When it says "partial view", absence from it is NOT evidence that no owner exists — search broadly with list_threads before spawning, or you may create a duplicate.
 - Spawn when no existing owner fits and separate ownership materially helps, including persistent operational state, parallel execution, waiting or retries, substantial context isolation, continued operation, or independent failure handling.
 - For multiple independent work units, assign the units to focused owners instead of executing the first unit on main.
 - For batches of independent repeated work, especially tool-heavy or waiting/polling work, coordinate focused workers. Consolidate closely related continuing responsibilities under one owner instead of creating one thread per schedule.
@@ -443,6 +444,145 @@ Codex may not expose provider reasoning summaries. When you call tools, include 
 	return prompt
 }
 
+// Roster budgets for the [ACTIVE THREADS] block. This block is re-sent as
+// UNCACHED input on every request-context refresh (it lives in the tail
+// ephemeral snapshot, not messages[0]), so its size is a recurring per-turn
+// cost rather than a one-time prefix cost.
+//
+// A rendered entry is ~300 chars (27 chars of scaffolding + label + a
+// directive hard-capped at 150 + the joined tool list, whose builtins alone
+// are 38 chars). 8 KB ≈ 2,000 tokens ≈ 27 typical entries, which keeps the
+// roster from being the largest uncached thing in a turn.
+//
+// The char budget is the real gate; the entry count is a cheap pre-check
+// sized to trip at roughly the same point. Neither alone is sufficient: a
+// handful of leaders with wide tool grants can exceed 8 KB well under 30
+// entries, and many lean workers can pass 30 entries well under 8 KB.
+const (
+	rosterInlineMaxEntries = 30
+	rosterInlineMaxChars   = 8 << 10
+	// rosterReexpandFraction is hysteresis. Both budgets must fall below
+	// this fraction before a digested roster returns to full rendering, so
+	// a fleet hovering at the boundary does not alternate every turn.
+	// Expressed as a fraction because an absolute margin does not translate
+	// between the two gates.
+	rosterReexpandFraction = 0.75
+	// rosterDigestDeltaNames caps how many ids are named per delta category
+	// so a burst of spawns cannot itself become an unbounded block.
+	rosterDigestDeltaNames = 5
+)
+
+// rosterView carries the cross-turn state the roster renderer needs: whether
+// the previous turn digested, and which thread ids were present then. Its zero
+// value means "render everything, report no delta", which is what the
+// two-argument buildDynamicTurnContext wrapper passes.
+type rosterView struct {
+	digested bool
+	previous map[string]bool
+}
+
+// rosterEntry renders one thread exactly as the full roster always has.
+// Extracted so the digest path can measure entries without duplicating the
+// format, and so the format lives in exactly one place.
+func rosterEntry(t ThreadInfo) string {
+	label := t.ID
+	if t.Name != "" && t.Name != t.ID {
+		label = fmt.Sprintf("%s (%s)", t.Name, t.ID)
+	}
+	subInfo := ""
+	if t.SubThreads > 0 {
+		subInfo = fmt.Sprintf(" [sub-threads: %d]", t.SubThreads)
+	}
+	runtimeInfo := ""
+	if t.Realtime {
+		ownership := "persistent"
+		if t.Ephemeral {
+			ownership = "ephemeral"
+		}
+		bridge := "not connected"
+		if t.BridgeConnected {
+			bridge = "connected"
+		}
+		runtimeInfo = fmt.Sprintf(" [realtime; %s; audio bridge %s; listed configuration already applied]", ownership, bridge)
+	}
+	return fmt.Sprintf("- %s%s%s\n  directive: %s\n  tools: %s\n",
+		label, subInfo, runtimeInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
+}
+
+// rosterShouldDigest applies the two budgets plus hysteresis. entries are the
+// already-rendered per-thread strings, so the char measurement is exact rather
+// than estimated.
+func rosterShouldDigest(entries []string, wasDigested bool) bool {
+	chars := 0
+	for _, e := range entries {
+		chars += len(e)
+	}
+	if wasDigested {
+		// Already digested: stay digested until BOTH budgets are
+		// comfortably clear.
+		return float64(len(entries)) > rosterInlineMaxEntries*rosterReexpandFraction ||
+			float64(chars) > rosterInlineMaxChars*rosterReexpandFraction
+	}
+	return len(entries) > rosterInlineMaxEntries || chars > rosterInlineMaxChars
+}
+
+// rosterDelta reports ids added and removed since the previous turn. previous
+// nil (first turn, or the zero rosterView) yields no delta rather than
+// reporting every thread as newly spawned.
+func rosterDelta(current []ThreadInfo, previous map[string]bool) (added, removed []string) {
+	if previous == nil {
+		return nil, nil
+	}
+	live := make(map[string]bool, len(current))
+	for _, t := range current {
+		live[t.ID] = true
+		if !previous[t.ID] {
+			added = append(added, t.ID)
+		}
+	}
+	for id := range previous {
+		if !live[id] {
+			removed = append(removed, id)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed
+}
+
+// formatRosterDeltaNames renders at most rosterDigestDeltaNames ids, with an
+// explicit overflow count so the model is never misled about the true number.
+func formatRosterDeltaNames(ids []string) string {
+	if len(ids) <= rosterDigestDeltaNames {
+		return strings.Join(ids, ", ")
+	}
+	shown := strings.Join(ids[:rosterDigestDeltaNames], ", ")
+	return fmt.Sprintf("%s, +%d more", shown, len(ids)-rosterDigestDeltaNames)
+}
+
+// advanceRoster records this turn's roster state for the next turn's delta and
+// hysteresis decision. Called once per iteration, after the view for the
+// current turn has been captured.
+func (t *Thinker) advanceRoster(activeThreads []ThreadInfo) {
+	visible := make([]string, 0, len(activeThreads))
+	entries := make([]string, 0, len(activeThreads))
+	for _, th := range activeThreads {
+		if th.System {
+			continue
+		}
+		visible = append(visible, th.ID)
+		entries = append(entries, rosterEntry(th))
+	}
+	present := make(map[string]bool, len(visible))
+	for _, id := range visible {
+		present[id] = true
+	}
+	t.roster = rosterView{
+		digested: rosterShouldDigest(entries, t.roster.digested),
+		previous: present,
+	}
+}
+
 // buildDynamicTurnContext returns the per-turn volatile context block
 // — the part of the prompt that MUST change between iterations:
 // active sub-threads (whose state changes constantly) and recalled
@@ -455,6 +595,26 @@ Codex may not expose provider reasoning summaries. When you call tools, include 
 // Returns "" when nothing dynamic applies (no threads, no memory) so
 // the user message stays clean.
 func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext string) string {
+	return buildDynamicTurnContextView(activeThreads, recallContext, rosterView{})
+}
+
+// activeThreadRoster returns the complete agent-visible hierarchy below the
+// current thinker. Keeping this selection in one helper prevents the prompt's
+// "complete list" claim from accidentally being built from direct children
+// while list_threads searches all descendants.
+func activeThreadRoster(tm *ThreadManager) []ThreadInfo {
+	if tm == nil {
+		return nil
+	}
+	return tm.ListTreeAgentVisible()
+}
+
+// buildDynamicTurnContextView is buildDynamicTurnContext with the cross-turn
+// roster state threaded through. The block always opens with the literal
+// "[ACTIVE THREADS]" token in both renderings — context_breakdown.go splits on
+// it for per-section accounting and retrieval_context.go prefix-matches it, so
+// any extra header text must follow on the same line.
+func buildDynamicTurnContextView(activeThreads []ThreadInfo, recallContext string, view rosterView) string {
 	var sb strings.Builder
 
 	// Active threads — only id, name, directive, tools. Wall-clock /
@@ -468,30 +628,21 @@ func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext string) s
 		}
 	}
 	if len(visibleThreads) > 0 {
-		sb.WriteString("[ACTIVE THREADS]\n")
+		entries := make([]string, 0, len(visibleThreads))
 		for _, t := range visibleThreads {
-			label := t.ID
-			if t.Name != "" && t.Name != t.ID {
-				label = fmt.Sprintf("%s (%s)", t.Name, t.ID)
+			entries = append(entries, rosterEntry(t))
+		}
+		if rosterShouldDigest(entries, view.digested) {
+			sb.WriteString(rosterDigest(visibleThreads, view.previous))
+		} else {
+			// Assert completeness explicitly. Without it the model
+			// spends a turn calling list_threads to check whether the
+			// roster is truncated — exactly the cost this block is
+			// supposed to avoid at small scale.
+			sb.WriteString(fmt.Sprintf("[ACTIVE THREADS] %d total — this is the complete list.\n", len(visibleThreads)))
+			for _, e := range entries {
+				sb.WriteString(e)
 			}
-			subInfo := ""
-			if t.SubThreads > 0 {
-				subInfo = fmt.Sprintf(" [sub-threads: %d]", t.SubThreads)
-			}
-			runtimeInfo := ""
-			if t.Realtime {
-				ownership := "persistent"
-				if t.Ephemeral {
-					ownership = "ephemeral"
-				}
-				bridge := "not connected"
-				if t.BridgeConnected {
-					bridge = "connected"
-				}
-				runtimeInfo = fmt.Sprintf(" [realtime; %s; audio bridge %s; listed configuration already applied]", ownership, bridge)
-			}
-			sb.WriteString(fmt.Sprintf("- %s%s%s\n  directive: %s\n  tools: %s\n",
-				label, subInfo, runtimeInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", ")))
 		}
 	}
 
@@ -502,6 +653,51 @@ func buildDynamicTurnContext(activeThreads []ThreadInfo, recallContext string) s
 		sb.WriteString(recallContext)
 	}
 
+	return sb.String()
+}
+
+// rosterDigest renders the over-budget form: counts, what changed since the
+// previous turn, and a pointer to list_threads. It deliberately carries the
+// dedupe correction — the system prompts instruct the model to consult
+// [ACTIVE THREADS] before spawning and to never spawn a replacement for an
+// existing thread, and against a partial roster that check produces false
+// negatives and therefore duplicate spawns.
+func rosterDigest(visibleThreads []ThreadInfo, previous map[string]bool) string {
+	// Only counts that are actually derivable from ThreadInfo. ThreadInfo.Running
+	// is hardcoded true by ThreadManager.List, so a running/paused split here
+	// would be fiction; NextWakeAt and SubThreads are real.
+	timed, eventOnly, leaders := 0, 0, 0
+	for _, t := range visibleThreads {
+		if t.NextWakeAt.IsZero() {
+			eventOnly++
+		} else {
+			timed++
+		}
+		if t.SubThreads > 0 {
+			leaders++
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[ACTIVE THREADS] %d total (%d with a pending wake, %d waiting on events, %d with sub-threads) — partial view.\n",
+		len(visibleThreads), timed, eventOnly, leaders))
+
+	added, removed := rosterDelta(visibleThreads, previous)
+	if len(added) > 0 || len(removed) > 0 {
+		sb.WriteString("  since last turn:")
+		if len(added) > 0 {
+			sb.WriteString(fmt.Sprintf(" +%d spawned (%s)", len(added), formatRosterDeltaNames(added)))
+		}
+		if len(removed) > 0 {
+			if len(added) > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(fmt.Sprintf(" -%d ended (%s)", len(removed), formatRosterDeltaNames(removed)))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("  Too many threads to list inline. Call list_threads(filter=\"...\", limit=25) to search them.\n")
+	sb.WriteString("  This view is PARTIAL: before spawning, use list_threads to confirm no existing thread already owns the work. Absence from this block is not evidence a thread does not exist.\n")
 	return sb.String()
 }
 
@@ -831,6 +1027,11 @@ type Thinker struct {
 	// snapshot avoids racing status requests against message slice updates.
 	runtimeStatus atomic.Value // thinkerRuntimeStatus
 	contextStatus atomic.Value // thinkerContextStatus
+
+	// roster carries [ACTIVE THREADS] state across turns: whether the last
+	// turn digested (for hysteresis) and which child ids were present (for
+	// the delta). Owned by the thinking loop, like the message slice.
+	roster rosterView
 }
 
 const defaultMaxConcurrentTools = 16
@@ -1603,7 +1804,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			// Check if this is an inline tool (handled here) or registry tool (handled by executeTool)
 			isInline := true
 			switch call.Name {
-			case "spawn", "kill", "update", "send", "evolve", "remember", "pace", "connect", "disconnect", "list_connected", "done", "search_tools":
+			case "spawn", "kill", "update", "list_threads", "send", "evolve", "remember", "pace", "connect", "disconnect", "list_connected", "done", "search_tools":
 				// inline — we handle _reason and telemetry here
 			default:
 				isInline = false // executeTool handles _reason and telemetry
@@ -1791,6 +1992,14 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					}
 				}
+				toolNames = append(toolNames, call.Raw)
+			case "list_threads":
+				// The list is intermediate discovery, not task completion. Give
+				// the model one immediate turn to consume the result and decide
+				// whether to reuse an owner or spawn. A further continuation only
+				// happens if the model explicitly calls the tool again.
+				t.kickNextTurn = true
+				addResult(runListThreads(t.threads, call.Args))
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
 				id := call.Args["id"]
@@ -2487,16 +2696,16 @@ func (t *Thinker) Run() {
 		)
 		recallRefreshed := recallRefreshReason != ""
 		if recallRefreshed {
-			// Query the current event, otherwise the latest durable user context,
-			// otherwise the standing directive. Generated assistant filler and
-			// previously injected request context are never retrieval queries.
-			memQuery, querySource := recallQueryForTurn(consumed, t.messages, t.directive)
+			// The standing directive always defines memory scope; current external
+			// context supplements it without replacing or diluting it. Generated
+			// assistant filler and injected request snapshots are never queries.
+			memQueries, querySource := recallQueriesForTurn(consumed, t.messages, t.directive)
 			memoryCandidates := 0
 			var recallMatches []MemoryRecallMatch
 			var recallContext string
-			if t.memory != nil && t.memory.Count() > 0 && memQuery != "" {
+			if t.memory != nil && t.memory.Count() > 0 && len(memQueries) > 0 {
 				memoryCandidates = len(t.memory.Active())
-				ranked := t.memory.RecallMatches(memQuery, automaticMemoryRecallMaxRecords)
+				ranked := t.memory.RecallMatchesForContexts(memQueries, automaticMemoryRecallMaxRecords)
 				recallMatches, recallContext = t.memory.BuildAutomaticRecallContext(ranked)
 			}
 			t.memoryRecall.set(
@@ -2524,14 +2733,17 @@ func (t *Thinker) Run() {
 			}
 		}
 		recallContext := t.memoryRecall.context
-		var activeThreads []ThreadInfo
-		if t.threads != nil {
-			activeThreads = t.threads.ListAgentVisible()
-		}
+		activeThreads := activeThreadRoster(t.threads)
+		// Resolve the roster view ONCE per iteration. The post-compaction
+		// re-render below reuses it deliberately: recomputing would advance
+		// the delta baseline mid-turn and make the two renderings of the same
+		// turn disagree.
+		rosterForTurn := t.roster
+		t.advanceRoster(activeThreads)
 		// Keep one current request-only context snapshot. A new external/wake or
 		// retrieval change replaces it; tool-result continuations retain it at
 		// the same anchor so selected memory remains visible without duplication.
-		dynCtx := buildDynamicTurnContext(activeThreads, recallContext)
+		dynCtx := buildDynamicTurnContextView(activeThreads, recallContext, rosterForTurn)
 		dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
 		refreshRequestContext := recallRefreshed || hasExternalEvent || (!hadEvents && len(toolResults) == 0)
 		requestMessages := t.requestContext.prepare(
@@ -2563,7 +2775,7 @@ func (t *Thinker) Run() {
 			t.compactForContextPressure("pre_llm", TokenUsage{}, emptyLLMResponses)
 			// Compaction resets request-only snapshots. Reattach the current
 			// retrieval-cycle memory exactly once to the new provider prefix.
-			dynCtx = buildDynamicTurnContext(activeThreads, recallContext)
+			dynCtx = buildDynamicTurnContextView(activeThreads, recallContext, rosterForTurn)
 			dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
 			requestMessages = t.requestContext.prepare(
 				t.messages,

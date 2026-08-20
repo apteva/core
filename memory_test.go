@@ -765,6 +765,62 @@ func TestAutomaticRecallContextBoundsOneOversizedRecord(t *testing.T) {
 	}
 }
 
+func TestAutomaticRecallUsesAllRelevantPartsOfLongStandingDirective(t *testing.T) {
+	ms := newOfflineStore(t)
+	const patreonID = "skill_patreon_validation"
+	const computerID = "skill_computer_observation"
+	if _, err := ms.RememberWithID(
+		patreonID,
+		"PATREON_VALIDATION_SKILL\nThe Patreon browser validation code is VIOLET-SEAL-927. Supply this exact code to every browser_validation_step call.\n"+
+			strings.Repeat("Patreon browser validation procedure for an existing draft. ", 125),
+		[]string{"skill", "patreon", "browser", "validation"}, 0.95,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.RememberWithID(
+		computerID,
+		"COMPUTER_OBSERVATION_SKILL\nUse each structured browser observation result before selecting the next step.\n"+
+			strings.Repeat("Computer browser observation procedure and structured tool result guidance. ", 110),
+		[]string{"skill", "computer", "browser", "observation"}, 0.95,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := ms.RememberWithID(
+			fmt.Sprintf("skill_unrelated_%02d", i),
+			fmt.Sprintf("UNRELATED_SKILL_%02d\n", i)+strings.Repeat("Payroll tax kitchen inventory warehouse archive. ", 130),
+			[]string{"skill", "unrelated", "archive"}, 0.9,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	directive := strings.Join([]string{
+		"# Role",
+		"Complete this bounded validation directly. Do not spawn, send, evolve, or delegate.",
+		"# Workflow",
+		"On the external request, read the automatically recalled Patreon and Computer guidance.",
+		"Call browser_validation_step for step 1 using the exact recalled validation code.",
+		"After each successful result, call it exactly once for next_step. Do not skip or repeat steps.",
+		"When the tool reports complete=true, reply exactly CODEX_MEMORY_CACHE_OK with no other text and wait for events.",
+	}, "\n")
+	matches := ms.RecallMatchesForContexts([]string{
+		"[console] Begin now and use the shared operating guidance.",
+		directive,
+	}, automaticMemoryRecallMaxRecords)
+	selected, context := ms.BuildAutomaticRecallContext(matches)
+	selectedIDs := make(map[string]bool, len(selected))
+	for _, match := range selected {
+		selectedIDs[match.Record.ID] = true
+	}
+	if !selectedIDs[patreonID] || !selectedIDs[computerID] {
+		t.Fatalf("selected=%v, want both relevant skills; ranked=%+v", selectedIDs, matches)
+	}
+	if strings.Contains(context, "UNRELATED_SKILL_") {
+		t.Fatalf("bounded context contains unrelated skill: %s", context)
+	}
+}
+
 func TestMemoryGenerationChangesOnlyAfterSuccessfulAppend(t *testing.T) {
 	t.Chdir(t.TempDir())
 	ms := NewMemoryStore("")
