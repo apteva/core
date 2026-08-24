@@ -300,3 +300,17 @@ func TestMCPHTTP_DecodeBody(t *testing.T) {
 		})
 	}
 }
+
+func TestIsAptevaAppMCPURLRecognizesRuntimeGateway(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://127.0.0.1:5280/api/apps/conversations/mcp?install_id=7",
+		"http://127.0.0.1:5280/api/environment-app-gateway/runtime-1/agent-7/conversations/mcp",
+	} {
+		if !isAptevaAppMCPURL(rawURL) {
+			t.Fatalf("Apteva app MCP URL not recognized: %s", rawURL)
+		}
+	}
+	if isAptevaAppMCPURL("https://example.com/api/apps/conversations/mcp") {
+		t.Fatal("remote app-looking URL was trusted")
+	}
+}

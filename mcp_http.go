@@ -183,7 +183,8 @@ func isAptevaAppMCPURL(raw string) bool {
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
 		return false
 	}
-	return strings.HasPrefix(u.Path, "/api/apps/") && strings.HasSuffix(u.Path, "/mcp")
+	return (strings.HasPrefix(u.Path, "/api/apps/") || strings.HasPrefix(u.Path, "/api/environment-app-gateway/")) &&
+		strings.HasSuffix(u.Path, "/mcp")
 }
 
 func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMessage, http.Header, error) {

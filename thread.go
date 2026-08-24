@@ -28,6 +28,7 @@ BEHAVIOR:
 {{REASONING}}
 - Process events when they arrive. Use your tools to accomplish tasks.
 - Stay focused on YOUR directive. Do not try to take over coordination duties.
+- Shared memories relevant to your directive are supplied automatically. If your work requires a named procedure or policy that is not actually present in your context, do not search for it as a tool, reconstruct it, or invent it. Send your parent one concise missing-guidance blocker, then wait for their reply without repeating the request.
 - Keep each thought concise — 1-2 short paragraphs max.
 - If you have no events to process, just sleep. Silence is normal — do not invent emergencies or report false failures.
 
@@ -71,6 +72,7 @@ BEHAVIOR:
 {{REASONING}}
 - Process events when they arrive. Use your tools to accomplish tasks.
 - Stay focused on YOUR directive. Delegate sub-tasks to your workers.
+- Shared memories relevant to your directive are supplied automatically. If your work requires a named procedure or policy that is not actually present in your context, do not search for it as a tool, reconstruct it, or invent it. Send your parent one concise missing-guidance blocker, then wait for their reply without repeating the request.
 - Keep each thought concise — 1-2 short paragraphs max.
 
 {{PACING}}
@@ -1789,6 +1791,11 @@ func (tm *ThreadManager) SetEphemeral(id string, ephemeral bool) error {
 
 type ThreadUpdateOptions struct {
 	RestartRealtime bool
+	// ReplaceTools distinguishes an explicitly empty exact-tool profile from
+	// an omitted tools field, which preserves the current profile.
+	ReplaceTools bool
+	// MCPNames, when non-nil, replaces the thread's discoverable MCP scopes.
+	MCPNames *[]string
 }
 
 type ThreadUpdateResult struct {
@@ -1796,6 +1803,7 @@ type ThreadUpdateResult struct {
 	NameChanged       bool
 	DirectiveChanged  bool
 	ToolsChanged      bool
+	MCPChanged        bool
 	RealtimeRestarted bool
 }
 
@@ -1805,6 +1813,41 @@ func sameToolSet(a, b map[string]bool) bool {
 	}
 	for name, enabled := range a {
 		if b[name] != enabled {
+			return false
+		}
+	}
+	return true
+}
+
+func compactStringList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func sameStringSliceSet(a, b []string) bool {
+	left := compactStringList(a)
+	right := compactStringList(b)
+	if len(left) != len(right) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(left))
+	for _, value := range left {
+		seen[value] = struct{}{}
+	}
+	for _, value := range right {
+		if _, exists := seen[value]; !exists {
 			return false
 		}
 	}
@@ -1837,7 +1880,7 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 	}
 	result.DirectiveChanged = nextDirective != thread.Directive
 	nextTools := thread.Tools
-	if len(tools) > 0 {
+	if opts.ReplaceTools || len(tools) > 0 {
 		toolSet := make(map[string]bool)
 		for _, t := range tools {
 			if name := strings.TrimSpace(t); name != "" {
@@ -1853,7 +1896,12 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 		nextTools = toolSet
 	}
 	result.ToolsChanged = !sameToolSet(nextTools, thread.Tools)
-	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged
+	nextMCPNames := thread.MCPNames
+	if opts.MCPNames != nil {
+		nextMCPNames = compactStringList(*opts.MCPNames)
+	}
+	result.MCPChanged = !sameStringSliceSet(nextMCPNames, thread.MCPNames)
+	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged || result.MCPChanged
 	if !result.Changed {
 		tm.mu.Unlock()
 		return result, nil
@@ -1861,7 +1909,7 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 
 	realtime := thread.Realtime
 	bridgeConnected := thread.bridgeConnected
-	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged) && thread.promptBuilder != nil {
+	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged || result.MCPChanged) && thread.promptBuilder != nil {
 		nextPrompt := thread.promptBuilder(nextDirective)
 		nextNativeTools := realtimeNativeToolsFor(thread.Thinker, nextTools, false)
 		if realtime.configurationDisposition(nextPrompt, nextNativeTools) == RealtimeConfigurationRestartRequired &&
@@ -1874,6 +1922,7 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 	if !thread.Ephemeral {
 		persisted := persistentThreadState(thread)
 		persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
+		persisted.MCPNames = append([]string(nil), nextMCPNames...)
 		if err := tm.parent.config.SaveThread(persisted); err != nil {
 			tm.mu.Unlock()
 			return ThreadUpdateResult{}, fmt.Errorf("persist thread update: %w", err)
@@ -1886,7 +1935,34 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 	thread.Name = nextName
 	thread.Directive = nextDirective
 	thread.Tools = nextTools
+	thread.MCPNames = append([]string(nil), nextMCPNames...)
 	thread.Thinker.toolAllowlist = nextTools
+	if result.MCPChanged {
+		nextScopes := make(map[string]bool, len(nextMCPNames))
+		for _, name := range nextMCPNames {
+			nextScopes[name] = true
+		}
+		thread.Thinker.toolMCPScopes = nextScopes
+		// MCP activation is sticky during ordinary thinking. A profile
+		// replacement is an authorization boundary, so discard activated tools
+		// that are neither exact grants nor members of a newly granted scope.
+		nextActive := make(map[string]bool, len(thread.Thinker.activeTools))
+		for name := range thread.Thinker.activeTools {
+			if nextTools[name] {
+				nextActive[name] = true
+				continue
+			}
+			if thread.Thinker.toolIndex != nil {
+				if entry, ok := thread.Thinker.toolIndex.Get(name); ok && nextScopes[entry.Server] {
+					nextActive[name] = true
+				}
+			}
+		}
+		thread.Thinker.activeTools = nextActive
+		thread.Thinker.presentedToolsMu.Lock()
+		thread.Thinker.presentedTools = nil
+		thread.Thinker.presentedToolsMu.Unlock()
+	}
 	if thread.Thinker.rebuildPrompt != nil && len(thread.Thinker.messages) > 0 {
 		thread.Thinker.messages[0] = Message{Role: "system", Content: thread.Thinker.rebuildPrompt("")}
 	}
@@ -1896,7 +1972,7 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 	}
 	tm.mu.Unlock()
 
-	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged) {
+	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged || result.MCPChanged) {
 		restarted, err := realtime.applyExternalConfigurationChange(opts.RestartRealtime || !bridgeConnected, "parent_configuration_update")
 		if err != nil {
 			return result, err

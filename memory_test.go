@@ -720,31 +720,42 @@ func TestBuildContext_IsDeterministicForCacheReuse(t *testing.T) {
 	}
 }
 
-func TestAutomaticRecallContextUsesSignalAndTotalBudget(t *testing.T) {
+func TestAutomaticRecallContextIncludesThreeRelevantSkillsWithin48KiBAndReportsOverflow(t *testing.T) {
+	if automaticMemoryRecallMaxChars != 48*1024 {
+		t.Fatalf("automatic recall limit = %d, want 48 KiB", automaticMemoryRecallMaxChars)
+	}
 	ms := &MemoryStore{}
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	matches := []MemoryRecallMatch{
-		{Record: MemoryRecord{ID: "primary", TS: now, Content: "PRIMARY\n" + strings.Repeat("p", 12_000), Tags: []string{"patreon"}, Weight: 0.95}, Signal: 0.9, Score: 0.85},
-		{Record: MemoryRecord{ID: "computer", TS: now, Content: "COMPUTER\n" + strings.Repeat("c", 8_000), Tags: []string{"computer"}, Weight: 0.9}, Signal: 0.8, Score: 0.72},
-		{Record: MemoryRecord{ID: "large-third", TS: now, Content: "THIRD\n" + strings.Repeat("x", 8_000), Tags: []string{"channels"}, Weight: 0.9}, Signal: 0.7, Score: 0.63},
+		{Record: MemoryRecord{ID: "tasks", TS: now, Content: "TASKS_SKILL\n" + strings.Repeat("t", 13_500), Tags: []string{"tasks"}, Weight: 0.95}, Signal: 0.95, Score: 0.90},
+		{Record: MemoryRecord{ID: "computer", TS: now, Content: "COMPUTER_SKILL\n" + strings.Repeat("c", 9_000), Tags: []string{"computer"}, Weight: 0.9}, Signal: 0.8, Score: 0.72},
+		{Record: MemoryRecord{ID: "patreon", TS: now, Content: "PATREON_SKILL\n" + strings.Repeat("p", 17_000), Tags: []string{"patreon"}, Weight: 0.9}, Signal: 0.7, Score: 0.63},
+		{Record: MemoryRecord{ID: "overflow", TS: now, Content: "OVERFLOW\n" + strings.Repeat("x", 12_000), Tags: []string{"other"}, Weight: 0.9}, Signal: 0.6, Score: 0.54},
 		{Record: MemoryRecord{ID: "weak", TS: now, Content: "WEAK", Tags: []string{"tasks"}, Weight: 0.9}, Signal: 0.19, Score: 0.17},
 	}
-	selected, context := ms.BuildAutomaticRecallContext(matches)
+	selected, skipped, context := ms.BuildAutomaticRecallContextDetailed(matches)
 	if len(context) > automaticMemoryRecallMaxChars {
 		t.Fatalf("automatic context chars = %d, limit = %d", len(context), automaticMemoryRecallMaxChars)
 	}
-	if len(selected) != 2 || selected[0].Record.ID != "primary" || selected[1].Record.ID != "computer" {
+	if len(context) <= 24*1024 {
+		t.Fatalf("production-shaped context did not cross the former 24 KiB cap: %d chars", len(context))
+	}
+	if len(selected) != 3 || selected[0].Record.ID != "tasks" || selected[1].Record.ID != "computer" || selected[2].Record.ID != "patreon" {
 		t.Fatalf("selected matches = %+v", selected)
 	}
-	for _, want := range []string{"PRIMARY", "COMPUTER"} {
+	for _, want := range []string{"TASKS_SKILL", "COMPUTER_SKILL", "PATREON_SKILL"} {
 		if !strings.Contains(context, want) {
 			t.Fatalf("context missing %q", want)
 		}
 	}
-	for _, unwanted := range []string{"THIRD", "WEAK"} {
+	for _, unwanted := range []string{"OVERFLOW", "WEAK"} {
 		if strings.Contains(context, unwanted) {
 			t.Fatalf("context contains %q despite budget/signal filtering", unwanted)
 		}
+	}
+	if len(skipped) != 2 || skipped[0].Match.Record.ID != "overflow" || skipped[0].Reason != memoryRecallSkipSizeLimit ||
+		skipped[1].Match.Record.ID != "weak" || skipped[1].Reason != memoryRecallSkipBelowThreshold {
+		t.Fatalf("skipped matches = %+v", skipped)
 	}
 }
 

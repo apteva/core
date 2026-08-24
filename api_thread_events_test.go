@@ -1,9 +1,11 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,52 @@ import (
 	"testing"
 	"time"
 )
+
+func TestAPIUpdateThreadReconcilesMCPProfileAndQueuesEvents(t *testing.T) {
+	api, thinker, _ := newPersistentThreadTestAPI(t)
+	spawn := postThreadForTest(t, api, "chat-profile", map[string]any{
+		"directive_suffix": " old", "mcp": []string{"conversations"},
+	})
+	if spawn.Code != http.StatusOK {
+		t.Fatalf("spawn status=%d body=%s", spawn.Code, spawn.Body.String())
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"directive_suffix": " current",
+		"tools":            []string{},
+		"mcp":              []string{"conversation"},
+		"events": []any{map[string]any{
+			"id": "conversation:7:message:9:agent:1", "message": "Hello",
+		}},
+	})
+	req := httptest.NewRequest(http.MethodPut, "/threads/chat-profile", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	api.updateThread(rec, req, "chat-profile")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	response := decodeThreadEventResponse(t, rec.Body.Bytes())
+	if response["status"] != "updated" {
+		t.Fatalf("status=%v", response["status"])
+	}
+	if accepted := responseEventIDs(t, response, "accepted"); len(accepted) != 1 || accepted[0] != "conversation:7:message:9:agent:1" {
+		t.Fatalf("accepted=%v", accepted)
+	}
+	stored, ok := persistentThreadByID(thinker.config.GetThreads(), "chat-profile")
+	if !ok || len(stored.MCPNames) != 1 || stored.MCPNames[0] != "conversation" {
+		t.Fatalf("stored profile=%+v", stored)
+	}
+	if len(stored.Events) != 1 || stored.Events[0].ID != "conversation:7:message:9:agent:1" {
+		t.Fatalf("stored events=%+v", stored.Events)
+	}
+	owner, _ := thinker.threads.findManagedThread("chat-profile")
+	owner.mu.RLock()
+	thread := owner.threads["chat-profile"]
+	if thread == nil || !thread.Thinker.toolMCPScopes["conversation"] || thread.Thinker.toolMCPScopes["conversations"] {
+		owner.mu.RUnlock()
+		t.Fatalf("live MCP scopes=%v", thread.Thinker.toolMCPScopes)
+	}
+	owner.mu.RUnlock()
+}
 
 type recordingThreadEventProvider struct {
 	requests chan []Message

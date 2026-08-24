@@ -119,6 +119,9 @@ func TestSpawnToolRequiresFocusedSelfContainedDirective(t *testing.T) {
 		"stop conditions",
 		"constraints before operational detail",
 		"omit unrelated parent context",
+		"operationally complete",
+		"explicitly name any required shared procedure or policy",
+		"never rely on vague references",
 	} {
 		if !strings.Contains(spawn.Description, want) {
 			t.Fatalf("spawn description missing %q: %s", want, spawn.Description)
@@ -126,6 +129,7 @@ func TestSpawnToolRequiresFocusedSelfContainedDirective(t *testing.T) {
 	}
 
 	if !strings.Contains(spawn.Rules, "containing only the worker's objective") ||
+		!strings.Contains(spawn.Rules, "Explicitly name required shared procedures or policies") ||
 		!strings.Contains(spawn.Rules, "omit unrelated parent context") {
 		t.Fatalf("spawn rules do not preserve the focused-directive contract: %s", spawn.Rules)
 	}
@@ -138,7 +142,7 @@ func TestSpawnToolRequiresFocusedSelfContainedDirective(t *testing.T) {
 		t.Fatalf("spawn directive schema = %#v", properties["directive"])
 	}
 	description, _ := directive["description"].(string)
-	for _, want := range []string{"non-negotiable constraints first", "stop conditions", "Omit unrelated parent context"} {
+	for _, want := range []string{"operationally complete", "non-negotiable constraints first", "stop conditions", "Explicitly name required shared procedures or policies", "Omit unrelated parent context"} {
 		if !strings.Contains(description, want) {
 			t.Fatalf("spawn directive parameter missing %q: %s", want, description)
 		}
@@ -209,6 +213,25 @@ func TestNormalThreadPromptKeepsRoutineActivityLocal(t *testing.T) {
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("worker prompt retains noisy reporting rule %q", forbidden)
+		}
+	}
+}
+
+func TestWorkerPromptBoundsMissingSharedGuidanceHandoff(t *testing.T) {
+	for _, prompt := range []string{
+		formatThreadBasePrompt(false, false, "worker", "main coordinator"),
+		formatThreadBasePrompt(true, false, "lead", "main coordinator"),
+	} {
+		for _, want := range []string{
+			"Shared memories relevant to your directive are supplied automatically",
+			"do not search for it as a tool",
+			"reconstruct it, or invent it",
+			"one concise missing-guidance blocker",
+			"wait for their reply without repeating the request",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("worker prompt missing bounded handoff rule %q: %s", want, prompt)
+			}
 		}
 	}
 }

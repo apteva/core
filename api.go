@@ -200,6 +200,7 @@ type threadJSON struct {
 	Reasoning  string   `json:"reasoning,omitempty"`
 	Age        string   `json:"age"`
 	Realtime   bool     `json:"realtime,omitempty"`
+	Ephemeral  bool     `json:"ephemeral,omitempty"`
 	Voice      string   `json:"voice,omitempty"`
 	Provider   string   `json:"provider,omitempty"`
 }
@@ -247,6 +248,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 				Reasoning:  t.Reasoning.String(),
 				Age:        formatAge(time.Since(t.Started)),
 				Realtime:   t.Realtime,
+				Ephemeral:  t.Ephemeral,
 				Voice:      t.Voice,
 				Provider:   t.Provider,
 			})
@@ -452,10 +454,12 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	var body struct {
-		Directive       string   `json:"directive"`
-		DirectiveSuffix string   `json:"directive_suffix"`
-		Tools           []string `json:"tools,omitempty"`
-		RestartRealtime bool     `json:"restart_realtime,omitempty"`
+		Directive       string                  `json:"directive"`
+		DirectiveSuffix string                  `json:"directive_suffix"`
+		Tools           *[]string               `json:"tools,omitempty"`
+		MCP             *[]string               `json:"mcp,omitempty"`
+		Events          []apiThreadEventRequest `json:"events,omitempty"`
+		RestartRealtime bool                    `json:"restart_realtime,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -470,7 +474,20 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 			directive = directive + body.DirectiveSuffix
 		}
 	}
-	result, err := a.thinker.threads.UpdateWithOpts(id, "", directive, body.Tools, ThreadUpdateOptions{RestartRealtime: body.RestartRealtime})
+	normalizedEvents, err := normalizeAPIThreadEvents(body.Events)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var tools []string
+	if body.Tools != nil {
+		tools = *body.Tools
+	}
+	result, err := a.thinker.threads.UpdateWithOpts(id, "", directive, tools, ThreadUpdateOptions{
+		RestartRealtime: body.RestartRealtime,
+		ReplaceTools:    body.Tools != nil,
+		MCPNames:        body.MCP,
+	})
 	if err != nil {
 		// Update returns "thread not found" for unknown ids.
 		status := http.StatusNotFound
@@ -480,16 +497,26 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		http.Error(w, err.Error(), status)
 		return
 	}
-	// Nudge the thread the same way the LLM-driven update tool does
-	// (thread.go) so it notices the change mid-conversation rather than
-	// silently swapping its system prompt on the next turn.
-	if result.DirectiveChanged {
+	eventResult, err := a.thinker.threads.QueueEvents(id, normalizedEvents)
+	if err != nil {
+		writeThreadEventQueueError(w, err)
+		return
+	}
+	// Nudge the thread the same way the LLM-driven update tool does when the
+	// request did not already queue an event. An ensured event is itself the
+	// wake-up; publishing the directive nudge first would reopen the original
+	// empty-iteration race this endpoint is designed to close.
+	if result.DirectiveChanged && len(normalizedEvents) == 0 {
 		a.thinker.threads.Send(id, "[directive updated]")
 	}
-	writeJSON(w, map[string]any{
+	response := map[string]any{
 		"status": resultStatus(result.Changed, "updated", "unchanged"),
 		"id":     id, "realtime_restarted": result.RealtimeRestarted,
-	})
+	}
+	if body.Events != nil {
+		response["events"] = threadEventsResponse(eventResult)
+	}
+	writeJSON(w, response)
 }
 
 func resultStatus(changed bool, changedStatus, unchangedStatus string) string {

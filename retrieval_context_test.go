@@ -571,7 +571,7 @@ func TestSpawnedWorkerRecallUsesDirectiveAlongsideVagueParentEvent(t *testing.T)
 	workerDirective := strings.Join([]string{
 		"Inspect previous Friday Patreon posts and determine the correct tiers.",
 		"Edit only draft 166563499 and schedule it without publishing immediately.",
-		"Use the shared operating guidance rather than reconstructing its procedure.",
+		"Follow the named Patreon scheduling and analytics procedure from shared memory.",
 	}, " ")
 	if err := parent.threads.SpawnWithOpts(
 		"patreon-worker", workerDirective, []string{"pace"},
@@ -583,7 +583,7 @@ func TestSpawnedWorkerRecallUsesDirectiveAlongsideVagueParentEvent(t *testing.T)
 	if worker == nil {
 		t.Fatal("spawned worker missing")
 	}
-	worker.Thinker.Inject("[from:main] Begin now and use the shared guidance.")
+	worker.Thinker.Inject("[from:main] Begin now.")
 	go worker.Thinker.Run()
 
 	select {
@@ -620,6 +620,86 @@ func TestSpawnedWorkerRecallUsesDirectiveAlongsideVagueParentEvent(t *testing.T)
 	if !foundCombinedRecall {
 		t.Fatal("missing combined event+directive recall telemetry for attached skill")
 	}
+}
+
+func TestMemoryRecallTelemetryReportsRelevantRecordSkippedBySizeLimit(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OLLAMA_HOST", "")
+	t.Chdir(t.TempDir())
+
+	provider := &retrievalCaptureProvider{called: make(chan struct{}, 1), sleep: "1h"}
+	cfg := &Config{
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: "Coordinate bounded workers.",
+		Mode:      ModeAutonomous,
+	}
+	parent := NewThinker("", provider, cfg)
+	defer parent.Stop()
+	defer parent.threads.KillAll()
+
+	records := []struct {
+		id     string
+		marker string
+		size   int
+		weight float64
+	}{
+		{id: "a_tasks", marker: "TASKS_SKILL", size: 13_500, weight: 1.00},
+		{id: "b_computer", marker: "COMPUTER_SKILL", size: 9_000, weight: 0.95},
+		{id: "c_patreon", marker: "PATREON_SKILL", size: 17_000, weight: 0.90},
+		{id: "d_overflow", marker: "OVERFLOW_SKILL", size: 12_000, weight: 0.85},
+	}
+	for _, rec := range records {
+		content := rec.marker + "\nAuthoritative shared alpha beta gamma operating procedure.\n" + strings.Repeat("detail ", rec.size/7)
+		if _, err := parent.memory.RememberWithID(rec.id, content, []string{"shared", "procedure"}, rec.weight); err != nil {
+			t.Fatalf("remember %s: %v", rec.id, err)
+		}
+	}
+
+	directive := "Follow the authoritative shared alpha beta gamma operating procedures for Tasks, Computer, and Patreon."
+	if err := parent.threads.SpawnWithOpts(
+		"recall-budget-worker", directive, []string{"pace"},
+		SpawnOpts{DeferRun: true, ParentID: "main"},
+	); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	worker := parent.threads.threads["recall-budget-worker"]
+	worker.Thinker.InjectConsole("Begin now.")
+	go worker.Thinker.Run()
+
+	select {
+	case <-provider.called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for worker model request")
+	}
+
+	events, _ := parent.telemetry.StoredEvents(0)
+	for _, event := range events {
+		if event.ThreadID != "recall-budget-worker" || event.Type != "memory.recall" {
+			continue
+		}
+		var data struct {
+			Accepted       int `json:"accepted"`
+			Chars          int `json:"chars"`
+			SkippedMatches []struct {
+				ID         string `json:"id"`
+				SkipReason string `json:"skip_reason"`
+				Chars      int    `json:"chars"`
+			} `json:"skipped_matches"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			t.Fatalf("decode memory.recall telemetry: %v", err)
+		}
+		if data.Accepted != 3 || data.Chars <= 24*1024 || data.Chars > automaticMemoryRecallMaxChars {
+			t.Fatalf("accepted=%d chars=%d limit=%d", data.Accepted, data.Chars, automaticMemoryRecallMaxChars)
+		}
+		if len(data.SkippedMatches) != 1 || data.SkippedMatches[0].ID != "d_overflow" ||
+			data.SkippedMatches[0].SkipReason != memoryRecallSkipSizeLimit || data.SkippedMatches[0].Chars == 0 {
+			t.Fatalf("skipped_matches=%+v", data.SkippedMatches)
+		}
+		return
+	}
+	t.Fatal("missing memory.recall telemetry for worker")
 }
 
 func TestThinkerRecallIsEphemeralAndReplacedAcrossManyTurns(t *testing.T) {

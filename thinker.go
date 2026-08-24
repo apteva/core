@@ -2702,11 +2702,12 @@ func (t *Thinker) Run() {
 			memQueries, querySource := recallQueriesForTurn(consumed, t.messages, t.directive)
 			memoryCandidates := 0
 			var recallMatches []MemoryRecallMatch
+			var recallSkipped []MemoryRecallSkip
 			var recallContext string
 			if t.memory != nil && t.memory.Count() > 0 && len(memQueries) > 0 {
 				memoryCandidates = len(t.memory.Active())
 				ranked := t.memory.RecallMatchesForContexts(memQueries, automaticMemoryRecallMaxRecords)
-				recallMatches, recallContext = t.memory.BuildAutomaticRecallContext(ranked)
+				recallMatches, recallSkipped, recallContext = t.memory.BuildAutomaticRecallContextDetailed(ranked)
 			}
 			t.memoryRecall.set(
 				memoryGeneration, t.directive, recallContext, querySource,
@@ -2719,16 +2720,24 @@ func (t *Thinker) Run() {
 						"id": match.Record.ID, "score": match.Score, "signal": match.Signal,
 					})
 				}
+				skippedMatches := make([]map[string]any, 0, len(recallSkipped))
+				for _, skipped := range recallSkipped {
+					skippedMatches = append(skippedMatches, map[string]any{
+						"id": skipped.Match.Record.ID, "score": skipped.Match.Score, "signal": skipped.Match.Signal,
+						"chars": skipped.EntryChars, "skip_reason": skipped.Reason,
+					})
+				}
 				t.telemetry.Emit("memory.recall", t.threadID, map[string]any{
-					"query_source":   querySource,
-					"refresh_reason": recallRefreshReason,
-					"context_hash":   t.memoryRecall.contextHash,
-					"candidates":     memoryCandidates,
-					"accepted":       len(recallMatches),
-					"matches":        matches,
-					"chars":          len(recallContext),
-					"tokens_est":     (len(recallContext) + 3) / 4,
-					"ephemeral":      true,
+					"query_source":    querySource,
+					"refresh_reason":  recallRefreshReason,
+					"context_hash":    t.memoryRecall.contextHash,
+					"candidates":      memoryCandidates,
+					"accepted":        len(recallMatches),
+					"matches":         matches,
+					"skipped_matches": skippedMatches,
+					"chars":           len(recallContext),
+					"tokens_est":      (len(recallContext) + 3) / 4,
+					"ephemeral":       true,
 				})
 			}
 		}

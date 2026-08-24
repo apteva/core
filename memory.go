@@ -51,8 +51,10 @@ const (
 	// selected records useful and bounded; full records remain in the journal
 	// and explicit memory search remains unchanged.
 	automaticMemoryRecallMaxRecords = 5
-	automaticMemoryRecallMaxChars   = 24 * 1024
+	automaticMemoryRecallMaxChars   = 48 * 1024
 	automaticMemoryRecallMinSignal  = 0.20
+	memoryRecallSkipSizeLimit       = "size_limit"
+	memoryRecallSkipBelowThreshold  = "below_relevance_threshold"
 
 	// Default decay half-life: a memory's effective weight halves
 	// every this many days unless reinforced. 90 days = a memory
@@ -741,6 +743,16 @@ type MemoryRecallMatch struct {
 	Signal float64
 }
 
+// MemoryRecallSkip records why a ranked automatic-recall candidate was not
+// included in the bounded request context. Content stays out of telemetry;
+// callers only need the record identity, rank metadata, rendered size, and
+// deterministic reason.
+type MemoryRecallSkip struct {
+	Match      MemoryRecallMatch
+	Reason     string
+	EntryChars int
+}
+
 // RecallMatches is Recall with score metadata and content deduplication.
 func (ms *MemoryStore) RecallMatches(query string, n int) []MemoryRecallMatch {
 	return ms.RecallMatchesForContexts([]string{query}, n)
@@ -926,23 +938,35 @@ func (ms *MemoryStore) BuildContext(records []MemoryRecord) string {
 // possible so procedural guidance is not silently cut in half. Only an
 // individually oversized first record is deterministically excerpted.
 func (ms *MemoryStore) BuildAutomaticRecallContext(matches []MemoryRecallMatch) ([]MemoryRecallMatch, string) {
+	selected, _, context := ms.BuildAutomaticRecallContextDetailed(matches)
+	return selected, context
+}
+
+// BuildAutomaticRecallContextDetailed is BuildAutomaticRecallContext plus the
+// ranked candidates excluded by the relevance or total-size bounds. The
+// detailed path lets request telemetry explain omissions without exposing
+// memory content or changing the compact public helper.
+func (ms *MemoryStore) BuildAutomaticRecallContextDetailed(matches []MemoryRecallMatch) ([]MemoryRecallMatch, []MemoryRecallSkip, string) {
 	if len(matches) == 0 {
-		return nil, ""
+		return nil, nil, ""
 	}
 	const header = "[memories — surfaced because they may be relevant; check the dates, do not treat as the user's current input]\n"
 	selected := make([]MemoryRecallMatch, 0, len(matches))
+	skipped := make([]MemoryRecallSkip, 0, len(matches))
 	used := len(header)
 	for _, match := range matches {
+		entry := renderMemoryContextEntry(match.Record)
 		if match.Signal < automaticMemoryRecallMinSignal {
+			skipped = append(skipped, MemoryRecallSkip{Match: match, Reason: memoryRecallSkipBelowThreshold, EntryChars: len(entry)})
 			continue
 		}
-		entry := renderMemoryContextEntry(match.Record)
 		if used+len(entry) <= automaticMemoryRecallMaxChars {
 			selected = append(selected, match)
 			used += len(entry)
 			continue
 		}
 		if len(selected) > 0 {
+			skipped = append(skipped, MemoryRecallSkip{Match: match, Reason: memoryRecallSkipSizeLimit, EntryChars: len(entry)})
 			continue
 		}
 
@@ -960,13 +984,13 @@ func (ms *MemoryStore) BuildAutomaticRecallContext(matches []MemoryRecallMatch) 
 		used += len(entry)
 	}
 	if len(selected) == 0 {
-		return nil, ""
+		return nil, skipped, ""
 	}
 	records := make([]MemoryRecord, len(selected))
 	for i, match := range selected {
 		records[i] = match.Record
 	}
-	return selected, ms.BuildContext(records)
+	return selected, skipped, ms.BuildContext(records)
 }
 
 func renderMemoryContextEntry(r MemoryRecord) string {

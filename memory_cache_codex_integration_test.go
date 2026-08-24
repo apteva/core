@@ -100,6 +100,12 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 				strings.Repeat("Computer browser observation procedure and structured tool result guidance. ", 110),
 			tags: []string{"skill", "computer", "browser", "observation"},
 		},
+		{
+			id: "skill_tasks_coordination",
+			content: "TASKS_COORDINATION_SKILL\nTrack the bounded Patreon browser validation through completion without taking over its execution.\n" +
+				strings.Repeat("Tasks coordination procedure for the Patreon browser validation workflow and its completion state. ", 170),
+			tags: []string{"skill", "tasks", "patreon", "browser", "validation"},
+		},
 	}
 	for _, rec := range relevantRecords {
 		if _, err := parent.memory.RememberWithID(rec.id, rec.content, rec.tags, 0.95); err != nil {
@@ -156,7 +162,7 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 		"Complete this bounded validation directly. Do not spawn, send, evolve, or delegate.",
 		"",
 		"# Workflow",
-		"On the external request, read the automatically recalled Patreon and Computer guidance.",
+		"On the external request, read the automatically recalled Patreon, Computer, and Tasks guidance.",
 		"Call browser_validation_step for step 1 using the exact recalled validation code.",
 		"After each successful result, call it exactly once for next_step. Do not skip or repeat steps.",
 		"When the tool reports complete=true, reply exactly CODEX_MEMORY_CACHE_OK with no other text and wait for events.",
@@ -215,6 +221,8 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 
 	events, _ := parent.telemetry.StoredEvents(0)
 	recalls := 0
+	coordinationCalls := 0
+	sawExpandedRecall := false
 	stableHashes := map[string]bool{}
 	cacheEpochs := map[uint64]bool{}
 	var cachedTokens []int
@@ -231,8 +239,15 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 			}
 			if chars, _ := data["chars"].(float64); int(chars) > automaticMemoryRecallMaxChars {
 				t.Fatalf("memory context chars = %d, limit = %d", int(chars), automaticMemoryRecallMaxChars)
+			} else if int(chars) > 24*1024 {
+				sawExpandedRecall = true
 			}
-			if !strings.Contains(string(event.Data), "skill_patreon_validation") || strings.Contains(string(event.Data), "skill_unrelated") {
+			for _, required := range []string{"skill_patreon_validation", "skill_computer_observation", "skill_tasks_coordination"} {
+				if !strings.Contains(string(event.Data), required) {
+					t.Fatalf("memory recall omitted %s: %s", required, event.Data)
+				}
+			}
+			if strings.Contains(string(event.Data), "skill_unrelated") {
 				t.Fatalf("unexpected recalled records: %s", event.Data)
 			}
 		case "llm.prompt_cache_reset":
@@ -246,10 +261,18 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 				cacheEpochs[data.PromptCacheEpoch] = true
 				cachedTokens = append(cachedTokens, data.TokensCached)
 			}
+		case "tool.call":
+			var data ToolCallData
+			if json.Unmarshal(event.Data, &data) == nil && (data.Name == "send" || data.Name == "search_tools") {
+				coordinationCalls++
+			}
 		}
 	}
 	if recalls != 1 {
 		t.Fatalf("memory recalls = %d, want exactly one external-cycle retrieval", recalls)
+	}
+	if !sawExpandedRecall {
+		t.Fatal("live recall did not exceed the former 24 KiB budget")
 	}
 	delete(stableHashes, "")
 	if len(stableHashes) != 1 {
@@ -257,6 +280,9 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 	}
 	if len(cacheEpochs) != 1 {
 		t.Fatalf("prompt cache epoch churned during six result continuations: %v", cacheEpochs)
+	}
+	if coordinationCalls != 0 {
+		t.Fatalf("worker made %d unnecessary send/search handoff calls during self-contained work", coordinationCalls)
 	}
 
 	requests := provider.capturedRequests()
@@ -269,8 +295,10 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 		if strings.Count(body, "[memories — surfaced") != 1 {
 			t.Fatalf("request %d contains a duplicated/missing memory block", i+1)
 		}
-		if !strings.Contains(body, "PATREON_VALIDATION_SKILL") || !strings.Contains(body, secret) {
-			t.Fatalf("request %d lost the selected skill", i+1)
+		for _, required := range []string{"PATREON_VALIDATION_SKILL", "COMPUTER_OBSERVATION_SKILL", "TASKS_COORDINATION_SKILL", secret} {
+			if !strings.Contains(body, required) {
+				t.Fatalf("request %d lost recalled guidance %q", i+1, required)
+			}
 		}
 		if strings.Contains(body, "UNRELATED_SKILL_") {
 			t.Fatalf("request %d contains an unrelated skill", i+1)
