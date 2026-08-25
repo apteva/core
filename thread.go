@@ -1111,7 +1111,15 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					}
 				} else {
 					tagged := thread.tagThreadMessage(msg)
-					mediaParts := parseMediaURLs(mediaStr)
+					mediaParts, attachmentErr := parseAttachmentURLs(mediaStr)
+					if attachmentErr != nil {
+						if t.scheduleSendCorrection() {
+							emitResult(call, sendCorrectionResult(attachmentErr))
+						} else {
+							emitResult(call, sendFinalFailureResult(attachmentErr))
+						}
+						break
+					}
 					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q media=%d", thread.ID, id, msg, len(mediaParts)))
 					if err := thread.resolveSend(tm, tagged, id, mediaParts); err != nil {
 						if t.scheduleSendCorrection() {

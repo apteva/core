@@ -1856,7 +1856,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					tools = strings.Split(toolsStr, ",")
 				}
 				mediaStr := call.Args["media"]
-				mediaParts := parseMediaURLs(mediaStr)
+				mediaParts, attachmentErr := parseAttachmentURLs(mediaStr)
+				if attachmentErr != nil {
+					addSpawnFailure(attachmentErr)
+					toolNames = append(toolNames, call.Raw)
+					continue
+				}
 				providerName := call.Args["provider"]
 				modelName := strings.ToLower(strings.TrimSpace(call.Args["model"]))
 				if modelName != "" {
@@ -2112,8 +2117,14 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					// else, and the dashboard rendered "bus" instead of
 					// "[from:main]".
 					tagged := fmt.Sprintf("[from:main] %s", msg)
-					parts := parseMediaURLs(mediaStr)
-					if err := t.threads.SendAgentWithParts(id, tagged, parts); err != nil {
+					parts, attachmentErr := parseAttachmentURLs(mediaStr)
+					if attachmentErr != nil {
+						if t.scheduleSendCorrection() {
+							addResult(sendCorrectionResult(attachmentErr))
+						} else {
+							addResult(sendFinalFailureResult(attachmentErr))
+						}
+					} else if err := t.threads.SendAgentWithParts(id, tagged, parts); err != nil {
 						if t.scheduleSendCorrection() {
 							addResult(sendCorrectionResult(err))
 						} else {
@@ -3367,13 +3378,30 @@ func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 
 func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Message) (ChatResponse, error) {
 	attempt := 0
+	attachmentRecoveryUsed := false
 	for {
 		primary := t.provider
 		resp, err := t.thinkWithProviderMessages(ctx, primary, messages)
+		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
+			var count int
+			messages, count = projectTransientAttachmentsFromMessages(messages)
+			consumeTransientAttachments(t.messages)
+			providerName := ""
+			if primary != nil {
+				providerName = primary.Name()
+			}
+			t.emitAttachmentLifecycle("attachment.quarantined", count, providerName, "provider_download_rejected")
+			attachmentRecoveryUsed = true
+			logMsg("ATTACHMENT", fmt.Sprintf("[%s] quarantined %d rejected attachments; retrying prepared turn without them", t.threadID, count))
+			continue
+		}
 		if err != nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
 			if fallback := t.pool.Fallback(primary.Name()); fallback != nil {
 				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), err, fallback.Name()))
 				if fallbackResp, fallbackErr := t.thinkWithProviderMessages(ctx, fallback, messages); fallbackErr == nil {
+					if count := consumeTransientAttachments(t.messages); count > 0 {
+						t.emitAttachmentLifecycle("attachment.consumed", count, fallback.Name(), "provider_request_completed")
+					}
 					return fallbackResp, nil
 				} else {
 					resp = fallbackResp
@@ -3381,7 +3409,27 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 				}
 			}
 		}
+		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
+			var count int
+			messages, count = projectTransientAttachmentsFromMessages(messages)
+			consumeTransientAttachments(t.messages)
+			providerName := ""
+			if resp.Provider != "" {
+				providerName = resp.Provider
+			}
+			t.emitAttachmentLifecycle("attachment.quarantined", count, providerName, "provider_download_rejected")
+			attachmentRecoveryUsed = true
+			logMsg("ATTACHMENT", fmt.Sprintf("[%s] quarantined %d rejected attachments after fallback; retrying prepared turn without them", t.threadID, count))
+			continue
+		}
 		if err == nil {
+			if count := consumeTransientAttachments(t.messages); count > 0 {
+				providerName := resp.Provider
+				if providerName == "" && primary != nil {
+					providerName = primary.Name()
+				}
+				t.emitAttachmentLifecycle("attachment.consumed", count, providerName, "provider_request_completed")
+			}
 			return resp, nil
 		}
 		if ctx.Err() != nil {
@@ -3736,38 +3784,6 @@ func (t *Thinker) InjectWithParts(text string, parts []ContentPart) {
 		text = "[multimodal input]"
 	}
 	t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Text: "[console] " + text, Parts: parts})
-}
-
-// parseMediaURLs splits a space-separated list of URLs into ContentParts.
-// Classifies each URL as image or audio by extension.
-func parseMediaURLs(urls string) []ContentPart {
-	if urls == "" {
-		return nil
-	}
-	var parts []ContentPart
-	for _, u := range strings.Fields(urls) {
-		u = strings.TrimSpace(u)
-		if u == "" {
-			continue
-		}
-		ext := ""
-		if idx := strings.LastIndex(u, "."); idx >= 0 {
-			ext = strings.ToLower(u[idx+1:])
-			if qIdx := strings.Index(ext, "?"); qIdx >= 0 {
-				ext = ext[:qIdx]
-			}
-		}
-		switch ext {
-		case "mp3", "wav", "aac", "ogg", "flac", "aiff", "m4a":
-			parts = append(parts, ContentPart{Type: "audio_url", AudioURL: &AudioURL{URL: u}})
-		case "png", "jpg", "jpeg", "gif", "webp":
-			parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: u}})
-		default:
-			// Unknown extension — treat as image (provider will attempt fetch)
-			parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: u}})
-		}
-	}
-	return parts
 }
 
 func (t *Thinker) TogglePause() {

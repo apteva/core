@@ -116,7 +116,8 @@ func TestRealtimeAudioTokenRenewalInvalidatesPreviousCapability(t *testing.T) {
 	}
 }
 
-// TestMediaInSend tests that parseMediaURLs correctly classifies audio and image URLs.
+// TestMediaInSend tests that the compatibility parser correctly classifies
+// audio and image attachment URLs.
 func TestMediaInSend(t *testing.T) {
 	tests := []struct {
 		urls     string
@@ -132,13 +133,17 @@ func TestMediaInSend(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		parts := parseMediaURLs(tt.urls)
+		parts, err := parseAttachmentURLs(tt.urls)
+		if err != nil {
+			t.Errorf("parseAttachmentURLs(%q): %v", tt.urls, err)
+			continue
+		}
 		if len(parts) != tt.wantLen {
-			t.Errorf("parseMediaURLs(%q): got %d parts, want %d", tt.urls, len(parts), tt.wantLen)
+			t.Errorf("parseAttachmentURLs(%q): got %d parts, want %d", tt.urls, len(parts), tt.wantLen)
 			continue
 		}
 		if tt.wantLen == 1 && parts[0].Type != tt.wantType {
-			t.Errorf("parseMediaURLs(%q): got type %s, want %s", tt.urls, parts[0].Type, tt.wantType)
+			t.Errorf("parseAttachmentURLs(%q): got type %s, want %s", tt.urls, parts[0].Type, tt.wantType)
 		}
 	}
 }
@@ -180,9 +185,12 @@ func TestAudioViaParts(t *testing.T) {
 	}
 
 	// Parse the audio URL into media parts (same as send tool does)
-	parts := parseMediaURLs(audioURL)
+	parts, err := parseAttachmentURLs(audioURL)
+	if err != nil {
+		t.Fatalf("parseAttachmentURLs: %v", err)
+	}
 	if len(parts) == 0 {
-		t.Fatal("parseMediaURLs returned no parts")
+		t.Fatal("parseAttachmentURLs returned no parts")
 	}
 	t.Logf("parsed %d media parts, type=%s", len(parts), parts[0].Type)
 

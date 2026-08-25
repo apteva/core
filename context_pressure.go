@@ -268,10 +268,11 @@ func checkpointHistoryWindow(messages []Message, maxHistory int, protectedToolCa
 	return next, dropped
 }
 
-// messageForSession removes transient computer pixels from the durable copy.
-// The live message retains its image for the next model decision; after a
-// restart, a fresh screenshot is safer than replaying an old browser frame.
+// messageForSession removes transient provider inputs from the durable copy.
+// The live message retains them for the next model decision; after a restart,
+// a stable receipt is safer than replaying old pixels or expired access URLs.
 func messageForSession(history []Message, msg Message) Message {
+	msg, _ = projectTransientAttachmentsFromMessage(msg)
 	names := toolNamesByCallID(history)
 	if len(msg.ToolResults) == 0 {
 		return msg

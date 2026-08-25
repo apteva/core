@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ func TestThinkerStopIsSafeConcurrently(t *testing.T) {
 type scriptedRetryProvider struct {
 	name       string
 	failures   int
+	failureErr error
 	response   ChatResponse
 	block      bool
 	started    chan struct{}
@@ -54,6 +56,9 @@ func (p *scriptedRetryProvider) Chat(ctx context.Context, messages []Message, _ 
 		return ChatResponse{}, ctx.Err()
 	}
 	if call <= p.failures {
+		if p.failureErr != nil {
+			return ChatResponse{}, p.failureErr
+		}
 		return ChatResponse{}, errors.New("provider HTTP 401 token_expired")
 	}
 	return p.response, nil
@@ -100,6 +105,94 @@ func TestCallLLMWithRetryPreservesPreparedTurn(t *testing.T) {
 		if len(seen) != 2 || seen[1].Content != "original work" {
 			t.Fatalf("attempt %d saw changed context: %#v", i+1, seen)
 		}
+	}
+}
+
+func TestCallLLMWithRetryQuarantinesRejectedAttachmentAndContinues(t *testing.T) {
+	provider := &scriptedRetryProvider{
+		name:       "primary",
+		failures:   1,
+		failureErr: errors.New(`OpenAI Responses API error 400: {"message":"Error while downloading file. Upstream status code: 403.","param":"url"}`),
+		response:   ChatResponse{Text: "recovered"},
+	}
+	thinker := retryTestThinker(provider)
+	thinker.messages[1] = Message{
+		Role:    "user",
+		Content: "Continue even if the attachment is unavailable.",
+		Parts: []ContentPart{
+			{Type: "text", Text: "Continue even if the attachment is unavailable."},
+			{Type: "image_url", ImageURL: &ImageURL{URL: "https://example.test/frame.jpg?x=1%26y=2%26z=3"}},
+		},
+	}
+	thinker.telemetry = &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})}
+
+	resp, err := thinker.callLLMWithRetry(context.Background())
+	if err != nil || resp.Text != "recovered" {
+		t.Fatalf("response=%q err=%v", resp.Text, err)
+	}
+	if provider.calls != 2 {
+		t.Fatalf("provider calls = %d, want rejected call plus immediate clean retry", provider.calls)
+	}
+	if transientAttachmentCount(provider.messages[0]) != 1 {
+		t.Fatalf("first request did not contain the attachment: %#v", provider.messages[0])
+	}
+	if transientAttachmentCount(provider.messages[1]) != 0 {
+		t.Fatalf("clean retry retained the attachment: %#v", provider.messages[1])
+	}
+	if transientAttachmentCount(thinker.messages) != 0 || !strings.Contains(thinker.messages[1].Content, transientAttachmentHistoryNotice) {
+		t.Fatalf("live history was not quarantined: %#v", thinker.messages)
+	}
+	events, _ := thinker.telemetry.Events(0)
+	quarantined := 0
+	for _, event := range events {
+		if event.Type == "attachment.quarantined" {
+			quarantined++
+		}
+	}
+	if quarantined != 1 {
+		t.Fatalf("attachment.quarantined events = %d, want 1", quarantined)
+	}
+}
+
+func TestAttachmentDownloadFailureDoesNotFanOutToFallback(t *testing.T) {
+	primary := &scriptedRetryProvider{
+		name:       "primary",
+		failures:   1,
+		failureErr: errors.New("Unable to download the file. Please verify the URL and try again."),
+		response:   ChatResponse{Text: "primary recovered"},
+	}
+	fallback := &scriptedRetryProvider{name: "fallback", response: ChatResponse{Text: "fallback"}}
+	thinker := retryTestThinker(primary)
+	thinker.messages[1].Parts = []ContentPart{{Type: "image_url", ImageURL: &ImageURL{URL: "https://example.test/broken.jpg"}}}
+	thinker.pool = &ProviderPool{
+		providers: map[string]LLMProvider{"primary": primary, "fallback": fallback},
+		order:     []string{"primary", "fallback"},
+		default_:  "primary",
+	}
+
+	resp, err := thinker.callLLMWithRetry(context.Background())
+	if err != nil || resp.Text != "primary recovered" {
+		t.Fatalf("response=%q err=%v", resp.Text, err)
+	}
+	if primary.calls != 2 || fallback.calls != 0 {
+		t.Fatalf("provider calls primary=%d fallback=%d, want 2/0", primary.calls, fallback.calls)
+	}
+}
+
+func TestSuccessfulAttachmentIsVisibleOnceThenConsumed(t *testing.T) {
+	provider := &scriptedRetryProvider{name: "primary", response: ChatResponse{Text: "seen"}}
+	thinker := retryTestThinker(provider)
+	thinker.messages[1].Parts = []ContentPart{{Type: "image_url", ImageURL: &ImageURL{URL: "https://example.test/frame.jpg"}}}
+
+	if _, err := thinker.callLLMWithRetry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := thinker.callLLMWithRetry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if transientAttachmentCount(provider.messages[0]) != 1 || transientAttachmentCount(provider.messages[1]) != 0 {
+		t.Fatalf("attachment counts across requests = %d, %d; want 1, 0",
+			transientAttachmentCount(provider.messages[0]), transientAttachmentCount(provider.messages[1]))
 	}
 }
 

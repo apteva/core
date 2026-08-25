@@ -154,6 +154,10 @@ func (s *Session) ArchiveToolResults(msg Message) (Message, error) {
 }
 
 func (s *Session) prepareEntryForDurability(entry SessionEntry) (SessionEntry, error) {
+	// Provider-facing attachments are one-shot inputs. Persist only a stable
+	// textual receipt: remote access URLs are commonly signed bearer tokens and
+	// become both unsafe and unusable when replayed after expiry or restart.
+	entry, _ = projectTransientAttachmentsFromEntry(entry)
 	if s == nil || len(entry.ToolResults) == 0 {
 		return entry, nil
 	}
@@ -322,10 +326,12 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 		migrationSafe = false
 	}
 	entries = sanitizeLegacyDynamicEntries(entries)
+	var attachmentProjectionCount int
+	entries, attachmentProjectionCount = projectTransientAttachmentsFromEntries(entries)
 	durableEntries, migrated, archiveErr := s.archiveEntriesForDurability(entries)
 	if archiveErr == nil {
 		entries = durableEntries
-		if migrated && migrationSafe {
+		if (migrated || attachmentProjectionCount > 0) && migrationSafe {
 			if err := s.rewriteEntriesLocked(entries); err == nil {
 				s.count = len(entries)
 			}
@@ -416,7 +422,8 @@ func (s *Session) LoadAfter(after int64, limit int) (entries []SessionEntry, nex
 		if archiveErr != nil {
 			return nil, nextCursor, archiveErr
 		}
-		entries = append(entries, archived[0])
+		projected, _ := projectTransientAttachmentsFromEntry(archived[0])
+		entries = append(entries, projected)
 		if entry.Sequence > nextCursor {
 			nextCursor = entry.Sequence
 		}
@@ -540,6 +547,7 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 	}
 
 	entries = sanitizeLegacyDynamicEntries(entries)
+	entries, _ = projectTransientAttachmentsFromEntries(entries)
 	entries, _, err = s.archiveEntriesForDurability(entries)
 	if err != nil {
 		s.mu.Unlock()
@@ -587,6 +595,7 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		return
 	}
 	entries = sanitizeLegacyDynamicEntries(entries)
+	entries, _ = projectTransientAttachmentsFromEntries(entries)
 	entries, _, err = s.archiveEntriesForDurability(entries)
 	if err != nil {
 		return
