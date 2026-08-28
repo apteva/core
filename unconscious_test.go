@@ -221,7 +221,9 @@ func TestUnconsciousHistoryGrowthWakeCreatesPersistentMemory(t *testing.T) {
 	baseline := fileSize(filepath.Join("history", "main.jsonl"))
 
 	go parent.Run()
-	padding := strings.Repeat("non-memory transport padding for threshold coverage. ", 700)
+	// Each event independently crosses the threshold so this test does not
+	// depend on two back-to-back bus deliveries landing in the same drain.
+	padding := strings.Repeat("non-memory transport padding for threshold coverage. ", 1100)
 	parent.InjectConsole("User explicitly said this durable fact: the deployment token is heliotrope-threshold-582. " + padding)
 	parent.InjectConsole("User confirmed heliotrope-threshold-582 must be available in future deployment checks. " + padding)
 	waitForHistoryGrowth(t, baseline+unconsciousByteThreshold, 5*time.Second)
