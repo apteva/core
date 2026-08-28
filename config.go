@@ -26,11 +26,13 @@ type PersistentPaceState struct {
 // entries retain their payload so they can be replayed after a crash;
 // consumed entries retain only ID+hash as the bounded deduplication ledger.
 type PersistentThreadEvent struct {
-	ID       string        `json:"id"`
-	Hash     string        `json:"hash"`
-	Text     string        `json:"text,omitempty"`
-	Parts    []ContentPart `json:"parts,omitempty"`
-	Consumed bool          `json:"consumed,omitempty"`
+	ID             string        `json:"id"`
+	Hash           string        `json:"hash"`
+	Text           string        `json:"text,omitempty"`
+	Parts          []ContentPart `json:"parts,omitempty"`
+	Consumed       bool          `json:"consumed,omitempty"`
+	TrackLifecycle bool          `json:"track_lifecycle,omitempty"`
+	ExecutionID    string        `json:"execution_id,omitempty"`
 }
 
 type PersistentThread struct {
@@ -103,13 +105,16 @@ type Config struct {
 	// RealtimeVoiceMCP is the operator-selected subset of attached MCP
 	// servers exposed to dashboard voice sessions. It is policy/config only;
 	// realtime execution still uses the normal thread registry and gates.
-	RealtimeVoiceMCP []string               `json:"realtime_voice_mcp,omitempty"`
-	Providers        []ProviderConfig       `json:"providers,omitempty"` // multi-provider pool
-	Provider         *ProviderConfig        `json:"provider,omitempty"`  // legacy single-provider (auto-migrated to Providers on load)
-	Threads          []PersistentThread     `json:"threads,omitempty"`
-	MainPace         *PersistentPaceState   `json:"main_pace,omitempty"`
-	MCPServers       []MCPServerConfig      `json:"mcp_servers,omitempty"`
-	Execution        ExecutionControlConfig `json:"execution_control,omitempty"`
+	RealtimeVoiceMCP     []string                   `json:"realtime_voice_mcp,omitempty"`
+	Providers            []ProviderConfig           `json:"providers,omitempty"` // multi-provider pool
+	Provider             *ProviderConfig            `json:"provider,omitempty"`  // legacy single-provider (auto-migrated to Providers on load)
+	Threads              []PersistentThread         `json:"threads,omitempty"`
+	MainPace             *PersistentPaceState       `json:"main_pace,omitempty"`
+	MainEvents           []PersistentThreadEvent    `json:"main_events,omitempty"`
+	EventExecutions      []PersistentEventExecution `json:"event_executions,omitempty"`
+	EventLifecycleOutbox []EventLifecycleTransition `json:"event_lifecycle_outbox,omitempty"`
+	MCPServers           []MCPServerConfig          `json:"mcp_servers,omitempty"`
+	Execution            ExecutionControlConfig     `json:"execution_control,omitempty"`
 }
 
 func NewConfig() *Config {
@@ -224,6 +229,9 @@ func (c *Config) restore(data []byte) {
 	c.Provider = restored.Provider
 	c.Threads = restored.Threads
 	c.MainPace = restored.MainPace
+	c.MainEvents = restored.MainEvents
+	c.EventExecutions = restored.EventExecutions
+	c.EventLifecycleOutbox = restored.EventLifecycleOutbox
 	c.MCPServers = restored.MCPServers
 	c.Execution = restored.Execution
 }

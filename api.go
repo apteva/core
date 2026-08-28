@@ -130,6 +130,7 @@ func newCoreHTTPServer(thinker *Thinker) (*http.Server, error) {
 	mux.HandleFunc("/pause", api.apiAuth(api.pause))
 	mux.HandleFunc("/control", api.apiAuth(api.control))
 	mux.HandleFunc("/event", api.apiAuth(api.postEvent))
+	mux.HandleFunc("/event-lifecycle", api.apiAuth(api.eventLifecycle))
 	mux.HandleFunc("/config", api.apiAuth(api.config))
 	// Memory inspection/editing.
 	//   GET  /memory               — list active memories
@@ -533,12 +534,13 @@ const (
 )
 
 type apiThreadEventRequest struct {
-	ID         string          `json:"id"`
-	Message    json.RawMessage `json:"message"`
-	Type       json.RawMessage `json:"type,omitempty"`
-	From       json.RawMessage `json:"from,omitempty"`
-	To         json.RawMessage `json:"to,omitempty"`
-	ToolResult json.RawMessage `json:"tool_result,omitempty"`
+	ID             string          `json:"id"`
+	Message        json.RawMessage `json:"message"`
+	Type           json.RawMessage `json:"type,omitempty"`
+	From           json.RawMessage `json:"from,omitempty"`
+	To             json.RawMessage `json:"to,omitempty"`
+	ToolResult     json.RawMessage `json:"tool_result,omitempty"`
+	TrackLifecycle bool            `json:"track_lifecycle,omitempty"`
 }
 
 func parseAPIEventMessage(raw json.RawMessage) (string, []ContentPart, error) {
@@ -608,6 +610,7 @@ func normalizeAPIThreadEvents(requests []apiThreadEventRequest) ([]PersistentThr
 		}
 		events = append(events, PersistentThreadEvent{
 			ID: id, Hash: threadEventHash(text, parts), Text: text, Parts: parts,
+			TrackLifecycle: request.TrackLifecycle,
 		})
 	}
 	return events, nil
@@ -622,7 +625,11 @@ func threadEventsResponse(result ThreadEventQueueResult) map[string]any {
 	if duplicates == nil {
 		duplicates = []string{}
 	}
-	return map[string]any{"accepted": accepted, "duplicates": duplicates}
+	executions := result.Executions
+	if executions == nil {
+		executions = map[string]string{}
+	}
+	return map[string]any{"accepted": accepted, "duplicates": duplicates, "executions": executions}
 }
 
 func writeThreadEventQueueError(w http.ResponseWriter, err error) {
@@ -1046,8 +1053,10 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Message  json.RawMessage `json:"message"`
-		ThreadID string          `json:"thread_id"`
+		Message        json.RawMessage `json:"message"`
+		ThreadID       string          `json:"thread_id"`
+		EventID        string          `json:"event_id,omitempty"`
+		TrackLifecycle bool            `json:"track_lifecycle,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -1071,6 +1080,15 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+	}
+	eventID := strings.TrimSpace(body.EventID)
+	if body.TrackLifecycle && eventID == "" {
+		http.Error(w, "track_lifecycle requires event_id", http.StatusBadRequest)
+		return
+	}
+	if eventID != "" && (len(eventID) > maxThreadEventIDBytes || strings.ContainsAny(eventID, "\r\n\x00")) {
+		http.Error(w, fmt.Sprintf("event_id must be at most %d bytes and contain no control separators", maxThreadEventIDBytes), http.StatusBadRequest)
+		return
 	}
 
 	// Lazy auto-spawn: if the event addresses a non-main thread that
@@ -1107,6 +1125,29 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if eventID != "" {
+		eventText := text
+		if threadID == "main" {
+			eventText = "[console] " + text
+		}
+		event := PersistentThreadEvent{
+			ID: eventID, Text: eventText, Parts: parts,
+			Hash: threadEventHash(eventText, parts), TrackLifecycle: body.TrackLifecycle,
+		}
+		var result ThreadEventQueueResult
+		if threadID == "main" {
+			result, err = a.thinker.QueueMainEvents([]PersistentThreadEvent{event})
+		} else {
+			result, err = a.thinker.threads.QueueEvents(threadID, []PersistentThreadEvent{event})
+		}
+		if err != nil {
+			writeThreadEventQueueError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"status": "queued", "thread_id": threadID, "events": threadEventsResponse(result)})
+		return
+	}
+
 	if len(parts) > 0 {
 		// Multimodal: publish event with parts directly on the bus
 		a.thinker.bus.Publish(Event{Type: EventInbox, To: threadID, Text: "[console] " + text, Parts: parts})
@@ -1117,6 +1158,32 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]string{"status": "injected", "thread_id": threadID})
+}
+
+func (a *APIServer) eventLifecycle(w http.ResponseWriter, r *http.Request) {
+	if a.thinker == nil || a.thinker.eventLifecycle == nil {
+		http.Error(w, "event lifecycle unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]any{"transitions": a.thinker.eventLifecycle.PendingTransitions()})
+	case http.MethodPost:
+		var body struct {
+			AckIDs []string `json:"ack_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if err := a.thinker.eventLifecycle.Acknowledge(body.AckIDs); err != nil {
+			http.Error(w, "ack lifecycle transitions: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"status": "acknowledged", "acknowledged": len(body.AckIDs)})
+	default:
+		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+	}
 }
 
 func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {

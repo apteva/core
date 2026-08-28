@@ -97,7 +97,7 @@ func TestCodexAPIThreadStartsWithIdempotentEventSmoke(t *testing.T) {
 		}, "\n"),
 		"tools": []string{"thread_event_probe"},
 		"events": []any{map[string]any{
-			"id": "codex-event:7f31", "message": eventText,
+			"id": "codex-event:7f31", "message": eventText, "track_lifecycle": true,
 		}},
 	}
 	w := postThreadForTest(t, api, "codex-event-thread", body)
@@ -107,6 +107,10 @@ func TestCodexAPIThreadStartsWithIdempotentEventSmoke(t *testing.T) {
 	response := decodeThreadEventResponse(t, w.Body.Bytes())
 	if ids := responseEventIDs(t, response, "accepted"); len(ids) != 1 || ids[0] != "codex-event:7f31" {
 		t.Fatalf("accepted=%v", ids)
+	}
+	executionID := response["events"].(map[string]any)["executions"].(map[string]any)["codex-event:7f31"].(string)
+	if executionID == "" {
+		t.Fatal("tracked Codex event did not return an execution id")
 	}
 
 	deadline := time.Now().Add(150 * time.Second)
@@ -141,6 +145,16 @@ func TestCodexAPIThreadStartsWithIdempotentEventSmoke(t *testing.T) {
 		t.Fatal("real Codex received no first request")
 	} else if _, found := messageContaining(request, eventText); !found {
 		t.Fatalf("real Codex first request omitted event: %#v", request)
+	} else {
+		for _, message := range request {
+			if strings.Contains(message.TextContent(), executionID) {
+				t.Fatal("execution lifecycle metadata leaked into the real Codex prompt")
+			}
+		}
+	}
+	transitions := waitForLifecycleTypes(t, thinker.eventLifecycle, eventClaimed, eventActive, eventSettled)
+	if len(transitions) != 3 || transitions[2].ExecutionID != executionID {
+		t.Fatalf("Codex lifecycle transitions=%#v", transitions)
 	}
 
 	retry := postThreadForTest(t, api, "codex-event-thread", body)
@@ -150,6 +164,9 @@ func TestCodexAPIThreadStartsWithIdempotentEventSmoke(t *testing.T) {
 	retryResponse := decodeThreadEventResponse(t, retry.Body.Bytes())
 	if ids := responseEventIDs(t, retryResponse, "duplicates"); len(ids) != 1 || ids[0] != "codex-event:7f31" {
 		t.Fatalf("retry duplicates=%v", ids)
+	}
+	if got := retryResponse["events"].(map[string]any)["executions"].(map[string]any)["codex-event:7f31"].(string); got != executionID {
+		t.Fatalf("retry execution=%q want %q", got, executionID)
 	}
 	time.Sleep(2 * time.Second)
 	if probeCalls.Load() != 1 {

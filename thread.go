@@ -262,6 +262,7 @@ type SpawnOpts struct {
 	Reasoning       ReasoningLevel
 	InitialMessages []string
 	Events          []PersistentThreadEvent // durable API inbox state restored before Run
+	ExecutionIDs    []string                // causal tracked-event executions inherited from the spawning turn
 	ParentID        string                  // "main" or parent thread ID (empty = "main")
 	Depth           int                     // depth in the spawn tree (0 = child of main)
 	MCPNames        []string                // MCP server capability scopes; eligible tools follow loading policy
@@ -709,10 +710,22 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		directive:              directive,
 		systemThread:           isSystem,
 		allowNoSpawn:           opts.BypassNoSpawn,
+		eventLifecycle:         tm.parent.eventLifecycle,
+		eventExecutionIDs:      map[string]bool{},
 		unconsciousSafety:      tm.parent.unconsciousSafety,
 		rebuildPrompt: func(_ string) string {
 			return thread.promptBuilder(thread.Directive)
 		},
+	}
+	thinker.addEventExecutions(opts.ExecutionIDs)
+	if thinker.eventLifecycle != nil {
+		thinker.addEventExecutions(thinker.eventLifecycle.ActiveForThread(id))
+	}
+	if thinker.eventLifecycle != nil && len(opts.ExecutionIDs) > 0 {
+		if err := thinker.eventLifecycle.Propagate(opts.ExecutionIDs, id); err != nil {
+			tm.parent.bus.Unsubscribe(id)
+			return fmt.Errorf("persist event execution propagation: %w", err)
+		}
 	}
 	thinker.onStop = func() { tm.cleanupThread(thinker.threadID) }
 	thread.Thinker = thinker
@@ -747,7 +760,15 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		}
 		thinker.messages = append(thinker.messages, saved...)
 		thinker.markLoadedToolResultsHistorical(saved)
+		var savedEventIDs []string
+		for eventID := range thinker.session.EventIDs() {
+			savedEventIDs = append(savedEventIDs, eventID)
+		}
+		executionIDs := thread.executionIDsForInboxEvents(savedEventIDs)
 		thread.reconcileInboxEvents(saved)
+		if err := thinker.claimEventExecutions(executionIDs); err != nil {
+			logMsg("EVENT-LIFECYCLE", fmt.Sprintf("[%s] restore claim: %v", id, err))
+		}
 		logMsg("THREAD", fmt.Sprintf("%s loaded %d messages from history (%d compacted summaries)", id, len(saved), len(summaries)))
 	}
 	if thread.hasPendingInboxEvents() {
@@ -769,6 +790,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 
 	tm.threads[id] = thread
 	thinker.ackInboxEvents = func(ids []string) error {
+		executionIDs := thread.executionIDsForInboxEvents(ids)
+		if err := thinker.claimEventExecutions(executionIDs); err != nil {
+			return err
+		}
 		return tm.markEventsConsumed(id, ids)
 	}
 
@@ -852,21 +877,27 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// operations reject System targets, so advertising one here creates an
 	// impossible delegation target that the model will reasonably try to use.
 	if !opts.System {
-		tm.parent.Inject(fmt.Sprintf("[thread:%s] started (provider: %s, role: %s, tools: %s)", id, provName, role, strings.Join(toolList, ", ")))
+		tm.parent.bus.Publish(Event{
+			Type: EventInbox, To: tm.parent.threadID,
+			Text:         fmt.Sprintf("[thread:%s] started (provider: %s, role: %s, tools: %s)", id, provName, role, strings.Join(toolList, ", ")),
+			ExecutionIDs: append([]string(nil), opts.ExecutionIDs...),
+		})
 	}
 	tm.parent.logAPI(APIEvent{Type: "thread_started", ThreadID: id})
 
 	// Telemetry: thread.spawn
 	if tm.parent.telemetry != nil {
 		tm.parent.telemetry.Emit("thread.spawn", id, ThreadSpawnData{
-			ParentID:       parentID,
-			Directive:      directive,
-			Tools:          append([]string(nil), toolList...),
-			RequestedTools: append([]string(nil), tools...),
-			MCP:            append([]string(nil), thread.MCPNames...),
-			Realtime:       thread.IsRealtime,
-			Voice:          thread.Voice,
-			Provider:       thread.ProviderName,
+			ParentID:          parentID,
+			Directive:         directive,
+			Tools:             append([]string(nil), toolList...),
+			RequestedTools:    append([]string(nil), tools...),
+			MCP:               append([]string(nil), thread.MCPNames...),
+			Realtime:          thread.IsRealtime,
+			Voice:             thread.Voice,
+			Provider:          thread.ProviderName,
+			ExecutionIDs:      append([]string(nil), opts.ExecutionIDs...),
+			ParentExecutionID: firstExecutionID(opts.ExecutionIDs),
 		})
 	}
 
@@ -991,30 +1022,37 @@ func (thread *Thread) resolveSend(tm *ThreadManager, tagged string, targetID str
 	if len(parts) > 0 {
 		mediaParts = parts[0]
 	}
+	executionIDs := thread.Thinker.currentEventExecutions()
 	// "parent" alias → route to parent thinker
 	if targetID == "parent" || targetID == thread.ParentID {
-		if len(mediaParts) > 0 {
-			thread.Parent.InjectWithParts(tagged, mediaParts)
-		} else {
-			thread.Parent.Inject(tagged)
+		if thread.Thinker.eventLifecycle != nil {
+			if err := thread.Thinker.eventLifecycle.Propagate(executionIDs, thread.Parent.threadID); err != nil {
+				return err
+			}
 		}
+		thread.Parent.bus.Publish(Event{Type: EventInbox, To: thread.Parent.threadID, Text: tagged, Parts: mediaParts, ExecutionIDs: executionIDs})
 		return nil
 	}
 	// "main" always goes to main (even from grandchildren)
 	if targetID == "main" {
-		thread.Parent.bus.Publish(Event{Type: EventInbox, To: "main", Text: tagged, Parts: mediaParts})
+		if thread.Thinker.eventLifecycle != nil {
+			if err := thread.Thinker.eventLifecycle.Propagate(executionIDs, "main"); err != nil {
+				return err
+			}
+		}
+		thread.Parent.bus.Publish(Event{Type: EventInbox, To: "main", Text: tagged, Parts: mediaParts, ExecutionIDs: executionIDs})
 		return nil
 	}
 	// Try own children first
 	if thread.Children != nil {
-		if err := thread.Children.SendAgentWithParts(targetID, tagged, mediaParts); err == nil {
+		if err := thread.Children.SendAgentWithPartsExecution(targetID, tagged, mediaParts, executionIDs); err == nil {
 			return nil
 		} else if !isThreadNotFound(err) {
 			return err
 		}
 	}
 	// Try sibling threads (same ThreadManager)
-	return tm.SendAgentWithParts(targetID, tagged, mediaParts)
+	return tm.SendAgentWithPartsExecution(targetID, tagged, mediaParts, executionIDs)
 }
 
 // tagThreadMessage preserves the source's runtime identity in the envelope.
@@ -1049,9 +1087,11 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			addResult(call.NativeID, call.Name, content)
 			if t.telemetry != nil {
 				isError := inlineToolResultIsError(content)
-				t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+				data := newToolResultData(
 					call.NativeID, call.Name, 0, !isError, content, content, 0,
-				))
+				)
+				data.ExecutionIDs = t.currentEventExecutions()
+				t.telemetry.Emit("tool.result", t.threadID, data)
 			}
 		}
 
@@ -1063,7 +1103,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				delete(call.Args, "_reason")
 				if t.telemetry != nil {
 					t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
-						ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
+						ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
 					})
 				}
 				emitResult(call, fmt.Sprintf(
@@ -1090,7 +1130,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			}
 			if isInline && t.telemetry != nil {
 				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
-					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
+					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
 				})
 			}
 			switch call.Name {
@@ -1134,7 +1174,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						if id == "parent" {
 							resolvedID = thread.ParentID
 						}
-						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{From: thread.ID, To: resolvedID, Message: msg})
+						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{From: thread.ID, To: resolvedID, Message: msg, ExecutionIDs: t.currentEventExecutions()})
 					}
 					t.scheduleSendCompletion()
 					emitResult(call, sendDeliveryResult(id))
@@ -1215,6 +1255,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						MCPNames:     mcpNames,
 						BuiltinTools: builtinTools,
 						Paused:       paused,
+						ExecutionIDs: t.currentEventExecutions(),
 					})
 					if err != nil {
 						emitResult(call, fmt.Sprintf("error: %v", err))
@@ -1295,7 +1336,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							RestartRealtime: parseTruthy(call.Args["restart_realtime"]),
 						})
 						if applyErr == nil && directiveChanged {
-							thread.Children.Send(sid, fmt.Sprintf("[directive updated] %s", directive))
+							thread.Children.SendWithPartsExecution(sid, fmt.Sprintf("[directive updated] %s", directive), nil, t.currentEventExecutions())
 						}
 					}
 					if applyErr != nil {
@@ -1408,11 +1449,18 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			addResult(doneCallID, "done", "stopping")
 			logMsg("THREAD", fmt.Sprintf("%s calling done, msg=%q", thread.ID, *doneMsg))
 			thread.doneForever = true // mark for permanent cleanup (deletes session)
-			if *doneMsg != "" {
-				thread.Parent.Inject(fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg))
-			} else {
-				thread.Parent.Inject(fmt.Sprintf("[thread:%s done]", thread.ID))
+			executionIDs := t.currentEventExecutions()
+			if t.eventLifecycle != nil {
+				if err := t.eventLifecycle.Propagate(executionIDs, thread.Parent.threadID); err != nil {
+					logMsg("EVENT-LIFECYCLE", fmt.Sprintf("[%s] done propagation: %v", thread.ID, err))
+				}
 			}
+			if *doneMsg != "" {
+				thread.Parent.bus.Publish(Event{Type: EventInbox, To: thread.Parent.threadID, Text: fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg), ExecutionIDs: executionIDs})
+			} else {
+				thread.Parent.bus.Publish(Event{Type: EventInbox, To: thread.Parent.threadID, Text: fmt.Sprintf("[thread:%s done]", thread.ID), ExecutionIDs: executionIDs})
+			}
+			t.settleEventExecutions("thread_done")
 			if thread.Realtime != nil {
 				thread.Realtime.setTerminalReason("caller_done")
 			}
@@ -1436,6 +1484,13 @@ func (tm *ThreadManager) KillWithReason(id, reason string) {
 	}
 	if thread.Realtime != nil {
 		thread.Realtime.setTerminalReason(reason)
+	}
+	if reason != "server_shutdown" {
+		if reason == "caller_done" {
+			thread.Thinker.settleEventExecutions("thread_done")
+		} else {
+			thread.Thinker.failEventExecutions(reason)
+		}
 	}
 	thread.Thinker.Stop()
 	// Wait briefly for cleanup
@@ -1469,13 +1524,23 @@ func (tm *ThreadManager) Send(id, message string) bool {
 }
 
 func (tm *ThreadManager) SendWithParts(id, message string, parts []ContentPart) bool {
+	return tm.SendWithPartsExecution(id, message, parts, nil)
+}
+
+func (tm *ThreadManager) SendWithPartsExecution(id, message string, parts []ContentPart, executionIDs []string) bool {
 	tm.mu.RLock()
 	_, exists := tm.threads[id]
 	tm.mu.RUnlock()
 	if !exists {
 		return false
 	}
-	tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: message, Parts: parts})
+	if tm.parent.eventLifecycle != nil {
+		if err := tm.parent.eventLifecycle.Propagate(executionIDs, id); err != nil {
+			logMsg("EVENT-LIFECYCLE", fmt.Sprintf("propagate to %s: %v", id, err))
+			return false
+		}
+	}
+	tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: message, Parts: parts, ExecutionIDs: append([]string(nil), executionIDs...)})
 	return true
 }
 
@@ -1505,10 +1570,14 @@ func (tm *ThreadManager) ValidateAgentTarget(id string) error {
 
 // SendAgentWithParts is the unprivileged send path used by LLM-facing tools.
 func (tm *ThreadManager) SendAgentWithParts(id, message string, parts []ContentPart) error {
+	return tm.SendAgentWithPartsExecution(id, message, parts, nil)
+}
+
+func (tm *ThreadManager) SendAgentWithPartsExecution(id, message string, parts []ContentPart, executionIDs []string) error {
 	if err := tm.ValidateAgentTarget(id); err != nil {
 		return err
 	}
-	if !tm.SendWithParts(id, message, parts) {
+	if !tm.SendWithPartsExecution(id, message, parts, executionIDs) {
 		return &threadNotFoundError{id: id}
 	}
 	return nil

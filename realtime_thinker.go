@@ -590,6 +590,12 @@ func (rt *RealtimeThinker) responseFinished(session RealtimeSession) {
 	}
 }
 
+func (rt *RealtimeThinker) responseInProgress() bool {
+	rt.responseMu.Lock()
+	defer rt.responseMu.Unlock()
+	return rt.responseActive || rt.responsePending
+}
+
 func realtimeToolMarkupResponseKey(event RealtimeEvent) string {
 	if strings.TrimSpace(event.ResponseID) != "" {
 		return strings.TrimSpace(event.ResponseID)
@@ -1059,6 +1065,9 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		if !hadToolBatch {
 			rt.setConversationState("listening", event)
 		}
+		if !hadToolBatch && !rt.responseInProgress() {
+			rt.Thinker.settleEventExecutions("realtime_response_done")
+		}
 		cost := calculateCostForRealtimeProvider(rt.provider, rt.opts.Model, event.Usage)
 		rt.emit("realtime.usage", map[string]any{
 			"model": rt.opts.Model, "cost": cost,
@@ -1193,6 +1202,7 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	if event.Type != EventInbox {
 		return
 	}
+	rt.Thinker.addEventExecutions(event.ExecutionIDs)
 	session := rt.currentSession()
 	if session == nil {
 		return

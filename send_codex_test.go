@@ -74,6 +74,8 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 	llmTurns := 0
 	var receiptAt, receiptTurnAt time.Time
 	var receiptTurnMessage string
+	var toolCallNames []string
+	sawPostReceiptPace := false
 	for time.Now().Before(deadline) {
 		events, _ := thinker.telemetry.StoredEvents(0)
 		for _, event := range events {
@@ -84,10 +86,16 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 			switch event.Type {
 			case "tool.call":
 				var data ToolCallData
-				if json.Unmarshal(event.Data, &data) == nil && data.Name == "send" {
-					sendCalls++
-					if sendCalls > 1 {
-						t.Fatalf("Codex resent after a delivery receipt: calls=%d args=%v", sendCalls, data.Args)
+				if json.Unmarshal(event.Data, &data) == nil {
+					toolCallNames = append(toolCallNames, data.Name)
+					if data.Name == "pace" && !receiptAt.IsZero() && !event.Time.Before(receiptAt) {
+						sawPostReceiptPace = true
+					}
+					if data.Name == "send" {
+						sendCalls++
+						if sendCalls > 1 {
+							t.Fatalf("Codex resent after a delivery receipt: calls=%d args=%v", sendCalls, data.Args)
+						}
 					}
 				}
 			case "tool.result":
@@ -117,8 +125,8 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 			if continuationDelay > 60*time.Second {
 				t.Fatalf("send receipt continuation took %s, want an immediate turn rather than paced sleep", continuationDelay)
 			}
-			if receiptTurnMessage == "" {
-				t.Fatal("Codex receipt-processing turn returned no feedback")
+			if receiptTurnMessage == "" && !sawPostReceiptPace {
+				t.Fatalf("Codex receipt-processing turn returned neither text nor a wait decision; tool calls=%v", toolCallNames)
 			}
 			time.Sleep(1500 * time.Millisecond)
 			events, _ = thinker.telemetry.StoredEvents(0)
@@ -139,8 +147,12 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 				!strings.Contains(mainEvents[0], "durable daily check-in") {
 				t.Fatalf("main inbox = %v", mainEvents)
 			}
+			feedback := receiptTurnMessage
+			if feedback == "" && sawPostReceiptPace {
+				feedback = "pace(wait)"
+			}
 			t.Logf("Codex processed the send receipt after %s without duplicating the handoff; feedback=%q",
-				continuationDelay.Round(time.Millisecond), receiptTurnMessage)
+				continuationDelay.Round(time.Millisecond), feedback)
 			return
 		}
 		time.Sleep(250 * time.Millisecond)

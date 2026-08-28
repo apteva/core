@@ -629,7 +629,7 @@ func TestTimerWakeIsConsumedAndDoesNotInventRecurrence(t *testing.T) {
 
 func TestEventProcessingThatCrossesDeadlineImmediatelyDeliversTimerWake(t *testing.T) {
 	t.Chdir(t.TempDir())
-	pendingWake := time.Now().Add(120 * time.Millisecond).UTC()
+	pendingWake := time.Now().Add(time.Second).UTC()
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate work.",

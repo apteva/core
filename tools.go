@@ -60,14 +60,16 @@ func executeTool(t *Thinker, call toolCall) {
 	// Extract _reason before dispatch (observability field, not passed to handler)
 	reason := call.Args["_reason"]
 	delete(call.Args, "_reason")
+	executionIDs := t.currentEventExecutions()
 	if !t.acquireToolSlot() {
 		return
 	}
+	t.asyncToolsActive.Add(1)
 
 	// Telemetry: tool.call
 	if t.telemetry != nil {
 		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
-			ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
+			ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: executionIDs,
 		})
 	}
 
@@ -81,6 +83,7 @@ func executeTool(t *Thinker, call toolCall) {
 
 	go func() {
 		defer t.releaseToolSlot()
+		defer t.asyncToolsActive.Add(-1)
 		logMsg("TOOL", fmt.Sprintf("dispatch %s reason=%q args=%v", call.Name, reason, call.Args))
 		start := time.Now()
 		defer func() {
@@ -94,10 +97,12 @@ func executeTool(t *Thinker, call toolCall) {
 				t.Inject(fmt.Sprintf("[tool:%s] error: panic: %v", call.Name, r))
 				if t.telemetry != nil {
 					result := fmt.Sprintf("panic: %v", r)
-					t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+					data := newToolResultData(
 						call.NativeID, call.Name, time.Since(start).Milliseconds(), false,
 						result, result, 0,
-					))
+					)
+					data.ExecutionIDs = executionIDs
+					t.telemetry.Emit("tool.result", t.threadID, data)
 				}
 			}
 		}()
@@ -127,10 +132,12 @@ func executeTool(t *Thinker, call toolCall) {
 		// Telemetry: tool.result
 		if t.telemetry != nil {
 			success := !resp.IsError && !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown")
-			t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+			data := newToolResultData(
 				call.NativeID, call.Name, time.Since(start).Milliseconds(), success,
 				resp.Text, resp.Text, len(resp.Image),
-			))
+			)
+			data.ExecutionIDs = executionIDs
+			t.telemetry.Emit("tool.result", t.threadID, data)
 		}
 
 		// Emit visual chunk for TUI
@@ -167,7 +174,7 @@ func executeTool(t *Thinker, call toolCall) {
 			lateText := fmt.Sprintf("[late-result] Tool %s (call id=%s) completed: %s", call.Name, call.NativeID, resultText)
 			t.bus.Publish(Event{
 				Type: EventInbox, To: t.threadID,
-				Text: lateText,
+				Text: lateText, ExecutionIDs: executionIDs,
 			})
 			return
 		}
@@ -188,8 +195,9 @@ func executeTool(t *Thinker, call toolCall) {
 
 		t.bus.Publish(Event{
 			Type: EventInbox, To: t.threadID,
-			Text:       fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
-			ToolResult: &toolResult,
+			Text:         fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
+			ToolResult:   &toolResult,
+			ExecutionIDs: executionIDs,
 		})
 	}()
 }

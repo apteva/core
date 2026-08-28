@@ -533,14 +533,16 @@ type LLMErrorData struct {
 }
 
 type ThreadSpawnData struct {
-	ParentID       string   `json:"parent_id"`
-	Directive      string   `json:"directive"`
-	Tools          []string `json:"tools"` // effective exact grants, including managed scaffolding
-	RequestedTools []string `json:"requested_tools,omitempty"`
-	MCP            []string `json:"mcp,omitempty"` // whole-server discovery scopes
-	Realtime       bool     `json:"realtime,omitempty"`
-	Voice          string   `json:"voice,omitempty"`
-	Provider       string   `json:"provider,omitempty"`
+	ParentID          string   `json:"parent_id"`
+	Directive         string   `json:"directive"`
+	Tools             []string `json:"tools"` // effective exact grants, including managed scaffolding
+	RequestedTools    []string `json:"requested_tools,omitempty"`
+	MCP               []string `json:"mcp,omitempty"` // whole-server discovery scopes
+	Realtime          bool     `json:"realtime,omitempty"`
+	Voice             string   `json:"voice,omitempty"`
+	Provider          string   `json:"provider,omitempty"`
+	ExecutionIDs      []string `json:"execution_ids,omitempty"`
+	ParentExecutionID string   `json:"parent_execution_id,omitempty"`
 }
 
 type ThreadDoneData struct {
@@ -560,29 +562,32 @@ type ThreadRenamedData struct {
 }
 
 type ThreadMessageData struct {
-	From    string `json:"from"`
-	To      string `json:"to"`
-	Message string `json:"message"`
+	From         string   `json:"from"`
+	To           string   `json:"to"`
+	Message      string   `json:"message"`
+	ExecutionIDs []string `json:"execution_ids,omitempty"`
 }
 
 type ToolCallData struct {
-	ID     string            `json:"id,omitempty"`
-	Name   string            `json:"name"`
-	Args   map[string]string `json:"args,omitempty"`
-	Reason string            `json:"reason,omitempty"`
+	ID           string            `json:"id,omitempty"`
+	Name         string            `json:"name"`
+	Args         map[string]string `json:"args,omitempty"`
+	Reason       string            `json:"reason,omitempty"`
+	ExecutionIDs []string          `json:"execution_ids,omitempty"`
 }
 
 type ToolResultData struct {
-	ID                  string `json:"id,omitempty"`
-	Name                string `json:"name"`
-	DurationMs          int64  `json:"duration_ms"`
-	Success             bool   `json:"success"`
-	Result              string `json:"result,omitempty"`
-	ResultOriginalBytes int    `json:"result_original_bytes"`
-	ResultContextBytes  int    `json:"result_context_bytes"`
-	ResultPreviewBytes  int    `json:"result_preview_bytes"`
-	ResultImageBytes    int    `json:"result_image_bytes,omitempty"`
-	ResultTruncated     bool   `json:"result_truncated"`
+	ID                  string   `json:"id,omitempty"`
+	Name                string   `json:"name"`
+	DurationMs          int64    `json:"duration_ms"`
+	Success             bool     `json:"success"`
+	Result              string   `json:"result,omitempty"`
+	ResultOriginalBytes int      `json:"result_original_bytes"`
+	ResultContextBytes  int      `json:"result_context_bytes"`
+	ResultPreviewBytes  int      `json:"result_preview_bytes"`
+	ResultImageBytes    int      `json:"result_image_bytes,omitempty"`
+	ResultTruncated     bool     `json:"result_truncated"`
+	ExecutionIDs        []string `json:"execution_ids,omitempty"`
 }
 
 const toolResultTelemetryPreviewBytes = 1000

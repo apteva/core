@@ -32,6 +32,10 @@ type Event struct {
 	ToolName   string        // tool name (for EventToolChunk)
 	Parts      []ContentPart // optional media (images, audio) attached to this event
 	ToolResult *ToolResult   // optional: structured tool result
+	// ExecutionIDs correlate opt-in durable inbox work across continuations,
+	// tools, sends, and spawned workers. They are runtime metadata only and are
+	// never exposed as model-authored input.
+	ExecutionIDs []string
 
 	// Structured fields (populated for ThinkDone events)
 	Iteration      int

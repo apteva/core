@@ -908,10 +908,15 @@ type Thinker struct {
 	threadID  string // "main" for main thinker, thread ID for sub-threads
 
 	// Telemetry — shared across all threads, owned by main thinker
-	telemetry   *Telemetry
-	execution   *ExecutionController
-	checkpoints *ExecutionCheckpointStore
-	restarting  bool
+	telemetry         *Telemetry
+	eventLifecycle    *EventLifecycle
+	eventExecutionMu  sync.Mutex
+	eventExecutionIDs map[string]bool
+	mainInboxMu       sync.Mutex
+	mainInboxEvents   []PersistentThreadEvent
+	execution         *ExecutionController
+	checkpoints       *ExecutionCheckpointStore
+	restarting        bool
 	// Shared by main and the unconscious child. The child records completed
 	// iterations; main uses the state to decide whether a forced wake is due.
 	unconsciousSafety *unconsciousSafetyState
@@ -988,8 +993,9 @@ type Thinker struct {
 	// MCP server catalog — lightweight metadata for prompt (name +
 	// tool count). Derived from toolIndex; kept as a Thinker field
 	// for buildSystemPrompt back-compat.
-	mcpCatalog   []MCPServerInfo
-	pendingTools sync.Map // tool call IDs with pending async results
+	mcpCatalog       []MCPServerInfo
+	pendingTools     sync.Map     // tool call IDs with pending async results
+	asyncToolsActive atomic.Int64 // all async registry calls, including providers without native call IDs
 	// ackInboxEvents marks durable API events consumed after their user message
 	// is appended to the session journal.
 	ackInboxEvents func([]string) error
@@ -1354,6 +1360,17 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		checkpoints:            NewExecutionCheckpointStore(),
 		blobs:                  NewBlobStore(DefaultBlobMaxTotal, DefaultBlobTTL),
 	}
+	t.eventLifecycle = NewEventLifecycle(config, t.telemetry)
+	t.eventExecutionIDs = map[string]bool{}
+	t.mainInboxEvents = config.getMainEvents()
+	t.addEventExecutions(t.eventLifecycle.ActiveForThread("main"))
+	t.ackInboxEvents = func(ids []string) error {
+		executionIDs := t.executionIDsForInboxEvents(ids)
+		if err := t.claimEventExecutions(executionIDs); err != nil {
+			return err
+		}
+		return t.markMainEventsConsumed(ids)
+	}
 	t.persistPace = func(state PersistentPaceState) error {
 		return config.SetMainPace(state)
 	}
@@ -1411,6 +1428,23 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		t.messages = append(t.messages, saved...)
 		t.markLoadedToolResultsHistorical(saved)
 		logMsg("SESSION", fmt.Sprintf("loaded %d messages from history (%d compacted summaries)", len(saved), len(summaries)))
+	}
+	if len(t.mainInboxEvents) > 0 {
+		seen := map[string]bool{}
+		for id := range t.session.EventIDs() {
+			seen[id] = true
+		}
+		var consumed []string
+		for _, event := range t.mainInboxEvents {
+			if !event.Consumed && seen[event.ID] {
+				consumed = append(consumed, event.ID)
+			}
+		}
+		if len(consumed) > 0 {
+			executionIDs := t.executionIDsForInboxEvents(consumed)
+			_ = t.claimEventExecutions(executionIDs)
+			_ = t.markMainEventsConsumed(consumed)
+		}
 	}
 	// Respawn persistent threads from config, sorted by depth (parents before children).
 	// DeferRun=true so all threads are created before any starts thinking.
@@ -1500,6 +1534,17 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		}
 	}
 
+	// Active lifecycle participants are persisted, while ephemeral threads are
+	// deliberately not. Reconcile only after the complete durable tree has been
+	// rebuilt and before any restored thread starts, otherwise an execution that
+	// reached an ephemeral or otherwise non-restorable participant could remain
+	// active forever after restart.
+	if failed, err := t.eventLifecycle.ReconcileRestoredParticipants(restoredEventParticipants(t)); err != nil {
+		logMsg("EVENT-LIFECYCLE", fmt.Sprintf("restart reconciliation: %v", err))
+	} else {
+		clearEventExecutionsInTree(t, failed)
+	}
+
 	// Now start all respawned threads (parents already see their children)
 	if len(persistedThreads) > 0 || config.Unconscious {
 		t.threads.StartAll()
@@ -1520,6 +1565,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 
 	t.publishRuntimeStatus()
 	t.publishContextStatus()
+	publishThreadInboxEvents(t.bus, "main", pendingPersistentEvents(t.mainInboxEvents))
 	return t
 }
 
@@ -1820,7 +1866,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			// Emit tool.call telemetry only for inline tools
 			if isInline && t.telemetry != nil {
 				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
-					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason,
+					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
 				})
 			}
 			// Helper to add inline tool result + emit telemetry
@@ -1830,9 +1876,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					results = append(results, ToolResult{CallID: call.NativeID, ToolName: call.Name, Content: content, IsError: isError})
 				}
 				if t.telemetry != nil {
-					t.telemetry.Emit("tool.result", t.threadID, newToolResultData(
+					data := newToolResultData(
 						call.NativeID, call.Name, 0, !isError, content, content, 0,
-					))
+					)
+					data.ExecutionIDs = t.currentEventExecutions()
+					t.telemetry.Emit("tool.result", t.threadID, data)
 				}
 			}
 
@@ -1966,6 +2014,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						Realtime:      realtime,
 						Voice:         voice,
 						TurnDetection: turnDetection,
+						ExecutionIDs:  t.currentEventExecutions(),
 					})
 					if err != nil {
 						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
@@ -2072,7 +2121,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							RestartRealtime: parseTruthy(call.Args["restart_realtime"]),
 						})
 						if applyErr == nil && directiveChanged {
-							t.threads.Send(id, fmt.Sprintf("[directive updated] %s", directive))
+							t.threads.SendWithPartsExecution(id, fmt.Sprintf("[directive updated] %s", directive), nil, t.currentEventExecutions())
 						}
 					}
 					if applyErr != nil {
@@ -2124,7 +2173,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						} else {
 							addResult(sendFinalFailureResult(attachmentErr))
 						}
-					} else if err := t.threads.SendAgentWithParts(id, tagged, parts); err != nil {
+					} else if err := t.threads.SendAgentWithPartsExecution(id, tagged, parts, t.currentEventExecutions()); err != nil {
 						if t.scheduleSendCorrection() {
 							addResult(sendCorrectionResult(err))
 						} else {
@@ -2132,7 +2181,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					} else {
 						if t.telemetry != nil {
-							t.telemetry.Emit("thread.message", "main", ThreadMessageData{From: "main", To: id, Message: msg})
+							t.telemetry.Emit("thread.message", "main", ThreadMessageData{From: "main", To: id, Message: msg, ExecutionIDs: t.currentEventExecutions()})
 						}
 						t.scheduleSendCompletion()
 						addResult(sendDeliveryResult(id))
@@ -2431,6 +2480,7 @@ func (t *Thinker) Run() {
 					Iteration: t.iteration,
 				})
 			}
+			t.failEventExecutions("thinker_panic")
 			t.Stop()
 		}
 		if t.restarting {
@@ -2524,16 +2574,19 @@ func (t *Thinker) Run() {
 		var mediaParts []ContentPart
 		var toolResults []ToolResult
 		var eventIDs []string
+		var executionIDs []string
 		for _, de := range drained {
 			consumed = append(consumed, de.Text)
 			mediaParts = append(mediaParts, de.Parts...)
 			if de.ID != "" {
 				eventIDs = append(eventIDs, de.ID)
 			}
+			executionIDs = append(executionIDs, de.ExecutionIDs...)
 			if de.ToolResult != nil {
 				toolResults = append(toolResults, *de.ToolResult)
 			}
 		}
+		t.addEventExecutions(executionIDs)
 		if silentResults := t.drainSilentToolResults(); len(silentResults) > 0 {
 			toolResults = append(toolResults, silentResults...)
 			logMsg("RUN", fmt.Sprintf("[%s] drained %d silent tool results", t.threadID, len(silentResults)))
@@ -2549,7 +2602,8 @@ func (t *Thinker) Run() {
 		// placeholder tool_result (see injectPlaceholdersForPending) so
 		// the tool_use is properly paired and the model is told not to
 		// retry.
-		t.waitForPendingTools(&toolResults, &consumed, &mediaParts, 3*time.Second, &eventIDs)
+		t.waitForPendingTools(&toolResults, &consumed, &mediaParts, 3*time.Second, &eventIDs, &executionIDs)
+		t.addEventExecutions(executionIDs)
 		if t.pendingToolCount() > 0 {
 			injectedBefore := len(toolResults)
 			t.injectPlaceholdersForPending(&toolResults)
@@ -3148,6 +3202,12 @@ func (t *Thinker) Run() {
 			continue
 		}
 
+		// Reaching the normal wait boundary is the deterministic definition of
+		// "settled" for tracked events. It does not assert application success;
+		// it only says this thread has stopped processing. Pending async tools
+		// keep the execution active and will wake the existing loop on result.
+		t.settleEventExecutions("event_wait")
+
 		// Core owns no recurrence policy. It waits for the agent's one pending
 		// wake, using only the remaining duration, or waits event-only when the
 		// agent left no timer.
@@ -3521,10 +3581,11 @@ func providerRetryDelay(err error, attempt int) time.Duration {
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.
 type drainedEvent struct {
-	ID         string
-	Text       string
-	Parts      []ContentPart
-	ToolResult *ToolResult
+	ID           string
+	Text         string
+	Parts        []ContentPart
+	ToolResult   *ToolResult
+	ExecutionIDs []string
 }
 
 // drainEventTexts is a convenience for tests — returns just the text strings.
@@ -3541,7 +3602,7 @@ func (t *Thinker) drainEvents() []drainedEvent {
 	var items []drainedEvent
 	for _, ev := range t.sub.DrainTargeted() {
 		if ev.Type == EventInbox {
-			items = append(items, drainedEvent{ID: ev.ID, Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult})
+			items = append(items, drainedEvent{ID: ev.ID, Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult, ExecutionIDs: append([]string(nil), ev.ExecutionIDs...)})
 		}
 	}
 	for {
@@ -3628,6 +3689,9 @@ func (t *Thinker) waitForPendingTools(
 			if ev.Type == EventInbox {
 				if ev.ID != "" && len(eventIDs) > 0 && eventIDs[0] != nil {
 					*eventIDs[0] = append(*eventIDs[0], ev.ID)
+				}
+				if len(eventIDs) > 1 && eventIDs[1] != nil {
+					*eventIDs[1] = append(*eventIDs[1], ev.ExecutionIDs...)
 				}
 				if ev.ToolResult != nil {
 					*toolResults = append(*toolResults, *ev.ToolResult)
