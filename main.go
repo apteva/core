@@ -245,8 +245,12 @@ func installSignalLogger() {
 			_ = logFile.Sync()
 		}
 		signal.Reset(sig)
-		if s, ok := sig.(syscall.Signal); ok {
-			_ = syscall.Kill(os.Getpid(), s)
+		process, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			if err := process.Signal(sig); err == nil {
+				return
+			}
 		}
+		os.Exit(1)
 	}()
 }
