@@ -215,6 +215,11 @@ PACING (call pace at the end of every cycle — you decide how long):
 
 You never communicate with other threads. You never interact with users. Treat the corpus like a journal you'd still want to read in six months: terse, useful, not exhaustive. Soft target ≤ 1000 active memories — past that, get more aggressive with drops and supersede-collapse.`
 
+// toolArgumentPresenceContract is shared by every text-model role. MCP schemas
+// describe the values a caller may provide; they must never be mistaken for a
+// request to manufacture every optional property.
+const toolArgumentPresenceContract = `Include only tool arguments needed for the operation. Omit optional properties unless you intentionally need to override their server-side behavior. JSON Schema constraints, examples, and enum ordering are not defaults: never fill optional properties with empty strings, false, zero or minimum values, the first enum value, or placeholder objects merely to complete a schema. If false, zero, or an empty string is deliberately required, preserve and send that value.`
+
 // baseSystemPrompt contains the fixed runtime contract. The editable directive
 // is appended separately at runtime.
 const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You govern standing goals, work ownership, permissions, conflicts, and escalation across the thread hierarchy.
@@ -259,6 +264,7 @@ REPORTING:
 - Leaders aggregate related child activity rather than forwarding every event to main.
 
 TOOL CALLS:
+- ` + toolArgumentPresenceContract + `
 - Every tool takes a "_reason" string for the operator UI. Write a clear capitalized activity phrase, maximum 6 words, usually ending in "-ing", naming the action and object so it is understandable without the tool name (e.g. "Searching for customer row", "Sending Pushover notification"). Do not use a generic tool name as the reason.`
 
 const mainDirectivePersistencePrompt = `

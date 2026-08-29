@@ -42,6 +42,7 @@ TIME AND STATE:
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
 IMPORTANT — tool calls and done:
+- ` + toolArgumentPresenceContract + `
 - NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
 - Always wait for tool results before calling done — you need to confirm the action succeeded.
 - Example: Thought 1: pushover_send_notification(...). Thought 2: see result, confirm success, done.`
@@ -85,6 +86,7 @@ TIME AND STATE:
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
 IMPORTANT — tool calls and done:
+- ` + toolArgumentPresenceContract + `
 - NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
 - Always wait for tool results before calling done — you need to confirm the action succeeded.`
 

@@ -267,6 +267,57 @@ func TestMCPArgumentsFromStringsKeepsNumericStringsWithoutSchema(t *testing.T) {
 	}
 }
 
+func TestMCPArgumentsPreserveOptionalPropertyPresenceAndExplicitFalsyValues(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":  map[string]any{"type": "string"},
+			"timeout": map[string]any{"type": "integer", "minimum": 60},
+			"persist": map[string]any{"type": "boolean"},
+			"backend": map[string]any{"type": "string", "enum": []any{"local", "remote"}},
+			"note":    map[string]any{"type": "string"},
+			"viewport": map[string]any{
+				"type": "object",
+			},
+		},
+		"required": []any{"action"},
+	}
+
+	minimal := mcpArgumentsFromStrings(map[string]string{"action": "open"}, schema)
+	if len(minimal) != 1 || minimal["action"] != "open" {
+		t.Fatalf("minimal arguments = %#v, want only action=open", minimal)
+	}
+	for _, absent := range []string{"timeout", "persist", "backend", "note", "viewport"} {
+		if _, ok := minimal[absent]; ok {
+			t.Errorf("absent optional property %q was materialized: %#v", absent, minimal)
+		}
+	}
+
+	explicit := mcpArgumentsFromStrings(map[string]string{
+		"action":   "open",
+		"timeout":  "0",
+		"persist":  "false",
+		"backend":  "local",
+		"note":     "",
+		"viewport": `{}`,
+	}, schema)
+	if len(explicit) != 6 {
+		t.Fatalf("explicit arguments = %#v, want all six supplied properties", explicit)
+	}
+	if v, ok := explicit["timeout"].(int64); !ok || v != 0 {
+		t.Errorf("timeout = %#v (%T), want explicit int64(0)", explicit["timeout"], explicit["timeout"])
+	}
+	if v, ok := explicit["persist"].(bool); !ok || v {
+		t.Errorf("persist = %#v (%T), want explicit false", explicit["persist"], explicit["persist"])
+	}
+	if v, ok := explicit["note"].(string); !ok || v != "" {
+		t.Errorf("note = %#v (%T), want explicit empty string", explicit["note"], explicit["note"])
+	}
+	if v, ok := explicit["viewport"].(map[string]any); !ok || len(v) != 0 {
+		t.Errorf("viewport = %#v (%T), want explicit empty object", explicit["viewport"], explicit["viewport"])
+	}
+}
+
 func TestExtractMCPResultImageFromComputerScreenshot(t *testing.T) {
 	rawImage := []byte{0x89, 0x50, 0x4e, 0x47}
 	result := map[string]any{

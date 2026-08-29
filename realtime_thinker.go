@@ -34,6 +34,10 @@ type RealtimeThinker struct {
 	provider RealtimeProvider
 	voice    string
 	opts     RealtimeSessionOpts
+	// currentTimeContext is fixed for one provider session so ordinary
+	// configuration comparisons cannot churn or reconnect live audio. It is
+	// refreshed immediately before each new provider session opens.
+	currentTimeContext string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -146,7 +150,8 @@ func newRealtimeThinker(
 	runCtx, cancel := context.WithCancel(ctx)
 	rt := &RealtimeThinker{
 		Thinker: thinker, provider: provider, voice: voice,
-		ctx: runCtx, cancel: cancel,
+		currentTimeContext: renderCurrentTimeContext(time.Now().UTC().Format(time.RFC3339)),
+		ctx:                runCtx, cancel: cancel,
 		audioIn: audioIn, audioOut: audioOut, audioControl: audioControl,
 		toolBatches: map[string]*realtimeToolBatch{}, toolCallBatches: map[string]string{},
 		toolMarkupTails: map[string]string{}, toolMarkupSuppressed: map[string]bool{},
@@ -205,10 +210,20 @@ func (rt *RealtimeThinker) currentInstructions() string {
 }
 
 func (rt *RealtimeThinker) currentInstructionsLocked() string {
+	base := rt.directive
 	if len(rt.messages) > 0 && rt.messages[0].Role == "system" {
-		return rt.messages[0].Content
+		base = rt.messages[0].Content
 	}
-	return rt.directive
+	if strings.TrimSpace(rt.currentTimeContext) == "" {
+		return base
+	}
+	return strings.TrimSpace(base) + "\n\n" + rt.currentTimeContext
+}
+
+func (rt *RealtimeThinker) refreshCurrentTimeContext() {
+	rt.transcriptMu.Lock()
+	rt.currentTimeContext = renderCurrentTimeContext(time.Now().UTC().Format(time.RFC3339))
+	rt.transcriptMu.Unlock()
 }
 
 func (rt *RealtimeThinker) configurationSnapshot() (string, []NativeTool) {
@@ -332,6 +347,7 @@ func (rt *RealtimeThinker) boundedTranscript() []Message {
 }
 
 func (rt *RealtimeThinker) openSession(restore bool) error {
+	rt.refreshCurrentTimeContext()
 	instructions, tools := rt.configurationSnapshot()
 	rt.transcriptMu.Lock()
 	rt.opts.Instructions, rt.opts.Tools = instructions, tools

@@ -61,7 +61,14 @@ func TestAppendEphemeralTurnContextPreservesDurablePrefix(t *testing.T) {
 
 func TestEphemeralTurnContextAlwaysIncludesCurrentUTC(t *testing.T) {
 	content := renderEphemeralTurnContext("", "2026-07-13T12:03:00Z", false)
-	for _, want := range []string{ephemeralContextHeader, "[CURRENT TIME]", "UTC: 2026-07-13T12:03:00Z"} {
+	for _, want := range []string{
+		ephemeralContextHeader,
+		"[CURRENT TIME]",
+		"UTC: 2026-07-13T12:03:00Z",
+		"UTC weekday: Monday",
+		"UTC calendar date: 2026-07-13",
+		"interpret unqualified calendar days and dates in UTC",
+	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("context missing %q: %q", want, content)
 		}
@@ -80,6 +87,23 @@ func TestEphemeralTurnContextAlwaysIncludesCurrentUTC(t *testing.T) {
 	}
 	if strings.Contains(latest, "2026-07-13T12:03:00Z") {
 		t.Fatalf("timer wake retained superseded time: %q", latest)
+	}
+}
+
+func TestCurrentTimeContextStatesWeekdayWithoutModelCalendarArithmetic(t *testing.T) {
+	tests := []struct {
+		now, weekday string
+	}{
+		{now: "2026-08-28T23:30:00Z", weekday: "Friday"},
+		{now: "2026-08-29T00:30:00Z", weekday: "Saturday"},
+		// An offset timestamp is normalized before its UTC weekday is rendered.
+		{now: "2026-08-29T01:30:00+02:00", weekday: "Friday"},
+	}
+	for _, test := range tests {
+		context := renderCurrentTimeContext(test.now)
+		if !strings.Contains(context, "UTC weekday: "+test.weekday) {
+			t.Errorf("renderCurrentTimeContext(%q) missing %s: %q", test.now, test.weekday, context)
+		}
 	}
 }
 

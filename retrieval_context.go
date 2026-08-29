@@ -76,7 +76,7 @@ func (s *ephemeralTurnContextState) reset() {
 }
 
 func renderEphemeralTurnContext(dynamicContext, now string, idle bool) string {
-	content := ephemeralContextHeader + "\n[CURRENT TIME]\nUTC: " + now
+	content := ephemeralContextHeader + "\n" + renderCurrentTimeContext(now)
 	if dynamic := strings.TrimSpace(dynamicContext); dynamic != "" {
 		content += "\n\n" + dynamic
 	}
@@ -85,6 +85,29 @@ func renderEphemeralTurnContext(dynamicContext, now string, idle bool) string {
 		content += "\n\n" + idleText
 	}
 	return content
+}
+
+func renderCurrentTimeContext(now string) string {
+	content := "[CURRENT TIME]\nUTC: " + now
+	if parsed, ok := parsePromptUTC(now); ok {
+		content += "\nUTC weekday: " + parsed.Weekday().String()
+		content += "\nUTC calendar date: " + parsed.Format("2006-01-02")
+	}
+	content += "\nTimezone rule: Unless an instruction explicitly specifies another timezone, interpret unqualified calendar days and dates in UTC."
+	return content
+}
+
+func parsePromptUTC(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), true
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04"} {
+		if parsed, err := time.ParseInLocation(layout, value, time.UTC); err == nil {
+			return parsed.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func appendWakeStateContext(dynamicContext, reason string, wake time.Time, fired bool) string {

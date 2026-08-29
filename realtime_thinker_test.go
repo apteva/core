@@ -331,8 +331,13 @@ func TestRealtimeOpenUsesFullCorePromptAndSelectedProfile(t *testing.T) {
 	provider.mu.Lock()
 	opts := provider.opens[0]
 	provider.mu.Unlock()
-	if opts.Instructions != thinker.messages[0].Content {
+	if !strings.HasPrefix(opts.Instructions, thinker.messages[0].Content) {
 		t.Fatalf("realtime received partial prompt:\n%s", opts.Instructions)
+	}
+	for _, want := range []string{"[CURRENT TIME]", "UTC weekday:", "UTC calendar date:", "interpret unqualified calendar days and dates in UTC"} {
+		if !strings.Contains(opts.Instructions, want) {
+			t.Fatalf("realtime instructions missing %q:\n%s", want, opts.Instructions)
+		}
 	}
 	if opts.Model != "fake-small" || opts.Reasoning != "high" || opts.Voice != "test-voice" {
 		t.Fatalf("profile not forwarded: %#v", opts)
@@ -477,7 +482,7 @@ func TestRealtimeCoreToolsUseNormalThreadHandlerAndRefreshPrompt(t *testing.T) {
 	if len(session.toolResults) != 1 || session.toolResults[0].callID != "e1" || session.toolResults[0].isError {
 		t.Fatalf("evolve result = %#v", session.toolResults)
 	}
-	if len(session.updates) != 1 || session.updates[0].Instructions != thread.Thinker.messages[0].Content {
+	if len(session.updates) != 1 || !strings.HasPrefix(session.updates[0].Instructions, thread.Thinker.messages[0].Content) || !strings.Contains(session.updates[0].Instructions, "UTC weekday:") {
 		t.Fatalf("updated prompt not pushed: %#v", session.updates)
 	}
 	if !strings.Contains(session.updates[0].Instructions, "[REALTIME CONVERSATION]") || strings.Contains(session.updates[0].Instructions, "Think out loud") {

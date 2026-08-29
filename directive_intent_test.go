@@ -28,6 +28,26 @@ func TestMainPromptRequiresAutomaticDurableInstructionPersistence(t *testing.T) 
 	}
 }
 
+func TestAllTextModelRolesPreserveOptionalToolArgumentPresence(t *testing.T) {
+	prompts := map[string]string{
+		"main":            buildSystemPrompt("# Role\nCoordinate work.", ModeAutonomous, NewToolRegistry("test"), "", nil, nil, nil, nil),
+		"worker":          formatThreadBasePrompt(false, false, "worker", "main coordinator"),
+		"leader":          formatThreadBasePrompt(true, false, "leader", "main coordinator"),
+		"realtime worker": formatThreadBasePrompt(false, true, "voice", "main coordinator") + realtimeConversationPrompt,
+	}
+	for name, prompt := range prompts {
+		for _, want := range []string{
+			"Omit optional properties",
+			"JSON Schema constraints, examples, and enum ordering are not defaults",
+			"If false, zero, or an empty string is deliberately required, preserve and send that value",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("%s prompt missing %q", name, want)
+			}
+		}
+	}
+}
+
 func TestMainPromptAssignsRecurringWorkByOwnership(t *testing.T) {
 	prompt := buildSystemPrompt("# Schedule\n- cadence: weekly", ModeAutonomous, NewToolRegistry("test"), "", nil, nil, nil, nil)
 	for _, want := range []string{
