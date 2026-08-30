@@ -40,6 +40,8 @@ func TestAllTextModelRolesPreserveOptionalToolArgumentPresence(t *testing.T) {
 			"Omit optional properties",
 			"JSON Schema constraints, examples, and enum ordering are not defaults",
 			"If false, zero, or an empty string is deliberately required, preserve and send that value",
+			"Sleeping and waiting use no model inference",
+			"Use at least a medium model with auto/medium reasoning for substantial active work",
 		} {
 			if !strings.Contains(prompt, want) {
 				t.Errorf("%s prompt missing %q", name, want)
@@ -183,6 +185,10 @@ func TestPaceToolDocumentsAutonomousDailyWakeContract(t *testing.T) {
 		"do not use d or w",
 		"fresh [CURRENT TIME]",
 		"No scheduler or waiting thread is required",
+		"Sleeping and waiting make no LLM calls",
+		"Keep reasoning=auto as the ordinary baseline",
+		"Use small or low/minimal only when the subsequent work itself is genuinely trivial and low-risk",
+		"restores the configured model/reasoning floor",
 	} {
 		if !strings.Contains(description, want) {
 			t.Fatalf("pace description missing %q", want)

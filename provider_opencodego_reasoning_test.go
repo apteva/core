@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestOpenCodeGoReasoning_ModelAwareAutoAndExplicitOverride(t *testing.T) {
+func TestOpenCodeGoReasoning_AutoUsesMediumBaselineAndExplicitOverride(t *testing.T) {
 	var bodies []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -26,10 +26,10 @@ func TestOpenCodeGoReasoning_ModelAwareAutoAndExplicitOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("default Chat: %v", err)
 	}
-	if got := bodies[0]["reasoning_effort"]; got != "minimal" {
-		t.Fatalf("default reasoning_effort = %#v, want minimal", got)
+	if got := bodies[0]["reasoning_effort"]; got != "medium" {
+		t.Fatalf("default reasoning_effort = %#v, want medium", got)
 	}
-	if resp.RequestedReasoningEffort != "auto" || resp.EffectiveReasoningEffort != "minimal" {
+	if resp.RequestedReasoningEffort != "auto" || resp.EffectiveReasoningEffort != "medium" {
 		t.Fatalf("default reasoning telemetry = requested %q effective %q", resp.RequestedReasoningEffort, resp.EffectiveReasoningEffort)
 	}
 
@@ -103,7 +103,7 @@ func TestOpenCodeGoReasoning_UnsupportedModelRetriesAndRemembers(t *testing.T) {
 	if len(bodies) != 4 {
 		t.Fatalf("requests = %d, want rejected request + retry + remembered call + other model", len(bodies))
 	}
-	if bodies[0]["reasoning_effort"] != "minimal" {
+	if bodies[0]["reasoning_effort"] != "medium" {
 		t.Fatalf("first request reasoning_effort = %#v", bodies[0]["reasoning_effort"])
 	}
 	if _, present := bodies[1]["reasoning_effort"]; present {

@@ -43,6 +43,7 @@ TIME AND STATE:
 
 IMPORTANT — tool calls and done:
 - ` + toolArgumentPresenceContract + `
+- ` + reasoningBaselineContract + `
 - NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
 - Always wait for tool results before calling done — you need to confirm the action succeeded.
 - Example: Thought 1: pushover_send_notification(...). Thought 2: see result, confirm success, done.`
@@ -87,6 +88,7 @@ TIME AND STATE:
 
 IMPORTANT — tool calls and done:
 - ` + toolArgumentPresenceContract + `
+- ` + reasoningBaselineContract + `
 - NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
 - Always wait for tool results before calling done — you need to confirm the action succeeded.`
 
@@ -692,6 +694,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		model:                  initialModel,
 		agentModel:             initialModel,
 		agentReasoning:         initialReasoning,
+		baselineModel:          initialModel,
+		baselineReasoning:      initialReasoning,
+		activeWork:             true,
 		maxHistory:             historyLimit,
 		promptCacheResetReason: "startup",
 		memory:                 tm.parent.memory,
@@ -1784,8 +1789,8 @@ func persistentThreadStateBase(thread *Thread) PersistentThread {
 		// loop. Reading it here avoids racing an API persistence request against
 		// a simultaneous pace-driven model or reasoning change.
 		status := thread.Thinker.status()
-		state.Model = status.Model.String()
-		state.Reasoning = status.Reasoning.String()
+		state.Model = status.BaselineModel.String()
+		state.Reasoning = status.BaselineReasoning.String()
 		if status.PaceDurable {
 			state.Pace = &PersistentPaceState{
 				Sleep:      formatPaceDuration(status.Sleep),

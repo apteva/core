@@ -109,10 +109,7 @@ func (p *OpenCodeGoProvider) Chat(ctx context.Context, messages []Message, model
 func openCodeGoReasoningEffort(model string, level ReasoningLevel) string {
 	switch normalizeReasoningLevel(level) {
 	case ReasoningAuto:
-		if normalizeOpenCodeGoModel(model) == "glm-5.2" {
-			return "medium"
-		}
-		return "minimal"
+		return "medium"
 	case ReasoningNone:
 		return "none"
 	case ReasoningMinimal:

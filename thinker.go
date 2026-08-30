@@ -220,6 +220,8 @@ You never communicate with other threads. You never interact with users. Treat t
 // request to manufacture every optional property.
 const toolArgumentPresenceContract = `Include only tool arguments needed for the operation. Omit optional properties unless you intentionally need to override their server-side behavior. JSON Schema constraints, examples, and enum ordering are not defaults: never fill optional properties with empty strings, false, zero or minimum values, the first enum value, or placeholder objects merely to complete a schema. If false, zero, or an empty string is deliberately required, preserve and send that value.`
 
+const reasoningBaselineContract = `Keep reasoning at auto for ordinary work. Sleeping and waiting use no model inference, so never lower reasoning merely because activity is sparse or you are about to wait. Use small models or low/minimal reasoning only for genuinely trivial, low-risk work that needs no analysis, synthesis, ambiguity resolution, multi-tool coordination, or consequential decision. Use at least a medium model with auto/medium reasoning for substantial active work, and medium/high reasoning when complexity warrants it.`
+
 // baseSystemPrompt contains the fixed runtime contract. The editable directive
 // is appended separately at runtime.
 const baseSystemPrompt = `You are the main coordinating thread of a continuous thinking engine. You govern standing goals, work ownership, permissions, conflicts, and escalation across the thread hierarchy.
@@ -265,6 +267,7 @@ REPORTING:
 
 TOOL CALLS:
 - ` + toolArgumentPresenceContract + `
+- ` + reasoningBaselineContract + `
 - Every tool takes a "_reason" string for the operator UI. Write a clear capitalized activity phrase, maximum 6 words, usually ending in "-ing", naming the action and object so it is understandable without the tool name (e.g. "Searching for customer row", "Sending Pushover notification"). Do not use a generic tool name as the reason.`
 
 const mainDirectivePersistencePrompt = `
@@ -852,6 +855,9 @@ type Thinker struct {
 	model             ModelTier
 	agentModel        ModelTier
 	agentReasoning    ReasoningLevel
+	baselineModel     ModelTier      // configured/spawn-time quality floor for externally driven work
+	baselineReasoning ReasoningLevel // configured/spawn-time quality floor for externally driven work
+	activeWork        bool           // external workflow remains active through tool/result continuations
 	memory            *MemoryStore
 	session           *Session
 	toolResultMu      sync.Mutex
@@ -1201,21 +1207,23 @@ func (t *Thinker) releaseToolSlot() {
 }
 
 type thinkerRuntimeStatus struct {
-	Iteration      int
-	Rate           ThinkRate
-	Model          ModelTier
-	Reasoning      ReasoningLevel
-	Provider       string
-	ContextMsgs    int
-	ContextChars   int
-	ModelID        string
-	Paused         bool
-	LLMActive      bool
-	Sleep          time.Duration
-	NextWakeAt     time.Time
-	PaceDurable    bool
-	ProviderModels map[ModelTier]string
-	MCPNames       []string
+	Iteration         int
+	Rate              ThinkRate
+	Model             ModelTier
+	Reasoning         ReasoningLevel
+	BaselineModel     ModelTier
+	BaselineReasoning ReasoningLevel
+	Provider          string
+	ContextMsgs       int
+	ContextChars      int
+	ModelID           string
+	Paused            bool
+	LLMActive         bool
+	Sleep             time.Duration
+	NextWakeAt        time.Time
+	PaceDurable       bool
+	ProviderModels    map[ModelTier]string
+	MCPNames          []string
 }
 
 type thinkerContextStatus struct {
@@ -1238,21 +1246,23 @@ func (t *Thinker) publishRuntimeStatus() {
 		mcpNames = append(mcpNames, server.GetName())
 	}
 	t.runtimeStatus.Store(thinkerRuntimeStatus{
-		Iteration:      t.iteration,
-		Rate:           t.rate,
-		Model:          t.model,
-		Reasoning:      t.agentReasoning,
-		Provider:       providerName,
-		ContextMsgs:    len(t.messages),
-		ContextChars:   contextChars(t.messages),
-		ModelID:        t.modelID(),
-		Paused:         t.paused,
-		LLMActive:      t.llmActive.Load(),
-		Sleep:          t.agentSleep,
-		NextWakeAt:     t.nextWakeAt,
-		PaceDurable:    t.paceDurable,
-		ProviderModels: providerModels,
-		MCPNames:       mcpNames,
+		Iteration:         t.iteration,
+		Rate:              t.rate,
+		Model:             t.model,
+		Reasoning:         t.effectiveReasoningLevel(),
+		BaselineModel:     t.baselineModel,
+		BaselineReasoning: normalizeReasoningLevel(t.baselineReasoning),
+		Provider:          providerName,
+		ContextMsgs:       len(t.messages),
+		ContextChars:      contextChars(t.messages),
+		ModelID:           t.modelID(),
+		Paused:            t.paused,
+		LLMActive:         t.llmActive.Load(),
+		Sleep:             t.agentSleep,
+		NextWakeAt:        t.nextWakeAt,
+		PaceDurable:       t.paceDurable,
+		ProviderModels:    providerModels,
+		MCPNames:          mcpNames,
 	})
 }
 
@@ -1351,6 +1361,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		paceDurable:            mainPace != nil,
 		wakeReason:             "startup",
 		agentReasoning:         ReasoningAuto,
+		baselineModel:          ModelLarge,
+		baselineReasoning:      ReasoningAuto,
+		activeWork:             true,
 		memory:                 NewMemoryStore(apiKey),
 		session:                NewSession(".", "main"),
 		toolResultAge:          map[string]int{},
@@ -1688,6 +1701,9 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 	t.model = cp.model
 	t.agentModel = cp.agentModel
 	t.agentReasoning = cp.agentReasoning
+	t.baselineModel = cp.baselineModel
+	t.baselineReasoning = cp.baselineReasoning
+	t.activeWork = cp.activeWork
 	t.directive = cp.directive
 	t.iteration = cp.Iteration
 	t.pendingTools = sync.Map{}
@@ -2660,12 +2676,14 @@ func (t *Thinker) Run() {
 
 		hadEvents := len(consumed) > 0
 		if hasExternalEvent {
+			t.activeWork = true
 			t.rate = RateReactive
 			t.model = ModelMedium
 		} else if hadEvents {
 			// Tool results — wake but less aggressive than external events
 			t.rate = RateFast
 		}
+		t.applyActiveModelFloor()
 		t.publishRuntimeStatus()
 
 		turnWakeReason := t.wakeReason
@@ -3083,6 +3101,7 @@ func (t *Thinker) Run() {
 		// (external events already set reactive above for this iteration)
 		t.rate = t.agentRate
 		t.model = t.agentModel
+		t.applyActiveModelFloor()
 		t.publishRuntimeStatus()
 
 		// Compute actual sleep duration: agentSleep takes priority, else rate enum
@@ -3111,7 +3130,7 @@ func (t *Thinker) Run() {
 			Iteration: t.iteration, Duration: duration,
 			ConsumedEvents: consumed, Usage: usage,
 			ToolCalls: toolNames, Replies: replies,
-			Rate: t.rate, SleepDuration: sleepDur, Model: t.model, Reasoning: t.agentReasoning,
+			Rate: t.rate, SleepDuration: sleepDur, Model: t.model, Reasoning: t.effectiveReasoningLevel(),
 			MemoryCount: t.memory.Count(), ThreadCount: threadCount,
 			ContextMsgs: len(t.messages), ContextChars: ctxChars,
 		})
@@ -3134,7 +3153,7 @@ func (t *Thinker) Run() {
 			}
 			requestedReasoning := chatResp.RequestedReasoningEffort
 			if requestedReasoning == "" {
-				requestedReasoning = t.agentReasoning.String()
+				requestedReasoning = t.effectiveReasoningLevel().String()
 			}
 			t.telemetry.Emit("llm.done", t.threadID, LLMDoneData{
 				Provider:           chatResp.Provider,
@@ -3213,6 +3232,11 @@ func (t *Thinker) Run() {
 		// it only says this thread has stopped processing. Pending async tools
 		// keep the execution active and will wake the existing loop on result.
 		t.settleEventExecutions("event_wait")
+		if t.pendingToolCount() == 0 {
+			t.activeWork = false
+			t.model = t.agentModel
+			t.publishRuntimeStatus()
+		}
 
 		// Core owns no recurrence policy. It waits for the agent's one pending
 		// wake, using only the remaining duration, or waits event-only when the
@@ -3389,10 +3413,15 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	// event is ever produced.
 	if t.telemetry != nil {
 		t.telemetry.Emit("llm.start", t.threadID, map[string]any{
-			"provider":            provider.Name(),
-			"model":               modelID,
-			"reasoning_requested": t.agentReasoning.String(),
-			"iteration":           t.iteration,
+			"provider":             provider.Name(),
+			"model":                modelID,
+			"model_selected":       t.agentModel.String(),
+			"model_baseline":       t.baselineModel.String(),
+			"reasoning_requested":  t.effectiveReasoningLevel().String(),
+			"reasoning_selected":   normalizeReasoningLevel(t.agentReasoning).String(),
+			"reasoning_baseline":   normalizeReasoningLevel(t.baselineReasoning).String(),
+			"active_quality_floor": t.activeWork,
+			"iteration":            t.iteration,
 		})
 	}
 
@@ -3412,8 +3441,8 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	// a user-abort channel) so a slow stream can be unblocked from outside.
 	// For now context.Background() preserves prior behaviour — the request
 	// is now cancellable in principle, just nothing is wired to cancel it.
-	requestedReasoning := t.agentReasoning.String()
-	chatProvider := providerWithReasoning(provider, t.agentReasoning)
+	requestedReasoning := t.effectiveReasoningLevel().String()
+	chatProvider := providerWithReasoning(provider, t.effectiveReasoningLevel())
 	ctx = t.preparePromptCacheContext(ctx, messages, nativeTools)
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
 	resp.Provider = provider.Name()

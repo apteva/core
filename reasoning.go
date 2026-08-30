@@ -90,3 +90,49 @@ func providerWithReasoning(provider LLMProvider, level ReasoningLevel) LLMProvid
 	}
 	return rp.WithReasoning(ReasoningSettings{Level: normalizeReasoningLevel(level)})
 }
+
+func reasoningQualityRank(level ReasoningLevel) int {
+	switch normalizeReasoningLevel(level) {
+	case ReasoningNone:
+		return 0
+	case ReasoningMinimal:
+		return 1
+	case ReasoningLow:
+		return 2
+	case ReasoningAuto, ReasoningMedium:
+		// Auto is Core's normal baseline. Providers may tune it, but a model-
+		// selected low/minimal override must not undercut it during newly
+		// assigned external work.
+		return 3
+	case ReasoningHigh:
+		return 4
+	case ReasoningXHigh:
+		return 5
+	default:
+		return 3
+	}
+}
+
+func (t *Thinker) effectiveReasoningLevel() ReasoningLevel {
+	if t == nil {
+		return ReasoningAuto
+	}
+	selected := normalizeReasoningLevel(t.agentReasoning)
+	baseline := normalizeReasoningLevel(t.baselineReasoning)
+	if t.activeWork && reasoningQualityRank(selected) < reasoningQualityRank(baseline) {
+		return baseline
+	}
+	return selected
+}
+
+func (t *Thinker) applyActiveModelFloor() {
+	if t == nil || !t.activeWork {
+		return
+	}
+	// A worker explicitly configured as small remains a small worker. For
+	// ordinary large/medium threads, active externally-driven workflows never
+	// fall below medium even if a prior idle pace selected small.
+	if t.baselineModel != ModelSmall && t.model == ModelSmall {
+		t.model = ModelMedium
+	}
+}
