@@ -41,7 +41,7 @@ func NewOpenAINativeProvider(apiKey string) LLMProvider {
 	return &OpenAINativeProvider{
 		name:         "openai",
 		apiKey:       apiKey,
-		responsesURL: "https://api.openai.com/v1/responses",
+		responsesURL: openAIBaseURL() + "/responses",
 		models: map[ModelTier]string{
 			ModelLarge:  "gpt-5.4-mini",
 			ModelMedium: "gpt-5.4-mini",
@@ -376,7 +376,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 
 	responsesURL := p.responsesURL
 	if responsesURL == "" {
-		responsesURL = "https://api.openai.com/v1/responses"
+		responsesURL = openAIBaseURL() + "/responses"
 	}
 	doRequest := func(payload []byte) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(payload))
