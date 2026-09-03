@@ -874,6 +874,99 @@ func TestSendFailureCorrectionAndReportingTurnsAreBounded(t *testing.T) {
 	}
 }
 
+func TestRootMainImpossibleSendTargetsAreNonRetryableAndBounded(t *testing.T) {
+	for _, target := range []string{"parent", "main"} {
+		t.Run(target, func(t *testing.T) {
+			thinker := newTestThinkerFull()
+			defer thinker.Stop()
+			handler := mainToolHandler(thinker)
+			call := toolCall{
+				Name: "send", Args: map[string]string{"id": target, "message": "acknowledging"},
+				Raw: "send", NativeID: "send-structural-1",
+			}
+
+			_, _, first := handler(thinker, []toolCall{call}, nil)
+			if !thinker.kickNextTurn || len(first) != 1 || !first[0].IsError {
+				t.Fatalf("first structural failure = kick:%v results:%+v", thinker.kickNextTurn, first)
+			}
+			if strings.Contains(first[0].Content, "retry once") || strings.Contains(first[0].Content, "Report the delivery failure") {
+				t.Fatalf("structural failure incorrectly invited another send: %q", first[0].Content)
+			}
+			for _, want := range []string{"No message was sent", "do not retry send", "Continue the current work locally"} {
+				if !strings.Contains(first[0].Content, want) {
+					t.Fatalf("structural failure missing %q: %q", want, first[0].Content)
+				}
+			}
+
+			// If a model ignores the explicit receipt and repeats the impossible
+			// destination, Core does not create an endless continuation loop.
+			thinker.kickNextTurn = false
+			call.NativeID = "send-structural-2"
+			_, _, second := handler(thinker, []toolCall{call}, nil)
+			if thinker.kickNextTurn {
+				t.Fatalf("repeated structural send to %q created a continuation loop", target)
+			}
+			if len(second) != 1 || !second[0].IsError || !strings.Contains(second[0].Content, "do not retry send") {
+				t.Fatalf("second structural failure = %+v", second)
+			}
+		})
+	}
+}
+
+func TestWorkerCannotSendToItselfButCanStillSendToParent(t *testing.T) {
+	thinker := newTestThinkerFull()
+	defer thinker.Stop()
+	if err := thinker.threads.SpawnWithOpts("worker", "Report to main.", nil, SpawnOpts{DeferRun: true}); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	thinker.drainEventTexts()
+	worker := thinker.threads.threads["worker"]
+	handler := threadToolHandler(worker, thinker.threads)
+
+	_, _, self := handler(worker.Thinker, []toolCall{{
+		Name: "send", Args: map[string]string{"id": "worker", "message": "loop"},
+		Raw: "send", NativeID: "send-self",
+	}}, nil)
+	if !worker.Thinker.kickNextTurn || len(self) != 1 || !self[0].IsError ||
+		!strings.Contains(self[0].Content, "cannot send a message to itself") ||
+		strings.Contains(self[0].Content, "retry once") {
+		t.Fatalf("worker self-send result = kick:%v results:%+v", worker.Thinker.kickNextTurn, self)
+	}
+
+	// A later ordinary event starts a new workflow and resets the bounded
+	// communication guard; legitimate child-to-parent messaging still works.
+	worker.Thinker.resetSendTurnGuards()
+	worker.Thinker.kickNextTurn = false
+	_, _, parent := handler(worker.Thinker, []toolCall{{
+		Name: "send", Args: map[string]string{"id": "parent", "message": "result ready"},
+		Raw: "send", NativeID: "send-parent",
+	}}, nil)
+	if !worker.Thinker.kickNextTurn || len(parent) != 1 || parent[0].IsError {
+		t.Fatalf("worker parent-send result = kick:%v results:%+v", worker.Thinker.kickNextTurn, parent)
+	}
+	if got := thinker.drainEventTexts(); len(got) != 1 || got[0] != "[from:worker] result ready" {
+		t.Fatalf("main inbox = %v", got)
+	}
+}
+
+func TestSendToolDocumentationDistinguishesRootAndChildRoles(t *testing.T) {
+	registry := NewToolRegistry("")
+	tool := registry.Get("send")
+	if tool == nil {
+		t.Fatal("send tool missing")
+	}
+	docs := tool.Description + " " + tool.Rules
+	for _, want := range []string{
+		"Child threads may use id=\"parent\" or id=\"main\"",
+		"Root main must never send to \"parent\" or \"main\"",
+		"No thread may send to its own ID",
+	} {
+		if !strings.Contains(docs, want) {
+			t.Fatalf("send documentation missing %q:\n%s", want, docs)
+		}
+	}
+}
+
 func TestMainSpawnDefaultRealtimeProfileCreatesOrdinaryWorkerWithoutRealtimeProvider(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()

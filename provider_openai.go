@@ -322,7 +322,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		"stream":   true,
 	}
 	// OpenAI supports stream_options for usage in streaming; Fireworks may not
-	if p.name == "openai" {
+	if p.name == "openai" || p.name == "managed" {
 		reqMap["stream_options"] = map[string]any{"include_usage": true}
 	}
 	// Add tools if provider supports them.
@@ -645,6 +645,18 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 }
 
 // --- Factory functions ---
+
+// NewManagedProvider talks only to the local Apteva Server gateway. The token
+// is the core process's row-scoped credential, not an upstream provider key;
+// the server resolves the platform-managed connection and applies policy.
+func NewManagedProvider(endpoint, token string) LLMProvider {
+	return &OpenAICompatProvider{
+		name: "managed", apiKey: token, url: endpoint, authHeader: "Bearer",
+		models: map[ModelTier]string{
+			ModelLarge: "managed", ModelMedium: "managed", ModelSmall: "managed",
+		},
+	}
+}
 
 func NewFireworksProvider(apiKey string) LLMProvider {
 	return &OpenAICompatProvider{

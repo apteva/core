@@ -1160,6 +1160,26 @@ func sendFinalFailureResult(err error) string {
 	return fmt.Sprintf("error: %v. The correction also failed; do not call send again for this message. Report the delivery failure before pacing", err)
 }
 
+func sendStructuralFailureResult(err error) string {
+	return fmt.Sprintf("error: %v. No message was sent. This destination is impossible from your role, so do not retry send or report this routing error with another send. Continue the current work locally", err)
+}
+
+// handleSendFailure keeps recoverable addressing mistakes separate from
+// structurally impossible routing. A misspelled/obsolete thread ID gets the
+// existing bounded correction opportunity. A root/no-parent or self target
+// cannot become valid by retrying, so it gets one receipt-processing turn to
+// resume local work and no correction loop.
+func (t *Thinker) handleSendFailure(err error) string {
+	if isStructuralSendTargetError(err) {
+		t.scheduleSendCompletion()
+		return sendStructuralFailureResult(err)
+	}
+	if t.scheduleSendCorrection() {
+		return sendCorrectionResult(err)
+	}
+	return sendFinalFailureResult(err)
+}
+
 func spawnCorrectionResult(err error) string {
 	return fmt.Sprintf("error: %v. Correct the spawn arguments and retry once now; do not claim the worker started", err)
 }
@@ -2173,11 +2193,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				mediaStr := call.Args["media"]
 				if id == "" || msg == "" {
 					err := fmt.Errorf("send requires both id and message (got id=%q, message_len=%d)", id, len(msg))
-					if t.scheduleSendCorrection() {
-						addResult(sendCorrectionResult(err))
-					} else {
-						addResult(sendFinalFailureResult(err))
-					}
+					addResult(t.handleSendFailure(err))
 				} else {
 					// Tag with [from:main] so the receiving thread (and the
 					// dashboard's IncomingEvents view) classifies the message
@@ -2190,17 +2206,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					tagged := fmt.Sprintf("[from:main] %s", msg)
 					parts, attachmentErr := parseAttachmentURLs(mediaStr)
 					if attachmentErr != nil {
-						if t.scheduleSendCorrection() {
-							addResult(sendCorrectionResult(attachmentErr))
-						} else {
-							addResult(sendFinalFailureResult(attachmentErr))
-						}
+						addResult(t.handleSendFailure(attachmentErr))
+					} else if err := validateRootSendTarget(id); err != nil {
+						addResult(t.handleSendFailure(err))
 					} else if err := t.threads.SendAgentWithPartsExecution(id, tagged, parts, t.currentEventExecutions()); err != nil {
-						if t.scheduleSendCorrection() {
-							addResult(sendCorrectionResult(err))
-						} else {
-							addResult(sendFinalFailureResult(err))
-						}
+						addResult(t.handleSendFailure(err))
 					} else {
 						if t.telemetry != nil {
 							t.telemetry.Emit("thread.message", "main", ThreadMessageData{From: "main", To: id, Message: msg, ExecutionIDs: t.currentEventExecutions()})

@@ -396,6 +396,10 @@ func isRealtimeProviderName(name string) bool {
 // createProviderByName creates a provider by name, returning nil if the required API key is missing.
 func createProviderByName(name string) LLMProvider {
 	switch name {
+	case "managed":
+		if endpoint, token := os.Getenv("APTEVA_MANAGED_LLM_URL"), os.Getenv("APTEVA_API_KEY"); endpoint != "" && token != "" {
+			return NewManagedProvider(endpoint, token)
+		}
 	case "fireworks":
 		if key := os.Getenv("FIREWORKS_API_KEY"); key != "" {
 			return NewFireworksProvider(key)

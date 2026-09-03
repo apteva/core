@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -158,4 +159,109 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 	t.Fatalf("timed out: receipt=%v llm_turns=%d send_calls=%d", seenReceipt, llmTurns, sendCalls)
+}
+
+// TestCodexRootStructuralSendFailureResumesLocalWorkSmoke forces the
+// production failure's model mistake without depending on any application:
+// root main first tries send(parent), receives the non-retryable role-aware
+// receipt, and must then perform the requested local authoritative read.
+func TestCodexRootStructuralSendFailureResumesLocalWorkSmoke(t *testing.T) {
+	if os.Getenv("RUN_CODEX_SEND_RECEIPT_SMOKE") == "" {
+		t.Skip("set RUN_CODEX_SEND_RECEIPT_SMOKE=1 to run the Codex send receipt smoke")
+	}
+	if testing.Short() {
+		t.Skip("skipping Codex send receipt smoke in short mode")
+	}
+	token := codexAccessTokenForMemorySmoke(t)
+	if token == "" {
+		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set and no valid local Codex token")
+	}
+
+	t.Chdir(t.TempDir())
+	provider := &forcedFirstResponseProvider{
+		LLMProvider: NewOpenAICodexProvider(token),
+		response: ChatResponse{ToolCalls: []NativeToolCall{{
+			ID: "forced-invalid-parent-send", Name: "send",
+			Args: map[string]string{
+				"id": "parent", "message": "I will handle the request.",
+				"_reason": "Acknowledging parent request",
+			},
+		}}},
+	}
+	cfg := &Config{
+		path: filepath.Join(t.TempDir(), "config.json"),
+		Directive: "Handle bounded external reconciliation work locally. " +
+			"Use the available authoritative read capability, then wait.",
+		Mode: ModeAutonomous,
+	}
+	thinker := NewThinker("", provider, cfg)
+	defer thinker.Stop()
+	var reads atomic.Int32
+	readCalled := make(chan struct{}, 1)
+	thinker.registry.Register(&ToolDef{
+		Name:        "authoritative_record_read",
+		Description: "Read the authoritative current state of one record before deciding what remains to do.",
+		Syntax:      `authoritative_record_read(record_id="case-42")`,
+		Handler: func(args map[string]string) ToolResponse {
+			reads.Add(1)
+			select {
+			case readCalled <- struct{}{}:
+			default:
+			}
+			return ToolResponse{Text: `{"record_id":"case-42","state":"complete"}`}
+		},
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"record_id": map[string]any{"type": "string"},
+			},
+			"required": []string{"record_id"},
+		},
+	})
+	thinker.agentSleep = 6 * time.Hour
+	started := time.Now()
+	thinker.bus.Publish(Event{
+		Type: EventInbox, From: "external", To: "main",
+		Text: `[console] Reconcile record case-42 locally. Read its authoritative state with the available read capability. This event came directly to root main and requires no thread acknowledgement.`,
+	})
+	go thinker.Run()
+
+	select {
+	case <-readCalled:
+	case <-time.After(90 * time.Second):
+		t.Fatal("Codex did not resume local work after root main's structural send error")
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	events, _ := thinker.telemetry.StoredEvents(0)
+	sends := 0
+	structuralReceipt := false
+	for _, event := range events {
+		if event.ThreadID != "main" || event.Time.Before(started) {
+			continue
+		}
+		switch event.Type {
+		case "tool.call":
+			var data ToolCallData
+			if json.Unmarshal(event.Data, &data) == nil && data.Name == "send" {
+				sends++
+			}
+		case "tool.result":
+			var data ToolResultData
+			if json.Unmarshal(event.Data, &data) == nil && data.Name == "send" &&
+				strings.Contains(data.Result, "destination is impossible from your role") {
+				structuralReceipt = true
+			}
+		}
+	}
+	if !structuralReceipt {
+		t.Fatal("missing role-aware structural send receipt")
+	}
+	if sends != 1 {
+		t.Fatalf("send calls=%d, want only the forced invalid attempt", sends)
+	}
+	if reads.Load() != 1 {
+		t.Fatalf("authoritative reads=%d, want exactly one", reads.Load())
+	}
+	t.Log("Codex resumed the root event locally after one non-retryable send(parent) receipt")
 }

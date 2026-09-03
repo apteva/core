@@ -110,9 +110,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	})
 	tr.Register(&ToolDef{
 		Name:        "send",
-		Description: "Send a message to another thread. Use id=\"parent\" for a final requested result, meaningful milestone, blocker, authority request, or conflict that your parent needs to handle.",
+		Description: "Send a message to another existing thread. Child threads may use id=\"parent\" or id=\"main\"; root main has no parent and must send only to a known child or other thread.",
 		Syntax:      `send(id="parent", message="...", media="url1 url2")`,
-		Rules:       `Use id="parent" for your parent thread. Use id="main" for the top coordinator. Communicate directly with a known responsible thread when permitted. Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures within the owning thread. media is optional — space-separated URLs (audio, images, video). Media URLs are sent natively to the target thread's LLM for analysis. A delivery receipt confirms only that the message reached the target; if you requested work or a reply, wait for the target's response before reporting completion, and never resend merely because you received the delivery receipt.`,
+		Rules:       `A child uses id="parent" for its spawner and may use id="main" for the top coordinator. Root main must never send to "parent" or "main": it has no parent and cannot message itself. No thread may send to its own ID. Communicate directly with a known responsible thread when permitted. Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures within the owning thread. media is optional — space-separated URLs (audio, images, video). Media URLs are sent natively to the target thread's LLM for analysis. A delivery receipt confirms only that the message reached the target; if you requested work or a reply, wait for the target's response before reporting completion, and never resend merely because you received the delivery receipt.`,
 		Core:        true,
 		// Explicit schema with required fields so the LLM is forced to
 		// include id and message. Without this, schemaFromSyntax would
@@ -122,7 +122,7 @@ func (tr *ToolRegistry) registerDefaults() {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"id":      map[string]any{"type": "string", "description": "Target thread id — use \"parent\" for your spawner, \"main\" for the top coordinator, or a sibling / child id."},
+				"id":      map[string]any{"type": "string", "description": "Target thread ID. Child only: \"parent\" means its spawner and \"main\" means the root coordinator. Root main uses only a known other thread ID."},
 				"message": map[string]any{"type": "string", "description": "Message body."},
 				"media":   map[string]any{"type": "string", "description": "Optional space-separated media URLs (audio/image/video)."},
 			},

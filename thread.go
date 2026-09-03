@@ -1029,9 +1029,15 @@ func (thread *Thread) resolveSend(tm *ThreadManager, tagged string, targetID str
 	if len(parts) > 0 {
 		mediaParts = parts[0]
 	}
+	if targetID == thread.ID {
+		return newStructuralSendTargetError(sendTargetSelf, targetID, fmt.Sprintf("thread %q cannot send a message to itself", thread.ID))
+	}
 	executionIDs := thread.Thinker.currentEventExecutions()
 	// "parent" alias → route to parent thinker
 	if targetID == "parent" || targetID == thread.ParentID {
+		if thread.Parent == nil || thread.ParentID == "" {
+			return newStructuralSendTargetError(sendTargetNoParent, targetID, fmt.Sprintf("thread %q has no parent", thread.ID))
+		}
 		if thread.Thinker.eventLifecycle != nil {
 			if err := thread.Thinker.eventLifecycle.Propagate(executionIDs, thread.Parent.threadID); err != nil {
 				return err
@@ -1151,29 +1157,17 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					// forever for a reply. Surface the mistake so the
 					// LLM retries next iteration.
 					err := fmt.Errorf("send requires both id and message (got id=%q, message_len=%d)", id, len(msg))
-					if t.scheduleSendCorrection() {
-						emitResult(call, sendCorrectionResult(err))
-					} else {
-						emitResult(call, sendFinalFailureResult(err))
-					}
+					emitResult(call, t.handleSendFailure(err))
 				} else {
 					tagged := thread.tagThreadMessage(msg)
 					mediaParts, attachmentErr := parseAttachmentURLs(mediaStr)
 					if attachmentErr != nil {
-						if t.scheduleSendCorrection() {
-							emitResult(call, sendCorrectionResult(attachmentErr))
-						} else {
-							emitResult(call, sendFinalFailureResult(attachmentErr))
-						}
+						emitResult(call, t.handleSendFailure(attachmentErr))
 						break
 					}
 					logMsg("THREAD", fmt.Sprintf("%s send to=%s msg=%q media=%d", thread.ID, id, msg, len(mediaParts)))
 					if err := thread.resolveSend(tm, tagged, id, mediaParts); err != nil {
-						if t.scheduleSendCorrection() {
-							emitResult(call, sendCorrectionResult(err))
-						} else {
-							emitResult(call, sendFinalFailureResult(err))
-						}
+						emitResult(call, t.handleSendFailure(err))
 						break
 					}
 					if t.telemetry != nil {
@@ -1558,6 +1552,41 @@ func (e *threadNotFoundError) Error() string { return fmt.Sprintf("thread %q not
 func isThreadNotFound(err error) bool {
 	var target *threadNotFoundError
 	return errors.As(err, &target)
+}
+
+type sendTargetErrorKind string
+
+const (
+	sendTargetNoParent sendTargetErrorKind = "no_parent"
+	sendTargetSelf     sendTargetErrorKind = "self_target"
+)
+
+type structuralSendTargetError struct {
+	kind    sendTargetErrorKind
+	target  string
+	message string
+}
+
+func (e *structuralSendTargetError) Error() string { return e.message }
+
+func newStructuralSendTargetError(kind sendTargetErrorKind, target, message string) error {
+	return &structuralSendTargetError{kind: kind, target: target, message: message}
+}
+
+func isStructuralSendTargetError(err error) bool {
+	var target *structuralSendTargetError
+	return errors.As(err, &target)
+}
+
+func validateRootSendTarget(id string) error {
+	switch id {
+	case "parent":
+		return newStructuralSendTargetError(sendTargetNoParent, id, "root main has no parent")
+	case "main":
+		return newStructuralSendTargetError(sendTargetSelf, id, "root main cannot send a message to itself")
+	default:
+		return nil
+	}
 }
 
 // ValidateAgentTarget rejects platform-managed threads while leaving public
