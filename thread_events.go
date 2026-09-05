@@ -50,6 +50,7 @@ func clonePersistentThreadEvents(in []PersistentThreadEvent) []PersistentThreadE
 	for i := range in {
 		out[i] = in[i]
 		out[i].Parts = cloneContentParts(in[i].Parts)
+		out[i].ExecutionIDs = append([]string(nil), in[i].ExecutionIDs...)
 	}
 	return out
 }
@@ -198,6 +199,11 @@ func (tm *ThreadManager) QueueEvents(id string, incoming []PersistentThreadEvent
 		return result, fmt.Errorf("thread %q not found", id)
 	}
 	thread.inboxMu.Lock()
+	if err := validateInboxCapacity(thread.inboxEvents, incoming); err != nil {
+		thread.inboxMu.Unlock()
+		owner.mu.RUnlock()
+		return result, err
+	}
 	for _, event := range incoming {
 		if event.TrackLifecycle && thread.Ephemeral {
 			thread.inboxMu.Unlock()
@@ -299,6 +305,9 @@ func (t *Thinker) QueueMainEvents(incoming []PersistentThreadEvent) (ThreadEvent
 	}
 	t.mainInboxMu.Lock()
 	defer t.mainInboxMu.Unlock()
+	if err := validateInboxCapacity(t.mainInboxEvents, incoming); err != nil {
+		return result, err
+	}
 
 	existing := make(map[string]PersistentThreadEvent, len(t.mainInboxEvents))
 	for _, event := range t.mainInboxEvents {
@@ -386,6 +395,9 @@ func (t *Thinker) markMainEventsConsumed(ids []string) error {
 }
 
 func executionIDsForEvent(event PersistentThreadEvent) []string {
+	if len(event.ExecutionIDs) > 0 {
+		return append([]string(nil), event.ExecutionIDs...)
+	}
 	if event.ExecutionID == "" {
 		return nil
 	}
@@ -433,7 +445,7 @@ func (tm *ThreadManager) markEventsConsumed(id string, ids []string) error {
 	if !thread.Ephemeral {
 		state := persistentThreadStateBase(thread)
 		state.Events = clonePersistentThreadEvents(thread.inboxEvents)
-		if err := tm.parent.config.SaveThread(state); err != nil {
+		if err := tm.parent.config.saveThreadAndRegisterEventExecutions(state, nil); err != nil {
 			thread.inboxEvents = before
 			thread.inboxMu.Unlock()
 			owner.mu.RUnlock()

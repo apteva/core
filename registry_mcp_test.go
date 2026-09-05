@@ -215,3 +215,46 @@ func TestNoActiveThreadsNoSection(t *testing.T) {
 		t.Error("dynamic context should NOT contain [ACTIVE THREADS] when empty slice")
 	}
 }
+
+func TestCopyAndInjectReasonStripsDefaultsOnlyFromModelFacingSchema(t *testing.T) {
+	original := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"timeout": map[string]any{"type": "integer", "minimum": 60, "default": 1800},
+			"environment": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"locale":  map[string]any{"type": "string", "default": "en-US"},
+					"default": map[string]any{"type": "string", "default": "legal-property-name"},
+				},
+			},
+		},
+		"required": []string{"timeout"},
+	}
+
+	modelFacing := copyAndInjectReason(original)
+	props := modelFacing["properties"].(map[string]any)
+	if _, ok := props["timeout"].(map[string]any)["default"]; ok {
+		t.Fatal("top-level property default reached the model-facing schema")
+	}
+	environment := props["environment"].(map[string]any)
+	environmentProps := environment["properties"].(map[string]any)
+	if _, ok := environmentProps["locale"].(map[string]any)["default"]; ok {
+		t.Fatal("nested property default reached the model-facing schema")
+	}
+	if _, ok := environmentProps["default"]; !ok {
+		t.Fatal("legal property named default was removed")
+	}
+	if _, ok := props["_reason"]; !ok {
+		t.Fatal("_reason was not injected")
+	}
+
+	originalProps := original["properties"].(map[string]any)
+	if got := originalProps["timeout"].(map[string]any)["default"]; got != 1800 {
+		t.Fatalf("authoritative schema was mutated: default=%v", got)
+	}
+	originalEnvironment := originalProps["environment"].(map[string]any)
+	if got := originalEnvironment["properties"].(map[string]any)["locale"].(map[string]any)["default"]; got != "en-US" {
+		t.Fatalf("nested authoritative schema was mutated: default=%v", got)
+	}
+}

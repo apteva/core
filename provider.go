@@ -239,9 +239,10 @@ func (ir *idleReader) Close() error {
 
 // NativeTool defines a tool sent to the provider API.
 type NativeTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"` // JSON Schema
+	serializedBytes int
+	Name            string         `json:"name"`
+	Description     string         `json:"description"`
+	Parameters      map[string]any `json:"parameters"` // JSON Schema
 }
 
 // NativeToolCall is a structured tool call returned by the provider.
@@ -251,6 +252,8 @@ type NativeToolCall struct {
 	Status           string            `json:"status,omitempty"`         // Responses output item status for exact replay/debugging
 	Name             string            `json:"name"`
 	Args             map[string]string `json:"args"`
+	CanonicalArgs    json.RawMessage   `json:"canonical_args,omitempty"`    // typed arguments retained for exact replay
+	RawArgs          string            `json:"-"`                           // exact transient provider JSON; emitted to bounded telemetry, never persisted
 	ThoughtSignature string            `json:"thought_signature,omitempty"` // Gemini: encrypted reasoning state
 }
 

@@ -33,12 +33,13 @@ import (
 // are capped in aggregate size; the oldest blob is evicted first when
 // the cap is reached on Put.
 type BlobStore struct {
-	mu       sync.Mutex
-	blobs    map[string]*blobEntry
-	total    int64
-	maxTotal int64
-	ttl      time.Duration
-	quit     chan struct{}
+	closeOnce sync.Once
+	mu        sync.Mutex
+	blobs     map[string]*blobEntry
+	total     int64
+	maxTotal  int64
+	ttl       time.Duration
+	quit      chan struct{}
 }
 
 type blobEntry struct {
@@ -74,14 +75,7 @@ func NewBlobStore(maxTotal int64, ttl time.Duration) *BlobStore {
 	return bs
 }
 
-func (bs *BlobStore) Close() {
-	select {
-	case <-bs.quit:
-		// already closed
-	default:
-		close(bs.quit)
-	}
-}
+func (bs *BlobStore) Close() { bs.closeOnce.Do(func() { close(bs.quit) }) }
 
 func (bs *BlobStore) janitor() {
 	t := time.NewTicker(30 * time.Second)
@@ -111,6 +105,9 @@ func (bs *BlobStore) evictExpired() {
 // Put stores bytes and returns a ref of the form "blobref://<id>".
 // Evicts the oldest blob(s) if the aggregate cap would be exceeded.
 func (bs *BlobStore) Put(mime string, data []byte) string {
+	if int64(len(data)) > bs.maxTotal {
+		return ""
+	}
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 

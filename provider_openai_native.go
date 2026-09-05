@@ -271,6 +271,7 @@ type oaiFunctionTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	Parameters  map[string]any `json:"parameters,omitempty"`
+	Strict      bool           `json:"strict"`
 }
 
 // --- Streaming response types ---
@@ -454,6 +455,7 @@ func (p *OpenAINativeProvider) buildAPITools(_ string, tools []NativeTool) []any
 			Name:        t.Name,
 			Description: t.Description,
 			Parameters:  t.Parameters,
+			Strict:      false,
 		})
 	}
 	return apiTools
@@ -653,6 +655,7 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
 	var providerItems []json.RawMessage
+	completedStream := false
 
 	// Track pending items
 	type pendingFunc struct {
@@ -666,6 +669,7 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
+streamLoop:
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -807,6 +811,9 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 							onToolChunk(pf.name, pf.id, argsJSON)
 						}
 					}
+					if err := json.Unmarshal([]byte(argsJSON), &rawArgs); err != nil || rawArgs == nil || pf.id == "" || pf.name == "" {
+						return ChatResponse{}, fmt.Errorf("invalid OpenAI tool call %q arguments or identity", pf.id)
+					}
 					if json.Unmarshal([]byte(argsJSON), &rawArgs) == nil {
 						for k, v := range rawArgs {
 							switch val := v.(type) {
@@ -819,11 +826,13 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 						}
 					}
 					toolCalls = append(toolCalls, NativeToolCall{
-						ID:           pf.id,
-						OutputItemID: item.ID,
-						Status:       item.Status,
-						Name:         pf.name,
-						Args:         args,
+						ID:            pf.id,
+						OutputItemID:  item.ID,
+						Status:        item.Status,
+						Name:          pf.name,
+						Args:          args,
+						RawArgs:       argsJSON,
+						CanonicalArgs: json.RawMessage(argsJSON),
 					})
 					delete(pendingFuncs, item.ID)
 				}
@@ -845,6 +854,7 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 
 		// Usage
 		case "response.completed":
+			completedStream = true
 			// Log raw usage for debugging
 			var rawCompleted map[string]any
 			json.Unmarshal([]byte(data), &rawCompleted)
@@ -871,6 +881,7 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 			usage.CompletionTokens = completed.Response.Usage.OutputTokens
 			usage.CachedTokens = completed.Response.Usage.InputDetails.CachedTokens
 			usage.CacheWriteTokens = completed.Response.Usage.InputDetails.CacheWriteTokens
+			break streamLoop
 
 		case "response.failed", "response.incomplete", "error":
 			var failed struct {
@@ -900,6 +911,9 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 		return ChatResponse{}, fmt.Errorf("OpenAI stream read error: %w", err)
 	}
 
+	if !completedStream || len(pendingFuncs) != 0 {
+		return ChatResponse{}, fmt.Errorf("OpenAI stream ended before response.completed or with unfinished calls")
+	}
 	response := full.String()
 	logMsg("OPENAI-NATIVE", fmt.Sprintf("done tokens_in=%d tokens_out=%d tools=%d len=%d", usage.PromptTokens, usage.CompletionTokens, len(toolCalls), len(response)))
 	var providerState *ProviderResponseState

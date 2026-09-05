@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -8,10 +9,13 @@ import (
 )
 
 type toolCall struct {
-	Name     string
-	Args     map[string]string
-	Raw      string // original matched text (or synthetic for native calls)
-	NativeID string // provider-assigned ID for native tool calls (empty for text-parsed)
+	generation   uint64
+	admitted     bool
+	executionIDs []string
+	Name         string
+	Args         map[string]string
+	Raw          string // original matched text (or synthetic for native calls)
+	NativeID     string // provider-assigned ID for native tool calls (empty for text-parsed)
 }
 
 // [[tool_name key="val" key2="val2"]] — values can span multiple lines, escaped quotes allowed
@@ -60,8 +64,23 @@ func executeTool(t *Thinker, call toolCall) {
 	// Extract _reason before dispatch (observability field, not passed to handler)
 	reason := call.Args["_reason"]
 	delete(call.Args, "_reason")
-	executionIDs := t.currentEventExecutions()
+	executionIDs := call.executionIDs
+	if executionIDs == nil {
+		executionIDs = t.currentEventExecutions()
+	}
+	generation := call.generation
+	if !call.admitted {
+		generation = t.toolGeneration.Load()
+	}
+	if generation != t.toolGeneration.Load() {
+		return
+	}
 	if !t.acquireToolSlot() {
+		t.pendingTools.Delete(call.NativeID)
+		return
+	}
+	if generation != t.toolGeneration.Load() {
+		t.releaseToolSlot()
 		return
 	}
 	t.asyncToolsActive.Add(1)
@@ -84,7 +103,23 @@ func executeTool(t *Thinker, call toolCall) {
 	go func() {
 		defer t.releaseToolSlot()
 		defer t.asyncToolsActive.Add(-1)
-		logMsg("TOOL", fmt.Sprintf("dispatch %s reason=%q args=%v", call.Name, reason, call.Args))
+		ctx, cancel := context.WithTimeout(t.toolContext(), 3*time.Minute)
+		t.toolLifecycleMu.Lock()
+		if generation != t.toolGeneration.Load() {
+			t.toolLifecycleMu.Unlock()
+			cancel()
+			return
+		}
+		t.toolCancels.Store(call.NativeID, context.CancelFunc(cancel))
+		t.toolLifecycleMu.Unlock()
+		defer func() { cancel(); t.toolCancels.Delete(call.NativeID) }()
+		defer func() {
+			select {
+			case t.toolCompleted <- struct{}{}:
+			default:
+			}
+		}()
+		logMsg("TOOL", fmt.Sprintf("dispatch %s", call.Name))
 		start := time.Now()
 		defer func() {
 			if call.NativeID != "" {
@@ -94,7 +129,7 @@ func executeTool(t *Thinker, call toolCall) {
 		defer func() {
 			if r := recover(); r != nil {
 				logMsg("TOOL", fmt.Sprintf("PANIC %s: %v", call.Name, r))
-				t.Inject(fmt.Sprintf("[tool:%s] error: panic: %v", call.Name, r))
+				t.publishToolFailure(call, generation, executionIDs, fmt.Sprintf("panic: %v", r))
 				if t.telemetry != nil {
 					result := fmt.Sprintf("panic: %v", r)
 					data := newToolResultData(
@@ -106,6 +141,12 @@ func executeTool(t *Thinker, call toolCall) {
 				}
 			}
 		}()
+		releaseBudget, budgetErr := t.acquireExecutionBudget(ctx)
+		if budgetErr != nil {
+			t.publishToolFailure(call, generation, executionIDs, budgetErr.Error())
+			return
+		}
+		defer releaseBudget()
 		wakePolicy := WakeOnResultAlways
 		if t.registry != nil {
 			if def := t.registry.Get(call.Name); def != nil && def.WakeOnResult != "" {
@@ -115,7 +156,13 @@ func executeTool(t *Thinker, call toolCall) {
 		var resp ToolResponse
 		if t.registry != nil {
 			dispatchArgs := toolDispatchArgs(t, call)
-			if res, ok := t.registry.Dispatch(call.Name, dispatchArgs); ok {
+			if t.telemetry != nil {
+				if def := t.registry.Get(call.Name); def != nil && def.MCP {
+					typedArgs := mcpArgumentsFromStrings(dispatchArgs, def.InputSchema)
+					t.telemetry.Emit("tool.arguments", t.threadID, newToolArgumentsData(call.NativeID, call.Name, "mcp_typed", typedArgs))
+				}
+			}
+			if res, ok := t.registry.DispatchContext(ctx, call.Name, dispatchArgs); ok {
 				resp = res
 			} else {
 				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
@@ -123,11 +170,10 @@ func executeTool(t *Thinker, call toolCall) {
 		} else {
 			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
 		}
-		resultPreview := resp.Text
-		if len(resultPreview) > 200 {
-			resultPreview = resultPreview[:200] + "..."
+		if generation != t.toolGeneration.Load() || t.toolContext().Err() != nil {
+			return
 		}
-		logMsg("TOOL", fmt.Sprintf("result %s (%dms): %s", call.Name, time.Since(start).Milliseconds(), resultPreview))
+		logMsg("TOOL", fmt.Sprintf("result %s (%dms): bytes=%d error=%v", call.Name, time.Since(start).Milliseconds(), len(resp.Text), resp.IsError))
 
 		// Telemetry: tool.result
 		if t.telemetry != nil {
@@ -160,6 +206,22 @@ func executeTool(t *Thinker, call toolCall) {
 			IsError:  resp.IsError,
 		}
 
+		if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
+			Tool:    call.Name,
+			CallID:  call.NativeID,
+			Summary: "Tool result ready",
+			Result:  resultText,
+		}) {
+			return
+		}
+		t.toolLifecycleMu.Lock()
+		defer t.toolLifecycleMu.Unlock()
+		if generation != t.toolGeneration.Load() {
+			return
+		}
+		// Remove pending atomically with publishing the terminal result, so a
+		// placeholder cannot be inserted between these operations.
+		t.pendingTools.Delete(call.NativeID)
 		// Late-result routing. If the iter-boundary barrier already
 		// injected a placeholder tool_result for this call id (because
 		// this goroutine didn't finish in time), we CANNOT publish a
@@ -174,30 +236,23 @@ func executeTool(t *Thinker, call toolCall) {
 			lateText := fmt.Sprintf("[late-result] Tool %s (call id=%s) completed: %s", call.Name, call.NativeID, resultText)
 			t.bus.Publish(Event{
 				Type: EventInbox, To: t.threadID,
-				Text: lateText, ExecutionIDs: executionIDs,
+				Text: lateText, ExecutionIDs: executionIDs, Parts: toolResponseParts(resp), ToolGeneration: &generation,
 			})
 			return
 		}
 
-		if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
-			Tool:    call.Name,
-			CallID:  call.NativeID,
-			Summary: "Tool result ready",
-			Result:  resultText,
-		}) {
-			return
-		}
-
-		if wakePolicy == WakeOnResultOnError && !resp.IsError {
+		if wakePolicy == WakeOnResultOnError && !resp.IsError && !t.realtimeMode {
 			t.queueSilentToolResult(toolResult)
 			return
 		}
 
 		t.bus.Publish(Event{
 			Type: EventInbox, To: t.threadID,
-			Text:         fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
-			ToolResult:   &toolResult,
-			ExecutionIDs: executionIDs,
+			Text:           fmt.Sprintf("[tool:%s] %s", call.Name, resultText),
+			ToolResult:     &toolResult,
+			ToolGeneration: &generation,
+			Parts:          resp.Parts,
+			ExecutionIDs:   executionIDs,
 		})
 	}()
 }

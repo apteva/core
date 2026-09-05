@@ -310,8 +310,23 @@ func TestMainEvolveIdenticalEditIsNoOp(t *testing.T) {
 		Raw:      "evolve",
 		NativeID: "call-2",
 	}}, nil)
+	if !thinker.kickNextTurn {
+		t.Fatal("second consecutive identical evolve still needs a receipt-processing turn")
+	}
+
+	thinker.kickNextTurn = false
+	mainToolHandler(thinker)(thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace",
+			"section":   "Schedule",
+			"content":   "- cadence: weekly",
+		},
+		Raw:      "evolve",
+		NativeID: "call-3",
+	}}, nil)
 	if thinker.kickNextTurn {
-		t.Fatal("second consecutive identical evolve should not create a completion loop")
+		t.Fatal("third identical evolve should stop the no-progress chain")
 	}
 
 	// Once the model moves on, a later task gets its own bounded completion.
@@ -324,7 +339,7 @@ func TestMainEvolveIdenticalEditIsNoOp(t *testing.T) {
 			"content":   "- cadence: weekly",
 		},
 		Raw:      "evolve",
-		NativeID: "call-3",
+		NativeID: "call-4",
 	}}, nil)
 	if !thinker.kickNextTurn {
 		t.Fatal("completion guard did not reset after a non-evolve turn")
@@ -375,8 +390,22 @@ func TestWorkerEvolveIdenticalEditIsNoOp(t *testing.T) {
 		Raw:      "evolve",
 		NativeID: "call-2",
 	}}, nil)
+	if !worker.Thinker.kickNextTurn {
+		t.Fatal("second consecutive worker no-op still needs a receipt-processing turn")
+	}
+	worker.Thinker.kickNextTurn = false
+	threadToolHandler(worker, thinker.threads)(worker.Thinker, []toolCall{{
+		Name: "evolve",
+		Args: map[string]string{
+			"edit_mode": "section_replace",
+			"section":   "Schedule",
+			"content":   "- cadence: weekly",
+		},
+		Raw:      "evolve",
+		NativeID: "call-3",
+	}}, nil)
 	if worker.Thinker.kickNextTurn {
-		t.Fatal("second consecutive worker no-op should not create a completion loop")
+		t.Fatal("third identical worker no-op should stop the no-progress chain")
 	}
 }
 
@@ -445,7 +474,7 @@ func TestMainEvolveRejectsFullReplaceForMarkdown(t *testing.T) {
 	if !thinker.kickNextTurn {
 		t.Fatal("second rejected evolve should kick one final reporting turn")
 	}
-	if len(secondResults) != 1 || !secondResults[0].IsError || !strings.Contains(secondResults[0].Content, "do not call evolve again") {
+	if len(secondResults) != 1 || !secondResults[0].IsError || !strings.Contains(secondResults[0].Content, "retry once now") {
 		t.Fatalf("second rejection results = %+v", secondResults)
 	}
 	thinker.kickNextTurn = false
@@ -754,7 +783,7 @@ func TestChildSendCannotTargetSystemSibling(t *testing.T) {
 	}
 }
 
-func TestMainSendReceiptKicksOnceWithoutHotLoop(t *testing.T) {
+func TestMainSendReceiptContinuesAndBoundsNoProgress(t *testing.T) {
 	thinker := newTestThinkerFull()
 	defer thinker.Stop()
 	if err := thinker.threads.SpawnWithOpts("worker", "Receive work.", nil, SpawnOpts{DeferRun: true}); err != nil {
@@ -785,12 +814,19 @@ func TestMainSendReceiptKicksOnceWithoutHotLoop(t *testing.T) {
 	thinker.kickNextTurn = false
 	call.NativeID = "send-2"
 	mainToolHandler(thinker)(thinker, []toolCall{call}, nil)
+	if !thinker.kickNextTurn {
+		t.Fatal("second consecutive send still needs its delivery receipt consumed")
+	}
+
+	thinker.kickNextTurn = false
+	call.NativeID = "send-3"
+	mainToolHandler(thinker)(thinker, []toolCall{call}, nil)
 	if thinker.kickNextTurn {
-		t.Fatal("second consecutive send should not rearm the completion loop")
+		t.Fatal("third identical send should stop the no-progress chain")
 	}
 
 	mainToolHandler(thinker)(thinker, nil, nil)
-	call.NativeID = "send-3"
+	call.NativeID = "send-4"
 	mainToolHandler(thinker)(thinker, []toolCall{call}, nil)
 	if !thinker.kickNextTurn {
 		t.Fatal("send completion guard did not reset after a non-send turn")
@@ -862,7 +898,7 @@ func TestSendFailureCorrectionAndReportingTurnsAreBounded(t *testing.T) {
 	thinker.kickNextTurn = false
 	call.NativeID = "send-2"
 	_, _, second := handler(thinker, []toolCall{call}, nil)
-	if !thinker.kickNextTurn || len(second) != 1 || !strings.Contains(second[0].Content, "do not call send again") {
+	if !thinker.kickNextTurn || len(second) != 1 || !strings.Contains(second[0].Content, "retry once now") {
 		t.Fatalf("second send failure = kick:%v results:%+v", thinker.kickNextTurn, second)
 	}
 
@@ -898,16 +934,22 @@ func TestRootMainImpossibleSendTargetsAreNonRetryableAndBounded(t *testing.T) {
 				}
 			}
 
-			// If a model ignores the explicit receipt and repeats the impossible
-			// destination, Core does not create an endless continuation loop.
+			// Every error result is consumable. A third identical attempt is the
+			// generic no-progress boundary, independent of tool name.
 			thinker.kickNextTurn = false
 			call.NativeID = "send-structural-2"
 			_, _, second := handler(thinker, []toolCall{call}, nil)
-			if thinker.kickNextTurn {
-				t.Fatalf("repeated structural send to %q created a continuation loop", target)
+			if !thinker.kickNextTurn {
+				t.Fatalf("second structural send to %q did not expose its error receipt", target)
 			}
 			if len(second) != 1 || !second[0].IsError || !strings.Contains(second[0].Content, "do not retry send") {
 				t.Fatalf("second structural failure = %+v", second)
+			}
+			thinker.kickNextTurn = false
+			call.NativeID = "send-structural-3"
+			handler(thinker, []toolCall{call}, nil)
+			if thinker.kickNextTurn {
+				t.Fatalf("third structural send to %q created a continuation loop", target)
 			}
 		})
 	}
@@ -935,7 +977,7 @@ func TestWorkerCannotSendToItselfButCanStillSendToParent(t *testing.T) {
 
 	// A later ordinary event starts a new workflow and resets the bounded
 	// communication guard; legitimate child-to-parent messaging still works.
-	worker.Thinker.resetSendTurnGuards()
+	worker.Thinker.resetInlineToolContinuation()
 	worker.Thinker.kickNextTurn = false
 	_, _, parent := handler(worker.Thinker, []toolCall{{
 		Name: "send", Args: map[string]string{"id": "parent", "message": "result ready"},
@@ -1035,7 +1077,7 @@ func TestMainSpawnFailureCorrectionAndReportingTurnsAreBounded(t *testing.T) {
 	call.NativeID = "spawn-2"
 	_, _, second := handler(thinker, []toolCall{call}, nil)
 	if !thinker.kickNextTurn || len(second) != 1 ||
-		!strings.Contains(second[0].Content, "do not call spawn again") {
+		!strings.Contains(second[0].Content, "retry once now") {
 		t.Fatalf("second spawn failure = kick:%v results:%+v", thinker.kickNextTurn, second)
 	}
 

@@ -130,10 +130,6 @@ func directiveEditCorrectionResult(err error) string {
 	return fmt.Sprintf("error: %v. Correct the evolve arguments and retry once now with the smallest valid section edit; do not abandon the durable update or repeat the same invalid call", err)
 }
 
-func directiveEditFinalFailureResult(err error) string {
-	return fmt.Sprintf("error: %v. The correction was also rejected; do not call evolve again for this instruction. Report the failure to the requester before pacing", err)
-}
-
 func normalizeDirectiveEditMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "", "replace", "full_replace":

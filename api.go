@@ -38,6 +38,13 @@ type contextResetResult struct {
 // prompt-cache identity behind, so a nominally clean context could still be
 // assembled with state from before the reset.
 func resetThinkerContext(t *Thinker) (contextResetResult, error) {
+	var result contextResetResult
+	err := t.mutateRuntime(func() error { var err error; result, err = resetThinkerContextNow(t); return err })
+	return result, err
+}
+func resetThinkerContextNow(t *Thinker) (contextResetResult, error) {
+	t.snapshotMu.Lock()
+	defer t.snapshotMu.Unlock()
 	result := contextResetResult{Status: "reset", ID: t.threadID}
 	result.BeforeCount = len(t.messages)
 	result.BeforeChars = contextChars(t.messages)
@@ -47,6 +54,7 @@ func resetThinkerContext(t *Thinker) (contextResetResult, error) {
 			return result, fmt.Errorf("remove conversation journal: %w", err)
 		}
 	}
+	t.invalidateTools()
 	if len(t.messages) > 1 {
 		t.messages = t.messages[:1]
 	}
@@ -56,7 +64,7 @@ func resetThinkerContext(t *Thinker) (contextResetResult, error) {
 	t.toolResultAge = map[string]int{}
 	t.toolResultMu.Unlock()
 	t.publishRuntimeStatus()
-	t.publishContextStatus()
+	t.contextStatus.Store(thinkerContextStatus{Messages: cloneMessages(t.messages), Composition: buildComposition(t, t.messages)})
 
 	result.AfterCount = len(t.messages)
 	result.AfterChars = contextChars(t.messages)
@@ -850,7 +858,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		opts.AudioControl = audioControl
 	}
 
-	if err := a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts); err != nil {
+	if err := a.thinker.mutateRuntime(func() error { return a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts) }); err != nil {
 		// Race: another caller spawned the same id between our
 		// findThinkerByID check and the lock inside Spawn. Treat as
 		// success — the caller's intent (a live thread by this name)
@@ -1106,7 +1114,7 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	if threadID != "main" && findThinkerByID(a.thinker, threadID) == nil && !a.thinker.bus.HasSubscriber(threadID) {
 		directive := a.thinker.config.GetDirective()
 		created := false
-		if err := a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}); err != nil {
+		if err := a.thinker.mutateRuntime(func() error { return a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}) }); err != nil {
 			if !strings.Contains(err.Error(), "already exists") {
 				logMsg("API", fmt.Sprintf("lazy spawn %q failed: %v", threadID, err))
 				http.Error(w, "failed to spawn thread: "+err.Error(), http.StatusInternalServerError)
@@ -1148,13 +1156,12 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(parts) > 0 {
-		// Multimodal: publish event with parts directly on the bus
-		a.thinker.bus.Publish(Event{Type: EventInbox, To: threadID, Text: "[console] " + text, Parts: parts})
-	} else if threadID != "main" {
-		a.thinker.bus.Publish(Event{Type: EventInbox, To: threadID, Text: text})
-	} else {
-		a.thinker.InjectConsole(text)
+	if threadID == "main" || len(parts) > 0 {
+		text = "[console] " + text
+	}
+	if !a.thinker.bus.TryPublish(Event{Type: EventInbox, To: threadID, Text: text, Parts: parts}) {
+		http.Error(w, "inbox full or unavailable; retry later", http.StatusTooManyRequests)
+		return
 	}
 
 	writeJSON(w, map[string]string{"status": "injected", "thread_id": threadID})
@@ -1187,6 +1194,15 @@ func (a *APIServer) eventLifecycle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPut {
+		if err := a.thinker.mutateRuntime(func() error { a.configNow(w, r); return nil }); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+		}
+		return
+	}
+	a.configNow(w, r)
+}
+func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 	logMsg("API", fmt.Sprintf("%s /config", r.Method))
 	switch r.Method {
 	case http.MethodGet:
@@ -1272,47 +1288,23 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "core computer config has been removed; use the Computer app MCP tools instead", http.StatusGone)
 			return
 		}
-		if body.Directive != "" {
-			if err := a.thinker.config.SetDirective(body.Directive); err != nil {
-				http.Error(w, "persist directive: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			a.thinker.ReloadDirectiveQuiet()
+		if body.Mode != "" && body.Mode != ModeAutonomous && body.Mode != ModeCautious && body.Mode != ModeLearn {
+			http.Error(w, "invalid mode", http.StatusBadRequest)
+			return
 		}
-		if body.Mode == ModeAutonomous || body.Mode == ModeCautious || body.Mode == ModeLearn {
-			if err := a.thinker.config.SetMode(body.Mode); err != nil {
-				http.Error(w, "persist mode: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if a.thinker.telemetry != nil {
-				a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
-			}
-		}
-		if body.Execution != nil {
-			if err := a.thinker.config.SetExecutionControl(*body.Execution); err != nil {
-				http.Error(w, "persist execution control: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if a.thinker.execution != nil {
-				a.thinker.execution.ApplyConfig(*body.Execution)
-			}
-			if a.thinker.telemetry != nil {
-				a.thinker.telemetry.Emit("execution.mode_changed", "main", a.thinker.executionStatus())
-			}
-		}
-		if body.RealtimeVoiceMCP != nil {
-			if err := a.thinker.config.SetRealtimeVoiceMCP(*body.RealtimeVoiceMCP); err != nil {
-				http.Error(w, "persist realtime voice capabilities: "+err.Error(), http.StatusInternalServerError)
+		for _, server := range body.MCPServers {
+			if err := validateMCPToolLoading(server); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 		}
 		if body.RealtimeVoice != nil {
-			if err := a.thinker.config.SetRealtimeVoice(*body.RealtimeVoice); err != nil {
-				http.Error(w, "persist realtime voice: "+err.Error(), http.StatusBadRequest)
+			candidate := &Config{}
+			if err := candidate.SetRealtimeVoice(*body.RealtimeVoice); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 		}
-		logMsg("API", fmt.Sprintf("PUT /config: providers=%d provider=%v", len(body.Providers), body.Provider != nil))
 		if len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil {
 			providers := a.thinker.config.GetProviders()
 			if len(body.Providers) > 0 {
@@ -1321,77 +1313,91 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			if body.Provider != nil {
 				providers = mergeProviderConfig(providers, *body.Provider)
 			}
-			realtimeEnabled := a.thinker.config.RealtimeEnabledFlag()
+			enabled := a.thinker.config.RealtimeEnabledFlag()
 			if body.RealtimeEnabled != nil {
-				realtimeEnabled = *body.RealtimeEnabled
+				enabled = *body.RealtimeEnabled
 			}
-			candidate := &Config{Providers: providers, RealtimeEnabled: realtimeEnabled}
-			pool, err := buildProviderPool(candidate)
-			if err != nil {
-				http.Error(w, "invalid provider configuration: "+err.Error(), http.StatusBadRequest)
+			if _, err := buildProviderPool(&Config{Providers: providers, RealtimeEnabled: enabled}); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if len(body.Providers) > 0 || body.Provider != nil {
-				if err := a.thinker.config.ReplaceProviders(providers); err != nil {
-					http.Error(w, "persist providers: "+err.Error(), http.StatusInternalServerError)
-					return
-				}
+		}
+
+		cfg := a.thinker.config
+		providers := cfg.GetProviders()
+		providerChanged := len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil
+		var pool *ProviderPool
+		enabled := cfg.RealtimeEnabledFlag()
+		if body.RealtimeEnabled != nil {
+			enabled = *body.RealtimeEnabled
+		}
+		if len(body.Providers) > 0 {
+			providers = cloneProviderConfigs(body.Providers)
+		}
+		if body.Provider != nil {
+			providers = mergeProviderConfig(providers, *body.Provider)
+		}
+		if providerChanged {
+			var err error
+			pool, err = buildProviderPool(&Config{Providers: providers, RealtimeEnabled: enabled})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
 			}
-			if body.RealtimeEnabled != nil {
-				if err := a.thinker.config.SetRealtimeEnabled(realtimeEnabled); err != nil {
-					http.Error(w, "persist realtime setting: "+err.Error(), http.StatusInternalServerError)
-					return
+		}
+		commit := func(mcp []MCPServerConfig) error {
+			return cfg.update(func() {
+				if body.Directive != "" {
+					cfg.Directive = body.Directive
 				}
-			}
-			oldDefault := a.thinker.status().Provider
+				if body.Mode != "" {
+					cfg.Mode = body.Mode
+				}
+				if body.Execution != nil {
+					cfg.Execution = *body.Execution
+				}
+				if body.RealtimeVoice != nil {
+					cfg.RealtimeVoice = strings.TrimSpace(*body.RealtimeVoice)
+				}
+				if body.RealtimeVoiceMCP != nil {
+					cfg.RealtimeVoiceMCP = compactStringList(*body.RealtimeVoiceMCP)
+				}
+				if providerChanged {
+					cfg.Providers = providers
+					cfg.Provider = nil
+					cfg.RealtimeEnabled = enabled
+				}
+				if body.MCPServers != nil {
+					cfg.MCPServers = mcp
+				}
+			})
+		}
+		var commitErr error
+		if body.MCPServers != nil {
+			commitErr = a.reconcileMCPTransaction(body.MCPServers, commit)
+		} else {
+			commitErr = commit(nil)
+		}
+		if commitErr != nil {
+			http.Error(w, "apply configuration: "+commitErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if providerChanged {
 			a.thinker.pool = pool
 			a.thinker.provider = pool.Default()
-			if a.thinker.provider != nil && a.thinker.provider.Name() != oldDefault && len(a.thinker.messages) > 0 {
-				a.thinker.messages = a.thinker.messages[:1]
-			}
-			if len(a.thinker.messages) > 0 && a.thinker.rebuildPrompt != nil {
-				a.thinker.messages[0] = Message{Role: "system", Content: a.thinker.rebuildPrompt("")}
-			}
-			a.thinker.publishRuntimeStatus()
-			a.thinker.publishContextStatus()
 		}
-		if body.MCPServers != nil {
-			for _, cfg := range body.MCPServers {
-				if err := validateMCPToolLoading(cfg); err != nil {
-					http.Error(w, "invalid MCP tool loading policy: "+err.Error(), http.StatusBadRequest)
-					return
-				}
-			}
-			if err := a.reconcileMCP(body.MCPServers); err != nil {
-				http.Error(w, "persist MCP configuration: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			// DO NOT rebuild t.mcpCatalog here — reconcileMCP already
-			// manages it correctly (populates for non-main-access
-			// servers in the connect pass at reconcileMCP:690, prunes
-			// removed entries in the prune pass). The old code here
-			// wiped the catalog and rebuilt it ONLY from t.mcpServers
-			// (the main-access list), which had the effect of deleting
-			// every catalog entry on every PUT /config — meaning an
-			// agent whose catalog MCPs were attached at runtime never
-			// saw them in its system prompt.
-			//
-			// Rebuild the system prompt so the updated `[AVAILABLE MCP
-			// SERVERS]` block reaches the LLM on its next iteration.
-			// Without this, the agent's system prompt stays frozen at
-			// the boot-time state and new catalog MCPs attached via
-			// dashboard are invisible to main. Use rebuildPrompt (which
-			// is set up at thinker init) so all the pieces — directive,
-			// core docs, providers, threads, MCPs — are consistent.
-			if a.thinker.rebuildPrompt != nil {
-				a.thinker.messages[0] = Message{
-					Role:    "system",
-					Content: a.thinker.rebuildPrompt(""),
-				}
-			}
-			a.thinker.publishRuntimeStatus()
-			a.thinker.publishContextStatus()
+		if body.Execution != nil && a.thinker.execution != nil {
+			a.thinker.execution.ApplyConfig(*body.Execution)
 		}
+		if body.Directive != "" || body.Mode != "" || providerChanged || body.MCPServers != nil {
+			a.thinker.reloadDirectiveNow()
+		}
+		a.thinker.publishRuntimeStatus()
+		a.thinker.publishContextStatus()
+		if body.Mode != "" && a.thinker.telemetry != nil {
+			a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
+		}
+
 		var resetResult *contextResetResult
 		if body.Reset != nil {
 			logMsg("API", fmt.Sprintf("PUT /config reset: history=%v memory=%v threads=%v", body.Reset.History, body.Reset.Memory, body.Reset.Threads))
@@ -1416,7 +1422,7 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, "recreate agent history: "+err.Error(), http.StatusInternalServerError)
 					return
 				}
-				contextResult, err := resetThinkerContext(a.thinker)
+				contextResult, err := resetThinkerContextNow(a.thinker)
 				if err != nil {
 					http.Error(w, "reset agent context: "+err.Error(), http.StatusInternalServerError)
 					return
@@ -1430,11 +1436,10 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 			}
 			if body.Reset.Memory && a.thinker.memory != nil {
 				result.MemoryRemoved = a.thinker.memory.Count()
-				os.Remove(a.thinker.memory.path)
-				a.thinker.memory.mu.Lock()
-				a.thinker.memory.records = nil
-				a.thinker.memory.byID = map[string]int{}
-				a.thinker.memory.mu.Unlock()
+				if err := a.thinker.memory.Reset(); err != nil {
+					http.Error(w, "reset memory: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
 			}
 			resetResult = &result
 		}
@@ -1460,202 +1465,9 @@ func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 // demand) is gone — see the proposal note in mcp.go's MCPServerConfig
 // comment.
 func (a *APIServer) reconcileMCP(desired []MCPServerConfig) error {
-	for _, cfg := range desired {
-		if err := validateMCPToolLoading(cfg); err != nil {
-			return err
-		}
-	}
-
-	names := make([]string, len(desired))
-	for i, c := range desired {
-		names[i] = c.Name
-	}
-	logMsg("API", fmt.Sprintf("reconcileMCP: %d desired servers (system entries preserved): %v", len(desired), names))
-	t := a.thinker
-
-	// Current config map lets us distinguish connection changes from prompt
-	// visibility changes. Loading/no_spawn policy can be updated in place;
-	// URL/command/transport changes still require reconnect for ordinary MCPs.
-	currentCfg := make(map[string]MCPServerConfig)
-	if t.config != nil {
-		for _, c := range t.config.GetMCPServers() {
-			currentCfg[c.Name] = c
-		}
-	}
-
-	// Index desired by name
-	want := make(map[string]MCPServerConfig, len(desired))
-	for _, cfg := range desired {
-		want[cfg.Name] = cfg
-	}
-
-	// For each server name currently known to exist, decide whether it
-	// stays as-is, gets removed, or gets replaced (close + reconnect).
-	// Replacement happens only for connection-level changes. Policy metadata
-	// is mirrored into ToolIndex without disturbing the live transport.
-	connectionChanged := func(old, new MCPServerConfig) bool {
-		if old.URL != new.URL || old.Command != new.Command || old.Transport != new.Transport {
-			return true
-		}
-		if len(old.Args) != len(new.Args) {
-			return true
-		}
-		for i := range old.Args {
-			if old.Args[i] != new.Args[i] {
-				return true
-			}
-		}
-		if len(old.Env) != len(new.Env) {
-			return true
-		}
-		for k, v := range old.Env {
-			if new.Env[k] != v {
-				return true
-			}
-		}
-		return false
-	}
-	visibilityChanged := func(old, new MCPServerConfig) bool {
-		return old.NoSpawn != new.NoSpawn || !toolLoadingEqual(old, new)
-	}
-	toolLoadingChanged := false
-	updateVisibility := func(current MCPServerConfig, hasCurrent bool, desiredCfg MCPServerConfig) error {
-		if hasCurrent && !visibilityChanged(current, desiredCfg) {
-			return nil
-		}
-		if err := t.config.SaveMCPServer(desiredCfg); err != nil {
-			return err
-		}
-		if t.toolIndex != nil {
-			t.toolIndex.UpdatePolicy(desiredCfg.Name, desiredCfg.NoSpawn, desiredCfg.ToolLoading)
-		}
-		if !toolLoadingEqual(current, desiredCfg) {
-			toolLoadingChanged = true
-			if t.telemetry != nil {
-				mode := ToolLoadAuto
-				if desiredCfg.ToolLoading != nil {
-					mode = normalizeToolLoadMode(desiredCfg.ToolLoading.Default)
-				}
-				t.telemetry.Emit("mcp.tool_loading_changed", "api", map[string]any{
-					"name":         desiredCfg.Name,
-					"default_mode": mode,
-				})
-			}
-		}
-		return nil
-	}
-
-	// Disconnect servers that are either absent from desired or whose
-	// config changed. System entries are never touched — they're not
-	// user-editable and the desired list doesn't include them.
-	var kept []MCPConn
-	for _, srv := range t.mcpServers {
-		name := srv.GetName()
-		desiredCfg, stillWant := want[name]
-		current, hasCurrent := currentCfg[name]
-		if stillWant && desiredCfg.NoSpawn {
-			// Host-owned MCPs (for example apteva-server and channels)
-			// are injected by the server and are already live. Runtime
-			// config updates may round-trip them with slightly different
-			// connection details; reconnecting them can deadlock the
-			// management request they are serving.
-			if err := updateVisibility(current, hasCurrent, desiredCfg); err != nil {
-				return err
-			}
-			// Preserve the server's existing connection-level round-trip
-			// behavior, but persist fresh host metadata such as its URL.
-			if !hasCurrent || connectionChanged(current, desiredCfg) {
-				if err := t.config.SaveMCPServer(desiredCfg); err != nil {
-					return err
-				}
-			}
-			kept = append(kept, srv)
-			continue
-		}
-		if stillWant && !hasCurrent {
-			// Some host-injected system MCPs are live without being
-			// persisted in config.json. A PUT /config from the server may
-			// round-trip those live entries back in `desired`; do not close
-			// the very MCP connection currently serving the request just
-			// because there is no persisted baseline to compare against.
-			if err := updateVisibility(current, false, desiredCfg); err != nil {
-				return err
-			}
-			kept = append(kept, srv)
-			continue
-		}
-		if stillWant && !connectionChanged(current, desiredCfg) {
-			if err := updateVisibility(current, true, desiredCfg); err != nil {
-				return err
-			}
-			kept = append(kept, srv)
-			continue
-		}
-		// Disconnect: either removed or replaced.
-		if err := t.config.RemoveMCPServer(name); err != nil {
-			return err
-		}
-		srv.Close()
-		t.registry.RemoveByMCPServer(name)
-		if t.toolIndex != nil {
-			t.toolIndex.Remove(name)
-		}
-		if t.telemetry != nil {
-			t.telemetry.Emit("mcp.disconnected", "api", map[string]string{"name": name})
-		}
-	}
-	t.mcpServers = kept
-
-	// Index what's now live after the prune pass so the connect loop
-	// doesn't reprocess servers that survived untouched.
-	live := make(map[string]bool, len(kept))
-	for _, srv := range kept {
-		live[srv.GetName()] = true
-	}
-
-	// Connect new / replaced servers. Single path, single registration
-	// shape — connectAndRegisterMCP handles registry + index together
-	// so they can't drift.
-	var toConnect []MCPServerConfig
-	for _, cfg := range desired {
-		if live[cfg.Name] {
-			continue
-		}
-		toConnect = append(toConnect, cfg)
-	}
-	if len(toConnect) > 0 {
-		connected := connectAndRegisterMCP(toConnect, t.registry, t.toolIndex, t.blobs)
-		byName := make(map[string]MCPServerConfig, len(toConnect))
-		for _, cfg := range toConnect {
-			byName[cfg.Name] = cfg
-		}
-		for _, srv := range connected {
-			cfg := byName[srv.GetName()]
-			if err := t.config.SaveMCPServer(cfg); err != nil {
-				srv.Close()
-				t.registry.RemoveByMCPServer(srv.GetName())
-				if t.toolIndex != nil {
-					t.toolIndex.Remove(srv.GetName())
-				}
-				return err
-			}
-			t.mcpServers = append(t.mcpServers, srv)
-		}
-		if t.telemetry != nil {
-			for _, srv := range connected {
-				t.telemetry.Emit("mcp.connected", "api", map[string]string{"name": srv.GetName()})
-			}
-		}
-	}
-	// Refresh the prompt catalog snapshot — tool counts may have moved.
-	t.mcpCatalog = computeMCPCatalog(t.toolIndex)
-	if toolLoadingChanged {
-		// This deliberately changes the stable tools prefix once. Give the
-		// provider cache a new epoch with an actionable reset reason instead
-		// of reporting the later hash mismatch as unexplained churn.
-		t.resetPromptCache("tool_loading_policy_changed")
-	}
-	return nil
+	return a.reconcileMCPTransaction(desired, func(next []MCPServerConfig) error {
+		return a.thinker.config.update(func() { a.thinker.config.MCPServers = next })
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

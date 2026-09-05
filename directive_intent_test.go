@@ -117,8 +117,8 @@ func TestDelegationToolDescriptionsUseOwnershipBoundary(t *testing.T) {
 		t.Fatal("done tool missing")
 	}
 	for _, want := range []string{
-		"one-shot worker should call done",
-		"final result owed to its parent",
+		"one-shot worker returns its complete final result once through done(message)",
+		"do not send the same final result separately first",
 		"Persistent event-driven threads should remain active",
 	} {
 		if !strings.Contains(done.Rules, want) {
@@ -222,7 +222,8 @@ func TestSubthreadPromptRequiresAutomaticParentInstructionPersistence(t *testing
 func TestNormalThreadPromptKeepsRoutineActivityLocal(t *testing.T) {
 	prompt := formatThreadBasePrompt(false, false, "worker", "main coordinator")
 	for _, want := range []string{
-		"final result when it requested work",
+		"complete final result exactly once with done(message)",
+		"continuing work, send requested results to your parent and remain active",
 		"meaningful milestones that change the plan",
 		"blockers or terminal failures",
 		"authority or resource requests",

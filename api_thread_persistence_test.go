@@ -25,9 +25,13 @@ func newParkedAPIProvider() *parkedAPIProvider {
 	return &parkedAPIProvider{started: make(chan struct{}), release: make(chan struct{})}
 }
 
-func (p *parkedAPIProvider) Chat(_ context.Context, _ []Message, _ string, _ []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
+func (p *parkedAPIProvider) Chat(ctx context.Context, _ []Message, _ string, _ []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
 	p.once.Do(func() { close(p.started) })
-	<-p.release
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return ChatResponse{}, ctx.Err()
+	}
 	return ChatResponse{Text: "Waiting for work."}, nil
 }
 

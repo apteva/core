@@ -2,9 +2,9 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,12 +29,16 @@ import (
 //     with one or more `event: message\ndata: {...}\n\n` frames) instead of
 //     plain JSON, even for POST requests. We parse both.
 type MCPHTTPServer struct {
-	Name      string
-	mu        sync.Mutex // guards url (after redirect)
-	url       string
-	sessionID string
-	nextID    atomic.Int64
-	client    *http.Client
+	closeOnce    sync.Once
+	lifetimeOnce sync.Once
+	lifetime     context.Context
+	cancel       context.CancelFunc
+	Name         string
+	mu           sync.Mutex // guards url (after redirect)
+	url          string
+	sessionID    string
+	nextID       atomic.Int64
+	client       *http.Client
 }
 
 func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
@@ -107,12 +111,24 @@ func decodeMCPBody(contentType string, body []byte) ([]byte, error) {
 // headers + raw body bytes. Updates srv.url in-place to the post-redirect
 // URL so subsequent calls skip the redirect entirely.
 func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []byte, int, error) {
+	return s.doPOSTContext(context.Background(), body, includeAccept)
+}
+func (s *MCPHTTPServer) doPOSTContext(ctx context.Context, body []byte, includeAccept bool) (http.Header, []byte, int, error) {
+	s.lifetimeOnce.Do(func() { s.lifetime, s.cancel = context.WithCancel(context.Background()) })
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(s.lifetime, cancel)
+	defer stop()
+	if s.lifetime.Err() != nil {
+		return nil, nil, 0, s.lifetime.Err()
+	}
 	s.mu.Lock()
 	currentURL := s.url
+	sessionID := s.sessionID
 	s.mu.Unlock()
 
 	for attempt := 0; attempt < 4; attempt++ {
-		httpReq, err := http.NewRequest("POST", currentURL, bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", currentURL, bytes.NewReader(body))
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("request: %w", err)
 		}
@@ -125,8 +141,8 @@ func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []
 		if agentID := os.Getenv("AGENT_ID"); agentID != "" && isAptevaAppMCPURL(currentURL) {
 			httpReq.Header.Set("X-Apteva-Caller-Agent", agentID)
 		}
-		if s.sessionID != "" {
-			httpReq.Header.Set("Mcp-Session-Id", s.sessionID)
+		if sessionID != "" {
+			httpReq.Header.Set("Mcp-Session-Id", sessionID)
 		}
 
 		resp, err := s.client.Do(httpReq)
@@ -156,7 +172,7 @@ func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []
 			currentURL = resolved.String()
 			continue
 		}
-		respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4_000_000))
+		respBody, rerr := readMCPResponse(resp, body)
 		resp.Body.Close()
 		if rerr != nil {
 			return resp.Header, nil, resp.StatusCode, fmt.Errorf("read: %w", rerr)
@@ -167,7 +183,7 @@ func (s *MCPHTTPServer) doPOST(body []byte, includeAccept bool) (http.Header, []
 			s.mu.Lock()
 			s.url = currentURL
 			s.mu.Unlock()
-			logMsg("MCP-HTTP", fmt.Sprintf("resolved redirect → %s", currentURL))
+			logMsg("MCP-HTTP", "resolved endpoint redirect")
 		}
 		return resp.Header, respBody, resp.StatusCode, nil
 	}
@@ -188,8 +204,11 @@ func isAptevaAppMCPURL(raw string) bool {
 }
 
 func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMessage, http.Header, error) {
+	return s.callWithHeadersContext(context.Background(), method, params)
+}
+func (s *MCPHTTPServer) callWithHeadersContext(ctx context.Context, method string, params any) (json.RawMessage, http.Header, error) {
 	id := s.nextID.Add(1)
-	logMsg("MCP-HTTP", fmt.Sprintf("call %s id=%d url=%s", method, id, s.url))
+	logMsg("MCP-HTTP", fmt.Sprintf("call %s id=%d", method, id))
 
 	req := jsonRPCRequest{
 		JSONRPC: "2.0",
@@ -199,7 +218,7 @@ func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMess
 	}
 	data, _ := json.Marshal(req)
 
-	headers, body, status, err := s.doPOST(data, true)
+	headers, body, status, err := s.doPOSTContext(ctx, data, true)
 	if err != nil {
 		return nil, headers, err
 	}
@@ -208,32 +227,31 @@ func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMess
 		if len(snippet) > 500 {
 			snippet = snippet[:500] + "…"
 		}
-		logMsg("MCP-HTTP", fmt.Sprintf("error %d: %s", status, snippet))
+		logMsg("MCP-HTTP", fmt.Sprintf("error status=%d bytes=%d", status, len(body)))
 		return nil, headers, fmt.Errorf("HTTP %d: %s", status, snippet)
 	}
 
 	payload, err := decodeMCPBody(headers.Get("Content-Type"), body)
 	if err != nil {
-		logMsg("MCP-HTTP", fmt.Sprintf("decode error: %v body=%s", err, string(body[:min(len(body), 200)])))
+		logMsg("MCP-HTTP", fmt.Sprintf("decode error; bytes=%d", len(body)))
 		return nil, headers, fmt.Errorf("decode: %w", err)
 	}
 
 	var rpcResp jsonRPCResponse
 	if err := json.Unmarshal(payload, &rpcResp); err != nil {
-		logMsg("MCP-HTTP", fmt.Sprintf("parse error: %v payload=%s", err, string(payload[:min(len(payload), 200)])))
+		logMsg("MCP-HTTP", fmt.Sprintf("parse error; bytes=%d", len(payload)))
 		return nil, headers, fmt.Errorf("parse: %w", err)
 	}
 
+	if rpcResp.ID != id {
+		return nil, headers, fmt.Errorf("MCP response ID mismatch: got %d want %d", rpcResp.ID, id)
+	}
 	if rpcResp.Error != nil {
-		logMsg("MCP-HTTP", fmt.Sprintf("rpc error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message))
+		logMsg("MCP-HTTP", fmt.Sprintf("rpc error code=%d", rpcResp.Error.Code))
 		return nil, headers, fmt.Errorf("MCP error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
 	}
 
-	resultPreview := string(rpcResp.Result)
-	if len(resultPreview) > 200 {
-		resultPreview = resultPreview[:200] + "..."
-	}
-	logMsg("MCP-HTTP", fmt.Sprintf("ok id=%d result=%s", id, resultPreview))
+	logMsg("MCP-HTTP", fmt.Sprintf("ok id=%d bytes=%d", id, len(rpcResp.Result)))
 
 	// For tools/list, also dump the full description of every tool —
 	// the truncated preview above hides whether dynamic blocks (like
@@ -293,15 +311,7 @@ func (s *MCPHTTPServer) notify(method string, params any) {
 }
 
 func (s *MCPHTTPServer) ListTools() ([]mcpToolDef, error) {
-	result, err := s.call("tools/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	var list mcpToolsListResult
-	if err := json.Unmarshal(result, &list); err != nil {
-		return nil, fmt.Errorf("parse tools: %w", err)
-	}
-	return list.Tools, nil
+	return listAllMCPTools(s.call)
 }
 
 func (s *MCPHTTPServer) CallTool(name string, args map[string]string) (ToolResponse, error) {
@@ -309,8 +319,11 @@ func (s *MCPHTTPServer) CallTool(name string, args map[string]string) (ToolRespo
 }
 
 func (s *MCPHTTPServer) CallToolTyped(name string, args map[string]string, inputSchema map[string]any) (ToolResponse, error) {
+	return s.CallToolContext(context.Background(), name, args, inputSchema)
+}
+func (s *MCPHTTPServer) CallToolContext(ctx context.Context, name string, args map[string]string, inputSchema map[string]any) (ToolResponse, error) {
 	arguments := mcpArgumentsFromStrings(args, inputSchema)
-	result, err := s.call("tools/call", map[string]any{
+	result, _, err := s.callWithHeadersContext(ctx, "tools/call", map[string]any{
 		"name":      name,
 		"arguments": arguments,
 	})
@@ -323,17 +336,12 @@ func (s *MCPHTTPServer) CallToolTyped(name string, args map[string]string, input
 		return ToolResponse{}, fmt.Errorf("parse result: %w", err)
 	}
 
-	var texts []string
-	for _, c := range callResult.Content {
-		if c.Type == "text" {
-			texts = append(texts, c.Text)
-		}
-	}
-	return ToolResponse{Text: strings.Join(texts, "\n"), IsError: callResult.IsError}, nil
+	return decodeMCPResult(callResult)
 }
 
 func (s *MCPHTTPServer) GetName() string { return s.Name }
 
 func (s *MCPHTTPServer) Close() {
-	// No process to kill — just stop using it
+	s.lifetimeOnce.Do(func() { s.lifetime, s.cancel = context.WithCancel(context.Background()) })
+	s.closeOnce.Do(s.cancel)
 }

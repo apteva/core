@@ -287,6 +287,7 @@ func TestThreadManager_ToolSetAlwaysIncludesBuiltins(t *testing.T) {
 }
 
 func TestToolRegistry_CoreDocs(t *testing.T) {
+	t.Setenv("APTEVA_MODEL_MCP_MANAGEMENT", "true")
 	reg := NewToolRegistry("test")
 	docs := reg.CoreDocs(true)
 

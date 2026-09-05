@@ -82,6 +82,65 @@ found:
 	}
 }
 
+func TestExecuteMCPToolEmitsFinalTypedArgumentTelemetry(t *testing.T) {
+	registry := NewToolRegistry("")
+	completed := make(chan struct{})
+	registry.Register(&ToolDef{
+		Name: "computer_browser_session",
+		MCP:  true,
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action":  map[string]any{"type": "string"},
+				"persist": map[string]any{"type": "boolean"},
+				"timeout": map[string]any{"type": "integer"},
+			},
+		},
+		Handler: func(map[string]string) ToolResponse {
+			close(completed)
+			return ToolResponse{Text: "ok"}
+		},
+	})
+	bus := NewEventBus()
+	telemetry := NewTelemetry()
+	thinker := &Thinker{
+		bus: bus, sub: bus.Subscribe("worker", 10), registry: registry,
+		quit: make(chan struct{}), telemetry: telemetry, threadID: "worker",
+	}
+	executeTool(thinker, toolCall{
+		Name: "computer_browser_session", NativeID: "call-typed",
+		Args: map[string]string{"action": "open", "persist": "false", "timeout": "60"},
+	})
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("MCP tool did not complete")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		events, _ := telemetry.StoredEvents(0)
+		for _, event := range events {
+			if event.Type != "tool.arguments" {
+				continue
+			}
+			var data ToolArgumentsData
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if data.Stage != "mcp_typed" {
+				continue
+			}
+			if data.ID != "call-typed" || data.Types["action"] != "string" || data.Types["persist"] != "boolean" || data.Types["timeout"] != "number" {
+				t.Fatalf("typed MCP telemetry = %+v", data)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("mcp_typed tool.arguments telemetry was not emitted")
+}
+
 func TestExecuteToolBoundsParallelism(t *testing.T) {
 	registry := NewToolRegistry("test")
 	var active atomic.Int32
@@ -509,8 +568,9 @@ func TestExecuteTool_WakeOnResultOnErrorFailureWakes(t *testing.T) {
 
 func TestWaitForPendingToolsDrainsSilentResults(t *testing.T) {
 	thinker := &Thinker{
-		bus:      NewEventBus(),
-		threadID: "main",
+		bus:           NewEventBus(),
+		toolCompleted: make(chan struct{}, 1),
+		threadID:      "main",
 	}
 	thinker.sub = thinker.bus.Subscribe("main", 100)
 	thinker.pendingTools.Store("call-1", "notify_send")
@@ -518,6 +578,7 @@ func TestWaitForPendingToolsDrainsSilentResults(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 		thinker.queueSilentToolResult(ToolResult{CallID: "call-1", Content: "delivered"})
 		thinker.pendingTools.Delete("call-1")
+		thinker.toolCompleted <- struct{}{}
 	}()
 
 	var results []ToolResult

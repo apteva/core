@@ -191,6 +191,21 @@ func writeImmutableToolResultObject(target string, object archivedToolResultObje
 		return err
 	}
 
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	if len(encoded) > maxArchivedToolResultObjectBytes {
+		return fmt.Errorf("tool archive object exceeds size limit")
+	}
+	root := filepath.Dir(filepath.Dir(filepath.Dir(dir)))
+	release, err := reserveArchiveBytes(root, int64(len(encoded)))
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() { release(committed) }()
 	tmp, err := os.CreateTemp(dir, ".tool-result-*.tmp")
 	if err != nil {
 		return err
@@ -198,7 +213,7 @@ func writeImmutableToolResultObject(target string, object archivedToolResultObje
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 	_ = tmp.Chmod(0600)
-	encErr := json.NewEncoder(tmp).Encode(object)
+	_, encErr := tmp.Write(encoded)
 	if encErr == nil {
 		encErr = tmp.Sync()
 	}
@@ -216,6 +231,7 @@ func writeImmutableToolResultObject(target string, object archivedToolResultObje
 		return err
 	}
 	_ = os.Chmod(target, 0600)
+	committed = true
 	return nil
 }
 
@@ -239,12 +255,23 @@ func (a *ToolResultArchive) appendCallRecord(result ToolResult) error {
 		ArchiveRef:         result.ArchiveRef,
 		IsError:            result.IsError,
 	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	release, err := reserveArchiveBytes(filepath.Join(a.historyDir, toolResultArchiveDir), int64(len(encoded)))
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() { release(committed) }()
 	f, err := os.OpenFile(a.callsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
 	_ = f.Chmod(0600)
-	err = json.NewEncoder(f).Encode(record)
+	_, err = f.Write(encoded)
 	if err == nil {
 		err = f.Sync()
 	}
@@ -255,6 +282,7 @@ func (a *ToolResultArchive) appendCallRecord(result ToolResult) error {
 	if closeErr != nil {
 		return closeErr
 	}
+	committed = true
 	a.seenCalls[key] = true
 	a.callRefs[result.CallID] = record
 	return nil

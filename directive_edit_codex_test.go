@@ -44,7 +44,7 @@ func TestCodexRecurringInstructionUsesMainWakeLoop(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex recurring evolve smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -61,7 +61,7 @@ func TestCodexRecurringNotificationUsesSectionEditSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex recurring evolve smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -168,7 +168,7 @@ func TestCodexAlreadyCurrentEvolveStillRepliesSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex recurring evolve smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -287,7 +287,7 @@ func TestCodexBoundedOneOffStaysOnMainSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex bounded-work smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -313,7 +313,7 @@ func runBoundedOneOffStaysOnMainSmoke(t *testing.T, provider LLMProvider) {
 	messages := appendEphemeralTurnContext([]Message{
 		{Role: "system", Content: prompt},
 		{Role: "user", Content: "[console] Complete this very small immediately actionable request: turn these three supplied facts into one concise customer update—migration finished, validation passed, no action required—and deliver it with deliver_result. No lookup, waiting, retries, persistent state, or separate ownership is involved."},
-	}, "", time.Now().UTC().Format(time.RFC3339), false)
+	}, "[ACTIVE THREADS] 0 total — this is the complete list.", time.Now().UTC().Format(time.RFC3339), false)
 	tools := append(registry.NativeTools(nil, nil), NativeTool{
 		Name:        "deliver_result",
 		Description: "Deliver the completed result to the operator on the current thread.",
@@ -362,7 +362,7 @@ func TestCodexOwnershipScalingSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex ownership smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -400,7 +400,7 @@ func runRecurringResponsibilitiesScaleOutSmoke(t *testing.T, provider LLMProvide
 			"- Prepare the monthly finance close with its own records and failure handling.",
 			"Establish appropriate durable ownership now. Do not execute any of these cycles yet.",
 		}, "\n")},
-	}, "", time.Now().UTC().Format(time.RFC3339), false)
+	}, "[ACTIVE THREADS] 0 total — this is the complete list.", time.Now().UTC().Format(time.RFC3339), false)
 	tools := append(registry.NativeTools(nil, nil),
 		NativeTool{
 			Name:        "support_cases",
@@ -673,7 +673,7 @@ func TestCodexDirectiveEditSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex directive edit smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -735,7 +735,7 @@ func TestCodexEmptyDirectiveSectionInitSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex directive edit smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -788,7 +788,7 @@ func TestCodexRedundantDirectiveHeadingSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex directive edit smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -847,7 +847,7 @@ func TestCodexPersistentIntentAutoEvolveSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex directive edit smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -909,7 +909,7 @@ func TestCodexSubthreadPersistentIntentAutoEvolveSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex directive edit smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -964,7 +964,7 @@ func TestCodexPersistentIntentBoundariesSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex directive edit smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -1023,7 +1023,7 @@ func TestCodexMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex directive edit smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}

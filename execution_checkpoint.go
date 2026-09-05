@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -254,6 +255,7 @@ func cloneToolCalls(in []NativeToolCall) []NativeToolCall {
 	for i, tc := range in {
 		out[i] = tc
 		out[i].Args = copyStringMap(tc.Args)
+		out[i].CanonicalArgs = append(json.RawMessage(nil), tc.CanonicalArgs...)
 	}
 	return out
 }

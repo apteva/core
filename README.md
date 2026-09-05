@@ -31,7 +31,7 @@ Core is a standalone Go binary. It can run headless, with its own TUI, or manage
 echo "FIREWORKS_API_KEY=your-key" > .env
 
 # Build and run with TUI
-go build -o apteva-core . && ./apteva-core
+go build -o apteva-core ./cmd/apteva-core && ./apteva-core
 
 # Or run headless (API only)
 ./apteva-core --headless

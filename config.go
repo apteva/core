@@ -26,6 +26,7 @@ type PersistentPaceState struct {
 // entries retain their payload so they can be replayed after a crash;
 // consumed entries retain only ID+hash as the bounded deduplication ledger.
 type PersistentThreadEvent struct {
+	ExecutionIDs   []string      `json:"execution_ids,omitempty"`
 	ID             string        `json:"id"`
 	Hash           string        `json:"hash"`
 	Text           string        `json:"text,omitempty"`
@@ -93,6 +94,7 @@ type ProviderConfig struct {
 }
 
 type Config struct {
+	RuntimeSequence uint64 `json:"runtime_sequence,omitempty"`
 	mu              sync.RWMutex
 	saveMu          sync.Mutex
 	path            string
@@ -151,7 +153,7 @@ func (c *Config) load() error {
 			return err
 		}
 	}
-	return nil
+	return c.loadRuntimeJournalLocked()
 }
 
 func (c *Config) LoadError() error {
@@ -219,6 +221,7 @@ func (c *Config) restore(data []byte) {
 	if err := json.Unmarshal(data, &restored); err != nil {
 		return
 	}
+	c.RuntimeSequence = restored.RuntimeSequence
 	c.Directive = restored.Directive
 	c.Mode = restored.Mode
 	c.Unconscious = restored.Unconscious

@@ -659,8 +659,13 @@ func TestMemoryRecallTelemetryReportsRelevantRecordSkippedBySizeLimit(t *testing
 		Mode:      ModeAutonomous,
 	}
 	parent := NewThinker("", provider, cfg)
-	defer parent.Stop()
-	defer parent.threads.KillAll()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := parent.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
 
 	records := []struct {
 		id     string

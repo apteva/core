@@ -454,11 +454,6 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	if t.toolIndex == nil {
 		return `{"error":"tool index not initialised — no MCPs attached"}`
 	}
-	// A valid search always owes the model one continuation. With hits, that
-	// turn exposes the newly activated schemas; without hits, it lets the
-	// model process the bounded diagnostic note and choose another path.
-	// This wake is independent of (and does not move) the pending pace timer.
-	t.kickNextTurn = true
 	hits := t.searchAuthorizedTools(query, k, allowNoSpawn)
 	res := searchToolsResult{Query: query}
 	for _, h := range hits {

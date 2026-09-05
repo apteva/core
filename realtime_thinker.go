@@ -130,6 +130,8 @@ func newRealtimeThinker(
 	audioControl chan<- string,
 	turnDetection ...RealtimeTurnDetectionConfig,
 ) *RealtimeThinker {
+	thinker.realtimeMode = true
+
 	if voice == "" {
 		voice = provider.DefaultVoice()
 	}
@@ -962,8 +964,13 @@ func (rt *RealtimeThinker) Run() {
 				logMsg("REALTIME", fmt.Sprintf("[%s] send audio: %v", rt.threadID, err))
 			}
 
-		case event := <-rt.sub.C:
-			rt.handleBusEvent(event)
+		case <-rt.sub.Wake:
+			for _, event := range rt.sub.DrainTargeted() {
+				if event.ToolGeneration != nil && *event.ToolGeneration != rt.toolGeneration.Load() {
+					continue
+				}
+				rt.handleBusEvent(event)
+			}
 
 		case paused := <-rt.pause:
 			rt.paused = paused

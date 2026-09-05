@@ -1,13 +1,16 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
@@ -136,6 +139,13 @@ type StreamEvent struct {
 // Run is the apteva-core entrypoint. cmd/apteva-core/main.go calls this
 // after wiring -ldflags Version/BuildTime via SetVersion.
 func Run() {
+	if err := runCore(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func runCore() error {
 	godotenv.Load()
 	initLogger()
 	defer func() {
@@ -146,18 +156,17 @@ func Run() {
 			os.Exit(2)
 		}
 	}()
-	installSignalLogger()
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
+	defer stopSignals()
 
 	cfg := NewConfig()
 	if err := cfg.LoadError(); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid core config: %v\n", err)
-		return
+		return fmt.Errorf("invalid core config: %w", err)
 	}
 
 	provider, err := selectProvider(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		return err
 	}
 	models := provider.Models()
 	fmt.Fprintf(os.Stderr, "LLM provider: %s (large=%s, medium=%s, small=%s)\n", provider.Name(), models[ModelLarge], models[ModelMedium], models[ModelSmall])
@@ -167,22 +176,6 @@ func Run() {
 	if apiKey == "" {
 		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
-
-	thinker := NewThinker(apiKey, provider, cfg)
-
-	// Startup summary
-	var mcpNames []string
-	for _, m := range cfg.MCPServers {
-		mcpNames = append(mcpNames, m.Name)
-	}
-	var threadNames []string
-	for _, t := range cfg.GetThreads() {
-		threadNames = append(threadNames, t.ID)
-	}
-	logMsg("BOOT", fmt.Sprintf("provider=%s mode=%s mcp=[%s] threads=[%s] directive=%d chars",
-		provider.Name(), cfg.GetMode(), joinOrNone(mcpNames), joinOrNone(threadNames), len(cfg.GetDirective())))
-
-	go thinker.Run()
 
 	apiPort := os.Getenv("API_PORT")
 	if apiPort == "" {
@@ -199,13 +192,53 @@ func Run() {
 	apiListener, err := net.Listen("tcp", apiAddr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "core API listen failed on %s: %v\n", apiAddr, err)
-		thinker.Stop()
-		return
+		return err
 	}
+
+	thinker := NewThinker(apiKey, provider, cfg)
+
+	// Startup summary
+	var mcpNames []string
+	for _, m := range cfg.MCPServers {
+		mcpNames = append(mcpNames, m.Name)
+	}
+	var threadNames []string
+	for _, t := range cfg.GetThreads() {
+		threadNames = append(threadNames, t.ID)
+	}
+	logMsg("BOOT", fmt.Sprintf("provider=%s mode=%s mcp=[%s] threads=[%s] directive=%d chars",
+		provider.Name(), cfg.GetMode(), joinOrNone(mcpNames), joinOrNone(threadNames), len(cfg.GetDirective())))
+
+	defer apiListener.Close()
+	server, err := newCoreHTTPServer(thinker)
+	if err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = thinker.Shutdown(shutdownCtx)
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+		if err := thinker.Shutdown(shutdownCtx); err != nil {
+			logMsg("EXIT", err.Error())
+		}
+	}()
+	go thinker.Run()
+	serveErr := make(chan error, 1)
 	go func() {
-		if err := serveAPI(thinker, apiListener); err != nil && !strings.Contains(err.Error(), "closed network connection") {
-			logMsg("CRASH", fmt.Sprintf("core API stopped: %v", err))
+		err := server.Serve(apiListener)
+		if err != nil && err != http.ErrServerClosed {
+			serveErr <- err
+		}
+		thinker.Stop()
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
 			thinker.Stop()
+		case <-thinker.quit:
 		}
 	}()
 
@@ -229,28 +262,13 @@ func Run() {
 	} else {
 		p := tea.NewProgram(newModel(thinker), tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 	}
-}
-
-func installSignalLogger() {
-	ch := make(chan os.Signal, 4)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
-	go func() {
-		sig := <-ch
-		logMsg("SIGNAL", fmt.Sprintf("received %s pid=%d", sig, os.Getpid()))
-		if logFile != nil {
-			_ = logFile.Sync()
-		}
-		signal.Reset(sig)
-		process, err := os.FindProcess(os.Getpid())
-		if err == nil {
-			if err := process.Signal(sig); err == nil {
-				return
-			}
-		}
-		os.Exit(1)
-	}()
+	select {
+	case err := <-serveErr:
+		return err
+	default:
+		return nil
+	}
 }

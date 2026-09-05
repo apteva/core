@@ -6,20 +6,24 @@
 // can import directly — `package main` cannot be imported.
 //
 // Build:
-//   go build -o apteva-core ./cmd/apteva-core
+//
+//	go build -o apteva-core ./cmd/apteva-core
 //
 // Build with versioning (matches the existing Dockerfile + scripts):
-//   go build -ldflags "-X main.Version=$APTEVA_VERSION \
-//                      -X main.BuildTime=$BUILD_TIME \
-//                      -X main.CLIVersion=$CLI_VERSION \
-//                      -X main.DashboardVersion=$DASHBOARD_VERSION \
-//                      -X main.IntegrationsVersion=$INTEGRATIONS_VERSION \
-//                      -X main.CoreVersion=$CORE_VERSION" \
-//     -o apteva-core ./cmd/apteva-core
+//
+//	go build -ldflags "-X main.Version=$APTEVA_VERSION \
+//	                   -X main.BuildTime=$BUILD_TIME \
+//	                   -X main.CLIVersion=$CLI_VERSION \
+//	                   -X main.DashboardVersion=$DASHBOARD_VERSION \
+//	                   -X main.IntegrationsVersion=$INTEGRATIONS_VERSION \
+//	                   -X main.CoreVersion=$CORE_VERSION" \
+//	  -o apteva-core ./cmd/apteva-core
 package main
 
 import (
+	"fmt"
 	"github.com/apteva/core"
+	"os"
 )
 
 // Version + BuildTime are injected by ldflags at build time. The remaining
@@ -37,6 +41,10 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		fmt.Printf("apteva-core %s (%s)\n", Version, BuildTime)
+		return
+	}
 	core.SetVersion(Version, BuildTime)
 	core.Run()
 }

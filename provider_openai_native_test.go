@@ -102,6 +102,9 @@ func TestOpenAINativeChat_BuildsFunctionToolsOnly(t *testing.T) {
 	if decoded["type"] != "function" || decoded["name"] != "app_tool" {
 		t.Fatalf("tool = %#v", decoded)
 	}
+	if strict, ok := decoded["strict"].(bool); !ok || strict {
+		t.Fatalf("function tool strict = %#v, want explicit false so optional properties remain optional", decoded["strict"])
+	}
 }
 
 func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
@@ -116,6 +119,7 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 		_, _ = w.Write([]byte(strings.Join([]string{
 			`data: {"type":"response.output_text.delta","delta":"ok"}`,
 			`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":5,"cache_write_tokens":2}}}}`,
+			`data: {"type":"response.completed"}`,
 			`data: [DONE]`,
 			``,
 		}, "\n")))
@@ -173,7 +177,7 @@ func TestOpenAICodexChatUsesAccountAndCatalogCapabilities(t *testing.T) {
 			t.Fatalf("request JSON: %v", err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n"))
 	}))
 	defer srv.Close()
 
@@ -250,6 +254,7 @@ func TestOpenAINativeChat_RetriesWithoutUnsupportedPromptCacheHints(t *testing.T
 		_, _ = w.Write([]byte(strings.Join([]string{
 			`data: {"type":"response.output_text.delta","delta":"ok"}`,
 			`data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}`,
+			`data: {"type":"response.completed"}`,
 			`data: [DONE]`,
 			``,
 		}, "\n")))
@@ -450,6 +455,7 @@ func TestOpenAINativeStreamResponse_ReasoningSummary(t *testing.T) {
 		`data: {"type":"response.reasoning_summary_text.delta","delta":"state"}`,
 		`data: {"type":"response.output_text.delta","delta":"done"}`,
 		`data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2,"input_tokens_details":{"cached_tokens":1}}}}`,
+		`data: {"type":"response.completed"}`,
 		`data: [DONE]`,
 		``,
 	}, "\n"))
@@ -481,6 +487,7 @@ func TestOpenAINativeStreamResponse_CapturesReasoningAndOutputItems(t *testing.T
 		`data: {"type":"response.output_item.done","item":{"id":"msg_123","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"I’ll check."}]}}`,
 		`data: {"type":"response.output_item.added","item":{"id":"fc_123","type":"function_call","call_id":"call_123","name":"lookup"}}`,
 		`data: {"type":"response.output_item.done","item":{"id":"fc_123","type":"function_call","status":"completed","call_id":"call_123","name":"lookup","arguments":"{\"query\":\"x\"}"}}`,
+		`data: {"type":"response.completed"}`,
 		`data: [DONE]`,
 		``,
 	}, "\n"))
@@ -515,6 +522,9 @@ func TestOpenAINativeStreamResponse_CapturesReasoningAndOutputItems(t *testing.T
 	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_123" || resp.ToolCalls[0].OutputItemID != "fc_123" || resp.ToolCalls[0].Status != "completed" {
 		t.Fatalf("ToolCalls = %#v", resp.ToolCalls)
 	}
+	if got := resp.ToolCalls[0].RawArgs; got != `{"query":"x"}` {
+		t.Fatalf("RawArgs = %q, want exact provider JSON", got)
+	}
 }
 
 func TestOpenAINativeStreamResponse_ToolChunkUsesCallID(t *testing.T) {
@@ -522,6 +532,7 @@ func TestOpenAINativeStreamResponse_ToolChunkUsesCallID(t *testing.T) {
 		`data: {"type":"response.output_item.added","item":{"id":"fc_item_123","type":"function_call","call_id":"call_final_456","name":"send"}}`,
 		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_item_123","delta":"{\"id\":\"main\"}"}`,
 		`data: {"type":"response.output_item.done","item":{"id":"fc_item_123","type":"function_call","call_id":"call_final_456","name":"send","arguments":"{\"id\":\"main\"}"}}`,
+		`data: {"type":"response.completed"}`,
 		`data: [DONE]`,
 		``,
 	}, "\n"))
@@ -556,6 +567,7 @@ func TestOpenAINativeStreamResponse_ReasoningSummaryPartDone(t *testing.T) {
 	stream := strings.NewReader(strings.Join([]string{
 		`data: {"type":"response.reasoning_summary_part.done","part":{"type":"summary_text","text":"summary only"}}`,
 		`data: {"type":"response.output_text.delta","delta":"done"}`,
+		`data: {"type":"response.completed"}`,
 		`data: [DONE]`,
 		``,
 	}, "\n"))
@@ -580,6 +592,7 @@ func TestOpenAINativeStreamResponse_BuffersToolChunkUntilCallID(t *testing.T) {
 		`data: {"type":"response.output_item.added","item":{"id":"fc_item_123","type":"function_call","name":"send"}}`,
 		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_item_123","delta":"{\"id\":\"main\"}"}`,
 		`data: {"type":"response.output_item.done","item":{"id":"fc_item_123","type":"function_call","call_id":"call_final_456","name":"send","arguments":"{\"id\":\"main\"}"}}`,
+		`data: {"type":"response.completed"}`,
 		`data: [DONE]`,
 		``,
 	}, "\n"))
@@ -607,6 +620,7 @@ func TestOpenAINativeStreamResponse_BuffersToolChunkUntilNameAndCallID(t *testin
 		`data: {"type":"response.output_item.added","item":{"id":"fc_item_123","type":"function_call"}}`,
 		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_item_123","delta":"{\"text\":\"hello\"}"}`,
 		`data: {"type":"response.output_item.done","item":{"id":"fc_item_123","type":"function_call","call_id":"call_final_456","name":"channels_respond","arguments":"{\"text\":\"hello\"}"}}`,
+		`data: {"type":"response.completed"}`,
 		`data: [DONE]`,
 		``,
 	}, "\n"))
@@ -633,6 +647,7 @@ func TestOpenAINativeStreamResponse_FinalArgumentsEmitToolChunkWhenNoDeltas(t *t
 	stream := strings.NewReader(strings.Join([]string{
 		`data: {"type":"response.output_item.added","item":{"id":"fc_item_123","type":"function_call"}}`,
 		`data: {"type":"response.output_item.done","item":{"id":"fc_item_123","type":"function_call","call_id":"call_final_456","name":"channels_respond","arguments":"{\"text\":\"hello\"}"}}`,
+		`data: {"type":"response.completed"}`,
 		`data: [DONE]`,
 		``,
 	}, "\n"))

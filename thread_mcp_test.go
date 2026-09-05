@@ -123,7 +123,7 @@ func TestSpawn_WithMCP_RegistersToolsPrefixed(t *testing.T) {
 	}()
 
 	err := thinker.threads.SpawnWithOpts("worker", "worker directive", []string{"send"}, SpawnOpts{
-		MCPNames: []string{"catalog-mcp"},
+		DeferRun: true, MCPNames: []string{"catalog-mcp"},
 		ParentID: "main",
 	})
 	if err != nil {

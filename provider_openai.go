@@ -465,6 +465,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		pendingBuf strings.Builder
 	})
 
+	streamDone := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -478,6 +479,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
+			streamDone = true
 			break
 		}
 		// Debug: dump the raw delta so we can see what fields Fireworks is
@@ -494,7 +496,8 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 				Code    any    `json:"code"`
 			} `json:"error,omitempty"`
 			Choices []struct {
-				Delta struct {
+				FinishReason *string `json:"finish_reason"`
+				Delta        struct {
 					Content          string                `json:"content"`
 					ReasoningContent string                `json:"reasoning_content,omitempty"`
 					Reasoning        string                `json:"reasoning,omitempty"`
@@ -505,6 +508,14 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
+		}
+		for _, choice := range event.Choices {
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				if *choice.FinishReason == "length" || *choice.FinishReason == "content_filter" {
+					return ChatResponse{}, fmt.Errorf("incomplete OpenAI-compatible response: %s", *choice.FinishReason)
+				}
+				streamDone = true
+			}
 		}
 		if event.Error != nil {
 			return failed("stream_error", fmt.Errorf("provider stream error (%s/%v): %s", event.Error.Type, event.Error.Code, event.Error.Message))
@@ -597,6 +608,10 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		return failed("stream_read", fmt.Errorf("stream read error: %w (model=%s request_ids=%v)", scerr, model, reqIDs))
 	}
 
+	if !streamDone {
+		return failed("stream_incomplete", fmt.Errorf("provider stream ended before completion"))
+	}
+
 	// Assemble completed tool calls
 	var toolCalls []NativeToolCall
 	for i := 0; i < len(pendingTools); i++ {
@@ -614,7 +629,12 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 		}
 		args := make(map[string]string)
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(pt.argsJSON.String()), &raw); err == nil {
+		if pt.id == "" || pt.name == "" {
+			return failed("tool_invalid", fmt.Errorf("tool call missing identity"))
+		}
+		if err := json.Unmarshal([]byte(pt.argsJSON.String()), &raw); err != nil || raw == nil {
+			return failed("tool_invalid", fmt.Errorf("invalid tool arguments for %s", pt.name))
+		} else {
 			for k, v := range raw {
 				switch v.(type) {
 				case string:
@@ -627,9 +647,11 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 			}
 		}
 		toolCalls = append(toolCalls, NativeToolCall{
-			ID:   pt.id,
-			Name: pt.name,
-			Args: args,
+			ID:            pt.id,
+			Name:          pt.name,
+			Args:          args,
+			RawArgs:       pt.argsJSON.String(),
+			CanonicalArgs: json.RawMessage(pt.argsJSON.String()),
 		})
 	}
 

@@ -1,0 +1,21 @@
+name: Test
+on:
+  push:
+    branches: ['main']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -short -count=1 -timeout=240s ./...
+      - run: go vet ./...
+      - run: go test -race -short -count=1 -timeout=240s .
+      - run: bash scripts/test-modules.sh
+      - run: go build -o /tmp/apteva-core ./cmd/apteva-core
+      - run: /tmp/apteva-core --version

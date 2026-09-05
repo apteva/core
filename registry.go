@@ -1,7 +1,10 @@
 package core
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -9,9 +12,10 @@ import (
 
 // ToolResponse is the return value from a tool handler.
 type ToolResponse struct {
-	Text    string // text result (always present)
-	Image   []byte // optional image (screenshot etc.) — sent as part of tool result to LLM
-	IsError bool   // true when the tool returned an MCP-level isError result
+	Parts   []ContentPart // non-text protocol content
+	Text    string        // text result (always present)
+	Image   []byte        // optional image (screenshot etc.) — sent as part of tool result to LLM
+	IsError bool          // true when the tool returned an MCP-level isError result
 }
 
 type WakeOnResultPolicy string
@@ -22,6 +26,19 @@ const (
 )
 
 const wakeOnResultMetaKey = "io.apteva/wakeOnResult"
+
+// ToolTurnDisposition describes what a successful inline Core-tool result
+// means for the current model turn. Ordinary tools continue so the model can
+// consume their receipt. Control tools may deliberately yield or terminate.
+// External/MCP tools use WakeOnResult because their results arrive
+// asynchronously through the event bus.
+type ToolTurnDisposition string
+
+const (
+	ToolTurnContinue  ToolTurnDisposition = "continue"
+	ToolTurnYield     ToolTurnDisposition = "yield"
+	ToolTurnTerminate ToolTurnDisposition = "terminate"
+)
 
 func normalizeWakeOnResultPolicy(v any) WakeOnResultPolicy {
 	switch strings.ToLower(strings.TrimSpace(fmt.Sprint(v))) {
@@ -36,30 +53,36 @@ func normalizeWakeOnResultPolicy(v any) WakeOnResultPolicy {
 
 // ToolDef defines a tool available to threads.
 type ToolDef struct {
-	Name        string
-	Description string                                    // human-readable
-	Syntax      string                                    // example usage
-	Rules       string                                    // usage rules for the prompt
-	Core        bool                                      // always in prompt (pace, send, done, evolve, search_tools)
-	MainOnly    bool                                      // only for main thread (spawn, kill)
-	ThreadOnly  bool                                      // only for sub-threads, not main (reply)
-	SystemOnly  bool                                      // only for system threads (unconscious)
-	MCP         bool                                      // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
-	MCPServer   string                                    // name of the MCP server that provides this tool
-	MCPApp      bool                                      // routed through Apteva's authenticated app MCP gateway
-	Handler     func(args map[string]string) ToolResponse // nil = handled inline by tool handler
-	InputSchema map[string]any                            // JSON Schema for native tool calling (nil = auto-generated from Syntax)
+	native         NativeTool
+	Name           string
+	Description    string // human-readable
+	Syntax         string // example usage
+	Rules          string // usage rules for the prompt
+	Core           bool   // always in prompt (pace, send, done, evolve, search_tools)
+	MainOnly       bool   // only for main thread (spawn, kill)
+	ThreadOnly     bool   // only for sub-threads, not main (reply)
+	SystemOnly     bool   // only for system threads (unconscious)
+	MCP            bool   // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
+	MCPServer      string // name of the MCP server that provides this tool
+	MCPApp         bool   // routed through Apteva's authenticated app MCP gateway
+	HandlerContext func(context.Context, map[string]string) ToolResponse
+	Handler        func(args map[string]string) ToolResponse // nil = handled inline by tool handler
+	InputSchema    map[string]any                            // JSON Schema for native tool calling (nil = auto-generated from Syntax)
 	// WakeOnResult controls whether an async tool result wakes the thinker.
 	// Default is always. MCP tools may override this via
 	// _meta["io.apteva/wakeOnResult"] = "on_error".
 	WakeOnResult WakeOnResultPolicy
+	// TurnDisposition defaults to continue for inline Core tools. pace yields
+	// after a successful result; done terminates its worker.
+	TurnDisposition ToolTurnDisposition
 }
 
 // ToolRegistry holds all tool definitions.
 type ToolRegistry struct {
-	mu     sync.RWMutex
-	tools  map[string]*ToolDef
-	apiKey string
+	serverSlots sync.Map
+	mu          sync.RWMutex
+	tools       map[string]*ToolDef
+	apiKey      string
 }
 
 // sortedToolKeys returns tool names in deterministic sorted order.
@@ -83,6 +106,14 @@ func NewToolRegistry(apiKey string) *ToolRegistry {
 	return tr
 }
 
+// modelMCPManagementEnabled is an explicit host-owned administrative
+// capability. MCP configuration remains available through Core's
+// authenticated API regardless; this flag controls only whether the model may
+// add or remove servers at runtime.
+func modelMCPManagementEnabled() bool {
+	return parseTruthy(os.Getenv("APTEVA_MODEL_MCP_MANAGEMENT"))
+}
+
 func (tr *ToolRegistry) registerDefaults() {
 	// Scaffolding meta-tools — search + (eventually) load_tool. Listed
 	// first so they sort to the top of the registry for readers and
@@ -90,11 +121,12 @@ func (tr *ToolRegistry) registerDefaults() {
 	registerSearchTool(tr)
 	// Core tools — always in prompt
 	tr.Register(&ToolDef{
-		Name:        "pace",
-		Description: "pace sets your next automatic wake. Set, replace, inspect, or clear that one pending wake. It can also select a temporary runtime model/provider/reasoning profile for subsequent calls. Timing settings and the pending wake survive restarts, and Core never advances it on its own: events may wake the thread early without changing it, and a timer wake is consumed after the agent processes it.",
-		Syntax:      `[[pace sleep="5m"]]`,
-		Rules:       `sleep accepts ms, s, m, or h and is capped at 24h; do not use d or w. sleep or rate sets/replaces the pending wake from the current time. clear_wake=true removes it and cannot be combined with sleep or rate. Sleeping and waiting make no LLM calls, so a normal timing call must omit model, provider, and reasoning. Keep reasoning=auto as the ordinary baseline. Use small or low/minimal only when the subsequent work itself is genuinely trivial and low-risk, never merely because the thread will wait. A new external instruction or thread message restores the configured model/reasoning floor for that active workflow; timer-only routine work may retain a deliberate temporary profile. A profile-only call preserves the pending wake; pace() reports it unchanged. After a timer wake, call pace if you want another automatic wake. For longer responsibilities, schedule at most 24h and reassess using the fresh [CURRENT TIME]. No scheduler or waiting thread is required.`,
-		Core:        true,
+		Name:            "pace",
+		Description:     "pace sets your next automatic wake. Set, replace, inspect, or clear that one pending wake. It can also select a temporary runtime model/provider/reasoning profile for subsequent calls. Timing settings and the pending wake survive restarts, and Core never advances it on its own: events may wake the thread early without changing it, and a timer wake is consumed after the agent processes it.",
+		Syntax:          `[[pace sleep="5m"]]`,
+		Rules:           `sleep accepts ms, s, m, or h and is capped at 24h; do not use d or w. sleep or rate sets/replaces the pending wake from the current time. clear_wake=true removes it and cannot be combined with sleep or rate. Sleeping and waiting make no LLM calls, so a normal timing call must omit model, provider, and reasoning. Keep reasoning=auto as the ordinary baseline. Use small or low/minimal only when the subsequent work itself is genuinely trivial and low-risk, never merely because the thread will wait. A new external instruction or thread message restores the configured model/reasoning floor for that active workflow; timer-only routine work may retain a deliberate temporary profile. A profile-only call preserves the pending wake; pace() reports it unchanged. After a timer wake, call pace if you want another automatic wake. For longer responsibilities, schedule at most 24h and reassess using the fresh [CURRENT TIME]. No scheduler or waiting thread is required.`,
+		Core:            true,
+		TurnDisposition: ToolTurnYield,
 		// All fields optional — pace() with no args reports current state.
 		InputSchema: map[string]any{
 			"type": "object",
@@ -130,11 +162,13 @@ func (tr *ToolRegistry) registerDefaults() {
 		},
 	})
 	tr.Register(&ToolDef{
-		Name:        "done",
-		Description: "Permanently terminate this thread. Send a final message and shut down.",
-		Syntax:      `[[done message="Final result"]]`,
-		Rules:       `PERMANENTLY kills this thread. A one-shot worker should call done after reporting any final result owed to its parent. Persistent event-driven threads should remain active after ordinary replies.`,
-		Core:        true,
+		Name:            "done",
+		Description:     "Deliver this worker's complete final result to its parent and permanently terminate the worker. For a completed one-shot assignment, call this tool with the result in message. Ordinary assistant text is private and does not deliver a result to the parent.",
+		Syntax:          `[[done message="Final result"]]`,
+		Rules:           `PERMANENTLY kills this thread. A one-shot worker returns its complete final result once through done(message); do not send the same final result separately first. Persistent event-driven threads should remain active and use send for requested reports. Call done alone, only after all earlier tool results have been consumed.`,
+		Core:            true,
+		ThreadOnly:      true,
+		TurnDisposition: ToolTurnTerminate,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -166,10 +200,9 @@ func (tr *ToolRegistry) registerDefaults() {
 		},
 	})
 
-	// remember tool intentionally NOT registered for now. Memory writes
-	// are off until we redesign that subsystem — the dispatch case in
-	// thinker.go / thread.go and the MemoryStore code stay in place so
-	// re-enabling is a one-line change (uncomment the Register block).
+	// remember is intentionally not model-facing. Memory writes belong to the
+	// platform-managed unconscious thread; the MemoryStore implementation
+	// remains available to that internal path.
 	/*
 		tr.Register(&ToolDef{
 			Name:        "remember",
@@ -189,9 +222,9 @@ func (tr *ToolRegistry) registerDefaults() {
 	// Main-only tools
 	tr.Register(&ToolDef{
 		Name:        "spawn",
-		Description: "Create a new thread with its own directive, hard tool capabilities, and continuous thinking loop. Use it when work materially benefits from distinct ownership or operational state, parallel execution, waiting or retries, continued operation, substantial context isolation, or independent failure handling. For multiple independent work units, assign focused owners instead of executing the first unit on the current thread. Capability alone does not determine ownership: keep only very small immediately completing actions local. Group closely related continuing responsibilities under one focused owner instead of creating one thread per schedule. Write a compact, self-contained worker directive containing only the context it needs: state the objective, non-negotiable constraints, exact scope, success criteria, and stop conditions explicitly; put constraints before operational detail and omit unrelated parent context. Make the handoff operationally complete: explicitly name any required shared procedure or policy, restate every constraint whose omission could make the work unsafe or invalid, and never rely on vague references such as \"the shared skill\" or \"the shared guidance\". By default the worker starts thinking immediately on its directive; pass paused=\"true\" to spawn it dormant — it'll wake on the first `send` you give it. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
+		Description: "Create a thread with its own directive, hard tool capabilities, and continuous thinking loop. Temporary and continuing workers are the same thread type: a completed one-shot worker ends with done(message), while a persistent owner sends requested reports and uses pace between cycles. Use spawn when work materially benefits from distinct ownership or operational state, parallel execution, waiting or retries, continued operation, substantial context isolation, or independent failure handling. For multiple independent work units, assign focused owners instead of executing the first unit on the current thread. Capability alone does not determine ownership: keep only very small immediately completing actions local. Group closely related continuing responsibilities under one focused owner instead of creating one thread per schedule. Write a compact, self-contained worker directive containing only the context it needs: state the objective, non-negotiable constraints, exact scope, success criteria, and stop conditions explicitly; put constraints before operational detail and omit unrelated parent context. Make the handoff operationally complete: explicitly name any required shared procedure or policy, restate every constraint whose omission could make the work unsafe or invalid, and never rely on vague references such as \"the shared skill\" or \"the shared guidance\". By default the worker starts thinking immediately on its directive; pass paused=\"true\" to spawn it dormant — it'll wake on the first `send` you give it. Use media to pass audio/image/video URLs for the new thread's LLM to analyze natively.",
 		Syntax:      `spawn(id="name", directive="What this thread does", tools="web,exec,store_lookup", mcp="store", paused="true")`,
-		Rules:       `id: unique name. directive: a compact, self-contained instruction containing only the worker's objective, non-negotiable constraints, exact scope, success criteria, stop conditions, and necessary context. Put constraints before operational detail; omit unrelated parent context. Explicitly name required shared procedures or policies, restate safety- or validity-critical constraints, and never use an opaque reference such as "the shared skill" as the worker's only instruction. tools: hard exact capability grant containing comma-separated FULL tool names (e.g. store_lookup); exact grants never imply sibling tools. mcp: optional comma-separated whole-server discovery scopes; grant one only when the worker may discover/use that server's broader surface. If a worker needs an exact visible tool, do not leave tools empty. provider: LLM provider name (optional). model and reasoning are optional configured baselines; omit them to receive large+auto. Use small or low/minimal only for a genuinely trivial, low-risk worker. Substantial analysis, synthesis, ambiguity, multi-tool coordination, or consequential work requires at least medium+auto/medium; use large or higher reasoning when warranted. paused: "true" to spawn dormant. Threads are ordinary non-realtime workers by default. Set realtime="true" only when bidirectional voice/audio is explicitly required and a realtime provider is configured. voice is optional for realtime threads. Omit realtime_profile for ordinary workers and provider-default realtime behavior; set realtime_profile="telephony" only with realtime="true" for narrowband telephone audio. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
+		Rules:       `id: unique name. directive: a compact, self-contained instruction containing only the worker's objective, non-negotiable constraints, exact scope, success criteria, stop conditions, and necessary context. Put constraints before operational detail; omit unrelated parent context. Explicitly name required shared procedures or policies, restate safety- or validity-critical constraints, and never use an opaque reference such as "the shared skill" as the worker's only instruction. All workers use the same thread abstraction: one-shot workers finish with done(message); persistent workers send requested reports and pace without terminating. tools: hard exact capability grant containing comma-separated FULL tool names (e.g. store_lookup); exact grants never imply sibling tools. mcp: optional comma-separated whole-server discovery scopes; grant one only when the worker may discover/use that server's broader surface. If a worker needs an exact visible tool, do not leave tools empty. provider: LLM provider name (optional). model and reasoning are optional configured baselines; omit them to receive large+auto. Use small or low/minimal only for a genuinely trivial, low-risk worker. Substantial analysis, synthesis, ambiguity, multi-tool coordination, or consequential work requires at least medium+auto/medium; use large or higher reasoning when warranted. paused: "true" to spawn dormant. Threads are ordinary non-realtime workers by default. Set realtime="true" only when bidirectional voice/audio is explicitly required and a realtime provider is configured. voice is optional for realtime threads. Omit realtime_profile for ordinary workers and provider-default realtime behavior; set realtime_profile="telephony" only with realtime="true" for narrowband telephone audio. media: space-separated URLs (audio/image/video) — sent directly to the thread's LLM as native content for analysis.`,
 		Core:        true,
 		MainOnly:    true,
 		InputSchema: map[string]any{
@@ -269,40 +302,42 @@ func (tr *ToolRegistry) registerDefaults() {
 			"required": []string{"id"},
 		},
 	})
-	tr.Register(&ToolDef{
-		Name:        "connect",
-		Description: "Register a NEW MCP server at runtime that isn't already in the instance catalog. For MCP servers already listed under [AVAILABLE MCP SERVERS] in your prompt, do NOT use connect — use spawn(mcp=\"name\", ...) to give a worker access to those tools. Only reach for connect when you need to hook up a brand-new server by URL.",
-		Syntax:      `[[connect name="server-name" url="http://host:port/mcp/1" transport="http"]]`,
-		Rules:       `HTTP only here: pass url and transport="http". The URL must already exist in instance configuration or its host must be listed in APTEVA_MCP_CONNECT_ALLOWLIST. Runtime stdio commands are forbidden; configure those through the authenticated server API.`,
-		Core:        true,
-		MainOnly:    true,
-		// Runtime process execution is deliberately not part of this tool.
-		// Host-managed stdio MCPs are configured through the authenticated
-		// server API, outside model control.
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"name":      map[string]any{"type": "string", "description": "Friendly name for the new MCP server."},
-				"url":       map[string]any{"type": "string", "description": "HTTP endpoint for Streamable-HTTP transport."},
-				"transport": map[string]any{"type": "string", "description": "\"http\" for Streamable-HTTP."},
+	if modelMCPManagementEnabled() {
+		tr.Register(&ToolDef{
+			Name:        "connect",
+			Description: "Register a NEW MCP server at runtime that isn't already in the instance catalog. For MCP servers already listed under [AVAILABLE MCP SERVERS] in your prompt, do NOT use connect — use spawn(mcp=\"name\", ...) to give a worker access to those tools. Only reach for connect when you need to hook up a brand-new server by URL.",
+			Syntax:      `[[connect name="server-name" url="http://host:port/mcp/1" transport="http"]]`,
+			Rules:       `HTTP only here: pass url and transport="http". The URL must already exist in instance configuration or its host must be listed in APTEVA_MCP_CONNECT_ALLOWLIST. Runtime stdio commands are forbidden; configure those through the authenticated server API.`,
+			Core:        true,
+			MainOnly:    true,
+			// Runtime process execution is deliberately not part of this tool.
+			// Host-managed stdio MCPs are configured through the authenticated
+			// server API, outside model control.
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":      map[string]any{"type": "string", "description": "Friendly name for the new MCP server."},
+					"url":       map[string]any{"type": "string", "description": "HTTP endpoint for Streamable-HTTP transport."},
+					"transport": map[string]any{"type": "string", "description": "\"http\" for Streamable-HTTP."},
+				},
+				"required": []string{"name", "url", "transport"},
 			},
-			"required": []string{"name", "url", "transport"},
-		},
-	})
-	tr.Register(&ToolDef{
-		Name:        "disconnect",
-		Description: "Disconnect from a running MCP server and unregister its tools.",
-		Syntax:      `[[disconnect name="server-name"]]`,
-		Core:        true,
-		MainOnly:    true,
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"name": map[string]any{"type": "string", "description": "Name of the MCP server to disconnect."},
+		})
+		tr.Register(&ToolDef{
+			Name:        "disconnect",
+			Description: "Disconnect from a running MCP server and unregister its tools.",
+			Syntax:      `[[disconnect name="server-name"]]`,
+			Core:        true,
+			MainOnly:    true,
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string", "description": "Name of the MCP server to disconnect."},
+				},
+				"required": []string{"name"},
 			},
-			"required": []string{"name"},
-		},
-	})
+		})
+	}
 	tr.Register(&ToolDef{
 		Name:        "list_connected",
 		Description: "List all MCP servers currently connected to this instance.",
@@ -323,7 +358,20 @@ func (tr *ToolRegistry) registerDefaults() {
 func (tr *ToolRegistry) Register(tool *ToolDef) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	tr.tools[tool.Name] = tool
+	cloned := *tool
+	nt := NativeTool{Name: tool.Name, Description: tool.Description}
+	if tool.Rules != "" {
+		nt.Description += " " + tool.Rules
+	}
+	schema := tool.InputSchema
+	if schema == nil {
+		schema = schemaFromSyntax(tool.Syntax)
+	}
+	nt.Parameters = copyAndInjectReason(schema)
+	raw, _ := json.Marshal(nt)
+	nt.serializedBytes = len(raw)
+	cloned.native = nt
+	tr.tools[tool.Name] = &cloned
 }
 
 func (tr *ToolRegistry) Get(name string) *ToolDef {
@@ -371,6 +419,9 @@ func (tr *ToolRegistry) CoreDocsSummary(includeMainOnly bool, includeSystemOnly 
 		if tool.MainOnly && !includeMainOnly {
 			continue
 		}
+		if tool.ThreadOnly && (includeMainOnly || sysOnly) {
+			continue
+		}
 		if tool.SystemOnly && !sysOnly {
 			continue
 		}
@@ -400,6 +451,9 @@ func (tr *ToolRegistry) CoreDocs(includeMainOnly bool, includeSystemOnly ...bool
 		if tool.MainOnly && !includeMainOnly {
 			continue
 		}
+		if tool.ThreadOnly && (includeMainOnly || sysOnly) {
+			continue
+		}
 		if tool.SystemOnly && !sysOnly {
 			continue
 		}
@@ -413,11 +467,29 @@ func (tr *ToolRegistry) CoreDocs(includeMainOnly bool, includeSystemOnly ...bool
 
 // Dispatch executes a tool by name if it has a Handler. Returns response and whether it was handled.
 func (tr *ToolRegistry) Dispatch(name string, args map[string]string) (ToolResponse, bool) {
+	return tr.DispatchContext(context.Background(), name, args)
+}
+
+func (tr *ToolRegistry) DispatchContext(ctx context.Context, name string, args map[string]string) (ToolResponse, bool) {
 	tr.mu.RLock()
 	tool, exists := tr.tools[name]
 	tr.mu.RUnlock()
-	if !exists || tool.Handler == nil {
+	if !exists || (tool.Handler == nil && tool.HandlerContext == nil) {
 		return ToolResponse{}, false
+	}
+	if ctx.Err() != nil {
+		return ToolResponse{Text: ctx.Err().Error(), IsError: true}, true
+	}
+	if tool.MCP && tool.MCPServer != "" {
+		slot, _ := tr.serverSlots.LoadOrStore(tool.MCPServer, make(chan struct{}, 8))
+		release, err := acquireBudget(ctx, slot.(chan struct{}))
+		if err != nil {
+			return ToolResponse{Text: err.Error(), IsError: true}, true
+		}
+		defer release()
+	}
+	if tool.HandlerContext != nil {
+		return tool.HandlerContext(ctx, args), true
 	}
 	return tool.Handler(args), true
 }
@@ -498,20 +570,7 @@ func (tr *ToolRegistry) NativeTools(allowlist, active map[string]bool, includeSy
 			continue
 		}
 
-		nt := NativeTool{
-			Name:        tool.Name,
-			Description: tool.Description,
-		}
-		if tool.Rules != "" {
-			nt.Description += " " + tool.Rules
-		}
-
-		// Use explicit schema if provided, otherwise generate from syntax
-		if tool.InputSchema != nil {
-			nt.Parameters = copyAndInjectReason(tool.InputSchema)
-		} else {
-			nt.Parameters = copyAndInjectReason(schemaFromSyntax(tool.Syntax))
-		}
+		nt := tool.native
 		out = append(out, nt)
 	}
 	return out
@@ -545,16 +604,17 @@ func toolVisible(tool *ToolDef, allowlist, active map[string]bool, includeSystem
 	return true
 }
 
-// copyAndInjectReason adds the _reason field to a tool's JSON Schema.
-// Returns a shallow copy so the original schema is not modified.
+// copyAndInjectReason builds the model-facing copy of a tool's JSON Schema and
+// adds the _reason field. Advisory "default" annotations are deliberately
+// omitted from this copy: omission is meaningful for MCP arguments, while
+// some models otherwise materialize every optional default into a tool call.
+// The authoritative schema kept on ToolDef is not modified and remains
+// available for typed dispatch and app-side validation.
 func copyAndInjectReason(schema map[string]any) map[string]any {
-	out := make(map[string]any, len(schema)+1)
-	for k, v := range schema {
-		out[k] = v
-	}
+	out := cloneSchemaWithoutDefaults(schema)
 	// Copy properties map and add _reason
 	props := make(map[string]any)
-	if existing, ok := schema["properties"].(map[string]any); ok {
+	if existing, ok := out["properties"].(map[string]any); ok {
 		for k, v := range existing {
 			props[k] = v
 		}
@@ -581,6 +641,81 @@ func copyAndInjectReason(schema map[string]any) map[string]any {
 	required = append(required, "_reason")
 	out["required"] = required
 	return out
+}
+
+// cloneSchemaWithoutDefaults deep-copies a schema while dropping only JSON
+// Schema's default annotation. Named maps such as properties and $defs retain
+// their keys, including the legal (if unusual) property name "default".
+func cloneSchemaWithoutDefaults(schema map[string]any) map[string]any {
+	if schema == nil {
+		return map[string]any{}
+	}
+	return cloneSchemaNodeWithoutDefaults(schema)
+}
+
+func cloneSchemaNodeWithoutDefaults(schema map[string]any) map[string]any {
+	out := make(map[string]any, len(schema))
+	for key, value := range schema {
+		if key == "default" {
+			continue
+		}
+		switch key {
+		case "properties", "patternProperties", "$defs", "definitions", "dependentSchemas":
+			if named, ok := value.(map[string]any); ok {
+				cloned := make(map[string]any, len(named))
+				for name, child := range named {
+					if childSchema, ok := child.(map[string]any); ok {
+						cloned[name] = cloneSchemaNodeWithoutDefaults(childSchema)
+					} else {
+						cloned[name] = cloneJSONValue(child)
+					}
+				}
+				out[key] = cloned
+				continue
+			}
+		case "allOf", "anyOf", "oneOf", "prefixItems":
+			if variants, ok := value.([]any); ok {
+				cloned := make([]any, len(variants))
+				for i, child := range variants {
+					if childSchema, ok := child.(map[string]any); ok {
+						cloned[i] = cloneSchemaNodeWithoutDefaults(childSchema)
+					} else {
+						cloned[i] = cloneJSONValue(child)
+					}
+				}
+				out[key] = cloned
+				continue
+			}
+		case "items", "contains", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else":
+			if childSchema, ok := value.(map[string]any); ok {
+				out[key] = cloneSchemaNodeWithoutDefaults(childSchema)
+				continue
+			}
+		}
+		out[key] = cloneJSONValue(value)
+	}
+	return out
+}
+
+func cloneJSONValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			out[key] = cloneJSONValue(child)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = cloneJSONValue(child)
+		}
+		return out
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return value
+	}
 }
 
 // schemaFromSyntax extracts a JSON Schema from tool syntax like: [[name key="val" key2="val2"]]

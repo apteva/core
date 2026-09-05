@@ -145,8 +145,19 @@ func TestLLMTransportMultiplexesOverWarmConnection(t *testing.T) {
 // falls back to. With Go's default MaxIdleConnsPerHost of 2, a second burst
 // reopens nearly every connection.
 func TestLLMTransportReusesIdleConnectionsAcrossBursts(t *testing.T) {
+	const burst = 20
 	var conns int64
+	var requests atomic.Int32
+	entered := make(chan struct{}, 2*burst)
+	releases := []chan struct{}{make(chan struct{}), make(chan struct{})}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		batch := int(requests.Add(1)-1) / burst
+		entered <- struct{}{}
+		select {
+		case <-releases[batch]:
+		case <-r.Context().Done():
+			return
+		}
 		w.Write([]byte("ok"))
 	}))
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -161,8 +172,7 @@ func TestLLMTransportReusesIdleConnectionsAcrossBursts(t *testing.T) {
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr}
 
-	const burst = 20
-	fire := func() {
+	fire := func(batch int) {
 		var wg sync.WaitGroup
 		for i := 0; i < burst; i++ {
 			wg.Add(1)
@@ -170,6 +180,7 @@ func TestLLMTransportReusesIdleConnectionsAcrossBursts(t *testing.T) {
 				defer wg.Done()
 				resp, err := client.Get(srv.URL)
 				if err != nil {
+					t.Errorf("request: %v", err)
 					return
 				}
 				// Body must be drained AND closed for the connection to
@@ -178,12 +189,23 @@ func TestLLMTransportReusesIdleConnectionsAcrossBursts(t *testing.T) {
 				resp.Body.Close()
 			}()
 		}
+		// Force identical concurrency in both bursts. Without this barrier a
+		// fast first burst can warm fewer sockets than the second burst needs.
+		for i := 0; i < burst; i++ {
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				close(releases[batch])
+				t.Fatal("burst did not reach expected concurrency")
+			}
+		}
+		close(releases[batch])
 		wg.Wait()
 	}
 
-	fire()
+	fire(0)
 	afterFirst := atomic.LoadInt64(&conns)
-	fire()
+	fire(1)
 	afterSecond := atomic.LoadInt64(&conns)
 
 	newInSecond := afterSecond - afterFirst

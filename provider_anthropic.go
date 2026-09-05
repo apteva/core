@@ -424,6 +424,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	var serverResults []ServerToolResult
 	var currentServerTool string // name of server tool being executed
 	var stopReason string
+	completedStream := false
 
 	// Track current tool_use block being streamed
 	type pendingTool struct {
@@ -526,6 +527,12 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 				// Parse accumulated JSON into args
 				args := make(map[string]string)
 				var raw map[string]any
+				if currentTool.json.Len() == 0 {
+					currentTool.json.WriteString("{}")
+				}
+				if err := json.Unmarshal([]byte(currentTool.json.String()), &raw); err != nil || raw == nil || currentTool.id == "" || currentTool.name == "" {
+					return ChatResponse{}, fmt.Errorf("invalid Anthropic tool call arguments or identity")
+				}
 				if err := json.Unmarshal([]byte(currentTool.json.String()), &raw); err == nil {
 					for k, v := range raw {
 						switch v.(type) {
@@ -538,9 +545,11 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 					}
 				}
 				toolCalls = append(toolCalls, NativeToolCall{
-					ID:   currentTool.id,
-					Name: currentTool.name,
-					Args: args,
+					ID:            currentTool.id,
+					Name:          currentTool.name,
+					Args:          args,
+					RawArgs:       currentTool.json.String(),
+					CanonicalArgs: json.RawMessage(currentTool.json.String()),
 				})
 				currentTool = nil
 			}
@@ -567,6 +576,8 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 						u.CacheRead, u.CacheCreation, u.InputTokens, usage.PromptTokens))
 				}
 			}
+		case "message_stop":
+			completedStream = true
 		case "message_delta":
 			if event.Delta != nil && event.Delta.StopReason != "" {
 				stopReason = event.Delta.StopReason
@@ -594,6 +605,9 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		return ChatResponse{}, fmt.Errorf("Anthropic response ended with incomplete tool input for %s after %d bytes (stop_reason=%s)", currentTool.name, currentTool.json.Len(), reason)
 	}
 
+	if !completedStream {
+		return ChatResponse{}, fmt.Errorf("Anthropic stream ended before message_stop")
+	}
 	return ChatResponse{
 		Text:          full.String(),
 		ToolCalls:     toolCalls,

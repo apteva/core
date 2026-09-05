@@ -44,9 +44,9 @@ TIME AND STATE:
 IMPORTANT — tool calls and done:
 - ` + toolArgumentPresenceContract + `
 - ` + reasoningBaselineContract + `
-- NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
-- Always wait for tool results before calling done — you need to confirm the action succeeded.
-- Example: Thought 1: pushover_send_notification(...). Thought 2: see result, confirm success, done.`
+- A one-shot worker returns its complete final result exactly once with done(message). Do not send the same final result separately first.
+- Call done alone and only after all earlier tool results have arrived; a mixed done-plus-tool batch is rejected.
+- Example: Thought 1: call the required work tool. Thought 2: consume its result, then call done(message="Final result").`
 
 // leaderThreadPromptTemplate is for threads that CAN spawn sub-threads (depth < MaxSpawnDepth).
 const leaderThreadPromptTemplate = `You are a SUB-THREAD (id="%s") in a continuous thinking engine. You were spawned by the %s thread.
@@ -89,14 +89,16 @@ TIME AND STATE:
 IMPORTANT — tool calls and done:
 - ` + toolArgumentPresenceContract + `
 - ` + reasoningBaselineContract + `
-- NEVER call done in the same thought as a tool call. Tool results arrive in your NEXT thought.
-- Always wait for tool results before calling done — you need to confirm the action succeeded.`
+- A one-shot worker returns its complete final result exactly once with done(message). Do not send the same final result separately first.
+- Call done alone and only after all earlier tool results have arrived; a mixed done-plus-tool batch is rejected.`
 
-const normalThreadReportingPrompt = `- Send your parent the final result when it requested work and is waiting for an answer. Also report meaningful milestones that change the plan, blockers or terminal failures, authority or resource requests, and conflicts affecting other work.
+const normalThreadReportingPrompt = `- If this is a one-shot assignment, return the complete final result exactly once with done(message); do not send that same result separately first.
+- Ordinary assistant text stays in your private thread transcript. It does not reach your parent and does not complete your assignment. When a one-shot result is ready, make the actual native done tool call with the result in its message argument; do not end with the result as plain text or merely describe the call.
+- If this is continuing work, send requested results to your parent and remain active. Also send meaningful milestones that change the plan, blockers or terminal failures, authority or resource requests, and conflicts affecting other work.
 - Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures in this thread. A persistent owner does not report every successful cycle unless its parent explicitly requested that result.
 - If you lead children, aggregate related activity before reporting upward instead of forwarding every event.`
 
-const normalThreadIdlePrompt = `- When current work is done and any result owed to your parent has been sent, decide whether you need another automatic wake. Use pace(sleep="5m") or pace(sleep="1h") to set one; use pace(clear_wake=true) to wait only for events.`
+const normalThreadIdlePrompt = `- When continuing work reaches a wait boundary and any result owed to your parent has been sent, decide whether you need another automatic wake. Use pace(sleep="5m") or pace(sleep="1h") to set one; use pace(clear_wake=true) to wait only for events. A completed one-shot assignment ends with done(message) instead.`
 
 const normalThreadReasoningPrompt = `- Think out loud — explain what you're doing and why. Never output empty thoughts.`
 
@@ -193,9 +195,10 @@ type ThreadInfo struct {
 }
 
 type Thread struct {
-	ID     string
-	Name   string // human-readable label, separate from ID. ID is immutable;
-	System bool   // platform-managed thread, not an agent-addressable worker
+	cachedToolNames []string
+	ID              string
+	Name            string // human-readable label, separate from ID. ID is immutable;
+	System          bool   // platform-managed thread, not an agent-addressable worker
 	// Name can be edited via update without touching parent_id
 	// references or session storage. Empty means "use ID for display".
 	ParentID      string   // "main" or parent thread ID
@@ -234,6 +237,8 @@ type Thread struct {
 }
 
 type ThreadManager struct {
+	order   []string
+	spawnMu sync.Mutex
 	mu      sync.RWMutex
 	threads map[string]*Thread
 	parent  *Thinker
@@ -359,16 +364,19 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if id == "main" {
 		return fmt.Errorf("thread id %q is reserved", id)
 	}
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
+	tm.spawnMu.Lock()
+	defer tm.spawnMu.Unlock()
+	tm.mu.RLock()
+	_, alreadyExists := tm.threads[id]
+	tm.mu.RUnlock()
 	logMsg("SPAWN", fmt.Sprintf("acquired tm.mu id=%q", id))
 
-	if _, exists := tm.threads[id]; exists {
+	if alreadyExists {
 		logMsg("SPAWN", fmt.Sprintf("reject id=%q: already exists in this manager", id))
 		return fmt.Errorf("thread %q already exists", id)
 	}
 	// Also check the entire tree — prevent duplicates across hierarchy levels
-	if threadExistsInTree(tm, id) {
+	if threadExistsInTreeLocked(tm, id) {
 		logMsg("SPAWN", fmt.Sprintf("reject id=%q: already exists elsewhere in tree", id))
 		return fmt.Errorf("thread %q already exists in tree", id)
 	}
@@ -674,6 +682,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	initialSleep, initialWake := restorePersistentPace(opts.Pace, 10*time.Second, time.Now())
 	thinker := &Thinker{
+		owner:    tm,
 		apiKey:   tm.parent.apiKey,
 		pool:     tm.parent.pool,
 		provider: threadProvider,
@@ -734,7 +743,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			return fmt.Errorf("persist event execution propagation: %w", err)
 		}
 	}
-	thinker.onStop = func() { tm.cleanupThread(thinker.threadID) }
+	thinker.onStop = func() { tm.cleanupThreadInstance(thinker.threadID, thinker) }
 	thread.Thinker = thinker
 	if !thread.Ephemeral {
 		thinker.persistPace = func(state PersistentPaceState) error {
@@ -795,7 +804,12 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		thread.Realtime.setInitialMessage(thread.initialMessage)
 	}
 
+	thread.runStarted = !opts.DeferRun
+	thinker.paused = opts.Paused
+	tm.mu.Lock()
+	tm.order = nil
 	tm.threads[id] = thread
+	tm.mu.Unlock()
 	thinker.ackInboxEvents = func(ids []string) error {
 		executionIDs := thread.executionIDsForInboxEvents(ids)
 		if err := thinker.claimEventExecutions(executionIDs); err != nil {
@@ -825,9 +839,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// Paused workers start their goroutine but block at the top of
 	// Run() until an inbox event arrives or PauseAll(false) wakes them.
 	if !opts.DeferRun {
-		thread.runStarted = true
 		if opts.Paused {
-			thinker.paused = true
 			logMsg("SPAWN", fmt.Sprintf("starting Run() PAUSED for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
 		} else {
 			logMsg("SPAWN", fmt.Sprintf("starting Run() for id=%q tools=%d mcps=%d", id, len(toolSet), len(threadMCPServers)))
@@ -854,11 +866,17 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				// goroutines never started, but we registered the
 				// thread in tm.threads above and that lookup needs
 				// cleanup so a retry with the same id succeeds.
+				tm.mu.Lock()
+				tm.order = nil
 				delete(tm.threads, id)
+				tm.mu.Unlock()
 				tm.parent.bus.Unsubscribe(id)
 				return fmt.Errorf("realtime open: %w", err)
 			}
+			tm.mu.Lock()
+			tm.order = nil
 			thread.Realtime = rt
+			tm.mu.Unlock()
 			rt.setInitialMessage(thread.initialMessage)
 			go rt.Run()
 		} else {
@@ -1082,36 +1100,43 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 		var toolNames []string
 		var results []ToolResult
 		var doneMsg *string
-		var doneCallID string
-		if !hasToolCallNamed(calls, "evolve") {
-			t.resetEvolveTurnGuards()
-		}
-		if !hasToolCallNamed(calls, "send") {
-			t.resetSendTurnGuards()
-		}
 
 		addResult := func(callID, toolName, content string) {
 			if callID != "" {
-				results = append(results, ToolResult{CallID: callID, ToolName: toolName, Content: content, IsError: inlineToolResultIsError(content)})
+				result := ToolResult{CallID: callID, ToolName: toolName, Content: content, IsError: inlineToolResultIsError(content)}
+				for i := range results {
+					if results[i].CallID == callID {
+						results[i] = result
+						return
+					}
+				}
+				results = append(results, result)
 			}
 		}
-		// Emit tool.result telemetry for inline tools
-		emitResult := func(call toolCall, content string) {
-			addResult(call.NativeID, call.Name, content)
+		// Emit tool.result telemetry for inline tools. Terminal results may ask
+		// for the same event to enter the crash-safe telemetry outbox before the
+		// worker is allowed to stop.
+		emitResult := func(call toolCall, content string, durable ...bool) error {
 			if t.telemetry != nil {
 				isError := inlineToolResultIsError(content)
 				data := newToolResultData(
 					call.NativeID, call.Name, 0, !isError, content, content, 0,
 				)
 				data.ExecutionIDs = t.currentEventExecutions()
-				t.telemetry.Emit("tool.result", t.threadID, data)
+				if len(durable) > 0 && durable[0] {
+					if err := t.telemetry.EmitDurable("tool.result", t.threadID, data); err != nil {
+						return err
+					}
+				} else {
+					t.telemetry.Emit("tool.result", t.threadID, data)
+				}
 			}
+			addResult(call.NativeID, call.Name, content)
+			return nil
 		}
 
-		rejectedToolCall := false
 		for _, call := range calls {
 			if !t.modelToolCallable(call.Name, thread.Tools) {
-				rejectedToolCall = true
 				reason := call.Args["_reason"]
 				delete(call.Args, "_reason")
 				if t.telemetry != nil {
@@ -1124,13 +1149,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					call.Name,
 				))
 				toolNames = append(toolNames, call.Name)
-				t.scheduleToolRejectionCorrection()
 				continue
 			}
 			// Check if inline or registry tool
 			isInline := true
 			switch call.Name {
-			case "send", "spawn", "kill", "update", "list_threads", "evolve", "remember", "pace", "done", "search_tools":
+			case "send", "spawn", "kill", "update", "list_threads", "evolve", "pace", "done", "search_tools":
 				// inline
 			default:
 				isInline = false // executeTool handles _reason and telemetry
@@ -1177,7 +1201,6 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 						t.telemetry.Emit("thread.message", thread.ID, ThreadMessageData{From: thread.ID, To: resolvedID, Message: msg, ExecutionIDs: t.currentEventExecutions()})
 					}
-					t.scheduleSendCompletion()
 					emitResult(call, sendDeliveryResult(id))
 				}
 			case "spawn":
@@ -1278,7 +1301,6 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "list_threads":
-				t.kickNextTurn = true
 				emitResult(call, runListThreads(thread.Children, call.Args))
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
@@ -1294,7 +1316,6 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						emitResult(call, fmt.Sprintf("error: persist thread removal: %v", err))
 					} else {
 						thread.Children.Kill(sid)
-						t.kickNextTurn = true
 						emitResult(call, fmt.Sprintf("thread %s killed", sid))
 					}
 				}
@@ -1346,11 +1367,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						if err := thread.Children.Rename(sid, newID); err != nil {
 							emitResult(call, fmt.Sprintf("error: %v", err))
 						} else {
-							t.kickNextTurn = true
 							emitResult(call, directiveEditToolResult(fmt.Sprintf("thread renamed %s → %s", sid, newID), directiveSummary))
 						}
 					} else {
-						t.kickNextTurn = true
 						status := fmt.Sprintf("thread %s updated", sid)
 						if !updateResult.Changed && newID == "" {
 							status = fmt.Sprintf("thread %s already has that configuration; no update or realtime reconnect was needed", sid)
@@ -1362,19 +1381,26 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "done":
-				msg := call.Args["message"]
-				doneMsg = &msg
-				doneCallID = call.NativeID
+				if len(calls) != 1 || t.pendingToolCount() > 0 || t.asyncToolsActive.Load() > 0 {
+					emitResult(call, "error: done must be called alone after all earlier tool results have been consumed")
+				} else {
+					if err := emitResult(call, "stopping", true); err != nil {
+						emitResult(call, "error: persist terminal tool result: "+err.Error())
+					} else {
+						msg := call.Args["message"]
+						if err := thread.queueCompletion(call.NativeID, msg); err != nil {
+							emitResult(call, "error: persist parent completion: "+err.Error())
+						} else {
+							doneMsg = &msg
+						}
+					}
+				}
 			case "search_tools":
 				// Sub-threads search the same index but with no_spawn
 				// filtering on — they must not discover or load gateway
 				// or channels tools, which only main is authorised for.
 				result := runSearchTools(t, call.Args, false)
 				emitResult(call, result)
-				if inlineToolResultIsError(result) {
-					rejectedToolCall = true
-					t.scheduleToolRejectionCorrection()
-				}
 				toolNames = append(toolNames, call.Raw)
 			case "pace":
 				result, err := applyPaceArgs(t, call.Args)
@@ -1386,21 +1412,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			case "evolve":
 				if !hasDirectiveEditArgs(call.Args) {
 					err := fmt.Errorf("evolve requires directive or directive edit args")
-					if t.scheduleEvolveCorrection() {
-						emitResult(call, directiveEditCorrectionResult(err))
-					} else {
-						emitResult(call, directiveEditFinalFailureResult(err))
-					}
+					emitResult(call, directiveEditCorrectionResult(err))
 				} else {
 					d, summary, err := applyDirectiveEdit(thread.Directive, call.Args)
 					if err != nil {
-						if t.scheduleEvolveCorrection() {
-							emitResult(call, directiveEditCorrectionResult(err))
-						} else {
-							emitResult(call, directiveEditFinalFailureResult(err))
-						}
+						emitResult(call, directiveEditCorrectionResult(err))
 					} else if d == thread.Directive {
-						t.scheduleEvolveCompletion()
 						emitResult(call, evolveCompletionToolResult("directive already current; no update was needed", ""))
 					} else {
 						var persistErr error
@@ -1411,7 +1428,6 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 						if persistErr != nil {
 							emitResult(call, fmt.Sprintf("error: persist directive: %v", persistErr))
-							t.scheduleEvolveCompletion()
 						} else {
 							if thread.Realtime != nil {
 								thread.Realtime.transcriptMu.Lock()
@@ -1424,30 +1440,19 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							if thread.Realtime != nil {
 								thread.Realtime.transcriptMu.Unlock()
 							}
-							t.scheduleEvolveCompletion()
 							t.logAPI(APIEvent{Type: "evolved", ThreadID: thread.ID, Message: d})
 							emitResult(call, evolveCompletionToolResult("directive updated", summary))
 						}
 					}
 				}
-			case "remember":
-				// Memory v2: sub-threads can't write either. The unconscious
-				// is the only writer and it observes sub-thread activity
-				// the same way it observes main. Surface a clear error so
-				// the LLM stops calling this if a legacy directive still
-				// instructs it to.
-				emitResult(call, "error: remember is not available — memory writes are owned by the unconscious thread")
 			default:
-				executeTool(t, call)
+				queueTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
 		}
-		if !rejectedToolCall {
-			t.resetToolRejectionTurnGuard()
-		}
+		t.applyInlineToolTurnDisposition(calls, results, doneMsg != nil)
 
 		if doneMsg != nil {
-			addResult(doneCallID, "done", "stopping")
 			logMsg("THREAD", fmt.Sprintf("%s calling done, msg=%q", thread.ID, *doneMsg))
 			thread.doneForever = true // mark for permanent cleanup (deletes session)
 			executionIDs := t.currentEventExecutions()
@@ -1456,11 +1461,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					logMsg("EVENT-LIFECYCLE", fmt.Sprintf("[%s] done propagation: %v", thread.ID, err))
 				}
 			}
-			if *doneMsg != "" {
-				thread.Parent.bus.Publish(Event{Type: EventInbox, To: thread.Parent.threadID, Text: fmt.Sprintf("[thread:%s done] %s", thread.ID, *doneMsg), ExecutionIDs: executionIDs})
-			} else {
-				thread.Parent.bus.Publish(Event{Type: EventInbox, To: thread.Parent.threadID, Text: fmt.Sprintf("[thread:%s done]", thread.ID), ExecutionIDs: executionIDs})
-			}
+
 			t.settleEventExecutions("thread_done")
 			if thread.Realtime != nil {
 				thread.Realtime.setTerminalReason("caller_done")
@@ -1477,6 +1478,11 @@ func (tm *ThreadManager) Kill(id string) {
 }
 
 func (tm *ThreadManager) KillWithReason(id, reason string) {
+	owner, _ := tm.findManagedThread(id)
+	if owner == nil {
+		return
+	}
+	tm = owner
 	tm.mu.RLock()
 	thread, exists := tm.threads[id]
 	tm.mu.RUnlock()
@@ -1505,7 +1511,7 @@ func (tm *ThreadManager) KillWithReason(id, reason string) {
 		}
 	}
 	// Force cleanup if still lingering
-	tm.cleanupThread(id)
+	tm.cleanupThreadInstance(id, thread.Thinker)
 }
 
 func (tm *ThreadManager) KillAll() {
@@ -1541,7 +1547,11 @@ func (tm *ThreadManager) SendWithPartsExecution(id, message string, parts []Cont
 			return false
 		}
 	}
-	tm.parent.bus.Publish(Event{Type: EventInbox, To: id, Text: message, Parts: parts, ExecutionIDs: append([]string(nil), executionIDs...)})
+	ev := Event{Type: EventInbox, To: id, Text: message, Parts: parts, ExecutionIDs: append([]string(nil), executionIDs...)}
+	if len(executionIDs) == 0 {
+		return tm.parent.bus.TryPublish(ev)
+	}
+	tm.parent.bus.Publish(ev)
 	return true
 }
 
@@ -1614,17 +1624,28 @@ func (tm *ThreadManager) SendAgentWithPartsExecution(id, message string, parts [
 		return err
 	}
 	if !tm.SendWithPartsExecution(id, message, parts, executionIDs) {
-		return &threadNotFoundError{id: id}
+		return fmt.Errorf("thread %q unavailable or inbox full; message not accepted", id)
 	}
 	return nil
 }
 
 func (tm *ThreadManager) List() []ThreadInfo {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 
-	var infos []ThreadInfo
-	for _, t := range tm.threads {
+	infos := make([]ThreadInfo, 0, len(tm.threads))
+	if tm.order == nil || len(tm.order) != len(tm.threads) {
+		tm.order = make([]string, 0, len(tm.threads))
+		for id := range tm.threads {
+			tm.order = append(tm.order, id)
+		}
+		sort.Strings(tm.order)
+	}
+	for _, id := range tm.order {
+		t := tm.threads[id]
+		if t.cachedToolNames == nil {
+			t.cachedToolNames = toolSetToSlice(t.Tools)
+		}
 		status := t.Thinker.status()
 		providerName := status.Provider
 		if t.IsRealtime && t.ProviderName != "" {
@@ -1641,7 +1662,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			ParentID:        t.ParentID,
 			Depth:           t.Depth,
 			Directive:       t.Directive,
-			Tools:           toolSetToSlice(t.Tools),
+			Tools:           append([]string(nil), t.cachedToolNames...),
 			Running:         true,
 			Iteration:       status.Iteration,
 			Rate:            status.Rate,
@@ -1661,10 +1682,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			SubThreads:      subCount,
 		})
 	}
-	// Sort by ID for deterministic order
-	sort.Slice(infos, func(i, j int) bool {
-		return infos[i].ID < infos[j].ID
-	})
+
 	return infos
 }
 
@@ -1742,6 +1760,7 @@ func (tm *ThreadManager) Directive(id string) (string, error) {
 // Used after batch-respawning persisted threads so parents see their children before thinking.
 func (tm *ThreadManager) StartAll() {
 	tm.mu.Lock()
+	tm.order = nil
 	threads := make([]*Thread, 0, len(tm.threads))
 	for _, thread := range tm.threads {
 		if thread.runStarted {
@@ -1974,8 +1993,22 @@ func (tm *ThreadManager) Update(id, name, directive string, tools []string) erro
 }
 
 func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []string, opts ThreadUpdateOptions) (ThreadUpdateResult, error) {
+	owner, thread := tm.findManagedThread(id)
+	if owner == nil {
+		return ThreadUpdateResult{}, fmt.Errorf("thread %q not found", id)
+	}
+	var result ThreadUpdateResult
+	err := thread.Thinker.mutateRuntime(func() error {
+		var err error
+		result, err = owner.updateWithOptsNow(id, name, directive, tools, opts)
+		return err
+	})
+	return result, err
+}
+func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []string, opts ThreadUpdateOptions) (ThreadUpdateResult, error) {
 	var result ThreadUpdateResult
 	tm.mu.Lock()
+	tm.order = nil
 	thread, exists := tm.threads[id]
 	if !exists {
 		tm.mu.Unlock()
@@ -2048,6 +2081,7 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 	thread.Name = nextName
 	thread.Directive = nextDirective
 	thread.Tools = nextTools
+	thread.cachedToolNames = nil
 	thread.MCPNames = append([]string(nil), nextMCPNames...)
 	thread.Thinker.toolAllowlist = nextTools
 	if result.MCPChanged {
@@ -2116,6 +2150,18 @@ func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []stri
 // Returns an error if the new id is empty, equals the old, collides
 // with an existing sibling, or any of the persistence steps fail.
 func (tm *ThreadManager) Rename(oldID, newID string) error {
+	owner, thread := tm.findManagedThread(oldID)
+	if owner == nil {
+		return fmt.Errorf("thread %q not found", oldID)
+	}
+	return thread.Thinker.mutateRuntime(func() error {
+		if thread.Thinker.pendingToolCount() > 0 || thread.Thinker.asyncToolsActive.Load() > 0 {
+			return fmt.Errorf("wait for active tools before renaming a thread")
+		}
+		return owner.renameNow(oldID, newID)
+	})
+}
+func (tm *ThreadManager) renameNow(oldID, newID string) error {
 	if err := validateThreadID(newID); err != nil {
 		return err
 	}
@@ -2126,6 +2172,7 @@ func (tm *ThreadManager) Rename(oldID, newID string) error {
 		return nil
 	}
 	tm.mu.Lock()
+	tm.order = nil
 	thread, exists := tm.threads[oldID]
 	if !exists {
 		tm.mu.Unlock()
@@ -2184,6 +2231,7 @@ func (tm *ThreadManager) Rename(oldID, newID string) error {
 			// Reverse the live routing/session rename so persistence failure is
 			// visible as a failed operation, not split-brain state.
 			tm.mu.Lock()
+			tm.order = nil
 			delete(tm.threads, newID)
 			thread.ID = oldID
 			if thread.Thinker != nil {
@@ -2221,24 +2269,26 @@ func (tm *ThreadManager) Rename(oldID, newID string) error {
 // PauseAll pauses or resumes all child threads.
 func (tm *ThreadManager) PauseAll(paused bool) {
 	tm.mu.RLock()
-	defer tm.mu.RUnlock()
+	all := make([]*Thinker, 0, len(tm.threads))
 	for _, thread := range tm.threads {
-		t := thread.Thinker
-		if t.paused != paused {
-			select {
-			case <-t.pause:
-			default:
-			}
-			t.pause <- paused
-			t.paused = paused
-		}
+		all = append(all, thread.Thinker)
+	}
+	tm.mu.RUnlock()
+	for _, t := range all {
+		_ = t.mutateRuntime(func() error { t.paused = paused; t.publishRuntimeStatus(); return nil })
 	}
 }
 
-func (tm *ThreadManager) cleanupThread(id string) {
+func (tm *ThreadManager) cleanupThread(id string) { tm.cleanupThreadInstance(id, nil) }
+func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 	logMsg("THREAD", fmt.Sprintf("%s cleanupThread start", id))
 	tm.mu.Lock()
+	tm.order = nil
 	thread := tm.threads[id]
+	if expected != nil && (thread == nil || thread.Thinker != expected) {
+		tm.mu.Unlock()
+		return
+	}
 	if thread != nil && thread.bridgeCleanupTimer != nil {
 		thread.bridgeCleanupTimer.Stop()
 		thread.bridgeCleanupTimer = nil
@@ -2248,7 +2298,7 @@ func (tm *ThreadManager) cleanupThread(id string) {
 	unregisterAudioBridge(id)
 
 	// Cascade: kill all children first
-	if thread != nil && thread.Children != nil {
+	if thread != nil && thread.Children != nil && !thread.Thinker.shuttingDown.Load() {
 		logMsg("THREAD", fmt.Sprintf("%s killing %d children", id, thread.Children.Count()))
 		thread.Children.KillAll()
 	}
@@ -2273,7 +2323,11 @@ func (tm *ThreadManager) cleanupThread(id string) {
 		parentID = thread.ParentID
 	}
 
-	tm.parent.config.RemoveThread(id)
+	if thread == nil || !thread.Thinker.shuttingDown.Load() {
+		if err := tm.parent.config.RemoveThread(id); err != nil {
+			logMsg("THREAD", fmt.Sprintf("remove durable thread %s: %v", id, err))
+		}
+	}
 	logMsg("THREAD", fmt.Sprintf("%s publishing EventThreadDone from cleanup", id))
 	tm.parent.bus.Publish(Event{Type: EventThreadDone, From: id})
 	logMsg("THREAD", fmt.Sprintf("%s unsubscribing from bus", id))

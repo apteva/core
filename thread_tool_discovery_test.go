@@ -368,8 +368,24 @@ func TestWorkerInactiveToolRejectedWithPairedResultTelemetryAndBoundedKick(t *te
 		Name: toolName, Args: map[string]string{"input": "repeat"},
 		Raw: toolName, NativeID: "rejected-again",
 	}}, nil)
+	if !worker.kickNextTurn {
+		t.Fatal("second rejected call did not expose its paired error result")
+	}
+	worker.kickNextTurn = false
+	handler(worker, []toolCall{{
+		Name: toolName, Args: map[string]string{"input": "repeat"},
+		Raw: toolName, NativeID: "rejected-third",
+	}}, nil)
+	if !worker.kickNextTurn {
+		t.Fatal("second identical repeat did not expose its paired error result")
+	}
+	worker.kickNextTurn = false
+	handler(worker, []toolCall{{
+		Name: toolName, Args: map[string]string{"input": "repeat"},
+		Raw: toolName, NativeID: "rejected-fourth",
+	}}, nil)
 	if worker.kickNextTurn {
-		t.Fatal("consecutive rejected calls created an unbounded correction loop")
+		t.Fatal("third identical repeat created an unbounded correction loop")
 	}
 
 	handler(worker, []toolCall{{
@@ -475,8 +491,16 @@ func TestWorkerMalformedSearchReturnsErrorAndImmediateBoundedCorrection(t *testi
 		Name: "search_tools", Args: map[string]string{},
 		Raw: "search_tools", NativeID: "malformed-search-repeat",
 	}}, nil)
+	if !worker.kickNextTurn {
+		t.Fatal("second malformed search did not expose its paired error result")
+	}
+	worker.kickNextTurn = false
+	handler(worker, []toolCall{{
+		Name: "search_tools", Args: map[string]string{},
+		Raw: "search_tools", NativeID: "malformed-search-third",
+	}}, nil)
 	if worker.kickNextTurn {
-		t.Fatal("repeated malformed search created an unbounded correction loop")
+		t.Fatal("third identical malformed search created an unbounded correction loop")
 	}
 }
 

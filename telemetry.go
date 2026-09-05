@@ -2,11 +2,14 @@ package core
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +29,8 @@ type TelemetryEvent struct {
 
 // Telemetry collects events and forwards them to the server.
 type Telemetry struct {
+	logBase          int
+	liveBase         int
 	mu               sync.Mutex
 	log              []TelemetryEvent // stored events (forwarded to server)
 	liveLog          []TelemetryEvent // all events including live-only (for SSE)
@@ -42,6 +47,8 @@ type Telemetry struct {
 	seq              int64
 	quit             chan struct{}
 	stopOnce         sync.Once
+	durableDir       string // crash-safe terminal receipts awaiting server acknowledgement
+	durablePaths     map[string]string
 
 	// dropCount tracks live-forward events dropped because forwardCh was
 	// full. We still drop (blocking Emit from the thinker hot path would
@@ -55,9 +62,10 @@ func NewTelemetry() *Telemetry {
 		notify: make(chan struct{}, 1),
 		// 5000-slot buffer (was 500) to absorb bursts during heavy tool
 		// activity like transcription runs without dropping events.
-		forwardCh:  make(chan TelemetryEvent, 5000),
-		notifySubs: make(map[uint64]chan struct{}),
-		quit:       make(chan struct{}),
+		forwardCh:    make(chan TelemetryEvent, 5000),
+		notifySubs:   make(map[uint64]chan struct{}),
+		quit:         make(chan struct{}),
+		durablePaths: make(map[string]string),
 	}
 
 	// Read agent ID from env (set by server when spawning).
@@ -85,6 +93,12 @@ func NewTelemetry() *Telemetry {
 	t.telemetryURL = os.Getenv("TELEMETRY_URL")
 	t.telemetryLiveURL = os.Getenv("TELEMETRY_LIVE_URL")
 	t.serverURL = os.Getenv("SERVER_URL")
+	if dir := strings.TrimSpace(os.Getenv("APTEVA_TELEMETRY_OUTBOX_DIR")); dir != "" {
+		t.durableDir = dir
+	} else if t.telemetryURL != "" {
+		t.durableDir = filepath.Join("telemetry", "outbox")
+	}
+	t.loadDurableEvents()
 
 	if t.telemetryURL != "" || t.telemetryLiveURL != "" {
 		logMsg("TELEMETRY", fmt.Sprintf("telemetry URLs configured: stored=%s live=%s instanceID=%d",
@@ -121,15 +135,45 @@ func (t *Telemetry) Emit(eventType, threadID string, data any) {
 	t.emit(eventType, threadID, data, true)
 }
 
+// EmitDurable records a terminal receipt in an fsync-backed local outbox
+// before exposing it to the ordinary telemetry streams. The regular forward
+// loop removes the receipt only after the Server accepts the same stable event
+// ID, so a Core restart replays it without inventing a duplicate identity.
+// This path is deliberately reserved for rare terminal boundaries; normal
+// high-volume telemetry remains non-blocking.
+func (t *Telemetry) EmitDurable(eventType, threadID string, data any) error {
+	if t == nil {
+		return nil
+	}
+	ev := t.newEvent(eventType, threadID, data)
+	// Hand-built telemetry values are used by small unit fixtures. Production
+	// always uses NewTelemetry, which configures the durable directory.
+	if t.durableDir == "" {
+		t.recordEvent(ev, true)
+		return nil
+	}
+	if err := t.persistDurableEvent(ev); err != nil {
+		return err
+	}
+	t.recordEvent(ev, true)
+	return nil
+}
+
 // EmitLive records a telemetry event for SSE only (not forwarded to server).
 func (t *Telemetry) EmitLive(eventType, threadID string, data any) {
 	t.emit(eventType, threadID, data, false)
 }
 
 func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
-	dataJSON, _ := json.Marshal(data)
+	if t == nil {
+		return
+	}
+	t.recordEvent(t.newEvent(eventType, threadID, data), store)
+}
 
-	ev := TelemetryEvent{
+func (t *Telemetry) newEvent(eventType, threadID string, data any) TelemetryEvent {
+	dataJSON, _ := json.Marshal(data)
+	return TelemetryEvent{
 		ID:         t.generateID(),
 		InstanceID: t.instanceID,
 		ThreadID:   threadID,
@@ -137,19 +181,23 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 		Time:       time.Now(),
 		Data:       json.RawMessage(dataJSON),
 	}
+}
 
+func (t *Telemetry) recordEvent(ev TelemetryEvent, store bool) {
 	t.mu.Lock()
 	if store {
 		t.log = append(t.log, ev)
-		logMsg("TELEMETRY", fmt.Sprintf("emit STORED %s (log=%d, url=%s)", eventType, len(t.log), t.telemetryURL))
+		logMsg("TELEMETRY", fmt.Sprintf("emit STORED %s (log=%d, url=%s)", ev.Type, len(t.log), t.telemetryURL))
 		if len(t.log) > 2000 {
+			t.logBase += len(t.log) - 1000
 			t.log = t.log[len(t.log)-1000:]
 		}
 	} else {
-		logMsg("TELEMETRY", fmt.Sprintf("emit LIVE-ONLY %s", eventType))
+		logMsg("TELEMETRY", fmt.Sprintf("emit LIVE-ONLY %s", ev.Type))
 	}
 	t.liveLog = append(t.liveLog, ev)
 	if len(t.liveLog) > 2000 {
+		t.liveBase += len(t.liveLog) - 1000
 		t.liveLog = t.liveLog[len(t.liveLog)-1000:]
 	}
 	t.mu.Unlock()
@@ -179,10 +227,116 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 			// without spamming when something goes badly wrong.
 			dropped := atomic.AddInt64(&t.dropCount, 1)
 			if dropped%50 == 1 {
-				logMsg("TELEMETRY", fmt.Sprintf("forwardCh FULL, dropped %s (total drops: %d)", eventType, dropped))
+				logMsg("TELEMETRY", fmt.Sprintf("forwardCh FULL, dropped %s (total drops: %d)", ev.Type, dropped))
 			}
 		}
 	}
+}
+
+func (t *Telemetry) durableEventPath(ev TelemetryEvent) string {
+	if t == nil || t.durableDir == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(ev.ID))
+	return filepath.Join(t.durableDir, fmt.Sprintf("%020d-%x.json", ev.Time.UnixNano(), sum[:8]))
+}
+
+func (t *Telemetry) persistDurableEvent(ev TelemetryEvent) error {
+	path := t.durableEventPath(ev)
+	if path == "" {
+		return fmt.Errorf("telemetry durable outbox is unavailable")
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	if err := atomicWriteFile(path, raw, 0600); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	if t.durablePaths == nil {
+		t.durablePaths = make(map[string]string)
+	}
+	t.durablePaths[ev.ID] = path
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *Telemetry) loadDurableEvents() {
+	if t == nil || t.durableDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(t.durableDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(t.durableDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var ev TelemetryEvent
+		if json.Unmarshal(raw, &ev) != nil || ev.ID == "" || ev.Type == "" {
+			continue
+		}
+		t.log = append(t.log, ev)
+		t.liveLog = append(t.liveLog, ev)
+		if t.durablePaths == nil {
+			t.durablePaths = make(map[string]string)
+		}
+		t.durablePaths[ev.ID] = filepath.Join(t.durableDir, entry.Name())
+	}
+}
+
+func (t *Telemetry) acknowledgeDurableEvents(events []TelemetryEvent) {
+	var paths []string
+	t.mu.Lock()
+	for _, ev := range events {
+		if path := t.durablePaths[ev.ID]; path != "" {
+			paths = append(paths, path)
+			delete(t.durablePaths, ev.ID)
+		}
+	}
+	t.mu.Unlock()
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+}
+
+func (t *Telemetry) includePendingDurableEvents(events []TelemetryEvent) []TelemetryEvent {
+	seen := make(map[string]bool, len(events))
+	for _, ev := range events {
+		seen[ev.ID] = true
+	}
+	t.mu.Lock()
+	paths := make([]string, 0, len(t.durablePaths))
+	for id, path := range t.durablePaths {
+		if !seen[id] {
+			paths = append(paths, path)
+		}
+	}
+	t.mu.Unlock()
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var ev TelemetryEvent
+		if json.Unmarshal(raw, &ev) == nil && ev.ID != "" && !seen[ev.ID] {
+			events = append(events, ev)
+			seen[ev.ID] = true
+		}
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].Time.Equal(events[j].Time) {
+			return events[i].ID < events[j].ID
+		}
+		return events[i].Time.Before(events[j].Time)
+	})
+	return events
 }
 
 // DroppedLiveEvents returns the cumulative count of live-forward events
@@ -323,15 +477,11 @@ func (t *Telemetry) forwardLive(events []TelemetryEvent) bool {
 func (t *Telemetry) Events(since int) ([]TelemetryEvent, int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if since > len(t.liveLog) {
-		since = 0
+	next := t.liveBase + len(t.liveLog)
+	if since < t.liveBase || since > next {
+		since = t.liveBase
 	}
-	if since == len(t.liveLog) {
-		return nil, len(t.liveLog)
-	}
-	events := make([]TelemetryEvent, len(t.liveLog)-since)
-	copy(events, t.liveLog[since:])
-	return events, len(t.liveLog)
+	return append([]TelemetryEvent(nil), t.liveLog[since-t.liveBase:]...), next
 }
 
 // StoredEvents returns only stored events since the given index. Used by forwardLoop.
@@ -339,16 +489,11 @@ func (t *Telemetry) Events(since int) ([]TelemetryEvent, int) {
 func (t *Telemetry) StoredEvents(since int) ([]TelemetryEvent, int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if since > len(t.log) {
-		// Log was truncated — reset to drain everything remaining
-		since = 0
+	next := t.logBase + len(t.log)
+	if since < t.logBase || since > next {
+		since = t.logBase
 	}
-	if since == len(t.log) {
-		return nil, len(t.log)
-	}
-	events := make([]TelemetryEvent, len(t.log)-since)
-	copy(events, t.log[since:])
-	return events, len(t.log)
+	return append([]TelemetryEvent(nil), t.log[since-t.logBase:]...), next
 }
 
 // forwardLoop batches stored events and POSTs them to the server for DB
@@ -388,6 +533,7 @@ func (t *Telemetry) forwardLoop() {
 				continue
 			}
 			events, total := t.StoredEvents(lastSent)
+			events = t.includePendingDurableEvents(events)
 			if len(events) == 0 {
 				timer.Reset(next)
 				continue
@@ -411,6 +557,7 @@ func (t *Telemetry) forwardLoop() {
 
 			ok := t.postBatch(client, body)
 			if ok {
+				t.acknowledgeDurableEvents(events)
 				lastSent = total
 				if consecutiveFailures > 0 {
 					logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: recovered after %d failures", consecutiveFailures))
@@ -574,6 +721,91 @@ type ToolCallData struct {
 	Args         map[string]string `json:"args,omitempty"`
 	Reason       string            `json:"reason,omitempty"`
 	ExecutionIDs []string          `json:"execution_ids,omitempty"`
+}
+
+// ToolArgumentsData records the three argument representations at the model
+// boundary: exact provider JSON, Core's parsed string map, and the final typed
+// MCP payload. JSON is bounded so observability cannot copy a large argument
+// indefinitely; SHA256 and OriginalBytes still identify the complete value.
+type ToolArgumentsData struct {
+	ID            string            `json:"id,omitempty"`
+	Name          string            `json:"name"`
+	Stage         string            `json:"stage"`
+	JSON          string            `json:"json"`
+	Types         map[string]string `json:"types,omitempty"`
+	OriginalBytes int               `json:"original_bytes"`
+	PreviewBytes  int               `json:"preview_bytes"`
+	Truncated     bool              `json:"truncated"`
+	SHA256        string            `json:"sha256"`
+}
+
+const toolArgumentsTelemetryPreviewBytes = 16 * 1024
+
+func newToolArgumentsData(id, name, stage string, value any) ToolArgumentsData {
+	var raw []byte
+	switch v := value.(type) {
+	case string:
+		raw = []byte(v)
+	case []byte:
+		raw = append([]byte(nil), v...)
+	default:
+		raw, _ = json.Marshal(v)
+	}
+	full := append([]byte(nil), raw...)
+	truncated := len(raw) > toolArgumentsTelemetryPreviewBytes
+	if truncated {
+		raw = raw[:toolArgumentsTelemetryPreviewBytes]
+		for len(raw) > 0 && !utf8.Valid(raw) {
+			raw = raw[:len(raw)-1]
+		}
+	}
+	sum := sha256.Sum256(full)
+	return ToolArgumentsData{
+		ID:            id,
+		Name:          name,
+		Stage:         stage,
+		JSON:          string(raw),
+		Types:         topLevelArgumentTypes(value),
+		OriginalBytes: len(full),
+		PreviewBytes:  len(raw),
+		Truncated:     truncated,
+		SHA256:        fmt.Sprintf("%x", sum[:]),
+	}
+}
+
+func topLevelArgumentTypes(value any) map[string]string {
+	var values map[string]any
+	switch typed := value.(type) {
+	case map[string]any:
+		values = typed
+	case map[string]string:
+		values = make(map[string]any, len(typed))
+		for key, child := range typed {
+			values[key] = child
+		}
+	default:
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for key, child := range values {
+		switch child.(type) {
+		case nil:
+			result[key] = "null"
+		case bool:
+			result[key] = "boolean"
+		case float32, float64, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
+			result[key] = "number"
+		case string:
+			result[key] = "string"
+		case []any, []string:
+			result[key] = "array"
+		case map[string]any, map[string]string:
+			result[key] = "object"
+		default:
+			result[key] = fmt.Sprintf("%T", child)
+		}
+	}
+	return result
 }
 
 type ToolResultData struct {

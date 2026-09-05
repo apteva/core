@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -43,7 +44,8 @@ type mcpToolDef struct {
 }
 
 type mcpToolsListResult struct {
-	Tools []mcpToolDef `json:"tools"`
+	NextCursor string       `json:"nextCursor,omitempty"`
+	Tools      []mcpToolDef `json:"tools"`
 }
 
 // ToolLoadMode controls when an MCP tool schema is included in model
@@ -146,10 +148,15 @@ func toolLoadingEqual(a, b MCPServerConfig) bool {
 
 type mcpCallResult struct {
 	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type     string          `json:"type"`
+		Text     string          `json:"text"`
+		Data     string          `json:"data,omitempty"`
+		MIMEType string          `json:"mimeType,omitempty"`
+		Resource json.RawMessage `json:"resource,omitempty"`
+		URI      string          `json:"uri,omitempty"`
 	} `json:"content"`
-	IsError bool `json:"isError"`
+	IsError           bool            `json:"isError"`
+	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
 }
 
 // MCPServerConfig is stored in config.json.
@@ -305,6 +312,11 @@ func (s *MCPServer) failPending(err error) {
 }
 
 func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
+	return s.callContext(context.Background(), method, params)
+}
+func (s *MCPServer) callContext(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
+	defer cancel()
 	id := s.nextID.Add(1)
 
 	ch := make(chan jsonRPCResponse, 1)
@@ -324,10 +336,25 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 		Params:  params,
 	}
 
-	s.mu.Lock()
-	data, _ := json.Marshal(req)
-	_, err := fmt.Fprintf(s.stdin, "%s\n", data)
-	s.mu.Unlock()
+	writeDone := make(chan error, 1)
+	go func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if ctx.Err() != nil {
+			writeDone <- ctx.Err()
+			return
+		}
+		data, _ := json.Marshal(req)
+		_, err := fmt.Fprintf(s.stdin, "%s\n", data)
+		writeDone <- err
+	}()
+	var err error
+	select {
+	case err = <-writeDone:
+	case <-ctx.Done():
+		s.Close()
+		return nil, ctx.Err()
+	}
 
 	if err != nil {
 		s.pendMu.Lock()
@@ -342,7 +369,7 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 			return nil, fmt.Errorf("MCP error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
 		return resp.Result, nil
-	case <-time.After(mcpCallTimeout):
+	case <-ctx.Done():
 		s.pendMu.Lock()
 		delete(s.pending, id)
 		s.pendMu.Unlock()
@@ -371,15 +398,7 @@ func (s *MCPServer) notify(method string, params any) {
 
 // ListTools calls tools/list on the MCP server
 func (s *MCPServer) ListTools() ([]mcpToolDef, error) {
-	result, err := s.call("tools/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	var list mcpToolsListResult
-	if err := json.Unmarshal(result, &list); err != nil {
-		return nil, fmt.Errorf("parse tools: %w", err)
-	}
-	return list.Tools, nil
+	return listAllMCPTools(s.call)
 }
 
 // CallTool invokes a tool on the MCP server
@@ -388,8 +407,11 @@ func (s *MCPServer) CallTool(name string, args map[string]string) (ToolResponse,
 }
 
 func (s *MCPServer) CallToolTyped(name string, args map[string]string, inputSchema map[string]any) (ToolResponse, error) {
+	return s.CallToolContext(context.Background(), name, args, inputSchema)
+}
+func (s *MCPServer) CallToolContext(ctx context.Context, name string, args map[string]string, inputSchema map[string]any) (ToolResponse, error) {
 	arguments := mcpArgumentsFromStrings(args, inputSchema)
-	result, err := s.call("tools/call", map[string]any{
+	result, err := s.callContext(ctx, "tools/call", map[string]any{
 		"name":      name,
 		"arguments": arguments,
 	})
@@ -402,13 +424,7 @@ func (s *MCPServer) CallToolTyped(name string, args map[string]string, inputSche
 		return ToolResponse{}, fmt.Errorf("parse result: %w", err)
 	}
 
-	var texts []string
-	for _, c := range callResult.Content {
-		if c.Type == "text" {
-			texts = append(texts, c.Text)
-		}
-	}
-	return ToolResponse{Text: strings.Join(texts, "\n"), IsError: callResult.IsError}, nil
+	return decodeMCPResult(callResult)
 }
 
 func (s *MCPServer) GetName() string { return s.Name }
@@ -430,7 +446,11 @@ func (s *MCPServer) Close() {
 // rewrites any _binary envelope returned by the tool into a compact
 // _file handle — so large binaries never traverse the LLM context.
 // Pass nil for blobs to get straight proxy behaviour (legacy path).
-func mcpProxyHandler(server MCPConn, toolName string, opts ...any) func(args map[string]string) ToolResponse {
+func mcpProxyHandler(server MCPConn, toolName string, opts ...any) func(map[string]string) ToolResponse {
+	handler := mcpProxyHandlerContext(server, toolName, opts...)
+	return func(args map[string]string) ToolResponse { return handler(context.Background(), args) }
+}
+func mcpProxyHandlerContext(server MCPConn, toolName string, opts ...any) func(context.Context, map[string]string) ToolResponse {
 	var inputSchema map[string]any
 	var blobs *BlobStore
 	for _, opt := range opts {
@@ -441,7 +461,7 @@ func mcpProxyHandler(server MCPConn, toolName string, opts ...any) func(args map
 			blobs = v
 		}
 	}
-	return func(args map[string]string) ToolResponse {
+	return func(ctx context.Context, args map[string]string) ToolResponse {
 		if blobs != nil {
 			args = blobs.RehydrateFileRefs(args)
 		}
@@ -449,7 +469,11 @@ func mcpProxyHandler(server MCPConn, toolName string, opts ...any) func(args map
 			resp ToolResponse
 			err  error
 		)
-		if inputSchema != nil {
+		if aware, ok := server.(interface {
+			CallToolContext(context.Context, string, map[string]string, map[string]any) (ToolResponse, error)
+		}); ok {
+			resp, err = aware.CallToolContext(ctx, toolName, args, inputSchema)
+		} else if inputSchema != nil {
 			if typed, ok := server.(schemaAwareMCPConn); ok {
 				resp, err = typed.CallToolTyped(toolName, args, inputSchema)
 			} else {
@@ -605,15 +629,16 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 			syntax := buildMCPSyntax(fullName, tool.InputSchema)
 
 			registry.Register(&ToolDef{
-				Name:        fullName,
-				Description: fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
-				Syntax:      syntax,
-				Rules:       fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
-				Handler:     mcpProxyHandler(srv, tool.Name, tool.InputSchema, blobs),
-				InputSchema: tool.InputSchema,
-				MCP:         true, // hidden until activated; old MainAccess flag is gone
-				MCPServer:   cfg.Name,
-				MCPApp:      cfg.URL != "" && isAptevaAppMCPURL(cfg.URL),
+				Name:           fullName,
+				Description:    fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
+				Syntax:         syntax,
+				Rules:          fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
+				Handler:        mcpProxyHandler(srv, tool.Name, tool.InputSchema, blobs),
+				HandlerContext: mcpProxyHandlerContext(srv, tool.Name, tool.InputSchema, blobs),
+				InputSchema:    tool.InputSchema,
+				MCP:            true, // hidden until activated; old MainAccess flag is gone
+				MCPServer:      cfg.Name,
+				MCPApp:         cfg.URL != "" && isAptevaAppMCPURL(cfg.URL),
 				WakeOnResult: normalizeWakeOnResultPolicy(
 					func() any {
 						if tool.Meta == nil {

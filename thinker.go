@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -250,7 +252,7 @@ OWNERSHIP AND DELEGATION:
 - Spawn when no existing owner fits and separate ownership materially helps, including persistent operational state, parallel execution, waiting or retries, substantial context isolation, continued operation, or independent failure handling.
 - For multiple independent work units, assign the units to focused owners instead of executing the first unit on main.
 - For batches of independent repeated work, especially tool-heavy or waiting/polling work, coordinate focused workers. Consolidate closely related continuing responsibilities under one owner instead of creating one thread per schedule.
-- One-shot workers should own one clear unit of work, use the smallest required tool set, report the result to their parent, then call done. Persistent workers remain active.
+- Temporary and continuing workers are the same thread type. A one-shot worker owns one clear unit of work, uses the smallest required tool set, and returns its final result exactly once with done(message). A persistent owner sends requested reports, uses pace between cycles, and remains active.
 - tools= is a hard exact capability grant. ALWAYS include EVERY exact tool the worker needs; a missing tool cannot be discovered or called unless its server is explicitly granted through mcp=. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
 - mcp= grants a complete server discovery scope. Use it only when the worker may discover/use that server's broader surface; naming one exact tool in tools= never grants its sibling tools.
 - Capability alone does not determine ownership: do not keep work on main merely because main can complete it. Keep only the very-small-work fast path local.
@@ -322,11 +324,11 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 	if pool != nil && pool.HasRealtimeProvider() {
 		voiceList := strings.Join(pool.RealtimeNames(), ", ")
 		prompt += "\n\n[REALTIME THREADS]\n"
-		prompt += "- Spawn realtime=true for voice/audio conversations (live phone call, kiosk interaction, voice booking, etc.). The worker holds the WebSocket session and handles audio; you handle backend tools and decisions. Reach the worker via send(id,text) — it speaks your text aloud. The worker escalates via send(id=\"main\",text=...) and reports completion via done(text=...). Audio never crosses into your context — you only see what the worker explicitly relays.\n"
+		prompt += "- Spawn realtime=true for voice/audio conversations (live phone call, kiosk interaction, voice booking, etc.). The worker holds the WebSocket session and uses its scoped tools. Reach it via send(id,message) when supervisory input is needed; it can escalate via send(id=\"main\",message=...) and end the live thread with done(message=...). Audio never crosses into your context — you only see what the worker explicitly relays.\n"
 		prompt += "- The directive and tools shown for an active realtime thread are its already-applied configuration. Leave them alone unless a real durable change is required: never call update merely to restate its role, instructions, or tools. Use send for temporary call context. A provider that cannot apply a real change live requires the explicit restart_realtime=true option because reconnecting can interrupt speech.\n"
 		prompt += "- Scope tools tightly at creation. Give the realtime worker the tools it needs to complete safe in-conversation actions directly; retain privileged or cross-domain decisions with the appropriate owner. Ephemeral realtime workers cannot evolve their caller-owned session directive.\n"
 		prompt += fmt.Sprintf("- Available realtime providers: %s. Set provider=\"<name>\" when spawning; default is used otherwise. Voice via voice=\"<id>\" (e.g. voice=\"alloy\").\n", voiceList)
-		prompt += "- Example: spawn(id=\"call-clinic\", realtime=true, voice=\"alloy\", directive=\"Call Dr. Patel's office to book a cleaning. Escalate scheduling decisions to main. done() with the confirmed slot.\", tools=\"channels_telephony_place\")\n"
+		prompt += "- Example: spawn(id=\"appointment-call\", realtime=true, voice=\"alloy\", directive=\"Handle the appointment conversation naturally. Use the scoped booking capability, escalate consequential ambiguity, and end when the conversation is complete.\", tools=\"booking_create\")\n"
 	}
 
 	// Inject the lightweight MCP server catalog — names + tool counts.
@@ -824,29 +826,38 @@ type APIEvent struct {
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 type Thinker struct {
-	apiKey       string
-	pool         *ProviderPool // all available providers (shared across threads)
-	provider     LLMProvider   // current active provider for this thinker
-	messages     []Message
-	bus          *EventBus
-	sub          *Subscription
-	pause        chan bool
-	quit         chan struct{}
-	runMu        sync.Mutex
-	runContextMu sync.Mutex
-	runCancel    context.CancelFunc
-	stopOnce     sync.Once
-	iteration    int
-	paused       bool
-	llmActive    atomic.Bool
-	rate         ThinkRate
-	agentRate    ThinkRate
-	agentSleep   time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
-	nextWakeAt   time.Time     // one pending agent-owned timer persisted by pace
-	resumeWakeAt time.Time     // one-shot startup gate restored from config
-	paceDurable  bool          // true after an explicit or restored pace
-	paceRevision uint64        // increments only when the agent replaces or clears its pending wake
-	wakeReason   string        // reason supplied to the next request-context snapshot
+	shuttingDown     atomic.Bool
+	compactionActive atomic.Bool
+	mutationMu       sync.Mutex
+	mutationWake     chan struct{}
+	mutations        []runtimeMutation
+	runtimeRunning   bool
+	requestCancel    context.CancelFunc
+	snapshotMu       sync.Mutex
+	owner            *ThreadManager
+	apiKey           string
+	pool             *ProviderPool // all available providers (shared across threads)
+	provider         LLMProvider   // current active provider for this thinker
+	messages         []Message
+	bus              *EventBus
+	sub              *Subscription
+	pause            chan bool
+	quit             chan struct{}
+	runMu            sync.Mutex
+	runContextMu     sync.Mutex
+	runCancel        context.CancelFunc
+	stopOnce         sync.Once
+	iteration        int
+	paused           bool
+	llmActive        atomic.Bool
+	rate             ThinkRate
+	agentRate        ThinkRate
+	agentSleep       time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
+	nextWakeAt       time.Time     // one pending agent-owned timer persisted by pace
+	resumeWakeAt     time.Time     // one-shot startup gate restored from config
+	paceDurable      bool          // true after an explicit or restored pace
+	paceRevision     uint64        // increments only when the agent replaces or clears its pending wake
+	wakeReason       string        // reason supplied to the next request-context snapshot
 	// wakeDeadlineFired remains true while the model processes a timer wake.
 	// The expired deadline stays persisted until that turn completes so a
 	// crash re-delivers rather than silently loses scheduled work.
@@ -928,7 +939,7 @@ type Thinker struct {
 	mainInboxEvents   []PersistentThreadEvent
 	execution         *ExecutionController
 	checkpoints       *ExecutionCheckpointStore
-	restarting        bool
+	restarting        atomic.Bool
 	// Shared by main and the unconscious child. The child records completed
 	// iterations; main uses the state to decide whether a forced wake is due.
 	unconsciousSafety *unconsciousSafetyState
@@ -965,36 +976,11 @@ type Thinker struct {
 	// be visible but uncallable, while a guessed hidden name cannot execute.
 	presentedToolsMu sync.RWMutex
 	presentedTools   map[string]bool
-	// kickNextTurn, when true, causes the iteration loop to skip its
-	// pace sleep and re-think immediately on the next pass. Set by
-	// runSearchTools when it activates new tools so the agent can
-	// call them on the very next iteration (the search_tools contract
-	// is "schemas appear next turn" — that next turn should fire
-	// straight away, not after a `rate: 2.0m` cadence wait).
-	// Cleared as it's consumed in Run().
-	kickNextTurn bool
-	// evolveCorrectionUsed bounds model-correctable evolve failures to one
-	// immediate repair turn.
-	evolveCorrectionUsed bool
-	// evolveCompletionUsed bounds the follow-up turn needed to report a
-	// successful, already-current, or finally failed evolve outcome. Together
-	// the two guards prevent consecutive evolve calls from creating a hot loop.
-	evolveCompletionUsed bool
-	// sendCorrectionUsed and sendCompletionUsed bound the immediate turns used
-	// to process a send failure or delivery receipt. A model can correct once
-	// and can process one terminal receipt, but consecutive sends cannot keep
-	// rearming the loop indefinitely.
-	sendCorrectionUsed bool
-	sendCompletionUsed bool
-	// spawnCorrectionUsed and spawnCompletionUsed give a model one immediate
-	// chance to repair rejected spawn arguments and one final turn to report a
-	// repeated failure. They prevent recoverable errors from sleeping for the
-	// normal cadence without permitting an unbounded retry loop.
-	spawnCorrectionUsed bool
-	spawnCompletionUsed bool
-	// toolRejectionCorrectionUsed bounds the immediate repair turn for a
-	// model call to a tool that was not presented to this thread.
-	toolRejectionCorrectionUsed bool
+	// kickNextTurn is the common inline-tool result continuation signal.
+	// Successful pace/done are control boundaries; ordinary receipts continue.
+	kickNextTurn            bool
+	inlineResultFingerprint string
+	inlineResultRepeats     int
 	// lastInboundForPreload carries the text of events drained on
 	// THIS iteration through to applyPreload's BM25 query. Set in
 	// Run() before think(); cleared after think() returns. Lets BM25
@@ -1032,9 +1018,19 @@ type Thinker struct {
 
 	// retryDelay is a deterministic test hook. Production uses
 	// providerRetryDelay when nil.
-	retryDelay  func(error, int) time.Duration
-	toolSemOnce sync.Once
-	toolSem     chan struct{}
+	retryDelay      func(error, int) time.Duration
+	toolSemOnce     sync.Once
+	toolSem         chan struct{}
+	toolCompleted   chan struct{}
+	toolQueueOnce   sync.Once
+	toolQueue       chan toolCall
+	realtimeMode    bool
+	toolGeneration  atomic.Uint64
+	toolCtx         context.Context
+	toolCancel      context.CancelFunc
+	toolCtxOnce     sync.Once
+	toolLifecycleMu sync.Mutex
+	toolCancels     sync.Map // call ID -> context.CancelFunc
 	// maxConcurrentTools is configurable in tests; zero uses the production
 	// default. Blocking dispatch provides backpressure without spawning an
 	// unbounded number of goroutines waiting on external services.
@@ -1053,89 +1049,6 @@ type Thinker struct {
 }
 
 const defaultMaxConcurrentTools = 16
-
-func (t *Thinker) scheduleEvolveCorrection() bool {
-	if !t.evolveCorrectionUsed {
-		t.evolveCorrectionUsed = true
-		t.kickNextTurn = true
-		return true
-	}
-	// A second invalid attempt gets one final turn to report the failure.
-	t.scheduleEvolveCompletion()
-	return false
-
-}
-
-func (t *Thinker) scheduleEvolveCompletion() {
-	if t.evolveCompletionUsed {
-		return
-	}
-	t.evolveCompletionUsed = true
-	t.kickNextTurn = true
-}
-
-func (t *Thinker) resetEvolveTurnGuards() {
-	t.evolveCorrectionUsed = false
-	t.evolveCompletionUsed = false
-}
-
-func (t *Thinker) scheduleSendCorrection() bool {
-	if !t.sendCorrectionUsed {
-		t.sendCorrectionUsed = true
-		t.kickNextTurn = true
-		return true
-	}
-	t.scheduleSendCompletion()
-	return false
-}
-
-func (t *Thinker) scheduleSendCompletion() {
-	if t.sendCompletionUsed {
-		return
-	}
-	t.sendCompletionUsed = true
-	t.kickNextTurn = true
-}
-
-func (t *Thinker) resetSendTurnGuards() {
-	t.sendCorrectionUsed = false
-	t.sendCompletionUsed = false
-}
-
-func (t *Thinker) scheduleSpawnCorrection() bool {
-	if !t.spawnCorrectionUsed {
-		t.spawnCorrectionUsed = true
-		t.kickNextTurn = true
-		return true
-	}
-	t.scheduleSpawnCompletion()
-	return false
-}
-
-func (t *Thinker) scheduleSpawnCompletion() {
-	if t.spawnCompletionUsed {
-		return
-	}
-	t.spawnCompletionUsed = true
-	t.kickNextTurn = true
-}
-
-func (t *Thinker) resetSpawnTurnGuards() {
-	t.spawnCorrectionUsed = false
-	t.spawnCompletionUsed = false
-}
-
-func (t *Thinker) scheduleToolRejectionCorrection() {
-	if t.toolRejectionCorrectionUsed {
-		return
-	}
-	t.toolRejectionCorrectionUsed = true
-	t.kickNextTurn = true
-}
-
-func (t *Thinker) resetToolRejectionTurnGuard() {
-	t.toolRejectionCorrectionUsed = false
-}
 
 func latestTurnContainsUserFacingRequest(messages []Message) bool {
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -1156,36 +1069,22 @@ func sendCorrectionResult(err error) string {
 	return fmt.Sprintf("error: %v. Correct the send arguments or target and retry once now; do not claim delivery", err)
 }
 
-func sendFinalFailureResult(err error) string {
-	return fmt.Sprintf("error: %v. The correction also failed; do not call send again for this message. Report the delivery failure before pacing", err)
-}
-
 func sendStructuralFailureResult(err error) string {
 	return fmt.Sprintf("error: %v. No message was sent. This destination is impossible from your role, so do not retry send or report this routing error with another send. Continue the current work locally", err)
 }
 
 // handleSendFailure keeps recoverable addressing mistakes separate from
-// structurally impossible routing. A misspelled/obsolete thread ID gets the
-// existing bounded correction opportunity. A root/no-parent or self target
-// cannot become valid by retrying, so it gets one receipt-processing turn to
-// resume local work and no correction loop.
+// structurally impossible routing. Continuation and no-progress protection
+// are shared with every other inline Core tool.
 func (t *Thinker) handleSendFailure(err error) string {
 	if isStructuralSendTargetError(err) {
-		t.scheduleSendCompletion()
 		return sendStructuralFailureResult(err)
 	}
-	if t.scheduleSendCorrection() {
-		return sendCorrectionResult(err)
-	}
-	return sendFinalFailureResult(err)
+	return sendCorrectionResult(err)
 }
 
 func spawnCorrectionResult(err error) string {
 	return fmt.Sprintf("error: %v. Correct the spawn arguments and retry once now; do not claim the worker started", err)
-}
-
-func spawnFinalFailureResult(err error) string {
-	return fmt.Sprintf("error: %v. The correction also failed; do not call spawn again for this worker. Report the launch failure before pacing", err)
 }
 
 func inlineToolResultIsError(content string) bool {
@@ -1193,23 +1092,90 @@ func inlineToolResultIsError(content string) bool {
 	return strings.HasPrefix(trimmed, "error:") || strings.HasPrefix(trimmed, `{"error":`)
 }
 
-func hasToolCallNamed(calls []toolCall, name string) bool {
-	for _, call := range calls {
-		if call.Name == name {
-			return true
-		}
-	}
-	return false
+const maxRepeatedInlineToolResults = 3
+
+func (t *Thinker) resetInlineToolContinuation() {
+	t.inlineResultFingerprint = ""
+	t.inlineResultRepeats = 0
 }
 
-func (t *Thinker) acquireToolSlot() bool {
+// applyInlineToolTurnDisposition is the ordinary function-calling contract
+// for every inline Core tool. Receipts continue; successful control tools
+// yield/terminate. Three identical call/result batches indicate no progress
+// and stop that immediate chain without spending another model turn.
+func (t *Thinker) applyInlineToolTurnDisposition(calls []toolCall, results []ToolResult, terminating bool) {
+	if t == nil {
+		return
+	}
+	if terminating || len(results) == 0 {
+		t.resetInlineToolContinuation()
+		return
+	}
+	argsByID := map[string]map[string]string{}
+	for _, call := range calls {
+		argsByID[call.NativeID] = call.Args
+	}
+	var fingerprints []string
+	for _, result := range results {
+		disposition := ToolTurnContinue
+		if t.registry != nil {
+			if def := t.registry.Get(result.ToolName); def != nil && def.TurnDisposition != "" {
+				disposition = def.TurnDisposition
+			}
+		} else if result.ToolName == "pace" {
+			disposition = ToolTurnYield
+		} else if result.ToolName == "done" {
+			disposition = ToolTurnTerminate
+		}
+		if !result.IsError && disposition != ToolTurnContinue {
+			continue
+		}
+		encoded, _ := json.Marshal(struct {
+			Name    string
+			Args    map[string]string
+			Content string
+			IsError bool
+		}{result.ToolName, argsByID[result.CallID], result.Content, result.IsError})
+		fingerprints = append(fingerprints, string(encoded))
+	}
+	if len(fingerprints) == 0 {
+		t.resetInlineToolContinuation()
+		return
+	}
+	sort.Strings(fingerprints)
+	// Retain only a digest, never another copy of a potentially large result.
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(fingerprints, "\n"))))
+	if fingerprint == t.inlineResultFingerprint {
+		t.inlineResultRepeats++
+	} else {
+		t.inlineResultFingerprint = fingerprint
+		t.inlineResultRepeats = 1
+	}
+	if t.inlineResultRepeats >= maxRepeatedInlineToolResults {
+		t.kickNextTurn = false
+		if t.telemetry != nil {
+			t.telemetry.Emit("tool.continuation_limited", t.threadID, map[string]any{
+				"reason": "repeated_identical_results", "repeats": t.inlineResultRepeats,
+			})
+		}
+		t.failEventExecutions("repeated_identical_tool_results")
+		return
+	}
+	t.kickNextTurn = true
+}
+
+func (t *Thinker) initializeToolSlots() {
 	t.toolSemOnce.Do(func() {
 		limit := t.maxConcurrentTools
 		if limit <= 0 {
 			limit = defaultMaxConcurrentTools
 		}
 		t.toolSem = make(chan struct{}, limit)
+		t.toolCompleted = make(chan struct{}, 1)
 	})
+}
+func (t *Thinker) acquireToolSlot() bool {
+	t.initializeToolSlots()
 	if t.quit == nil {
 		t.toolSem <- struct{}{}
 		return true
@@ -1287,6 +1253,8 @@ func (t *Thinker) publishRuntimeStatus() {
 }
 
 func (t *Thinker) publishContextStatus() {
+	t.snapshotMu.Lock()
+	defer t.snapshotMu.Unlock()
 	messages := cloneMessages(t.messages)
 	t.contextStatus.Store(thinkerContextStatus{
 		Messages:    messages,
@@ -1691,11 +1659,14 @@ func (t *Thinker) restoreExecutionCheckpoint(checkpointID string) (*ExecutionChe
 }
 
 func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error {
-	t.restarting = true
+	t.restarting.Store(true)
 	if t.execution == nil || !t.execution.CancelThread(t.threadID) {
-		t.restarting = false
+		t.restarting.Store(false)
 		return fmt.Errorf("thread %q is not waiting at an execution gate", t.threadID)
 	}
+
+	t.runMu.Lock()
+	defer t.runMu.Unlock()
 
 	t.messages = cloneMessages(cp.messages)
 	t.resetPromptCache("execution_checkpoint_restored")
@@ -1726,8 +1697,7 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 	t.activeWork = cp.activeWork
 	t.directive = cp.directive
 	t.iteration = cp.Iteration
-	t.pendingTools = sync.Map{}
-	t.placeholdersSent = sync.Map{}
+	t.invalidateTools()
 	t.silentToolMu.Lock()
 	t.silentToolResults = nil
 	t.silentToolMu.Unlock()
@@ -1740,7 +1710,9 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 		t.session.Delete()
 		t.session = NewSession(".", t.threadID)
 		for _, msg := range t.messages[1:] {
-			t.session.AppendMessage(msg, t.iteration, TokenUsage{})
+			if err := t.session.AppendMessage(msg, t.iteration, TokenUsage{}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1872,15 +1844,6 @@ func mainToolHandler(t *Thinker) ToolHandler {
 		var replies []string
 		var toolNames []string
 		var results []ToolResult
-		if !hasToolCallNamed(calls, "evolve") {
-			t.resetEvolveTurnGuards()
-		}
-		if !hasToolCallNamed(calls, "send") {
-			t.resetSendTurnGuards()
-		}
-		if !hasToolCallNamed(calls, "spawn") {
-			t.resetSpawnTurnGuards()
-		}
 		if len(calls) > 0 {
 			names := make([]string, len(calls))
 			for i, c := range calls {
@@ -1892,7 +1855,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			// Check if this is an inline tool (handled here) or registry tool (handled by executeTool)
 			isInline := true
 			switch call.Name {
-			case "spawn", "kill", "update", "list_threads", "send", "evolve", "remember", "pace", "connect", "disconnect", "list_connected", "done", "search_tools":
+			case "spawn", "kill", "update", "list_threads", "send", "evolve", "pace", "connect", "disconnect", "list_connected", "search_tools":
 				// inline — we handle _reason and telemetry here
 			default:
 				isInline = false // executeTool handles _reason and telemetry
@@ -1929,11 +1892,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			switch call.Name {
 			case "spawn":
 				addSpawnFailure := func(err error) {
-					if t.scheduleSpawnCorrection() {
-						addResult(spawnCorrectionResult(err))
-						return
-					}
-					addResult(spawnFinalFailureResult(err))
+					addResult(spawnCorrectionResult(err))
 				}
 				id := call.Args["id"]
 				directive := call.Args["directive"]
@@ -2090,11 +2049,6 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 				toolNames = append(toolNames, call.Raw)
 			case "list_threads":
-				// The list is intermediate discovery, not task completion. Give
-				// the model one immediate turn to consume the result and decide
-				// whether to reuse an owner or spawn. A further continuation only
-				// happens if the model explicitly calls the tool again.
-				t.kickNextTurn = true
 				addResult(runListThreads(t.threads, call.Args))
 				toolNames = append(toolNames, call.Raw)
 			case "kill":
@@ -2110,7 +2064,6 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						continue
 					}
 					t.threads.Kill(id)
-					t.kickNextTurn = true
 					// Result intentionally includes a notify-back reminder.
 					// kill (and other "terminal-feeling" tools like done /
 					// pace=sleep) bias the model toward ending the turn
@@ -2172,11 +2125,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						if err := t.threads.Rename(id, newID); err != nil {
 							addResult(fmt.Sprintf("error: %v", err))
 						} else {
-							t.kickNextTurn = true
 							addResult(directiveEditToolResult(fmt.Sprintf("thread renamed %s → %s", id, newID), directiveSummary))
 						}
 					} else {
-						t.kickNextTurn = true
 						status := fmt.Sprintf("thread %s updated", id)
 						if !updateResult.Changed && newID == "" {
 							status = fmt.Sprintf("thread %s already has that configuration; no update or realtime reconnect was needed", id)
@@ -2215,7 +2166,6 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						if t.telemetry != nil {
 							t.telemetry.Emit("thread.message", "main", ThreadMessageData{From: "main", To: id, Message: msg, ExecutionIDs: t.currentEventExecutions()})
 						}
-						t.scheduleSendCompletion()
 						addResult(sendDeliveryResult(id))
 					}
 				}
@@ -2223,11 +2173,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			case "evolve":
 				if !hasDirectiveEditArgs(call.Args) {
 					err := fmt.Errorf("evolve requires directive or directive edit args")
-					if t.scheduleEvolveCorrection() {
-						addResult(directiveEditCorrectionResult(err))
-					} else {
-						addResult(directiveEditFinalFailureResult(err))
-					}
+					addResult(directiveEditCorrectionResult(err))
 				} else {
 					currentDirective := t.directive
 					if currentDirective == "" && t.config != nil {
@@ -2235,23 +2181,16 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					}
 					d, summary, err := applyDirectiveEdit(currentDirective, call.Args)
 					if err != nil {
-						if t.scheduleEvolveCorrection() {
-							addResult(directiveEditCorrectionResult(err))
-						} else {
-							addResult(directiveEditFinalFailureResult(err))
-						}
+						addResult(directiveEditCorrectionResult(err))
 					} else if d == currentDirective {
-						t.scheduleEvolveCompletion()
 						addResult(evolveCompletionToolResult("directive already current; no update was needed", ""))
 					} else {
 						if err := t.config.SetDirective(d); err != nil {
 							addResult(fmt.Sprintf("error: persist directive: %v", err))
-							t.scheduleEvolveCompletion()
 						} else {
 							t.directive = d
 							t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 							t.resetPromptCache("directive_evolved")
-							t.scheduleEvolveCompletion()
 							t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 							if t.telemetry != nil {
 								t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
@@ -2260,18 +2199,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					}
 				}
-			case "remember":
-				// Memory v2: main has no write tools. The unconscious is
-				// the sole writer. If a legacy directive still calls
-				// `remember`, surface a clear error so the agent (and the
-				// operator looking at telemetry) understands why nothing
-				// was stored — silent no-op would just hide the wiring
-				// problem.
-				addResult("error: remember is not available — memory writes are owned by the unconscious thread")
 			case "search_tools":
 				addResult(runSearchTools(t, call.Args, true /* main allows no_spawn results */))
 				toolNames = append(toolNames, call.Raw)
-				continue
 			case "pace":
 				result, err := applyPaceArgs(t, call.Args)
 				if err != nil {
@@ -2280,6 +2210,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					addResult(result)
 				}
 			case "connect":
+				if !modelMCPManagementEnabled() {
+					addResult("error: runtime MCP management is not enabled for this agent; use the authenticated Core configuration API")
+					toolNames = append(toolNames, call.Raw)
+					break
+				}
 				name := call.Args["name"]
 				command := call.Args["command"]
 				url := call.Args["url"]
@@ -2354,14 +2289,15 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						fullName := name + "_" + tool.Name
 						syntax := buildMCPSyntax(fullName, tool.InputSchema)
 						t.registry.Register(&ToolDef{
-							Name:        fullName,
-							Description: fmt.Sprintf("[%s] %s", name, tool.Description),
-							Syntax:      syntax,
-							Rules:       fmt.Sprintf("Provided by MCP server '%s'.", name),
-							Handler:     mcpProxyHandler(srv, tool.Name, tool.InputSchema, t.blobs),
-							InputSchema: tool.InputSchema,
-							MCP:         true,
-							MCPServer:   name,
+							Name:           fullName,
+							Description:    fmt.Sprintf("[%s] %s", name, tool.Description),
+							Syntax:         syntax,
+							Rules:          fmt.Sprintf("Provided by MCP server '%s'.", name),
+							Handler:        mcpProxyHandler(srv, tool.Name, tool.InputSchema, t.blobs),
+							HandlerContext: mcpProxyHandlerContext(srv, tool.Name, tool.InputSchema, t.blobs),
+							InputSchema:    tool.InputSchema,
+							MCP:            true,
+							MCPServer:      name,
 						})
 					}
 					// Feed the search index so the freshly-connected
@@ -2374,6 +2310,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					addResult(fmt.Sprintf("connected to %s: %d tools", name, len(tools)))
 				}()
 			case "disconnect":
+				if !modelMCPManagementEnabled() {
+					addResult("error: runtime MCP management is not enabled for this agent; use the authenticated Core configuration API")
+					toolNames = append(toolNames, call.Raw)
+					break
+				}
 				name := call.Args["name"]
 				if name != "" {
 					found := false
@@ -2410,10 +2351,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				addResult(fmt.Sprintf("%d servers: %s", len(names), strings.Join(names, ", ")))
 			default:
 				// Dispatch to registry (MCP tools, etc)
-				executeTool(t, call)
+				queueTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
 		}
+		t.applyInlineToolTurnDisposition(calls, results, false)
 		return replies, toolNames, results
 	}
 }
@@ -2432,6 +2374,8 @@ func (t *Thinker) waitForRestoredWake() bool {
 		}
 		logMsg("RUN", fmt.Sprintf("[%s] restored event-only wait", t.threadID))
 		select {
+		case <-t.mutationWake:
+			t.applyRuntimeMutations()
 		case <-t.sub.Wake:
 			t.wakeReason = "event"
 			return true
@@ -2463,6 +2407,9 @@ func (t *Thinker) waitForRestoredWake() bool {
 		t.wakeReason = "timer"
 		logMsg("RUN", fmt.Sprintf("[%s] restored timer expired", t.threadID))
 		return true
+	case <-t.mutationWake:
+		t.applyRuntimeMutations()
+		return t.waitForRestoredWake()
 	case <-t.sub.Wake:
 		// The event remains on the bus for the first iteration. The pending
 		// timer is deliberately untouched.
@@ -2481,6 +2428,8 @@ func (t *Thinker) waitForRestoredWake() bool {
 func (t *Thinker) Run() {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
+	t.beginRuntime()
+	defer t.endRuntime()
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	t.runContextMu.Lock()
 	t.runCancel = cancelRun
@@ -2515,8 +2464,7 @@ func (t *Thinker) Run() {
 			t.failEventExecutions("thinker_panic")
 			t.Stop()
 		}
-		if t.restarting {
-			t.restarting = false
+		if t.restarting.Swap(false) {
 			return
 		}
 		if t.onStop != nil {
@@ -2530,6 +2478,7 @@ func (t *Thinker) Run() {
 
 	emptyLLMResponses := 0
 	for {
+		t.applyRuntimeMutations()
 		// Pause / quit handling.
 		//
 		// Three sources can pause this loop:
@@ -2550,6 +2499,8 @@ func (t *Thinker) Run() {
 				return
 			case p := <-t.pause:
 				t.paused = p
+			case <-t.mutationWake:
+				t.applyRuntimeMutations()
 			case <-t.sub.Wake:
 				t.paused = false
 				logMsg("RUN", fmt.Sprintf("[%s] unpaused by inbox event", t.threadID))
@@ -2564,6 +2515,8 @@ func (t *Thinker) Run() {
 					select {
 					case p = <-t.pause:
 						t.paused = p
+					case <-t.mutationWake:
+						t.applyRuntimeMutations()
 					case <-t.sub.Wake:
 						t.paused = false
 						logMsg("RUN", fmt.Sprintf("[%s] unpaused by inbox event", t.threadID))
@@ -2575,6 +2528,9 @@ func (t *Thinker) Run() {
 			}
 		}
 
+		if t.paused {
+			continue
+		}
 		// A deadline may become due just before an event/resume iteration
 		// starts. Deliver both facts in one model turn rather than running a
 		// redundant second iteration. Keep the expired timestamp until the
@@ -2595,8 +2551,9 @@ func (t *Thinker) Run() {
 		drained := t.drainEvents()
 		for _, event := range drained {
 			if event.ToolResult == nil && strings.TrimSpace(event.Text) != "" {
-				t.resetEvolveTurnGuards()
-				t.resetSendTurnGuards()
+				// A fresh external instruction starts a new workflow, so a
+				// prior no-progress fingerprint must not constrain it.
+				t.resetInlineToolContinuation()
 				break
 			}
 		}
@@ -2722,7 +2679,10 @@ func (t *Thinker) Run() {
 			trMsg := t.archiveToolResultMessage(Message{Role: "user", ToolResults: toolResults})
 			t.messages = append(t.messages, trMsg)
 			if t.session != nil {
-				t.session.AppendMessage(trMsg, t.iteration, TokenUsage{})
+				if err := t.session.AppendMessage(trMsg, t.iteration, TokenUsage{}); err != nil {
+					t.recordPersistenceFailure(err)
+					return
+				}
 			}
 		}
 
@@ -2764,7 +2724,8 @@ func (t *Thinker) Run() {
 				persisted := t.session == nil
 				if t.session != nil {
 					if err := t.session.AppendMessage(msg, t.iteration, TokenUsage{}); err != nil {
-						logMsg("SESSION", fmt.Sprintf("[%s] persist inbox events: %v", t.threadID, err))
+						t.recordPersistenceFailure(err)
+						return
 					} else {
 						persisted = true
 					}
@@ -2899,7 +2860,12 @@ func (t *Thinker) Run() {
 		if !t.executionGate(ExecutionPhaseLLMStart, ExecutionGate{Summary: fmt.Sprintf("Calling %s", t.modelID())}) {
 			return
 		}
-		chatResp, err := t.callLLMWithRetryMessages(runCtx, requestMessages)
+		requestCtx, finishRequest := t.runtimeRequest(runCtx)
+		chatResp, err := t.callLLMWithRetryMessages(requestCtx, requestMessages)
+		finishRequest()
+		if t.applyRuntimeMutations() && runCtx.Err() == nil {
+			continue
+		}
 		t.lastInboundForPreload = ""
 
 		duration := time.Since(start)
@@ -2907,7 +2873,19 @@ func (t *Thinker) Run() {
 		usage := chatResp.Usage
 
 		if err != nil {
-			return
+			if runCtx.Err() != nil {
+				return
+			}
+			t.failEventExecutions("provider_retry_budget_exhausted")
+			// Stay available for updated configuration or a new instruction.
+			select {
+			case <-t.quit:
+				return
+			case <-t.mutationWake:
+				t.applyRuntimeMutations()
+			case <-t.sub.Wake:
+			}
+			continue
 		}
 		t.markToolResultsConsumed(requestMessages)
 		var llmSummary string
@@ -2925,6 +2903,18 @@ func (t *Thinker) Run() {
 		}
 		if !t.executionGate(ExecutionPhaseLLMDone, ExecutionGate{Summary: llmSummary}) {
 			return
+		}
+		for i := range chatResp.ToolCalls {
+			call := &chatResp.ToolCalls[i]
+			if t.telemetry != nil {
+				if call.RawArgs != "" {
+					t.telemetry.Emit("tool.arguments", t.threadID, newToolArgumentsData(call.ID, call.Name, "provider_raw", call.RawArgs))
+				}
+				t.telemetry.Emit("tool.arguments", t.threadID, newToolArgumentsData(call.ID, call.Name, "core_parsed", call.Args))
+			}
+			// Raw provider frames are diagnostic-only. Never retain them in
+			// assistant history or duplicate them into subsequent requests.
+			call.RawArgs = ""
 		}
 
 		// Build assistant message — may include native tool calls.
@@ -2972,7 +2962,10 @@ func (t *Thinker) Run() {
 
 		// Persist to session history
 		if t.session != nil {
-			t.session.AppendMessage(assistantMsg, t.iteration, usage)
+			if err := t.session.AppendMessage(assistantMsg, t.iteration, usage); err != nil {
+				t.recordPersistenceFailure(err)
+				return
+			}
 		}
 
 		// Log server-executed built-in tool results (code execution, etc.)
@@ -3071,7 +3064,10 @@ func (t *Thinker) Run() {
 			inlineMessage := t.archiveToolResultMessage(Message{Role: "user", ToolResults: inlineResults})
 			t.messages = append(t.messages, inlineMessage)
 			if t.session != nil {
-				t.session.AppendMessage(inlineMessage, t.iteration, TokenUsage{})
+				if err := t.session.AppendMessage(inlineMessage, t.iteration, TokenUsage{}); err != nil {
+					t.recordPersistenceFailure(err)
+					return
+				}
 			}
 		}
 
@@ -3104,7 +3100,7 @@ func (t *Thinker) Run() {
 			}
 		}
 
-		t.compactSessionIfNeeded()
+		t.startBackgroundCompaction()
 		t.publishContextStatus()
 
 		// After processing, fall back to agent's chosen rate/sleep
@@ -3222,14 +3218,12 @@ func (t *Thinker) Run() {
 
 		// Check if session needs compaction (background, non-blocking)
 		if t.session != nil && t.session.NeedsCompaction() {
-			go t.session.Compact(nil) // nil = simple count-based summary, no LLM call for now
+			// Failed semantic compaction must preserve unsummarized history.
 		}
 
-		// Kick: search_tools (or any future setter) flips this when it
-		// wants the next iteration to fire immediately rather than
-		// honor the pace cadence. Consumed exactly once. Keeps the
-		// "schemas appear next turn" contract feeling instant instead
-		// of waiting a multi-minute pace tick after a tool discovery.
+		// Inline Core-tool receipts follow the normal function-calling
+		// contract: the model consumes them immediately. Successful pace
+		// and done are the explicit yield/termination boundaries.
 		if t.kickNextTurn {
 			t.kickNextTurn = false
 			t.wakeReason = "continuation"
@@ -3281,6 +3275,8 @@ func (t *Thinker) Run() {
 			t.wakeDeadlineFired = true
 			t.wakeReason = "timer"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
+		case <-t.mutationWake:
+			t.applyRuntimeMutations()
 		case <-t.sub.Wake:
 			t.wakeReason = "event"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: event received", t.threadID))
@@ -3297,6 +3293,8 @@ func (t *Thinker) Run() {
 					t.paused = p
 					t.wakeReason = "resume"
 					logMsg("RUN", fmt.Sprintf("[%s] resumed", t.threadID))
+				case <-t.mutationWake:
+					t.applyRuntimeMutations()
 				case <-t.sub.Wake:
 					t.paused = false
 					t.wakeReason = "event"
@@ -3454,6 +3452,11 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	requestedReasoning := t.effectiveReasoningLevel().String()
 	chatProvider := providerWithReasoning(provider, t.effectiveReasoningLevel())
 	ctx = t.preparePromptCacheContext(ctx, messages, nativeTools)
+	releaseBudget, budgetErr := t.acquireLLMBudget(ctx)
+	if budgetErr != nil {
+		return ChatResponse{}, budgetErr
+	}
+	defer releaseBudget()
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
 	resp.Provider = provider.Name()
 	resp.Model = modelID
@@ -3482,6 +3485,8 @@ func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 }
 
 func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Message) (ChatResponse, error) {
+	ctx, cancelBudget := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancelBudget()
 	attempt := 0
 	attachmentRecoveryUsed := false
 	for {
@@ -3569,11 +3574,17 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 				Iteration:      t.iteration,
 			})
 		}
+		if attempt >= 4 || permanentProviderError(err) {
+			return resp, err
+		}
 		delayFn := t.retryDelay
 		if delayFn == nil {
 			delayFn = providerRetryDelay
 		}
 		delay := delayFn(err, attempt)
+		if t.retryDelay == nil {
+			delay = delay * time.Duration(80+time.Now().UnixNano()%41) / 100
+		}
 		logMsg("RUN", fmt.Sprintf("[%s] LLM attempt %d failed; retrying same prepared turn in %s: %v", t.threadID, attempt, delay, err))
 		timer := time.NewTimer(delay)
 		select {
@@ -3646,17 +3657,14 @@ func (t *Thinker) drainEventTexts() []string {
 func (t *Thinker) drainEvents() []drainedEvent {
 	var items []drainedEvent
 	for _, ev := range t.sub.DrainTargeted() {
+		if ev.ToolGeneration != nil && *ev.ToolGeneration != t.toolGeneration.Load() {
+			continue
+		}
 		if ev.Type == EventInbox {
 			items = append(items, drainedEvent{ID: ev.ID, Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult, ExecutionIDs: append([]string(nil), ev.ExecutionIDs...)})
 		}
 	}
-	for {
-		select {
-		case <-t.sub.Wake:
-		default:
-			return items
-		}
-	}
+	return items
 }
 
 // pendingToolCount returns the number of in-flight async tool calls.
@@ -3725,12 +3733,14 @@ func (t *Thinker) waitForPendingTools(
 		return
 	}
 	start := time.Now()
-	poll := time.NewTicker(20 * time.Millisecond)
-	defer poll.Stop()
+
 	deadlineCh := time.After(deadline)
 	for {
 		// Drain whatever's in the bus right now.
 		for _, ev := range t.sub.DrainTargeted() {
+			if ev.ToolGeneration != nil && *ev.ToolGeneration != t.toolGeneration.Load() {
+				continue
+			}
 			if ev.Type == EventInbox {
 				if ev.ID != "" && len(eventIDs) > 0 && eventIDs[0] != nil {
 					*eventIDs[0] = append(*eventIDs[0], ev.ID)
@@ -3753,6 +3763,9 @@ func (t *Thinker) waitForPendingTools(
 			*toolResults = append(*toolResults, silentResults...)
 			logMsg("RUN", fmt.Sprintf("[%s] drained %d silent tool results while waiting for pending tools", t.threadID, len(silentResults)))
 		}
+		if len(*consumed) > 0 && len(*toolResults) == 0 {
+			return
+		}
 		if t.pendingToolCount() == 0 {
 			logMsg("RUN", fmt.Sprintf("[%s] pending tools drained in %s", t.threadID, time.Since(start)))
 			return
@@ -3761,7 +3774,11 @@ func (t *Thinker) waitForPendingTools(
 		case <-deadlineCh:
 			logMsg("RUN", fmt.Sprintf("[%s] pending tool wait deadline (%s) — %d still in-flight, injecting placeholders", t.threadID, deadline, t.pendingToolCount()))
 			return
-		case <-poll.C:
+		case <-t.mutationWake:
+			return
+		case <-t.sub.Wake:
+			continue
+		case <-t.toolCompleted:
 			continue
 		case <-t.quit:
 			return
@@ -3777,6 +3794,8 @@ func (t *Thinker) waitForPendingTools(
 // "late-result" text message (see late-result routing below) instead of
 // appending a second ToolResult for the same id.
 func (t *Thinker) injectPlaceholdersForPending(toolResults *[]ToolResult) {
+	t.toolLifecycleMu.Lock()
+	defer t.toolLifecycleMu.Unlock()
 	t.pendingTools.Range(func(k, v any) bool {
 		id, ok := k.(string)
 		if !ok || id == "" {
@@ -3810,12 +3829,17 @@ func (t *Thinker) injectPlaceholdersForPending(toolResults *[]ToolResult) {
 // MCP calls. Prevents placeholdersSent from growing unbounded when a
 // tool genuinely hangs.
 func (t *Thinker) sweepStalePlaceholders() {
+	t.toolLifecycleMu.Lock()
+	defer t.toolLifecycleMu.Unlock()
 	now := time.Now()
 	var stale []string
 	t.placeholdersSent.Range(func(k, v any) bool {
 		id, ok1 := k.(string)
 		info, ok2 := v.(placeholderInfo)
 		if !ok1 || !ok2 {
+			return true
+		}
+		if _, pending := t.pendingTools.Load(id); !pending {
 			return true
 		}
 		if now.Sub(info.dispatchedAt) > 5*time.Minute || t.iteration-info.iteration > 20 {
@@ -3826,7 +3850,8 @@ func (t *Thinker) sweepStalePlaceholders() {
 		return true
 	})
 	for _, id := range stale {
-		t.placeholdersSent.Delete(id)
+		t.pendingTools.Delete(id)
+		// Keep the pairing marker until completion; never create a second placeholder.
 		// Don't delete from pendingTools — the goroutine may still
 		// complete and we want its late-result path to fire naturally.
 	}
@@ -3864,11 +3889,16 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 }
 
 func (t *Thinker) ReloadDirective() {
-	t.ReloadDirectiveQuiet()
-	t.InjectConsole("Directive updated to: " + t.directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
+	_ = t.mutateRuntime(func() error {
+		t.reloadDirectiveNow()
+		t.InjectConsole("Directive updated to: " + t.directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
+		return nil
+	})
 }
-
 func (t *Thinker) ReloadDirectiveQuiet() {
+	_ = t.mutateRuntime(func() error { t.reloadDirectiveNow(); return nil })
+}
+func (t *Thinker) reloadDirectiveNow() {
 	directive := t.config.GetDirective()
 	t.directive = directive
 	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
@@ -3896,18 +3926,9 @@ func (t *Thinker) InjectWithParts(text string, parts []ContentPart) {
 }
 
 func (t *Thinker) TogglePause() {
-	newState := !t.paused
-	// Non-blocking send — channel is buffered(1), drain any stale value first
-	select {
-	case <-t.pause:
-	default:
-	}
-	t.pause <- newState
-	t.paused = newState
-	t.publishRuntimeStatus()
-	// Pause/resume all child threads too
+	_ = t.mutateRuntime(func() error { t.paused = !t.paused; t.publishRuntimeStatus(); return nil })
 	if t.threads != nil {
-		t.threads.PauseAll(newState)
+		t.threads.PauseAll(t.status().Paused)
 	}
 }
 
@@ -4107,6 +4128,9 @@ func (t *Thinker) compactForContextPressure(reason string, usage TokenUsage, emp
 }
 
 func (t *Thinker) Stop() {
+	t.toolContext()
+	t.toolCancel()
+	t.toolGeneration.Add(1)
 	t.runContextMu.Lock()
 	if t.runCancel != nil {
 		t.runCancel()

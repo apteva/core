@@ -47,6 +47,7 @@ type SessionEntry struct {
 
 // Session manages persistent JSONL history for one thread.
 type Session struct {
+	revision  uint64
 	mu        sync.Mutex
 	compactMu sync.Mutex
 	path      string
@@ -125,6 +126,9 @@ func (s *Session) Append(entry SessionEntry) error {
 	defer f.Close()
 
 	if err := json.NewEncoder(f).Encode(entry); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		return err
 	}
 	s.count++
@@ -570,6 +574,7 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 	if compactPrefix < 0 {
 		compactPrefix = 0
 	}
+	revision := s.revision
 	s.mu.Unlock()
 
 	// Summarization can be arbitrary caller code. Run it outside the
@@ -588,6 +593,9 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.revision != revision {
+		return
+	}
 	// Re-read after the unlocked summarization window so entries appended
 	// concurrently are preserved when the file is rewritten.
 	entries, err = s.readEntriesLocked()
@@ -638,7 +646,11 @@ func (s *Session) rewriteEntriesLocked(entries []SessionEntry) error {
 			return err
 		}
 	}
-	return atomicWriteFile(s.path, buf.Bytes(), 0600)
+	if err := atomicWriteFile(s.path, buf.Bytes(), 0600); err != nil {
+		return err
+	}
+	s.revision++
+	return nil
 }
 
 func (s *Session) readEntriesLocked() ([]SessionEntry, error) {
@@ -787,14 +799,13 @@ func (s *Session) Delete() {
 // the pointer during a reset can race an in-flight append and resurrect the
 // deleted history through the old Session instance.
 func (s *Session) Reset() error {
-	s.compactMu.Lock()
-	defer s.compactMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	s.revision++
 	s.count = 0
 	s.nextSeq = 0
 	return nil

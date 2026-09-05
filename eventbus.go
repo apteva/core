@@ -20,6 +20,7 @@ const (
 
 // Event is the single message type flowing through the system.
 type Event struct {
+	ToolGeneration *uint64 // identifies tool results from a particular conversation generation
 	// ID is an optional caller-supplied durable inbox identifier. It is used
 	// only for idempotent API delivery and is never interpreted as an internal
 	// event type or exposed to the model.
@@ -77,8 +78,9 @@ type Subscription struct {
 	// Targeted thinker events are reliable. Once C fills, events queue here
 	// in publication order until the thinker drains them. Observer streams do
 	// not use this queue and remain lossy under backpressure.
-	queueMu  sync.Mutex
-	overflow []Event
+	queueMu     sync.Mutex
+	queuedBytes int
+	overflow    []Event
 }
 
 // Publishes (on drop) emit a log line at most once per logDropThrottle.
@@ -86,8 +88,11 @@ const logDropThrottle = int64(time.Second)
 
 // EventBus is the central pub/sub hub. All thinkers share one bus.
 type EventBus struct {
-	mu   sync.RWMutex
-	subs map[string]*Subscription
+	budgetOnce sync.Once
+	budget     *runtimeBudgets
+	mu         sync.RWMutex
+	subs       map[string]*Subscription
+	observers  map[string]*Subscription
 }
 
 func NewEventBus() *EventBus {
@@ -117,12 +122,22 @@ func (b *EventBus) subscribe(id string, buffer int, all, unique bool) (*Subscrip
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if unique && len(b.subs) >= 256 {
+		return nil, fmt.Errorf("instance subscription limit reached (256)")
+	}
 	if unique {
 		if _, exists := b.subs[id]; exists {
 			return nil, fmt.Errorf("subscription %q already exists", id)
 		}
 	}
 	b.subs[id] = sub
+	if b.observers == nil {
+		b.observers = map[string]*Subscription{}
+	}
+	delete(b.observers, id)
+	if all {
+		b.observers[id] = sub
+	}
 	return sub, nil
 }
 
@@ -146,6 +161,10 @@ func (b *EventBus) RenameSubscription(oldID, newID string) error {
 		return fmt.Errorf("subscription %q already exists", newID)
 	}
 	delete(b.subs, oldID)
+	if sub.all {
+		delete(b.observers, oldID)
+		b.observers[newID] = sub
+	}
 	sub.ID = newID
 	b.subs[newID] = sub
 	return nil
@@ -162,6 +181,7 @@ func (b *EventBus) HasSubscriber(id string) bool {
 func (b *EventBus) Unsubscribe(id string) {
 	b.mu.Lock()
 	delete(b.subs, id)
+	delete(b.observers, id)
 	b.mu.Unlock()
 }
 
@@ -174,33 +194,39 @@ func (b *EventBus) Unsubscribe(id string) {
 // Subscribers are snapshotted under a read lock and delivered to without
 // holding the lock, so one slow channel never stalls other subscribers or
 // blocks concurrent publishers / (un)subscribes.
-func (b *EventBus) Publish(ev Event) {
+func (b *EventBus) Publish(ev Event) { b.publish(ev, false) }
+func (b *EventBus) publish(ev Event, bounded bool) bool {
 	b.mu.RLock()
-	snapshot := make([]*Subscription, 0, len(b.subs))
-	for _, sub := range b.subs {
-		snapshot = append(snapshot, sub)
+	target := b.subs[ev.To]
+	observers := make([]*Subscription, 0, len(b.observers))
+	for _, sub := range b.observers {
+		observers = append(observers, sub)
 	}
 	b.mu.RUnlock()
-
-	for _, sub := range snapshot {
-		switch {
-		case sub.all:
-			// Observers (TUI, API SSE, tests) get everything.
-			deliver(sub, ev, false)
-		case ev.To == sub.ID:
-			// Targeted delivery — also signal Wake so consumers using the
-			// wake channel (e.g. the thinker's drain loop) spin even if
-			// the buffered channel was already full.
-			deliverTargeted(sub, ev)
+	if target != nil && !target.all {
+		if !deliverTargetedBounded(target, ev, bounded) {
+			return false
 		}
-		// Broadcasts (To=="") to non-observers are silently skipped —
-		// they're observational (chunks, think_done) and would flood the
-		// channel.
 	}
+	for _, sub := range observers {
+		deliver(sub, ev, false)
+	}
+	return ev.To == "" || target != nil
 }
 
-func deliverTargeted(sub *Subscription, ev Event) {
+func deliverTargeted(sub *Subscription, ev Event) { deliverTargetedBounded(sub, ev, false) }
+func deliverTargetedBounded(sub *Subscription, ev Event, bounded bool) bool {
 	sub.queueMu.Lock()
+	count := len(sub.C) + len(sub.overflow)
+	if count == 0 {
+		sub.queuedBytes = 0
+	}
+	size := eventPayloadBytes(ev)
+	if bounded && (count >= maxMailboxEvents || sub.queuedBytes+size > maxMailboxBytes) {
+		sub.queueMu.Unlock()
+		return false
+	}
+	sub.queuedBytes += size
 	if len(sub.overflow) > 0 {
 		sub.overflow = append(sub.overflow, ev)
 	} else {
@@ -210,11 +236,12 @@ func deliverTargeted(sub *Subscription, ev Event) {
 			sub.overflow = append(sub.overflow, ev)
 		}
 	}
-	sub.queueMu.Unlock()
 	select {
 	case sub.Wake <- struct{}{}:
 	default:
 	}
+	sub.queueMu.Unlock()
+	return true
 }
 
 // DrainTargeted returns every currently queued event in publication order.
@@ -226,6 +253,10 @@ func (sub *Subscription) DrainTargeted() []Event {
 	}
 	sub.queueMu.Lock()
 	defer sub.queueMu.Unlock()
+	select {
+	case <-sub.Wake:
+	default:
+	}
 	events := make([]Event, 0, len(sub.C)+len(sub.overflow))
 	for {
 		select {
@@ -234,6 +265,7 @@ func (sub *Subscription) DrainTargeted() []Event {
 		default:
 			events = append(events, sub.overflow...)
 			sub.overflow = nil
+			sub.queuedBytes = 0
 			return events
 		}
 	}

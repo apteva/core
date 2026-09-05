@@ -245,15 +245,27 @@ func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
 		if event.Type != "memory.recall" {
 			continue
 		}
-		data := string(event.Data)
-		if strings.Contains(data, relevantID) {
-			recalls++
+		var data struct {
+			Matches []struct {
+				ID string `json:"id"`
+			} `json:"matches"`
+			Ephemeral bool `json:"ephemeral"`
 		}
-		if strings.Contains(data, unrelatedID) {
-			t.Fatalf("unrelated memory was recalled: %s", data)
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			t.Fatal(err)
 		}
-		if !strings.Contains(data, `"ephemeral":true`) {
-			t.Fatalf("recall telemetry missing ephemeral marker: %s", data)
+		// Rejected candidates are separately recorded under skipped_matches.
+		// Only accepted matches were injected into the model's context.
+		for _, match := range data.Matches {
+			if match.ID == relevantID {
+				recalls++
+			}
+			if match.ID == unrelatedID {
+				t.Fatalf("unrelated memory was recalled: %s", event.Data)
+			}
+		}
+		if !data.Ephemeral {
+			t.Fatalf("recall telemetry missing ephemeral marker: %s", event.Data)
 		}
 	}
 	if recalls < 3 {

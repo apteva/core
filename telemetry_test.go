@@ -4,10 +4,78 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestDurableTerminalTelemetryReplaysOnceAfterRestart(t *testing.T) {
+	outbox := t.TempDir()
+	t.Setenv("APTEVA_TELEMETRY_OUTBOX_DIR", outbox)
+	t.Setenv("TELEMETRY_URL", "")
+	t.Setenv("TELEMETRY_LIVE_URL", "")
+
+	first := NewTelemetry()
+	if err := first.EmitDurable("tool.result", "worker", ToolResultData{
+		ID: "done-call", Name: "done", Success: true,
+		ExecutionIDs: []string{"exe-replay"},
+	}); err != nil {
+		t.Fatalf("persist terminal result: %v", err)
+	}
+	stored, _ := first.StoredEvents(0)
+	if len(stored) != 1 {
+		t.Fatalf("initial stored events=%d want 1", len(stored))
+	}
+	wantID := stored[0].ID
+	first.Stop()
+	if entries, err := os.ReadDir(outbox); err != nil || len(entries) != 1 {
+		t.Fatalf("durable outbox before restart: entries=%d err=%v", len(entries), err)
+	}
+
+	received := make(chan []TelemetryEvent, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var events []TelemetryEvent
+		if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+			t.Errorf("decode replay batch: %v", err)
+		}
+		received <- events
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	t.Setenv("TELEMETRY_URL", server.URL)
+
+	second := NewTelemetry()
+	select {
+	case events := <-received:
+		if len(events) != 1 || events[0].ID != wantID || events[0].Type != "tool.result" {
+			t.Fatalf("replayed events=%+v want terminal event %s", events, wantID)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("durable terminal result was not replayed")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(outbox)
+		if err == nil && len(entries) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if entries, err := os.ReadDir(outbox); err != nil || len(entries) != 0 {
+		t.Fatalf("acknowledged outbox: entries=%d err=%v", len(entries), err)
+	}
+	second.Stop()
+
+	third := NewTelemetry()
+	defer third.Stop()
+	select {
+	case events := <-received:
+		t.Fatalf("acknowledged completion replayed twice: %+v", events)
+	case <-time.After(1200 * time.Millisecond):
+	}
+}
 
 func TestTelemetryLiveForwardBatchesBurstIntoOneRequest(t *testing.T) {
 	requests := make(chan []TelemetryEvent, 2)
@@ -376,5 +444,64 @@ func TestTelemetry_NotifyChannel(t *testing.T) {
 		// ok
 	case <-time.After(100 * time.Millisecond):
 		t.Error("expected notify signal")
+	}
+}
+
+func TestToolArgumentsTelemetryDistinguishesProviderParsedAndTypedPayloads(t *testing.T) {
+	tel := &Telemetry{
+		notify: make(chan struct{}, 1),
+		quit:   make(chan struct{}),
+	}
+	raw := `{"action":"open","persist":false,"timeout":60}`
+	parsed := map[string]string{"action": "open", "persist": "false", "timeout": "60"}
+	typed := mcpArgumentsFromStrings(parsed, map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":  map[string]any{"type": "string"},
+			"persist": map[string]any{"type": "boolean"},
+			"timeout": map[string]any{"type": "integer"},
+		},
+	})
+
+	tel.Emit("tool.arguments", "worker", newToolArgumentsData("call-1", "computer_browser_session", "provider_raw", raw))
+	tel.Emit("tool.arguments", "worker", newToolArgumentsData("call-1", "computer_browser_session", "core_parsed", parsed))
+	tel.Emit("tool.arguments", "worker", newToolArgumentsData("call-1", "computer_browser_session", "mcp_typed", typed))
+
+	events, _ := tel.Events(0)
+	if len(events) != 3 {
+		t.Fatalf("tool argument events = %d, want 3", len(events))
+	}
+	wantStages := []string{"provider_raw", "core_parsed", "mcp_typed"}
+	for i, event := range events {
+		if event.Type != "tool.arguments" {
+			t.Fatalf("event %d type = %q", i, event.Type)
+		}
+		var data ToolArgumentsData
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			t.Fatalf("decode event %d: %v", i, err)
+		}
+		if data.Stage != wantStages[i] || data.ID != "call-1" || data.Name != "computer_browser_session" {
+			t.Fatalf("event %d = %+v", i, data)
+		}
+		if data.JSON == "" || data.SHA256 == "" || data.OriginalBytes == 0 || data.Truncated {
+			t.Fatalf("event %d missing bounded payload metadata: %+v", i, data)
+		}
+	}
+	var final ToolArgumentsData
+	if err := json.Unmarshal(events[2].Data, &final); err != nil {
+		t.Fatal(err)
+	}
+	if final.Types["action"] != "string" || final.Types["persist"] != "boolean" || final.Types["timeout"] != "number" {
+		t.Fatalf("typed argument types = %#v", final.Types)
+	}
+}
+
+func TestToolArgumentsTelemetryBoundsLargeRawProviderJSON(t *testing.T) {
+	data := newToolArgumentsData("call-large", "upload", "provider_raw", strings.Repeat("x", toolArgumentsTelemetryPreviewBytes+500))
+	if !data.Truncated || data.OriginalBytes != toolArgumentsTelemetryPreviewBytes+500 || data.PreviewBytes != toolArgumentsTelemetryPreviewBytes {
+		t.Fatalf("bounded raw argument telemetry = %+v", data)
+	}
+	if len(data.JSON) != toolArgumentsTelemetryPreviewBytes || data.SHA256 == "" {
+		t.Fatalf("bounded preview/hash missing: %+v", data)
 	}
 }

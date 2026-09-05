@@ -249,6 +249,9 @@ func breakdownSystem(text string) SystemBreakdown {
 // real provider) we fall back to a simpler sum so the total is at
 // least monotonic.
 func nativeToolSize(nt NativeTool) int {
+	if nt.serializedBytes > 0 {
+		return nt.serializedBytes
+	}
 	if b, err := json.Marshal(nt); err == nil {
 		return len(b)
 	}

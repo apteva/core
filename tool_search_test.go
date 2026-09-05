@@ -98,8 +98,8 @@ func TestRunSearchTools_EmptyResultNote(t *testing.T) {
 	if !strings.Contains(res.Note, "storage") {
 		t.Errorf("note should mention attached servers, got %q", res.Note)
 	}
-	if !th.kickNextTurn {
-		t.Error("valid empty search must schedule one continuation to process its result")
+	if th.kickNextTurn {
+		t.Error("runSearchTools should not own scheduling; its handler applies the common tool-result continuation")
 	}
 }
 
@@ -211,18 +211,19 @@ func TestApplyPreloadExtraQuery(t *testing.T) {
 	}
 }
 
-// TestSearchToolsSetsKick pins the immediate-rethink contract: after
-// search_tools activates new tools, the thinker should flag itself to
-// skip its next pace sleep so the just-discovered tools can be called
-// without a multi-minute cadence wait.
-func TestSearchToolsSetsKick(t *testing.T) {
+// TestSearchToolsHandlerSetsKick pins the common inline-tool continuation:
+// after search_tools returns, its handler schedules the next model turn so
+// the newly exposed schemas can be used immediately.
+func TestSearchToolsHandlerSetsKick(t *testing.T) {
 	th := indexedThinker("main")
 	if th.kickNextTurn {
 		t.Fatal("kickNextTurn should start false")
 	}
-	out := runSearchTools(th, map[string]string{"query": "file upload"}, true)
-	if out == "" {
-		t.Fatal("runSearchTools returned empty")
+	_, _, results := mainToolHandler(th)(th, []toolCall{{
+		Name: "search_tools", Args: map[string]string{"query": "file upload"}, NativeID: "search-1",
+	}}, nil)
+	if len(results) != 1 || results[0].Content == "" {
+		t.Fatalf("search_tools results = %+v", results)
 	}
 	if !th.kickNextTurn {
 		t.Error("kickNextTurn should be true after a successful search_tools call")

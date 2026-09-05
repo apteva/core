@@ -61,13 +61,33 @@ func safePath(p string) (string, error) {
 		return "", err
 	}
 	base, _ := filepath.Abs(codebaseDir)
-	if !strings.HasPrefix(abs, base) {
+	rel, relErr := filepath.Rel(base, abs)
+	if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("path escapes codebase directory")
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	if _, err := root.Stat(rel); err != nil && !os.IsNotExist(err) {
+		return "", err
 	}
 	return abs, nil
 }
 
 func handleToolCall(id int64, name string, args map[string]string) {
+	root, err := os.OpenRoot(codebaseDir)
+	if err != nil {
+		textResult(id, fmt.Sprintf("ERROR: %v", err))
+		return
+	}
+	defer root.Close()
+	relative := func(path string) string {
+		base, _ := filepath.Abs(codebaseDir)
+		rel, _ := filepath.Rel(base, path)
+		return rel
+	}
 	switch name {
 	case "read_file":
 		path := args["path"]
@@ -80,7 +100,7 @@ func handleToolCall(id int64, name string, args map[string]string) {
 			textResult(id, fmt.Sprintf("ERROR: %v", err))
 			return
 		}
-		data, err := os.ReadFile(abs)
+		data, err := root.ReadFile(relative(abs))
 		if err != nil {
 			textResult(id, fmt.Sprintf("ERROR: %v", err))
 			return
@@ -99,8 +119,11 @@ func handleToolCall(id int64, name string, args map[string]string) {
 			textResult(id, fmt.Sprintf("ERROR: %v", err))
 			return
 		}
-		os.MkdirAll(filepath.Dir(abs), 0755)
-		if err := os.WriteFile(abs, []byte(content), 0644); err != nil {
+		if err := root.MkdirAll(filepath.Dir(relative(abs)), 0755); err != nil {
+			textResult(id, fmt.Sprintf("ERROR: %v", err))
+			return
+		}
+		if err := root.WriteFile(relative(abs), []byte(content), 0644); err != nil {
 			textResult(id, fmt.Sprintf("ERROR: %v", err))
 			return
 		}
@@ -182,7 +205,7 @@ func handleToolCall(id int64, name string, args map[string]string) {
 			if strings.HasPrefix(info.Name(), ".") {
 				return nil
 			}
-			data, err := os.ReadFile(path)
+			data, err := root.ReadFile(relative(path))
 			if err != nil {
 				return nil
 			}
@@ -234,8 +257,8 @@ func main() {
 		case "initialize":
 			respond(id, map[string]any{
 				"protocolVersion": "2024-11-05",
-				"capabilities":   map[string]any{"tools": map[string]any{}},
-				"serverInfo":     map[string]string{"name": "codebase", "version": "1.0.0"},
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]string{"name": "codebase", "version": "1.0.0"},
 			})
 		case "tools/list":
 			respond(id, map[string]any{

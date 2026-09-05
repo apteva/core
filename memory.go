@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
@@ -151,14 +152,20 @@ func (r MemoryRecord) IsTombstone() bool { return r.Tombstone }
 // MemoryStore is the in-process journal owner. Append-only on disk,
 // rebuilds the active-set on load.
 type MemoryStore struct {
-	mu          sync.RWMutex
-	records     []MemoryRecord // full sequence, in insertion order
-	byID        map[string]int // id → index in records
-	active      map[string]MemoryRecord
-	activeOrder []string
-	generation  uint64            // increments whenever records are appended
-	backend     *embeddingBackend // nil → no embeddings, lexical-only
-	path        string
+	normalized       map[string]string
+	embeddingMu      sync.Mutex
+	embeddingCache   map[[32]byte]embeddingCacheEntry
+	embeddingRetryAt time.Time
+	mu               sync.RWMutex
+	records          []MemoryRecord // full sequence, in insertion order
+	byID             map[string]int // id → index in records
+	active           map[string]MemoryRecord
+	activeOrder      []string
+	lexical          map[string]map[string]int
+	postings         map[string]map[string]bool
+	generation       uint64            // increments whenever records are appended
+	backend          *embeddingBackend // nil → no embeddings, lexical-only
+	path             string
 }
 
 // NewMemoryStore opens (or creates) memory.jsonl at the cwd, picks
@@ -264,7 +271,8 @@ func (ms *MemoryStore) migrateLegacyIfNeeded() {
 			Embedding []float64 `json:"embedding"`
 		}
 		if err := dec.Decode(&legacy); err != nil {
-			continue
+			logMsg("MEMORY", fmt.Sprintf("legacy migration stopped at malformed record: %v", err))
+			break
 		}
 		if legacy.Text == "" {
 			continue
@@ -300,10 +308,14 @@ func (ms *MemoryStore) load() {
 	if err != nil {
 		return
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	for dec.More() {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 64*1024), 32<<20)
+	line := 0
+	for scanner.Scan() {
+		line++
 		var rec MemoryRecord
-		if err := dec.Decode(&rec); err != nil {
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			logMsg("MEMORY", fmt.Sprintf("skipping corrupt journal record %d: %v", line, err))
 			continue
 		}
 		if rec.ID == "" {
@@ -311,6 +323,9 @@ func (ms *MemoryStore) load() {
 		}
 		ms.records = append(ms.records, rec)
 		ms.byID[rec.ID] = len(ms.records) - 1
+	}
+	if err := scanner.Err(); err != nil {
+		logMsg("MEMORY", fmt.Sprintf("journal read stopped at record %d: %v", line, err))
 	}
 	ms.rebuildActiveLocked()
 	logMsg("MEMORY", fmt.Sprintf("loaded %d records (%d active)", len(ms.records), ms.activeCount()))
@@ -330,6 +345,9 @@ func (ms *MemoryStore) ensureActiveLocked() {
 }
 
 func (ms *MemoryStore) rebuildActiveLocked() {
+	ms.normalized = map[string]string{}
+	ms.lexical = map[string]map[string]int{}
+	ms.postings = map[string]map[string]bool{}
 	ms.active = make(map[string]MemoryRecord)
 	ms.activeOrder = nil
 	for _, rec := range ms.records {
@@ -348,7 +366,9 @@ func (ms *MemoryStore) applyActiveRecordLocked(rec MemoryRecord) {
 	if _, exists := ms.active[rec.ID]; !exists {
 		ms.activeOrder = append(ms.activeOrder, rec.ID)
 	}
+	ms.unindexLocked(rec.ID)
 	ms.active[rec.ID] = rec
+	ms.indexLocked(rec)
 }
 
 func (ms *MemoryStore) removeActiveLocked(id string) {
@@ -358,6 +378,7 @@ func (ms *MemoryStore) removeActiveLocked(id string) {
 	if _, exists := ms.active[id]; !exists {
 		return
 	}
+	ms.unindexLocked(id)
 	delete(ms.active, id)
 	for i, activeID := range ms.activeOrder {
 		if activeID == id {
@@ -765,68 +786,11 @@ func (ms *MemoryStore) RecallMatches(query string, n int) []MemoryRecallMatch {
 // source. A record relevant to both contexts ranks above one relevant to only
 // one, while the normal record limit and content deduplication still apply.
 func (ms *MemoryStore) RecallMatchesForContexts(queries []string, n int) []MemoryRecallMatch {
-	if n <= 0 {
-		n = 5
-	}
-	type combinedMatch struct {
-		record MemoryRecord
-		signal float64
-		factor float64
-	}
-	combined := make(map[string]combinedMatch)
-	seenQueries := make(map[string]struct{}, len(queries))
-	for _, query := range queries {
-		query = strings.TrimSpace(query)
-		if query == "" {
-			continue
-		}
-		if _, duplicate := seenQueries[query]; duplicate {
-			continue
-		}
-		seenQueries[query] = struct{}{}
-		for _, item := range ms.scoreActive(query, scoreOpts{useEmbedding: ms.backend != nil, applyDecay: true}) {
-			current := combined[item.rec.ID]
-			current.record = item.rec
-			// Probabilistic union keeps the result in [0,1], preserves a
-			// single-query score, and rewards evidence from both contexts.
-			current.signal = 1 - (1-current.signal)*(1-item.signal)
-			if item.signal > 0 {
-				current.factor = item.score / item.signal // weight * decay
-			}
-			combined[item.rec.ID] = current
-		}
-	}
-	scored := make([]scoredRec, 0, len(combined))
-	for _, item := range combined {
-		scored = append(scored, scoredRec{
-			rec:    item.record,
-			signal: item.signal,
-			score:  item.signal * item.factor,
-		})
-	}
-	sort.Slice(scored, func(i, j int) bool {
-		if scored[i].score == scored[j].score {
-			return scored[i].rec.ID < scored[j].rec.ID
-		}
-		return scored[i].score > scored[j].score
-	})
-	out := make([]MemoryRecallMatch, 0, min(n, len(scored)))
-	seenContent := make(map[string]struct{}, len(scored))
-	for _, item := range scored {
-		contentKey := normalizeMemoryContent(item.rec.Content)
-		if _, duplicate := seenContent[contentKey]; duplicate {
-			continue
-		}
-		seenContent[contentKey] = struct{}{}
-		out = append(out, MemoryRecallMatch{Record: item.rec, Score: item.score, Signal: item.signal})
-		if len(out) == n {
-			break
-		}
-	}
-	return out
+	return ms.recallIndexed(queries, n)
 }
 
 type scoreOpts struct {
+	unsorted     bool
 	useEmbedding bool
 	applyDecay   bool
 }
@@ -854,22 +818,45 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 	if strings.TrimSpace(query) == "" {
 		return nil
 	}
-	active := ms.Active()
-	if len(active) == 0 {
-		return nil
-	}
 
 	var queryEmb []float64
 	if opts.useEmbedding && ms.backend != nil {
-		if emb, err := ms.embed(query); err == nil {
+		if emb, err := ms.cachedQueryEmbedding(query); err == nil {
 			queryEmb = emb
 		}
 	}
+	ms.mu.Lock()
+	ms.ensureActiveLocked()
+	if ms.lexical == nil {
+		ms.lexical = map[string]map[string]int{}
+		ms.postings = map[string]map[string]bool{}
+		for _, r := range ms.active {
+			ms.indexLocked(r)
+		}
+	}
+	ms.mu.Unlock()
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
 	queryTokenSets := recallQueryTokenSets(query)
 	now := time.Now().UTC()
 
-	out := make([]scoredRec, 0, len(active))
-	for _, r := range active {
+	candidates := map[string]bool{}
+	if queryEmb != nil {
+		for id := range ms.active {
+			candidates[id] = true
+		}
+	} else {
+		for _, tokens := range queryTokenSets {
+			for token := range tokens {
+				for id := range ms.postings[token] {
+					candidates[id] = true
+				}
+			}
+		}
+	}
+	out := make([]scoredRec, 0, len(candidates))
+	for id := range candidates {
+		r := ms.active[id]
 		// Signal: prefer embedding cosine when both sides have one
 		// of matching dim; fall back to lexical otherwise.
 		var signal float64
@@ -880,7 +867,7 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 				signal = 0
 			}
 		} else {
-			signal = lexicalScore(queryTokenSets, r)
+			signal = lexicalTokenScore(queryTokenSets, ms.lexical[r.ID])
 		}
 		if signal <= 0 || (usedEmbedding && signal < minEmbeddingRecallSimilarity) {
 			continue
@@ -908,6 +895,9 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 		})
 	}
 
+	if opts.unsorted {
+		return out
+	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].score == out[j].score {
 			return out[i].rec.ID < out[j].rec.ID
@@ -1198,6 +1188,10 @@ func lexicalScore(queryTokenSets []map[string]int, r MemoryRecord) float64 {
 		doc += " " + strings.Join(r.Tags, " ")
 	}
 	docTokens := tokenize(doc)
+	return lexicalTokenScore(queryTokenSets, docTokens)
+}
+
+func lexicalTokenScore(queryTokenSets []map[string]int, docTokens map[string]int) float64 {
 	best := 0.0
 	for _, queryTokens := range queryTokenSets {
 		hits := 0
@@ -1272,4 +1266,55 @@ func formatAge(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dd", int(d.Hours()/24))
 	}
+}
+
+// Reset commits an empty journal before invalidating every in-memory view.
+func (ms *MemoryStore) Reset() error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if err := atomicWriteFile(ms.path, nil, 0600); err != nil {
+		return err
+	}
+	ms.records = nil
+	ms.byID = map[string]int{}
+	ms.active = map[string]MemoryRecord{}
+	ms.activeOrder = nil
+	ms.lexical = nil
+	ms.postings = nil
+	ms.normalized = nil
+	ms.embeddingMu.Lock()
+	ms.embeddingCache = nil
+	ms.embeddingRetryAt = time.Time{}
+	ms.embeddingMu.Unlock()
+	ms.generation++
+	return nil
+}
+
+func (ms *MemoryStore) indexLocked(rec MemoryRecord) {
+	if ms.normalized == nil {
+		ms.normalized = map[string]string{}
+	}
+	ms.normalized[rec.ID] = normalizeMemoryContent(rec.Content)
+	if ms.lexical == nil {
+		ms.lexical = map[string]map[string]int{}
+		ms.postings = map[string]map[string]bool{}
+	}
+	tokens := tokenize(rec.Content + " " + strings.Join(rec.Tags, " "))
+	ms.lexical[rec.ID] = tokens
+	for token := range tokens {
+		if ms.postings[token] == nil {
+			ms.postings[token] = map[string]bool{}
+		}
+		ms.postings[token][rec.ID] = true
+	}
+}
+func (ms *MemoryStore) unindexLocked(id string) {
+	delete(ms.normalized, id)
+	for token := range ms.lexical[id] {
+		delete(ms.postings[token], id)
+		if len(ms.postings[token]) == 0 {
+			delete(ms.postings, token)
+		}
+	}
+	delete(ms.lexical, id)
 }

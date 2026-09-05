@@ -92,6 +92,26 @@ func upsertPersistentThreadLocked(c *Config, pt PersistentThread) {
 }
 
 func (c *Config) saveThreadAndRegisterEventExecutions(pt PersistentThread, accepted []PersistentThreadEvent) error {
+	c.mu.RLock()
+	exists := false
+	for _, thread := range c.Threads {
+		if thread.ID == pt.ID {
+			exists = true
+			break
+		}
+	}
+	c.mu.RUnlock()
+	if exists {
+		return c.updateRuntime(func() {
+			for i := range c.Threads {
+				if c.Threads[i].ID == pt.ID {
+					c.Threads[i].Events = clonePersistentThreadEvents(pt.Events)
+					break
+				}
+			}
+			registerEventExecutionsLocked(c, pt.ID, accepted)
+		})
+	}
 	return c.update(func() {
 		upsertPersistentThreadLocked(c, pt)
 		registerEventExecutionsLocked(c, pt.ID, accepted)
@@ -99,14 +119,14 @@ func (c *Config) saveThreadAndRegisterEventExecutions(pt PersistentThread, accep
 }
 
 func (c *Config) saveMainEventsAndRegisterExecutions(events, accepted []PersistentThreadEvent) error {
-	return c.update(func() {
+	return c.updateRuntime(func() {
 		c.MainEvents = clonePersistentThreadEvents(events)
 		registerEventExecutionsLocked(c, "main", accepted)
 	})
 }
 
 func (c *Config) saveMainEvents(events []PersistentThreadEvent) error {
-	return c.update(func() { c.MainEvents = clonePersistentThreadEvents(events) })
+	return c.updateRuntime(func() { c.MainEvents = clonePersistentThreadEvents(events) })
 }
 
 func (c *Config) getMainEvents() []PersistentThreadEvent {
@@ -166,7 +186,7 @@ func (l *EventLifecycle) Claim(threadID string, executionIDs []string) error {
 	defer l.mu.Unlock()
 	now := time.Now().UTC()
 	var emitted []EventLifecycleTransition
-	err := l.config.update(func() {
+	err := l.config.updateRuntime(func() {
 		for i := range l.config.EventExecutions {
 			execution := &l.config.EventExecutions[i]
 			if !containsString(executionIDs, execution.ExecutionID) || executionTerminal(execution.Status) {
@@ -198,8 +218,21 @@ func (l *EventLifecycle) Propagate(executionIDs []string, targetThreadID string)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Repeated messages to an already active participant do not change durable state.
+	l.config.mu.RLock()
+	changed := false
+	for _, execution := range l.config.EventExecutions {
+		if containsString(executionIDs, execution.ExecutionID) && !executionTerminal(execution.Status) && !execution.Participants[targetThreadID] {
+			changed = true
+			break
+		}
+	}
+	l.config.mu.RUnlock()
+	if !changed {
+		return nil
+	}
 	now := time.Now().UTC()
-	return l.config.update(func() {
+	return l.config.updateRuntime(func() {
 		for i := range l.config.EventExecutions {
 			execution := &l.config.EventExecutions[i]
 			if !containsString(executionIDs, execution.ExecutionID) || executionTerminal(execution.Status) {
@@ -224,7 +257,7 @@ func (l *EventLifecycle) SettleThread(threadID string, executionIDs []string, re
 	defer l.mu.Unlock()
 	now := time.Now().UTC()
 	var emitted []EventLifecycleTransition
-	err := l.config.update(func() {
+	err := l.config.updateRuntime(func() {
 		for i := range l.config.EventExecutions {
 			execution := &l.config.EventExecutions[i]
 			if !containsString(executionIDs, execution.ExecutionID) || executionTerminal(execution.Status) {
@@ -261,7 +294,7 @@ func (l *EventLifecycle) Fail(executionIDs []string, threadID, reason string) er
 	defer l.mu.Unlock()
 	now := time.Now().UTC()
 	var emitted []EventLifecycleTransition
-	err := l.config.update(func() {
+	err := l.config.updateRuntime(func() {
 		for i := range l.config.EventExecutions {
 			execution := &l.config.EventExecutions[i]
 			if !containsString(executionIDs, execution.ExecutionID) || executionTerminal(execution.Status) {
@@ -313,7 +346,7 @@ func (l *EventLifecycle) ReconcileRestoredParticipants(restored map[string]bool)
 	now := time.Now().UTC()
 	var emitted []EventLifecycleTransition
 	var failed []string
-	err := l.config.update(func() {
+	err := l.config.updateRuntime(func() {
 		for i := range l.config.EventExecutions {
 			execution := &l.config.EventExecutions[i]
 			if executionTerminal(execution.Status) {
@@ -371,7 +404,7 @@ func (l *EventLifecycle) Acknowledge(ids []string) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.config.update(func() {
+	return l.config.updateRuntime(func() {
 		kept := l.config.EventLifecycleOutbox[:0]
 		for _, transition := range l.config.EventLifecycleOutbox {
 			if !wanted[transition.ID] {

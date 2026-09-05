@@ -130,7 +130,11 @@ func TestCodexSubthreadMainEvolveConfirmationWorkflowSmoke(t *testing.T) {
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set and no valid local Codex token")
 	}
-	runSubthreadMainEvolveConfirmationWorkflow(t, NewOpenAICodexProvider(token), 4*time.Minute)
+	provider := NewOpenAICodexProvider(token)
+	if model := strings.TrimSpace(os.Getenv("CODEX_SMOKE_MODEL")); model != "" {
+		provider = &fixedModelProvider{LLMProvider: provider, model: model}
+	}
+	runSubthreadMainEvolveConfirmationWorkflow(t, provider, 4*time.Minute)
 }
 
 func runSubthreadMainEvolveConfirmationWorkflow(t *testing.T, provider LLMProvider, timeout time.Duration) {
@@ -161,6 +165,7 @@ func runSubthreadMainEvolveConfirmationWorkflow(t *testing.T, provider LLMProvid
 	thinker.registry.Register(&ToolDef{
 		Name:        evolveHandoffTool,
 		Description: "Deliver main's completed durable-policy result to the waiting user. Call exactly once and only after main replies.",
+		ThreadOnly:  true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -183,7 +188,8 @@ func runSubthreadMainEvolveConfirmationWorkflow(t *testing.T, provider LLMProvid
 		"",
 		"# Workflow",
 		"For a durable policy request, send it to main exactly once. The send receipt is not completion: wait for main's actual reply without pacing or sending again.",
-		"Do not evolve your own directive. When main replies that the policy was updated, call deliver_durable_confirmation exactly once with a concise user-facing confirmation.",
+		"A send tool result is only a delivery receipt and is never main's reply. Main's reply is a later inbox message beginning literally [from:main].",
+		"Do not evolve your own directive. Only after a literal [from:main] message says the policy was updated, call deliver_durable_confirmation exactly once with a concise user-facing confirmation.",
 	}, "\n")
 	if err := thinker.threads.SpawnWithOpts(
 		evolveHandoffThreadID,

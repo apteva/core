@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -63,6 +64,7 @@ var GeminiModelOrder = []string{
 }
 
 type GoogleProvider struct {
+	mu          sync.RWMutex
 	apiKey      string
 	models      map[ModelTier]string
 	activeModel string // current model ID for cost tracking
@@ -80,9 +82,17 @@ func NewGoogleProvider(apiKey string) LLMProvider {
 	}
 }
 
-func (p *GoogleProvider) Name() string                 { return "google" }
-func (p *GoogleProvider) Models() map[ModelTier]string { return p.models }
-func (p *GoogleProvider) SupportsNativeTools() bool    { return true }
+func (p *GoogleProvider) Name() string { return "google" }
+func (p *GoogleProvider) Models() map[ModelTier]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := map[ModelTier]string{}
+	for k, v := range p.models {
+		out[k] = v
+	}
+	return out
+}
+func (p *GoogleProvider) SupportsNativeTools() bool { return true }
 
 func (p *GoogleProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
@@ -95,11 +105,11 @@ func (p *GoogleProvider) SetBuiltinTools(tools []string) {
 }
 
 func (p *GoogleProvider) WithBuiltins(builtins []string) LLMProvider {
-	return p // Google builtins handled separately
+	return &GoogleProvider{apiKey: p.apiKey, models: p.Models(), activeModel: p.ActiveModel()}
 }
 
 func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
-	if m, ok := geminiModels[p.activeModel]; ok {
+	if m, ok := geminiModels[p.ActiveModel()]; ok {
 		return m.InputPer1M, m.CachedPer1M, m.OutputPer1M
 	}
 	// Fallback to the default Gemini 3.6 Flash pricing.
@@ -108,6 +118,8 @@ func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
 
 // SetModel updates the active model. Called from TUI model cycling.
 func (p *GoogleProvider) SetModel(modelID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if _, ok := geminiModels[modelID]; ok {
 		p.activeModel = modelID
 		p.models[ModelLarge] = modelID
@@ -117,7 +129,11 @@ func (p *GoogleProvider) SetModel(modelID string) {
 }
 
 // ActiveModel returns the current model ID.
-func (p *GoogleProvider) ActiveModel() string { return p.activeModel }
+func (p *GoogleProvider) ActiveModel() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.activeModel
+}
 
 // AvailableModels returns all supported Gemini model IDs in cycle order.
 func (p *GoogleProvider) AvailableModels() []string { return GeminiModelOrder }
@@ -154,11 +170,13 @@ type geminiPart struct {
 }
 
 type geminiFunctionCall struct {
+	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args"`
 }
 
 type geminiFunctionResponse struct {
+	ID       string         `json:"id,omitempty"`
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response"`
 }
@@ -260,7 +278,8 @@ func isEmptyGeminiSchema(v any) bool {
 // Gemini streaming response
 type geminiStreamResponse struct {
 	Candidates []struct {
-		Content struct {
+		FinishReason string `json:"finishReason"`
+		Content      struct {
 			Parts []geminiPart `json:"parts"`
 		} `json:"content"`
 	} `json:"candidates"`
@@ -272,8 +291,10 @@ type geminiStreamResponse struct {
 }
 
 func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
-	// Track active model for cost calculation
+	// Per-request providers use independent cost metadata.
+	p.mu.Lock()
 	p.activeModel = model
+	p.mu.Unlock()
 
 	// Convert messages to Gemini format
 	// Gemini requires: one optional systemInstruction, then strictly alternating user/model turns.
@@ -308,7 +329,8 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 				response := map[string]any{"result": tr.Content}
 				parts = append(parts, geminiPart{
 					FunctionResponse: &geminiFunctionResponse{
-						Name:     tr.CallID,
+						Name:     tr.ToolName,
+						ID:       tr.CallID,
 						Response: response,
 					},
 				})
@@ -338,15 +360,21 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 			}
 			for _, tc := range m.ToolCalls {
 				args := make(map[string]any)
-				for k, v := range tc.Args {
-					args[k] = v
+				if len(tc.CanonicalArgs) > 0 {
+					if err := json.Unmarshal(tc.CanonicalArgs, &args); err != nil {
+						return ChatResponse{}, fmt.Errorf("invalid replay arguments: %w", err)
+					}
+				} else {
+					for k, v := range tc.Args {
+						args[k] = v
+					}
 				}
 				sig := tc.ThoughtSignature
 				if sig == "" {
 					sig = "skip_thought_signature_validator"
 				}
 				part := geminiPart{
-					FunctionCall:     &geminiFunctionCall{Name: tc.Name, Args: args},
+					FunctionCall:     &geminiFunctionCall{ID: tc.ID, Name: tc.Name, Args: args},
 					ThoughtSignature: sig,
 				}
 				parts = append(parts, part)
@@ -484,7 +512,9 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
+	callPrefix := "gemini_" + newULID()
 	toolCallSeq := 0
+	completedStream := false
 
 	scanner := bufio.NewScanner(stream)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -502,6 +532,12 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 		}
 
 		for _, candidate := range event.Candidates {
+			if candidate.FinishReason != "" {
+				if candidate.FinishReason != "STOP" {
+					return ChatResponse{}, fmt.Errorf("Gemini incomplete response: %s", candidate.FinishReason)
+				}
+				completedStream = true
+			}
 			for _, part := range candidate.Content.Parts {
 				if part.Text != "" {
 					full.WriteString(part.Text)
@@ -510,7 +546,15 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 					}
 				}
 				if part.FunctionCall != nil {
+					if part.FunctionCall.Name == "" || part.FunctionCall.Args == nil {
+						return ChatResponse{}, fmt.Errorf("invalid Gemini function call")
+					}
 					toolCallSeq++
+					callID := part.FunctionCall.ID
+					if callID == "" {
+						callID = fmt.Sprintf("%s_%d", callPrefix, toolCallSeq)
+					}
+					argsJSON, _ := json.Marshal(part.FunctionCall.Args)
 					args := make(map[string]string)
 					for k, v := range part.FunctionCall.Args {
 						switch v.(type) {
@@ -522,15 +566,15 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 						}
 					}
 					toolCalls = append(toolCalls, NativeToolCall{
-						ID:               fmt.Sprintf("gemini_%d", toolCallSeq),
+						ID:               callID,
 						Name:             part.FunctionCall.Name,
 						Args:             args,
+						RawArgs:          string(argsJSON),
+						CanonicalArgs:    append(json.RawMessage(nil), argsJSON...),
 						ThoughtSignature: part.ThoughtSignature,
 					})
 					// Gemini delivers complete tool calls, emit the full args as one chunk
 					if onToolChunk != nil {
-						argsJSON, _ := json.Marshal(part.FunctionCall.Args)
-						callID := fmt.Sprintf("gemini_%d", toolCallSeq)
 						onToolChunk(part.FunctionCall.Name, callID, string(argsJSON))
 					}
 				}
@@ -547,6 +591,9 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 		return ChatResponse{}, fmt.Errorf("Gemini stream read error: %w", err)
 	}
 
+	if !completedStream {
+		return ChatResponse{}, fmt.Errorf("Gemini stream ended before finishReason")
+	}
 	response := full.String()
 	preview := response
 	if len(preview) > 200 {

@@ -22,7 +22,7 @@ func TestCodexLargeToolResultPreservedSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex context-pressure smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
@@ -68,7 +68,7 @@ func TestCodexSemanticCompactionSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Codex context-pressure smoke in short mode")
 	}
-	token := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"))
+	token := codexAccessTokenForMemorySmoke(t)
 	if token == "" {
 		t.Skip("OPENAI_CODEX_ACCESS_TOKEN not set")
 	}
