@@ -730,11 +730,45 @@ func NewOpenCodeGoProvider(apiKey string) LLMProvider {
 	}
 }
 
+// openAIBaseURL returns the API root for OpenAI-shaped requests,
+// honouring OPENAI_BASE_URL so a compatible gateway (LiteLLM,
+// OpenRouter, vLLM, a corporate proxy) can stand in for OpenAI itself.
+// The value is the versioned root — callers append the endpoint path,
+// e.g. "/chat/completions". Matches the convention already used by the
+// server's preset planner: trailing slashes trimmed, empty falls back
+// to the real API.
+func openAIBaseURL() string {
+	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")), "/"); base != "" {
+		return base
+	}
+	return "https://api.openai.com/v1"
+}
+
+// openAIUsesChatCompletions reports whether the "openai" provider should
+// talk Chat Completions instead of the Responses API.
+//
+// Apteva picks the Responses API for OpenAI, which is right for OpenAI
+// itself but not for the compatible gateways OPENAI_BASE_URL exists to
+// support: many front non-OpenAI models (Claude, Llama, …) and expose
+// them only under /chat/completions. Those requests fail in gateway
+// -specific and often misleading ways — a 503 "no available accounts",
+// a 400, a 502 — none of which identify the endpoint as the problem.
+//
+// Defaults to the Responses API so nothing changes for stock OpenAI.
+func openAIUsesChatCompletions() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_API_STYLE"))) {
+	case "chat", "chat_completions", "chat-completions", "completions":
+		return true
+	default:
+		return false
+	}
+}
+
 func NewOpenAIProvider(apiKey string) LLMProvider {
 	return &OpenAICompatProvider{
 		name:       "openai",
 		apiKey:     apiKey,
-		url:        "https://api.openai.com/v1/chat/completions",
+		url:        openAIBaseURL() + "/chat/completions",
 		authHeader: "Bearer",
 		models: map[ModelTier]string{
 			ModelLarge:  "gpt-4.1",

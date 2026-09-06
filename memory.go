@@ -104,7 +104,7 @@ func detectEmbeddingBackend() *embeddingBackend {
 	}
 	if k := os.Getenv("OPENAI_API_KEY"); k != "" {
 		return &embeddingBackend{
-			URL:    "https://api.openai.com/v1/embeddings",
+			URL:    openAIBaseURL() + "/embeddings",
 			Model:  "text-embedding-3-small",
 			APIKey: k, Header: "Bearer", Dim: 1536, Source: "openai",
 		}
