@@ -62,6 +62,17 @@ func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit fu
 		cleanup()
 		return fmt.Errorf("MCP replacement failed: connected %d of %d; previous configuration retained", len(staged), len(connect))
 	}
+	for _, def := range stagedRegistry.tools {
+		old := t.registry.Get(def.Name)
+		if old == nil {
+			continue
+		}
+		_, retained := want[old.MCPServer]
+		if !old.MCP || (retained && !replacement[old.MCPServer] && (old.MCPServer != def.MCPServer || old.MCPLocalName != def.MCPLocalName)) {
+			cleanup()
+			return fmt.Errorf("MCP tool identity collision for %q; previous configuration retained", def.Name)
+		}
+	}
 	if err := commit(desired); err != nil {
 		cleanup()
 		return err
@@ -86,9 +97,12 @@ func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit fu
 	if t.toolIndex != nil {
 		t.toolIndex.mu.Lock()
 		t.toolIndex.entries = append(t.toolIndex.entries, stagedIndex.entries...)
+		t.toolIndex.revision++
+		t.toolIndex.rebuildNamesLocked()
 		t.toolIndex.mu.Unlock()
 		for _, c := range desired {
 			t.toolIndex.UpdatePolicy(c.Name, c.NoSpawn, c.ToolLoading)
+			t.toolIndex.replaceServerAliases(c.Name, c.ToolAliases)
 		}
 	}
 	t.mcpServers = append(kept, staged...)

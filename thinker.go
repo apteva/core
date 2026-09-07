@@ -969,13 +969,19 @@ type Thinker struct {
 	// activeToolAge tracks the iteration each active tool was last
 	// surfaced — the recency key for evictActiveToolsLRU. Lazily
 	// initialised by touchActiveTool.
-	activeToolAge map[string]int
+	activeToolAge       map[string]int
+	discoveredToolUntil map[string]int
 	// presentedTools is the exact schema-name set supplied to the model for
 	// its current request/session configuration. Sub-thread dispatch uses
 	// this same set so a dynamically discovered or always-loaded tool cannot
 	// be visible but uncallable, while a guessed hidden name cannot execute.
-	presentedToolsMu sync.RWMutex
-	presentedTools   map[string]bool
+	presentedToolsMu     sync.RWMutex
+	presentedTools       map[string]bool
+	presentedIdentities  map[string]ToolIdentity
+	presentedDefinitions map[string]*ToolDef
+	toolManifestHash     string
+	mcpFailureMu         sync.Mutex
+	mcpFailures          map[string]mcpFailure
 	// kickNextTurn is the common inline-tool result continuation signal.
 	// Successful pace/done are control boundaries; ordinary receipts continue.
 	kickNextTurn            bool
@@ -1685,6 +1691,7 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 	// The immutable objects remain in the internal audit archive.
 	t.markLoadedToolResultsHistorical(t.messages)
 	t.activeTools = copyBoolMap(cp.activeTools)
+	t.discoveredToolUntil = copyIntMap(cp.discoveredToolUntil)
 	t.activeToolAge = copyIntMap(cp.activeToolAge)
 	t.rate = cp.rate
 	t.agentRate = cp.agentRate
@@ -2290,6 +2297,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						syntax := buildMCPSyntax(fullName, tool.InputSchema)
 						t.registry.Register(&ToolDef{
 							Name:           fullName,
+							MCPLocalName:   tool.Name,
 							Description:    fmt.Sprintf("[%s] %s", name, tool.Description),
 							Syntax:         syntax,
 							Rules:          fmt.Sprintf("Provided by MCP server '%s'.", name),
@@ -2351,6 +2359,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				addResult(fmt.Sprintf("%d servers: %s", len(names), strings.Join(names, ", ")))
 			default:
 				// Dispatch to registry (MCP tools, etc)
+				t.touchActiveTool(call.Name)
 				queueTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}
@@ -2550,7 +2559,8 @@ func (t *Thinker) Run() {
 		// Drain events from bus, optionally filter/route
 		drained := t.drainEvents()
 		for _, event := range drained {
-			if event.ToolResult == nil && strings.TrimSpace(event.Text) != "" {
+			if event.ToolResult == nil && strings.TrimSpace(event.Text) != "" && !strings.HasPrefix(event.Text, "[late-result]") && !strings.HasPrefix(event.Text, "[tool:") {
+				t.resetMCPFailures()
 				// A fresh external instruction starts a new workflow, so a
 				// prior no-progress fingerprint must not constrain it.
 				t.resetInlineToolContinuation()
@@ -3421,6 +3431,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	// event is ever produced.
 	if t.telemetry != nil {
 		t.telemetry.Emit("llm.start", t.threadID, map[string]any{
+			"tool_manifest_hash":   t.currentToolManifestHash(),
 			"provider":             provider.Name(),
 			"model":                modelID,
 			"model_selected":       t.agentModel.String(),

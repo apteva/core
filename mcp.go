@@ -170,12 +170,14 @@ type mcpCallResult struct {
 // Old configs containing main_access:true|false deserialize cleanly —
 // json.Unmarshal silently drops the unknown field.
 type MCPServerConfig struct {
-	Name      string            `json:"name"`
-	Command   string            `json:"command,omitempty"`   // stdio transport
-	Args      []string          `json:"args,omitempty"`      // stdio transport
-	Env       map[string]string `json:"env,omitempty"`       // stdio transport
-	Transport string            `json:"transport,omitempty"` // "stdio" (default) or "http"
-	URL       string            `json:"url,omitempty"`       // http transport
+	// ToolAliases maps discovery aliases to raw tool names on this server.
+	ToolAliases map[string]string `json:"tool_aliases,omitempty"`
+	Name        string            `json:"name"`
+	Command     string            `json:"command,omitempty"`   // stdio transport
+	Args        []string          `json:"args,omitempty"`      // stdio transport
+	Env         map[string]string `json:"env,omitempty"`       // stdio transport
+	Transport   string            `json:"transport,omitempty"` // "stdio" (default) or "http"
+	URL         string            `json:"url,omitempty"`       // http transport
 	// ToolLoading controls prompt-schema availability independently from
 	// connection and authorization. Always-loaded tools are present on every
 	// authorized model request; deferred tools require search/preload; auto
@@ -623,13 +625,15 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 			continue
 		}
 
+		var registered []mcpToolDef
 		for _, tool := range tools {
 			// Prefix with server name to avoid collisions
 			fullName := cfg.Name + "_" + tool.Name
 			syntax := buildMCPSyntax(fullName, tool.InputSchema)
 
-			registry.Register(&ToolDef{
+			if !registry.Register(&ToolDef{
 				Name:           fullName,
+				MCPLocalName:   tool.Name,
 				Description:    fmt.Sprintf("[%s] %s", cfg.Name, tool.Description),
 				Syntax:         syntax,
 				Rules:          fmt.Sprintf("Provided by MCP server '%s'.", cfg.Name),
@@ -647,14 +651,22 @@ func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, in
 						return tool.Meta[wakeOnResultMetaKey]
 					}(),
 				),
-			})
+			}) {
+				continue
+			}
+			registered = append(registered, tool)
 		}
 
 		// Mirror into the searchable index. Done after registry.Register
 		// so the index's "this tool exists" claim is always consistent
 		// with what the registry can actually dispatch.
 		if index != nil {
-			index.Add(cfg.Name, tools, cfg.NoSpawn, cfg.ToolLoading)
+			index.Add(cfg.Name, registered, cfg.NoSpawn, cfg.ToolLoading)
+			for alias, rawName := range cfg.ToolAliases {
+				if err := index.RegisterAlias(alias, cfg.Name+"_"+rawName); err != nil {
+					logMsg("MCP", err.Error())
+				}
+			}
 		}
 
 		servers = append(servers, srv)

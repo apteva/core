@@ -1446,6 +1446,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					}
 				}
 			default:
+				t.touchActiveTool(call.Name)
 				queueTool(t, call)
 				toolNames = append(toolNames, call.Raw)
 			}

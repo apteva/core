@@ -9,13 +9,18 @@ import (
 )
 
 type toolCall struct {
-	generation   uint64
-	admitted     bool
-	executionIDs []string
-	Name         string
-	Args         map[string]string
-	Raw          string // original matched text (or synthetic for native calls)
-	NativeID     string // provider-assigned ID for native tool calls (empty for text-parsed)
+	prerequisites     map[string]RequiredFirstAction
+	prerequisiteNames map[string]string
+	definition        *ToolDef
+	resolutionError   string
+	manifestHash      string
+	generation        uint64
+	admitted          bool
+	executionIDs      []string
+	Name              string
+	Args              map[string]string
+	Raw               string // original matched text (or synthetic for native calls)
+	NativeID          string // provider-assigned ID for native tool calls (empty for text-parsed)
 }
 
 // [[tool_name key="val" key2="val2"]] — values can span multiple lines, escaped quotes allowed
@@ -68,9 +73,14 @@ func executeTool(t *Thinker, call toolCall) {
 	if executionIDs == nil {
 		executionIDs = t.currentEventExecutions()
 	}
+	call.executionIDs = executionIDs
+	if call.definition == nil && call.resolutionError == "" {
+		t.resolveToolCall(&call)
+	}
 	generation := call.generation
 	if !call.admitted {
 		generation = t.toolGeneration.Load()
+		call.executionIDs = executionIDs
 	}
 	if generation != t.toolGeneration.Load() {
 		return
@@ -154,21 +164,41 @@ func executeTool(t *Thinker, call toolCall) {
 			}
 		}
 		var resp ToolResponse
-		if t.registry != nil {
-			dispatchArgs := toolDispatchArgs(t, call)
-			if t.telemetry != nil {
-				if def := t.registry.Get(call.Name); def != nil && def.MCP {
-					typedArgs := mcpArgumentsFromStrings(dispatchArgs, def.InputSchema)
-					t.telemetry.Emit("tool.arguments", t.threadID, newToolArgumentsData(call.NativeID, call.Name, "mcp_typed", typedArgs))
+		def := call.definition
+		if call.resolutionError != "" {
+			resp = ToolResponse{Text: call.resolutionError, IsError: true}
+		} else if def == nil || (def.Handler == nil && def.HandlerContext == nil) {
+			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
+		} else {
+			var blocked error
+			if def.MCP {
+				blocked = t.checkRequiredAction(call)
+				if blocked == nil {
+					blocked = t.checkMCPProgress(call)
 				}
 			}
-			if res, ok := t.registry.DispatchContext(ctx, call.Name, dispatchArgs); ok {
-				resp = res
+			if blocked != nil {
+				resp = ToolResponse{Text: blocked.Error(), IsError: true}
+				if t.telemetry != nil {
+					t.telemetry.Emit("tool.blocked", t.threadID, map[string]any{"id": call.NativeID, "name": call.Name, "manifest_hash": call.manifestHash, "reason": blocked.Error()})
+				}
 			} else {
-				resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
+				dispatchArgs := toolDispatchArgs(t, call)
+				if t.telemetry != nil && def.MCP {
+					typedArgs := mcpArgumentsFromStrings(dispatchArgs, def.InputSchema)
+					t.telemetry.Emit("tool.arguments", t.threadID, newToolArgumentsData(call.NativeID, call.Name, "mcp_typed", typedArgs))
+					t.telemetry.Emit("tool.dispatch", t.threadID, map[string]any{"id": call.NativeID, "manifest_hash": call.manifestHash, "resolved": toolIdentity(def), "arguments": newToolArgumentsData(call.NativeID, call.Name, "dispatched", typedArgs)})
+				}
+				resp = t.registry.dispatchDefinition(ctx, def, dispatchArgs)
+				if def.MCP && generation == t.toolGeneration.Load() {
+					t.recordMCPProgress(call, resp)
+					if !resp.IsError {
+						if err := t.satisfyRequiredAction(call); err != nil {
+							resp = ToolResponse{Text: "failed to persist prerequisite success: " + err.Error(), IsError: true}
+						}
+					}
+				}
 			}
-		} else {
-			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
 		}
 		if generation != t.toolGeneration.Load() || t.toolContext().Err() != nil {
 			return

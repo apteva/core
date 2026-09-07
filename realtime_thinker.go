@@ -95,8 +95,9 @@ type realtimeToolBatch struct {
 
 func realtimeNativeToolsFor(thinker *Thinker, allowlist map[string]bool, record bool) []NativeTool {
 	var tools []NativeTool
+	var definitions map[string]*ToolDef
 	if thinker.registry != nil {
-		tools = thinker.registry.NativeTools(thinker.authorizedToolAllowlist(allowlist), thinker.authorizedActiveTools(thinker.activeTools), thinker.systemThread)
+		tools, definitions = thinker.registry.nativeToolSnapshot(thinker.authorizedToolAllowlist(allowlist), thinker.authorizedActiveTools(thinker.activeTools), thinker.systemThread)
 	}
 	tools = append(tools, NativeTool{
 		Name:        "interrupt",
@@ -106,7 +107,7 @@ func realtimeNativeToolsFor(thinker *Thinker, allowlist map[string]bool, record 
 		},
 	})
 	if record {
-		thinker.recordPresentedTools(tools)
+		thinker.recordPresentedTools(tools, definitions)
 	}
 	return tools
 }

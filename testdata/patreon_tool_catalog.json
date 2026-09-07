@@ -1,0 +1,584 @@
+{
+  "media": [
+    {
+      "name": "media_analyze",
+      "description": "Analyze an existing image, video, or audio source without modifying it. Returns catalog/stream encoding details, decode integrity, sampled visual measurements, black/frozen video segments, and LUFS/peak/RMS/silence audio measurements where applicable. When render_host_id is configured, analysis runs on that remote host without silent local fallback; the result reports the effective executor. depth=standard analyzes at most 60 seconds; depth=full analyzes the requested/full duration. No render, derivation, or Storage object is created."
+    },
+    {
+      "name": "media_ask",
+      "description": "Ask a grounded question about a media file using the configured descriptions vision/chat integration. Images use an existing thumbnail or source object. Videos use the existing canonical thumbnail plus cached storyboard keyframes; at_ms selects the nearest existing keyframe and reports its actual timestamp. Audio uses an existing completed transcript. This tool never runs ffmpeg, generates frames/derivations, or writes files."
+    },
+    {
+      "name": "media_audio_extract",
+      "description": "Pull the audio track from a video into a standalone file. Args: file_id, format (mp3|wav|m4a|opus|flac)."
+    },
+    {
+      "name": "media_audio_filter",
+      "description": "Modify audio in an audio or video file. Normalization preserves the indexed source sample rate and applies a lossy-codec-safe peak limiter. For videos, copies the video stream unchanged and only filters/re-encodes audio. Args: file_id, mode ('normalize' default | 'speech_clean' | 'volume' | 'mute'), target_lufs (optional, default -16 for normalize/speech_clean), gain_db (for volume), output_name?, output_folder?. Audio-only inputs keep their audio container; video inputs keep their video container unless output_name has an audio extension."
+    },
+    {
+      "name": "media_cancel_render",
+      "description": "Cancel a pending or running render. Idempotent \u2014 already-terminal rows are no-ops. Args: render_id."
+    },
+    {
+      "name": "media_concat",
+      "description": "Join multiple sources end-to-end (must share container/codec). Args: file_ids (array of strings, 2+), output_name (string, required)."
+    },
+    {
+      "name": "media_create_folder",
+      "description": "Create an empty folder in storage. Pass-through to storage's files_create_folder; idempotent. Args: path (e.g. '/raw-footage/2026-05/')."
+    },
+    {
+      "name": "media_crop",
+      "description": "Crop or reframe an existing video/image. Exact mode: file_id, x, y, width, height. With target_ratio, fit_mode='crop' (default) uses content-agnostic Smart Crop v2 evidence\u2014saliency, foreground change, motion, shape and optional face geometry\u2014while fit_mode='contain' preserves the complete source frame with black padding. Args: file_id, target_ratio, crop_mode? ('smart' default|'center'), fit_mode? ('crop' default|'contain'), output_width?. Use media_extract_frame for a video timestamp."
+    },
+    {
+      "name": "media_delete",
+      "description": "Delete a media file and its backing storage file. This is destructive: the storage row/blob is hard-deleted, then media removes its catalog row, transcript, thumbnails, waveform, and keyframes. Args: file_id (string)."
+    },
+    {
+      "name": "media_describe",
+      "description": "Queue an auto-generated description for one media file. The describer worker picks it up on its next sweep, calls the bound LLM integration, and writes the result via media_set_description with description_source='ai-generated'. force=true ignores both the cooldown and any existing ai-generated description. Won't overwrite human-set descriptions in any case. Args: file_id, force?."
+    },
+    {
+      "name": "media_extract_frame",
+      "description": "Save a video frame as PNG. With target_ratio, fit_mode='crop' uses generic cached/source visual evidence to reframe at at_ms; fit_mode='contain' preserves the complete frame with padding. Args: file_id, at_ms, width?, target_ratio?, output_width?, crop_mode?, fit_mode?."
+    },
+    {
+      "name": "media_extract_reel",
+      "description": "Cut and reframe a clip in one ffmpeg pass. fit_mode='crop' (default) uses content-agnostic Smart Crop v2 evidence and a smoothed path; fit_mode='contain' preserves every source edge with black padding when the composition cannot fit a destructive crop. Args: file_id, start_ms, end_ms, target_ratio? (default '9:16'), output_width?, crop_mode?, fit_mode?."
+    },
+    {
+      "name": "media_get",
+      "description": "Fetch one media record by storage file_id. Returns arbitrary metadata + metadata_version, display-space width/height/orientation, and derivation pointers. External ingestion URL delivery defaults to apteva with inline disposition; pass delivery=proxy, delivery=direct, or disposition=attachment when needed. Returned delivery, disposition, and expires_at are Storage-confirmed effective values. Raw ffprobe JSON and renderer-only rotation metadata are hidden unless include_raw_probe=true."
+    },
+    {
+      "name": "media_get_keyframes",
+      "description": "Get the storyboard keyframes for a video \u2014 list of {position_ms, storage_file_id, url} ordered by position. Empty for non-video files or videos before the indexer's keyframe step has run. The set is what the describer samples for multi-image prompts; agents can use it for timeline scrubbing, scene detection, or as input to further analysis tools."
+    },
+    {
+      "name": "media_get_render",
+      "description": "Status of one render. Returns the original params and, once execution starts, resolved_params with effective executor values such as Smart Crop coordinates/path. Args: render_id."
+    },
+    {
+      "name": "media_get_thumbnail",
+      "description": "Return the storage file_id (and pointer URL on the storage app) of the cached thumbnail. If missing or stale, kicks off generation. Args: file_id."
+    },
+    {
+      "name": "media_get_transcript",
+      "description": "Fetch one file's transcript (status, language, full text, segments)."
+    },
+    {
+      "name": "media_get_waveform",
+      "description": "Return the storage file_id of the cached waveform PNG. Args: file_id."
+    },
+    {
+      "name": "media_index_status",
+      "description": "Counts of pending / ok / failed / unsupported / skipped_size for the catalog."
+    },
+    {
+      "name": "media_list_folders",
+      "description": "List immediate child folders of `parent` that contain media (audio/video/image). Args: parent (default '/')."
+    },
+    {
+      "name": "media_list_renders",
+      "description": "List renders filtered by status (pending|running|ok|failed|cancelled), operation, or limit."
+    },
+    {
+      "name": "media_move",
+      "description": "Move and/or rename a media file in storage. At least one of folder / name must be set. Media's row auto-updates via the file.updated event. Args: file_id (string), folder?, name?."
+    },
+    {
+      "name": "media_patch_metadata",
+      "description": "Atomically apply an RFC 7396 merge patch to a media row's arbitrary workflow metadata. Nested objects merge and null deletes a field. conditions is an optional map of exact scalar predicates keyed by paths such as metadata.patreon.status; the write occurs only when all still match. expected_metadata_version optionally adds optimistic compare-and-swap. Returns updated=false with reason not_found, condition_failed, metadata_version_mismatch, or metadata_too_large instead of overwriting concurrent work."
+    },
+    {
+      "name": "media_reindex",
+      "description": "Queue one atomic re-probe + re-derive. Exact file IDs are fetched directly from Storage, so reindexing is independent of catalog position and inventory size. A queued response is asynchronous; wait for media.derived or poll media_get/media_get_keyframes instead of submitting a second force request while keyframes are still being generated. Pass file_id to re-index one row, or failed_only=true to retry every failed/unsupported row in the project. force=true (with file_id) bypasses the max_probe_size_mb cap for that one file \u2014 useful for genuinely huge sources where you accept the temp-disk hit."
+    },
+    {
+      "name": "media_resize",
+      "description": "Scale a video/image. Args: file_id, width (int), height (int, optional if keep_aspect), keep_aspect (bool, optional), output_name (string, optional)."
+    },
+    {
+      "name": "media_search",
+      "description": "Search the media catalog before calling media_get. Use q for a case-insensitive match across filename, title, description, and alt text; use filename or title for narrower matching. With folder, folder_scope='exact' (the default) searches only that folder; folder_scope='subtree' searches it and every descendant. Namespace roots such as /hgv, /ashley, /monika, /alexa, and /lily normally require subtree. An empty exact result does not prove its subtree is empty: inspect has_matching_descendants and retry_recommended. Results are compact discovery rows (file_id, filename/title, type, duration, dimensions, folder, thumbnail) by default. Filters include folder, media_type, aspect (portrait|landscape|square|reel|wide), duration, rating, dimensions, codec, and metadata_filters exact matches such as {'metadata.patreon.status':'ready'}. Call media_get with the chosen file_id for complete metadata and source URLs. Default limit is 20, maximum 100. If has_more is true, repeat the same filters with next_cursor. detail and include_raw_probe are exceptional opt-ins."
+    },
+    {
+      "name": "media_set_audience_rating",
+      "description": "Override the audience rating on a media row. The describer auto-rates new files (general/mature/adult); this tool lets an operator/agent set it manually. Use rating='unrated' to clear and re-queue for the describer. Args: file_id, rating (general|mature|adult|unrated), reasoning? (short explanation)."
+    },
+    {
+      "name": "media_set_description",
+      "description": "Set title / description / alt_text on a media row. Partial update \u2014 omitted fields preserved, empty string clears. Requires the media row to already exist (the indexer creates it on probe). Args: file_id (required), title (optional), description (optional), alt_text (optional)."
+    },
+    {
+      "name": "media_set_transcript",
+      "description": "Upsert an externally-produced transcript (e.g. uploaded captions, third-party tool). Bypasses the auto pipeline. Args: file_id, text, language?, segments? (array of {start_ms, end_ms, text, speaker?}), provider?."
+    },
+    {
+      "name": "media_transcode",
+      "description": "Re-encode to a new container/codec. Args: file_id, format (mp4|webm|mp3|...), video_codec (string, optional), audio_codec (string, optional), bitrate (string, optional, e.g. '2M')."
+    },
+    {
+      "name": "media_transcribe",
+      "description": "Queue a transcription for one media file. Inserts a pending row that the transcriber picks up on its next tick. force=true also re-queues already-ok rows (useful when you want a re-run after model upgrades or to retry a failed attempt). Args: file_id, force?."
+    },
+    {
+      "name": "media_trim",
+      "description": "Cut a clip from a video/audio file. Args: file_id (string), start_ms, end_ms (int), output_name (string, optional)."
+    }
+  ],
+  "social": [
+    {
+      "name": "account_add",
+      "description": "Begin connecting a social account. For multi-page platforms (Facebook, Instagram, YouTube) with an existing active connection in this project, the call SKIPS OAuth \u2014 the existing access token already covers all the user's pages/channels \u2014 and returns a pending_account_id directly. The caller goes straight to account_list_pending_pages without opening a browser. Otherwise returns authorize_url + pending_account_id and the human must visit the URL. The integrations system handles token exchange + refresh; this app never sees the access token. To connect through an optional provider, pass provider='zernio'; Social starts the provider OAuth flow and imports the selected provider-backed account into this project. Args: platform, provider? ('zernio' for provider-backed accounts), provider_profile_id? (Zernio profile/workspace id; omitted uses the first Zernio profile), force_new? (default false; set true to force a fresh OAuth dance even when an existing connection is available, e.g. to switch to a different provider-side account)."
+    },
+    {
+      "name": "account_check",
+      "description": "Check that a connected social account still works by calling the cheapest authenticated read endpoint for its platform. For Facebook/Instagram, also verifies that the selected page/IG account is still accessible and refreshes the stored page token when available. Args: social_account_id OR all=true. Optional profile_id/profile filters when all=true."
+    },
+    {
+      "name": "account_disconnect",
+      "description": "Disconnect a social account while preserving historical posts and inbox rows. Pass hard_delete=true and delete_posts=true together to permanently remove the account and its local-only history; upstream posts are never deleted by this tool. Args: id, hard_delete?, delete_posts?."
+    },
+    {
+      "name": "account_finalize",
+      "description": "Commit a pending account into the active social_accounts list. For destination-based platforms (Facebook, Instagram, Pinterest) supply page_id from account_list_pending_pages; for personal platforms page_id is optional. Args: pending_account_id, page_id?, name?."
+    },
+    {
+      "name": "account_import_provider",
+      "description": "Import accounts from an optional social provider integration into Social. Today provider must be zernio. The imported accounts behave like normal Social accounts: use post_create, post_list, account_check, metrics, and explicit imports through Social. Account connection never opts into historical post import; automatic synchronization defaults to managed_only. Args: provider? (default zernio), provider_profile_id?, platforms?[], account_ids?[], profile_id?/profile?, dry_run?."
+    },
+    {
+      "name": "account_list",
+      "description": "List connected social accounts in this project, including provider_import_mode for provider-backed accounts. Disconnected history-only rows are hidden unless status='disconnected' is requested. Args: platform? (filter), status? (active|needs_reauth|disconnected)."
+    },
+    {
+      "name": "account_list_pending_pages",
+      "description": "After OAuth completes, list the pages/channels/boards/accounts the user can pick from. Empty result means the platform has no setup step (e.g. Twitter personal) and you can call account_finalize directly. Args: pending_account_id."
+    },
+    {
+      "name": "account_metrics",
+      "description": "Fetch normalized totals, history, and provider-supported audience breakdowns. Use social_account_id for the backward-compatible single-account response. Use social_account_ids or profile_id with group_by=['social_account'] to compare channels; filters such as {device:['tv']} rank only matching views. Unsupported dimensions are reported explicitly and never treated as zero. YouTube supports device, OS, country, traffic source, audience type, content type, sharing service, and video; Instagram supports available audience demographics; organic X currently exposes temporal metrics but no device breakdown."
+    },
+    {
+      "name": "account_provider_sync_update",
+      "description": "Configure automatic provider synchronization for one provider-backed account without changing its publishing or direct-scheduling access. managed_only (default) reads only provider posts already created, mirrored, or explicitly imported through Social; it never imports unrelated account history. off disables automatic provider reads. full_history explicitly opts into automatic discovery/import of recent provider history. Manual Import history remains an explicit one-time full import in every mode. Args: social_account_id, mode."
+    },
+    {
+      "name": "inbox_archive",
+      "description": "Archive one or more inbox items (removes from the default list view; reverse with inbox_mark_unread/read). Local-only. Args: id OR ids[]."
+    },
+    {
+      "name": "inbox_delete",
+      "description": "Delete a comment we authored (or, where the platform permits, any comment on our content). Args: id."
+    },
+    {
+      "name": "inbox_get",
+      "description": "Fetch one inbox item by id. Pass with_thread=true to also return every sibling in the same conversation (walked via parent_external_id). Args: id, with_thread?."
+    },
+    {
+      "name": "inbox_hide",
+      "description": "Hide a comment on the platform side (Facebook, Instagram). Returns `unsupported` for platforms without a hide verb. Args: id."
+    },
+    {
+      "name": "inbox_like",
+      "description": "Like a comment on the platform side (Facebook, Instagram). Returns `unsupported` elsewhere. Args: id."
+    },
+    {
+      "name": "inbox_list",
+      "description": "List inbox items (comments, DMs, mentions, reviews) pulled from connected social accounts. Items are kind-discriminated; filter by `kinds` (comment|dm|mention|review), `status` (unread|read|replied|hidden|archived; archived hidden by default), `social_account_ids`, and `since` (RFC3339). Returns {items: [...], count}. Newest first by occurred_at. Args: social_account_ids?, kinds?, status?, since?, limit? (default 50, max 200)."
+    },
+    {
+      "name": "inbox_mark_read",
+      "description": "Mark one or more inbox items as read. Local-only \u2014 no platform call. Args: id OR ids[]."
+    },
+    {
+      "name": "inbox_mark_unread",
+      "description": "Mark one or more inbox items as unread. Local-only. Args: id OR ids[]."
+    },
+    {
+      "name": "inbox_private_reply",
+      "description": "Compatibility alias for inbox_reply with mode=private. Sends a private reply to a comment where supported (Facebook Pages and Instagram Business). Args: id (must be a comment kind), body."
+    },
+    {
+      "name": "inbox_reply",
+      "description": "Reply to an inbox item. Routes by kind \u2014 a `comment` produces a child comment, a `dm` produces an outbound message in the same thread. Returns {status: ok|partial|unsupported|skipped|failed, reason?, error?, external_id?, permalink?, deliveries?}. For comment items, mode controls the route: `auto`/`public` creates a public child comment, `private` sends a private reply where supported (Facebook Pages and Instagram Business). For DMs, attachments can reference Storage through media_storage_ids or attachments:[{source:'storage',storage_id}], or a public HTTPS URL through attachments:[{source:'url',url,type}]. Platform capabilities decide the allowed types. Args: id, body?, mode?, media_storage_ids?, media_project_id?, attachments?."
+    },
+    {
+      "name": "inbox_sync",
+      "description": "Trigger an out-of-cycle poll of the named social accounts (or all active accounts when omitted). The same sync path runs automatically every five minutes. Returns one {status, reason?, error?} per account. Args: social_account_ids?."
+    },
+    {
+      "name": "inbox_unhide",
+      "description": "Reverse inbox_hide. Args: id."
+    },
+    {
+      "name": "post_create",
+      "description": "Create a post with an explicit, required intent: mode=draft stores it without publishing, mode=schedule requires schedule_at, and mode=publish publishes now. Omitting mode is always rejected and has no side effects. Drafts may omit targets; scheduling and publishing require at least one. Pass EITHER social_account_ids[] (simple multicast \u2014 every target uses the post body) OR targets[] (when you want per-target overrides). The two are mutually exclusive. Each target object: {social_account_id (required), body? (required when top-level body is omitted; otherwise override text for this target), plus platform-specific keys for the target's platform}. Today: youtube accepts {title, body, visibility (public|unlisted|private), category, tags[], thumbnail_storage_id}. X accepts {body, allow_longform}; normal posts are validated against X's 280-character weighted limit before media is uploaded. Facebook accepts {body, thumbnail_storage_id} for video posts; Instagram accepts {body, thumbnail_storage_id, thumbnail_frame_ms} for Reels; TikTok accepts videos with {body, thumbnail_frame_ms} or photo posts with {body, title, auto_add_music, photo_cover_index}. Use plain platform text, not Markdown formatting; most social platforms do not render Markdown. Body resolution per target: target.body if set, else post-level body. Top-level body may be omitted only when every target has its own non-empty body. Immediate publishes return targets[] with per-platform status, platform_post_id, and platform_url when available. Scheduled publishes return a local scheduled post; call post_list after it runs to get platform_url. Scheduled creates are idempotent: if the same profile/account/media/body/options/time already exists, the existing post is returned or its failed scheduling is retried instead of creating a duplicate. If scheduling fails, retry that existing post with post_retry; do not create a second post with the same args. Args: mode (draft|schedule|publish), body? or targets[].body..."
+    },
+    {
+      "name": "post_delete",
+      "description": "Delete a post locally and, where the platform/provider allows it, remove the upstream copy too. Provider imports receive a local tombstone so automatic or manual history imports cannot recreate them. For each published target the app calls the native platform delete verb or the bound provider delete verb (for example Zernio). Some providers/platforms report published-post deletion as unsupported; in that case local rows still go and the response includes a per-target `upstream` array (status: deleted | unsupported | skipped | failed) so callers can flag platforms that still hold a copy. Cancels any scheduled job first. Args: post_id, force_local_only? (skip all upstream calls; default false)."
+    },
+    {
+      "name": "post_draft_approve",
+      "description": "Approve the exact revision currently in review. Later edits invalidate this approval. Args: post_id, expected_revision."
+    },
+    {
+      "name": "post_draft_create",
+      "description": "Create a local draft without publishing. Convenience alias for post_create mode=draft. Targets and media are optional and may be added later. Args: body?, social_account_ids? or targets?, media_storage_ids?, media_project_id?, approval_required?, provider_sync_mode?."
+    },
+    {
+      "name": "post_draft_publish",
+      "description": "Publish or schedule a stored draft revision. mode=publish publishes now; mode=schedule requires schedule_at. Approval is enforced only when the post opted into it. Args: post_id, expected_revision, mode, schedule_at?."
+    },
+    {
+      "name": "post_draft_reject",
+      "description": "Reject the exact revision currently in review with a required reason. Args: post_id, expected_revision, reason."
+    },
+    {
+      "name": "post_draft_submit",
+      "description": "Submit a draft revision for review. This opts the post into approval; direct scheduling/publishing remains available for drafts that do not require approval. Args: post_id, expected_revision."
+    },
+    {
+      "name": "post_draft_update",
+      "description": "Update a draft using optimistic revision locking. Body, targets and media attachments can be replaced. Any approved revision returns to draft and requires fresh approval. Args: post_id, expected_revision, body?, social_account_ids? or targets?, media_storage_ids?, media_project_id?."
+    },
+    {
+      "name": "post_edit",
+      "description": "Edit an already-published post's body and/or per-target metadata. Updates the local post + fans out to each platform's edit verb where supported. Editable platforms today: Facebook (message), X/Twitter (body/text via edit_options.previous_post_id when the authenticated account/API plan permits it), YouTube (title, description, tags, privacy, category, thumbnail_storage_id). YouTube thumbnail-only edits are allowed; pass targets:[{social_account_id, thumbnail_storage_id}]. TikTok / Instagram return status=unsupported \u2014 those platforms don't permit programmatic edits or the catalog doesn't expose the verb yet. Args: post_id, body? (new post-level default body), targets? (per-target overrides keyed by social_account_id, same shape as post_create's targets \u2014 body, title, visibility, category, tags, thumbnail_storage_id, etc.). At least one of body/targets must be set."
+    },
+    {
+      "name": "post_list",
+      "description": "List recent posts with per-target status. Args: limit? (default 50, max 200), status? (filter)."
+    },
+    {
+      "name": "post_metrics",
+      "description": "Fetch fresh per-target performance metrics for a post by fanning out to each platform's analytics tool. Returns a per-target array of {status: ok|unsupported|skipped|failed, metrics?: {views, likes, comments, shares, raw}, reason?, error?}. Native accounts use their platform adapter; provider-backed accounts use the bound provider adapter, including LinkedIn through Zernio. Fresh normalized snapshots are stored for history. Be mindful of upstream rate limits when looping over many posts. Args: post_id."
+    },
+    {
+      "name": "post_publish_scheduled",
+      "description": "Internal Jobs callback. Publishes one scheduled post and returns status=published only after every downstream target succeeds; failures remain retryable for Jobs. Args: post_id."
+    },
+    {
+      "name": "post_reschedule",
+      "description": "Change a scheduled post's run time. Cancels the existing jobs row and creates a fresh one \u2014 only valid while status='scheduled' (already-published or in-flight posts are immutable). Args: post_id, schedule_at (RFC3339 or datetime-local)."
+    },
+    {
+      "name": "post_retry",
+      "description": "Re-attempt a failed post. For failed scheduled posts where no job was created, this retries scheduling the same post. Otherwise it resets failed publish targets and re-publishes. Args: post_id."
+    },
+    {
+      "name": "profile_create",
+      "description": "Create a profile (brand/client/site container) inside the social app. Args: name, description?, color? (#hex), is_default?. Returns the row including the auto-generated slug. The first profile in a project is automatically marked default."
+    },
+    {
+      "name": "profile_delete",
+      "description": "Delete a profile. Args: id (required), reassign_to? (profile_id to move accounts+posts to; defaults to 0 = unassigned). Refuses to delete the last default profile if other profiles still exist \u2014 promote a replacement first."
+    },
+    {
+      "name": "profile_get",
+      "description": "Fetch one profile by id or slug. Returns the row + nested accounts + recent posts. Args: id?, profile? (slug). One of the two is required."
+    },
+    {
+      "name": "profile_list",
+      "description": "List profiles in the current project with their account_count + post_count. Returns [{id, slug, name, color, account_count, post_count, is_default}]. Use this when the agent prompt mentions a profile name and you need its slug/id, or to surface available brands to the operator."
+    },
+    {
+      "name": "profile_update",
+      "description": "Rename / recolor / promote-to-default a profile. Args: id (required), name?, description?, color?, is_default?. Setting is_default=true demotes the previous default."
+    }
+  ],
+  "computer": [
+    {
+      "name": "browser_download",
+      "description": "List, wait for, or export files captured by an active browser session. Workflow: after computer_use clicks a download control, use action=list when the click did not return downloads_started; use action=wait with its dl_* download_id until browser-confirmed completed/failed/cancelled state; then use action=get to receive a Core-managed blobref file handle. Click success never proves download completion. get exports the browser-captured bytes and never refetches the source URL. Computer does not unzip or interpret files. Actions: list, wait, get."
+    },
+    {
+      "name": "browser_recording",
+      "description": "Retrieve provider-neutral playback metadata for an active or historical app-owned browser session. Browserbase and Steel recordings become playable after the session closes; recently closed sessions may return status=processing. Returns app-owned playlist URLs and never provider credentials or provider API URLs. Args: session_id."
+    },
+    {
+      "name": "browser_screenshot",
+      "description": "Capture a clean PNG of the session's current viewport. Args: session_id, annotate? (default false; set true for Set-of-Mark labels), include_som? (default false; returns structured SoM targets only when true). Returns {png_b64, screenshot_url, current_url, width, height} and som only when include_som=true. screenshot_url remains valid as the clean final frame after the session closes."
+    },
+    {
+      "name": "browser_session",
+      "description": "Session lifecycle and tab control for app-owned browsers. Actions: open, status, close, tabs, switch_tab, close_tab. Ordinary open: pass only action=open plus url? or context_id?/context_name?. Generic example: {\"action\":\"open\",\"url\":\"https://example.com\"}. Omit every other optional field unless the task explicitly requires that override; never populate optional fields with guessed or schema-default values. Advanced open overrides are backend?, persist?, auto_create_context?, timeout?, proxy_mode?/proxy_profile?/proxy_country?/proxy_sticky?, viewport?, environment?, and presentation_mode?. environment is advanced, opt-in QA/device emulation and requires environment_override=true. Never send environment for normal navigation, read-only audits, or saved-login contexts; omit environment_override there too. Proxy overrides are opt-in; omit proxy_mode and every proxy_* selector to use Computer's configured routing. Use presentation_mode=demo for visible cursor/click feedback, human-paced typing, non-interactive structured-control cues, and longer holds in user-facing walkthroughs. Usually omit viewport to use Computer's default desktop viewport, 1600x800. Pass viewport when a specific resolution is needed, for example mobile/tablet testing or a site-specific requirement. session_id is the app-owned live br_* handle for status/close/computer_use and cannot reopen a closed session. Always use action=open for new browsing work. To continue saved login and browser state, open a new session with context_id or context_name; do not reuse a prior session_id. For tab control, call action=tabs first, then action=switch_tab with tab_id or action=close_tab with tab_id. Do not use keyboard shortcuts such as Ctrl+Tab, Ctrl+PageDown, or Ctrl+1-9 to switch browser tabs. Omitted timeout gives cloud sessions a 1800-second maximum lifetime. timeout is not a page-load, action, or task timeout: it terminates the entire cloud browser on wall-clock expiry even while the agent is active. Omit t..."
+    },
+    {
+      "name": "computer_context_create",
+      "description": "Create or import an app-managed browser context. Browserbase creates a provider Context immediately; local/browser-engine use the app id as provider id; Steel materializes the profile id on first persisted session."
+    },
+    {
+      "name": "computer_context_delete",
+      "description": "Delete or unlink an app-managed browser context. Args: id, delete_provider? (Browserbase only; default false)."
+    },
+    {
+      "name": "computer_context_get",
+      "description": "Fetch one app-managed browser context by id, by backend+name, or by unique name across all backends when backend is omitted."
+    },
+    {
+      "name": "computer_context_list",
+      "description": "List app-managed browser contexts. Omit backend, or pass backend=all, to see every saved context across providers. Use backend=default/auto for the Computer app default provider. Only pass a concrete backend when the user explicitly wants that provider."
+    },
+    {
+      "name": "computer_context_update",
+      "description": "Update context name, provider id, persist default, or metadata. Args: id, name?, provider_context_id?, persist_default?, metadata?."
+    },
+    {
+      "name": "computer_proxy_profile_list",
+      "description": "List enabled proxy profiles that agents may select when opening a browser session. Returns only safe routing metadata and never credentials or proxy URLs."
+    },
+    {
+      "name": "computer_use",
+      "description": "Drive a browser session opened by browser_session. Default workflow: call action=screenshot first; screenshots contain Set-of-Mark numeric badges on interactive elements. To click, use action=click with label=N from the latest screenshot. label must be >= 1; do not pass 0. Structured SoM reports accessible_name, disabled, loading, dangerous, and destructive_effect. Computer re-checks the live target immediately before dispatch. Pass expected_text for target identity. When dangerous=true, also pass expected_effect and repeat that exact generic effect in confirm_consequence; Computer rejects missing or contradictory consequence intent before mouse dispatch. Omit both consequence fields for ordinary clicks. Prefer label over coordinate; use coordinate only for targets with no badge such as canvas or custom rendered widgets. Raw coordinates receive the same consequence guard. Do not pass both; when both are present, coordinate wins. selector is accepted for deterministic compatibility flows, but agents should continue using fresh screenshot labels when available. For an operation outcome, prefer action=wait_for with declarative URL, text, selector, semantic-target, or media conditions; target_state=ready|loading|enabled|disabled|checked|unchecked ignores unrelated page activity. For an embed, use media_present and media_error together with match=any to wait for a terminal rendered-player-or-error outcome. Computer reports the visible provider/source and player state but does not decide whether the media is the intended asset. Use action=wait_for_stable only when the whole page must become quiet. If the page asks to Browse, choose, attach, upload, or drop a file, use action=upload_file with selector or label plus source_url/base64/file_path; do not operate the native OS file picker. For any native select, dropdown, combobox, listbox, or multiselect, use action=select_option first with label/selector plus text/value or texts/values and optional mode=replace|add|remove|tog..."
+    }
+  ],
+  "analytics": [
+    {
+      "name": "analytics_count",
+      "description": "Count current-project events matching filters. Args: app?, topic?, since?, until?, where?. Returns {count}."
+    },
+    {
+      "name": "analytics_event_property_delete",
+      "description": "Delete one event property spec."
+    },
+    {
+      "name": "analytics_event_property_upsert",
+      "description": "Create or update one property spec. reference_set optionally enforces an active canonical dimension value."
+    },
+    {
+      "name": "analytics_event_spec_delete",
+      "description": "Delete an event spec by id."
+    },
+    {
+      "name": "analytics_event_spec_get",
+      "description": "Get one current-project event spec by id or by app/topic."
+    },
+    {
+      "name": "analytics_event_spec_upsert",
+      "description": "Create or safely patch an event spec in the current project. Omitted properties and policies are preserved; clearing requires an explicit clear_* flag."
+    },
+    {
+      "name": "analytics_event_specs_for_app",
+      "description": "Show active current-project event specs for an app before tracking. Args app (required). Returns required properties, examples, and ingest/upsert policies."
+    },
+    {
+      "name": "analytics_event_specs_list",
+      "description": "List current-project event specs. Args app?, status?. Returns specs with properties."
+    },
+    {
+      "name": "analytics_event_validate",
+      "description": "Validate a sample current-project event against specs without storing it."
+    },
+    {
+      "name": "analytics_event_violations",
+      "description": "List recent current-project event spec violations. Args app?, topic?, since?, limit?."
+    },
+    {
+      "name": "analytics_fx_rate_upsert",
+      "description": "Create or update one project-scoped FX reference rate. This changes only the rate cache, never Analytics events. One base unit equals rate quote units."
+    },
+    {
+      "name": "analytics_fx_rates_list",
+      "description": "List project-scoped FX reference rates for auditing money aggregates."
+    },
+    {
+      "name": "analytics_objective_metrics_list",
+      "description": "List built-in objective metric query templates. These are Analytics queries, not external app integrations."
+    },
+    {
+      "name": "analytics_objective_progress",
+      "description": "Evaluate every target in one current-project objective against Analytics events for its stored period, cache the result, and return actual versus target progress."
+    },
+    {
+      "name": "analytics_objectives_archive",
+      "description": "Archive one current-project objective without deleting its history."
+    },
+    {
+      "name": "analytics_objectives_create",
+      "description": "Create an objective with one or more targets over data already ingested into the current project's Analytics event store. Queries support count, distinct, sum, sum_money, average, min, max, latest and change; project and period scope come from the platform and target."
+    },
+    {
+      "name": "analytics_objectives_get",
+      "description": "Get one current-project objective, its targets and cached progress."
+    },
+    {
+      "name": "analytics_objectives_search",
+      "description": "Search current-project objectives. Args status?, search?, include_archived?, limit?."
+    },
+    {
+      "name": "analytics_objectives_update",
+      "description": "Update a current-project objective. Metadata fields are optional; passing targets replaces the target set atomically."
+    },
+    {
+      "name": "analytics_query",
+      "description": "Read events in the current project. Args: app?, topic?, since? (unix ms), until?, where? (map of \"props.X\" \u2192 value, equality only), group_by? (array of \"props.X\" / app / topic / source), limit? (default 100, max 1000). Without group_by returns recent rows; with group_by returns aggregate buckets."
+    },
+    {
+      "name": "analytics_reference_set_upsert",
+      "description": "Create or update one project-scoped reference set. Reference management is separate from event ingestion."
+    },
+    {
+      "name": "analytics_reference_value_upsert",
+      "description": "Create, update, activate, or deactivate one value in a project-scoped reference set."
+    },
+    {
+      "name": "analytics_reference_values_list",
+      "description": "List canonical values in one current-project reference set. Defaults to active values for agent discovery."
+    },
+    {
+      "name": "analytics_sum",
+      "description": "Sum a numeric current-project event field/path. Args value (required, e.g. props.views), app?, topic?, since?, until?, where?, group_by? (array), limit?. Returns buckets with sum/count."
+    },
+    {
+      "name": "analytics_sum_money",
+      "description": "Read-only mixed-currency sum over current-project events. Converts each amount with the latest project FX rate at or before its event/accounting date and never changes source events."
+    },
+    {
+      "name": "analytics_top",
+      "description": "Top-N values for a JSON props key in the current project. Args: by (required, e.g. \"props.platform\"), app?, topic?, since?, until?, where?, limit? (default 10, max 200). Returns [{value, count}]."
+    },
+    {
+      "name": "analytics_topics",
+      "description": "List distinct (app, topic) pairs seen. Args: app?. Returns [{app, topic, last_ts, count}]."
+    },
+    {
+      "name": "analytics_track",
+      "description": "Record one event in the current project. Args: event (required), props?, app?, user_id?, session_id?, install_id?, ts? (unix ms; defaults to now). Do not pass project_id; the platform assigns it automatically. Returns {id, ts}."
+    },
+    {
+      "name": "analytics_validate_track",
+      "description": "Dry-run analytics_track in the current project without storing it. Args: app?, event/topic, props?, user_id?, session_id?, upsert_key?, ts?. Returns validation status, required-property hints, example payload, and ingest preview."
+    }
+  ],
+  "tasks": [
+    {
+      "name": "assign",
+      "description": "Assign a task to an existing opaque thread id belonging to the same agent. This records ownership and sends an event containing the authoritative task ID, which wakes a paused worker; it never creates a thread. Main must use the platform spawn tool first, grant the worker tasks_get plus only required domain tools, and retain all Tasks mutation tools. The worker must call tasks_get before any domain action."
+    },
+    {
+      "name": "cancel",
+      "description": "Cancel an active task or scheduled series."
+    },
+    {
+      "name": "complete",
+      "description": "Required final write after successful task work. Call tasks_complete exactly once with the concrete result before pace, idle, stopping, or sending the final response. Neither progress 100 nor a final-looking current_step completes the task. Completion sets progress to 100 and current_step to Completed. When a worker reports success, main must record the result here before it stops. Include result_reference when a durable output ID or URL exists. Tasks sends a structured terminal receipt to its creator thread when different; do not duplicate that delivery."
+    },
+    {
+      "name": "create",
+      "description": "Create exactly one durable task before substantive work begins when an outcome is multi-step, combines multiple sources or independent checks, is scheduled, delegated, or must survive the current exchange. A multi-area review or synthesis is task work even when calls run in parallel or finish in one turn. A quick lookup means one bounded read or action with no multi-source synthesis. Creating a task does not imply delegation: the current opaque thread may create, execute, update, and complete its own task. For immediate work, omit schedule entirely; never invent schedule placeholders. For scheduled work, provide exactly one of at, after, every, or cron with its matching kind. The current thread becomes creator; immediate work defaults to that creator, while scheduled work defaults to the agent's configured default thread. assigned_thread_id overrides either default."
+    },
+    {
+      "name": "edit",
+      "description": "Atomically edit an existing task definition while preserving omitted fields. Change title, description, and/or a partial schedule. Use clear_description=true to intentionally remove the description. For recurring work, edit the recurring parent; dispatched or materialized occurrence definitions are immutable. Editing a paused schedule keeps it paused. Call tasks_get first and never create a placeholder replacement task."
+    },
+    {
+      "name": "fail",
+      "description": "Record an explicit terminal task failure with a concrete error. Use this instead of tasks_update(state=failed). Include result_reference when durable evidence or an external operation record exists. Call exactly once before pace, idle, stopping, or sending the final response."
+    },
+    {
+      "name": "get",
+      "description": "Read the authoritative task and its chronological event history. Every thread receiving a task event, including a delegated worker, must call this before any domain action. Main may grant this read-only tool to a worker without granting Tasks mutation tools."
+    },
+    {
+      "name": "list",
+      "description": "List this agent's durable task inventory across all of its threads. Caller, creator, assignee, and executor thread IDs are provenance only and never limit visibility. Use this directly for task and schedule questions instead of asking another thread. Use next_cursor to request the next page when has_more is true; do not repeat a page."
+    },
+    {
+      "name": "pause",
+      "description": "Pause a scheduled task without deleting it."
+    },
+    {
+      "name": "recover_occurrence",
+      "description": "Create one linked reconciliation-only attempt for a failed scheduled occurrence. This does not reopen the original occurrence and must not blindly repeat its external action. The recovery executor must call tasks_get first, reconcile durable external state, complete when the original outcome is verified, retry the domain action only when it is proven absent and safe, or record failed with external_outcome_unknown. Use this instead of run_now when recovering a specific occurrence."
+    },
+    {
+      "name": "resume",
+      "description": "Resume a paused scheduled task, preserving a future deadline and skipping overdue recurring runs."
+    },
+    {
+      "name": "run_now",
+      "description": "Run one manual occurrence now, preserving the recurring schedule cadence and pause state. Returns the occurrence to execute; do not use this to recover a failed occurrence."
+    },
+    {
+      "name": "set_progress",
+      "description": "Record one meaningful nonterminal task milestone. Always provide state, progress, and a concrete current_step. State must be running while any executor is actively working, waiting only when nobody can progress until an external event, or blocked for a concrete dependency. Progress is monotonic and must not decrease. Progress 100 is still nonterminal: call tasks_complete after success or tasks_fail after failure. Do not call after every tool call."
+    },
+    {
+      "name": "update",
+      "description": "Legacy compatibility tool combining definition edits, progress, and failure state. Do not use for new work. Use tasks_set_progress for milestones, tasks_edit for definitions, tasks_fail for failures, and tasks_complete for success."
+    }
+  ],
+  "conversations": [
+    {
+      "name": "alert",
+      "description": "Raise a global alert from main, or a conversation-local urgent alert from the originating conversation thread using its exact id. Generic workers report problems to their parent. Alerts are severity-ranked in the inbox."
+    },
+    {
+      "name": "create",
+      "description": "Main-thread conversation management only. Create a conversation you lead, for an ongoing topic (\"Reports\", \"Infra monitoring\", an incident name). Title-idempotent: if you already have a conversation with this title it is returned with created=false, so reusing a stable title never duplicates. Conversation threads and generic workers do not create conversations. Titles name ongoing topics \u2014 never put timestamps, ids, or per-item detail in them."
+    },
+    {
+      "name": "history",
+      "description": "Read a conversation transcript. Main may inspect a participating conversation; a conversation thread may read only its own exact conversation; generic workers are not granted this tool."
+    },
+    {
+      "name": "list",
+      "description": "Main-thread conversation management only. List conversations this agent participates in. Conversation threads already have their exact id; generic workers report to their parent. Pass query to filter by title (case-insensitive substring) \u2014 search before creating."
+    },
+    {
+      "name": "report",
+      "description": "Main-thread global output only: file a substantive report into an operator conversation. Conversation threads and generic workers report results to their parent/main instead. Keep one standing Reports conversation and reuse it."
+    },
+    {
+      "name": "request_approval",
+      "description": "Ask the operator to approve gated work owned by main or by the originating conversation thread, using that conversation's exact id. Generic workers report the blocked decision to their parent instead. The card is actionable in the conversation and inbox; the verdict returns to the asking thread as approval.result."
+    },
+    {
+      "name": "send",
+      "description": "Reply from the originating conversation thread to that exact conversation. Main routes requested outcomes back to the originating thread; generic workers report to their parent and are never granted Conversations tools. Delivery updates every bound surface. Set phase to acknowledgement, progress, or final."
+    }
+  ],
+  "bunny-lily": [
+    {
+      "name": "list_libraries",
+      "description": "[Bunny Stream] List all video libraries in your Bunny account. This is a Core API endpoint and requires the accountApiKey credential, not the per-library streamApiKey. Returns Id, Name, VideoCount, StorageUsage, PullZoneId, StorageZoneId, ApiKey, and ReadOnlyApiKey where available."
+    },
+    {
+      "name": "create_library",
+      "description": "[Bunny Stream] Create a new video library for organizing and hosting videos. This is a Core API endpoint and requires accountApiKey, not streamApiKey. The response includes the new library Id and ApiKey; use those as libraryId and streamApiKey for Stream tools."
+    },
+    {
+      "name": "list_videos",
+      "description": "[Bunny Stream] List videos in the library with pagination and filtering. Each video includes guid, videoLibraryId, title, status, length, views, collectionId, and more. Pass collectionId to filter to one Bunny collection; the integration sends this to Bunny as the required collection query parameter.\n\nURL construction for agents:\n- Use guid as the video ID.\n- Use videoLibraryId from the video response as the library ID. If videoLibraryId is missing, use the configured libraryId or the Id from list_libraries/get_library.\n- Embed/player URL: https://iframe.mediadelivery.net/embed/{videoLibraryId}/{guid}\n- Alternate player host: https://player.mediadelivery.net/embed/{videoLibraryId}/{guid}\n- Thumbnail URL: https://vz-{videoLibraryId}.b-cdn.net/{guid}/thumbnail.jpg\n- Direct MP4/download URLs are only available when MP4 fallback is enabled and require the library pull-zone hostname from Bunny; the video response alone is not enough."
+    },
+    {
+      "name": "get_video",
+      "description": "[Bunny Stream] Get video details including status, encoding progress, resolution, duration, collectionId, and metadata.\n\nURL construction for agents:\n- The guid field in the response is the Bunny video ID.\n- The videoLibraryId field in the response is the Bunny Stream library ID. If videoLibraryId is missing, use the configured libraryId or the Id from list_libraries/get_library.\n- Embed/player URL: https://iframe.mediadelivery.net/embed/{videoLibraryId}/{guid}\n- Alternate player host: https://player.mediadelivery.net/embed/{videoLibraryId}/{guid}\n- Thumbnail URL: https://vz-{videoLibraryId}.b-cdn.net/{guid}/thumbnail.jpg\n- Direct MP4/download URLs are not returned by get_video. They only work when MP4 fallback is enabled and require the library pull-zone hostname from Bunny, for example https://{pullZoneHostname}/{guid}/play_720p.mp4. Do not invent this hostname from guid or videoLibraryId alone."
+    },
+    {
+      "name": "create_video",
+      "description": "[Bunny Stream] Create a new video entry in the library (use fetch-video to add content from a URL)"
+    },
+    {
+      "name": "update_video",
+      "description": "[Bunny Stream] Update video metadata including title, description, chapters, moments, and meta tags. metaTags must be an array of objects like [{\"property\":\"keywords\",\"value\":\"tag one, tag two\"}], not an array of strings."
+    },
+    {
+      "name": "list_collections",
+      "description": "[Bunny Stream] List all video collections in the library"
+    },
+    {
+      "name": "create_collection",
+      "description": "[Bunny Stream] Create a new collection for organizing videos in the library"
+    },
+    {
+      "name": "fetch_video",
+      "description": "[Bunny Stream] Fetch and upload a video from an external URL to Bunny Stream for processing. If collectionId is provided, it is sent as Bunny's collectionId query parameter so the fetched video is assigned to that collection. thumbnailTime is in milliseconds."
+    }
+  ]
+}

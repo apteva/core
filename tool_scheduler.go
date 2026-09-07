@@ -26,6 +26,7 @@ func queueTool(t *Thinker, call toolCall) {
 	call.admitted = true
 	call.Args = copyStringMap(call.Args)
 	call.executionIDs = t.currentEventExecutions()
+	t.resolveToolCall(&call)
 	if call.NativeID != "" {
 		t.pendingTools.Store(call.NativeID, call.Name)
 	}
@@ -61,6 +62,7 @@ func (t *Thinker) invalidateTools() {
 	t.toolLifecycleMu.Lock()
 	defer t.toolLifecycleMu.Unlock()
 	t.toolGeneration.Add(1)
+	t.resetMCPFailures()
 	t.toolCancels.Range(func(_, v any) bool { v.(context.CancelFunc)(); return true })
 	t.pendingTools.Clear()
 	t.placeholdersSent.Clear()

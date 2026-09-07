@@ -1,6 +1,8 @@
 package core
 
 import (
+	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -24,8 +26,13 @@ import (
 //   - The registry will eventually want to evict tools (uninstall an
 //     app); a separate index keeps that bookkeeping local.
 type ToolIndex struct {
-	mu      sync.RWMutex
-	entries []IndexEntry
+	mu                sync.RWMutex
+	entries           []IndexEntry
+	byName            map[string]int
+	serverPrefixes    map[string]bool
+	aliases           map[string]string
+	revision          uint64
+	diagnosedRevision uint64
 }
 
 // IndexEntry is one tool's worth of searchable metadata.
@@ -36,9 +43,13 @@ type IndexEntry struct {
 	Description string
 	NoSpawn     bool // sub-threads cannot see this tool in search
 	LoadMode    ToolLoadMode
-	// tokens is the lowercased, deduplicated set of search terms
-	// (name segments + description words). Precomputed at Add() time.
-	tokens map[string]int
+	Match       string
+	Score       float64
+	// Full-description term frequencies and separate name terms are computed
+	// at registration. Descriptive ranking uses BM25 with a distinct name boost.
+	tokens     map[string]int
+	nameTokens map[string]int
+	tokenCount int
 }
 
 // NewToolIndex returns an empty index.
@@ -54,6 +65,7 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loadin
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.revision++
 	// Drop existing entries from this server first
 	filtered := ix.entries[:0]
 	for _, e := range ix.entries {
@@ -62,6 +74,18 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loadin
 		}
 	}
 	ix.entries = filtered
+	for alias, target := range ix.aliases {
+		found := false
+		for _, e := range ix.entries {
+			if e.Name == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(ix.aliases, alias)
+		}
+	}
 	cfg := MCPServerConfig{Name: server}
 	if len(loading) > 0 {
 		cfg.ToolLoading = loading[0]
@@ -75,10 +99,15 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loadin
 			Description: t.Description,
 			NoSpawn:     noSpawn,
 			LoadMode:    cfg.toolLoadMode(t.Name),
-			tokens:      indexTokens(full + " " + t.Description),
+			tokens:      indexTokens(t.Description),
+			nameTokens:  indexTokens(full),
+		}
+		for _, count := range e.tokens {
+			e.tokenCount += count
 		}
 		ix.entries = append(ix.entries, e)
 	}
+	ix.rebuildNamesLocked()
 }
 
 // UpdatePolicy changes only prompt visibility metadata. MCP connections and
@@ -92,6 +121,7 @@ func (ix *ToolIndex) UpdatePolicy(server string, noSpawn bool, loading *MCPToolL
 	cfg := MCPServerConfig{Name: server, ToolLoading: loading}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.revision++
 	for i := range ix.entries {
 		if ix.entries[i].Server != server {
 			continue
@@ -109,6 +139,7 @@ func (ix *ToolIndex) Remove(server string) {
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.revision++
 	filtered := ix.entries[:0]
 	for _, e := range ix.entries {
 		if e.Server != server {
@@ -116,6 +147,19 @@ func (ix *ToolIndex) Remove(server string) {
 		}
 	}
 	ix.entries = filtered
+	for alias, target := range ix.aliases {
+		found := false
+		for _, e := range ix.entries {
+			if e.Name == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(ix.aliases, alias)
+		}
+	}
+	ix.rebuildNamesLocked()
 }
 
 // Get returns the entry for a fully-qualified tool name, if present.
@@ -125,10 +169,8 @@ func (ix *ToolIndex) Get(name string) (IndexEntry, bool) {
 	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
-	for _, e := range ix.entries {
-		if e.Name == name {
-			return e, true
-		}
+	if index, ok := ix.byName[strings.ToLower(name)]; ok && ix.entries[index].Name == name {
+		return ix.entries[index], true
 	}
 	return IndexEntry{}, false
 }
@@ -331,37 +373,149 @@ func (ix *ToolIndex) Servers() []string {
 // path is used from sub-threads, which must not discover gateway or
 // channels tools they have no business calling.
 func (ix *ToolIndex) Search(query string, k int, allowNoSpawn bool) []IndexEntry {
+	return ix.search(query, k, allowNoSpawn, nil)
+}
+
+// RegisterAlias registers a discovery alias for an existing canonical name.
+// Aliases never become dispatch names and cannot shadow canonical identities.
+func (ix *ToolIndex) RegisterAlias(alias, canonical string) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	ix.revision++
+	alias = strings.ToLower(strings.TrimSpace(alias))
+	if alias == "" || len(toolNameTokens(alias)) != 1 || toolNameTokens(alias)[0] != alias {
+		return fmt.Errorf("invalid tool alias %q", alias)
+	}
+	found := false
+	for _, e := range ix.entries {
+		if strings.EqualFold(e.Name, alias) && e.Name != canonical {
+			return fmt.Errorf("alias shadows tool %q", alias)
+		}
+		if e.Name == canonical {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("unknown alias target %q", canonical)
+	}
+	if target, exists := ix.aliases[alias]; exists && target != canonical {
+		return fmt.Errorf("ambiguous tool alias %q", alias)
+	}
+	if ix.aliases == nil {
+		ix.aliases = map[string]string{}
+	}
+	ix.aliases[alias] = canonical
+	return nil
+}
+
+// toolNameTokens preserves qualified names, unlike descriptive tokenization.
+func toolNameTokens(query string) []string {
+	return strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-')
+	})
+}
+
+func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized func(string) bool) []IndexEntry {
 	if ix == nil || k <= 0 {
 		return nil
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	allowed := func(e IndexEntry) bool {
+		return (allowNoSpawn || !e.NoSpawn) && (authorized == nil || authorized(e.Name))
+	}
+	requested := map[string]int{}
+	explicit := false
+	for pos, token := range toolNameTokens(query) {
+		canonical := token
+		if _, exists := ix.byName[canonical]; !exists {
+			if target, ok := ix.aliases[token]; ok {
+				canonical = strings.ToLower(target)
+				explicit = true
+			}
+		}
+		if _, exists := ix.byName[canonical]; exists {
+			if _, seen := requested[canonical]; !seen {
+				requested[canonical] = pos
+			}
+			explicit = true
+		}
+		for prefix := range ix.serverPrefixes {
+			if strings.HasPrefix(token, prefix) {
+				explicit = true
+				break
+			}
+		}
+	}
+	if strings.Contains(strings.TrimSpace(query), "_") && len(strings.Fields(query)) == 1 {
+		explicit = true
+	}
+	if explicit {
+		var out []IndexEntry
+		for canonical := range requested {
+			e := ix.entries[ix.byName[canonical]]
+			if allowed(e) {
+				e.Match = "exact_or_alias"
+				out = append(out, e)
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			a, b := requested[strings.ToLower(out[i].Name)], requested[strings.ToLower(out[j].Name)]
+			if a != b {
+				return a < b
+			}
+			return out[i].Name < out[j].Name
+		})
+		if len(out) > k {
+			out = out[:k]
+		}
+		return out
 	}
 	terms := indexQueryTokens(query)
 	if len(terms) == 0 {
 		return nil
 	}
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-
+	var candidates []IndexEntry
+	totalLength := 0
+	df := map[string]int{}
+	for _, e := range ix.entries {
+		if !allowed(e) || normalizeToolLoadMode(e.LoadMode) == ToolLoadAlways {
+			continue
+		}
+		candidates = append(candidates, e)
+		totalLength += e.tokenCount
+		for _, term := range terms {
+			if e.tokens[term] > 0 || e.nameTokens[term] > 0 {
+				df[term]++
+			}
+		}
+	}
+	avgLength := 1.0
+	if len(candidates) > 0 {
+		avgLength = math.Max(1, float64(totalLength)/float64(len(candidates)))
+	}
 	type scored struct {
 		entry IndexEntry
 		score float64
 	}
 	var hits []scored
-	for _, e := range ix.entries {
-		if !allowNoSpawn && e.NoSpawn {
-			continue
+	for _, e := range candidates {
+		score := 0.0
+		for _, term := range terms {
+			idf := math.Log1p((float64(len(candidates)-df[term]) + 0.5) / (float64(df[term]) + 0.5))
+			if e.nameTokens[term] > 0 {
+				score += 8 * idf
+			}
+			tf := float64(e.tokens[term])
+			if tf > 0 {
+				score += idf * tf * 2.2 / (tf + 1.2*(0.25+0.75*float64(e.tokenCount)/avgLength))
+			}
 		}
-		// Always-loaded schemas are already callable. Returning them from
-		// search would waste an activation slot and encourage a needless
-		// extra model round-trip.
-		if normalizeToolLoadMode(e.LoadMode) == ToolLoadAlways {
-			continue
-		}
-		s := scoreEntry(terms, e)
-		if s > 0 {
-			hits = append(hits, scored{e, s})
+		if score > 0 {
+			hits = append(hits, scored{e, score})
 		}
 	}
-	sort.SliceStable(hits, func(i, j int) bool {
+	sort.Slice(hits, func(i, j int) bool {
 		if hits[i].score == hits[j].score {
 			return hits[i].entry.Name < hits[j].entry.Name
 		}
@@ -373,29 +527,10 @@ func (ix *ToolIndex) Search(query string, k int, allowNoSpawn bool) []IndexEntry
 	out := make([]IndexEntry, len(hits))
 	for i, h := range hits {
 		out[i] = h.entry
+		out[i].Match = "bm25"
+		out[i].Score = h.score
 	}
 	return out
-}
-
-// scoreEntry ranks a single entry against the query terms. The
-// scoring is intentionally simple — keyword presence with a small
-// boost for name hits over description hits — because the index sits
-// at ~100-500 tools where BM25 vs naive TF makes no observable recall
-// difference. If that changes (10k+ tools, ambiguous queries), swap
-// in a real BM25 here without touching callers.
-func scoreEntry(terms []string, e IndexEntry) float64 {
-	name := strings.ToLower(e.Name)
-	score := 0.0
-	for _, t := range terms {
-		if cnt, ok := e.tokens[t]; ok {
-			weight := 1.0
-			if strings.Contains(name, t) {
-				weight = 2.5 // name hits are stronger signal
-			}
-			score += weight * float64(cnt)
-		}
-	}
-	return score
 }
 
 // indexTokens lowercases s, splits on non-alphanumeric, and returns a
@@ -456,4 +591,32 @@ func stopWord(t string) bool {
 		return true
 	}
 	return false
+}
+
+func (ix *ToolIndex) replaceServerAliases(server string, aliases map[string]string) {
+	ix.mu.Lock()
+	for alias, target := range ix.aliases {
+		for _, e := range ix.entries {
+			if e.Name == target && e.Server == server {
+				delete(ix.aliases, alias)
+				break
+			}
+		}
+	}
+	ix.mu.Unlock()
+	for alias, target := range aliases {
+		if err := ix.RegisterAlias(alias, server+"_"+target); err != nil {
+			logMsg("MCP", err.Error())
+		}
+	}
+}
+
+// Rebuilt only at mount/reconnect. Exact lookup avoids corpus scans and ranking.
+func (ix *ToolIndex) rebuildNamesLocked() {
+	ix.byName = make(map[string]int, len(ix.entries))
+	ix.serverPrefixes = map[string]bool{}
+	for i, e := range ix.entries {
+		ix.byName[strings.ToLower(e.Name)] = i
+		ix.serverPrefixes[strings.ToLower(e.Server)+"_"] = true
+	}
 }

@@ -21,16 +21,17 @@ const (
 )
 
 type PersistentEventExecution struct {
-	EventID           string          `json:"event_id"`
-	ExecutionID       string          `json:"execution_id"`
-	ThreadID          string          `json:"thread_id"`
-	ParentExecutionID string          `json:"parent_execution_id,omitempty"`
-	Status            string          `json:"status"`
-	Reason            string          `json:"reason,omitempty"`
-	Sequence          uint64          `json:"sequence"`
-	Participants      map[string]bool `json:"participants,omitempty"` // true while that thread is processing
-	CreatedAt         time.Time       `json:"created_at"`
-	UpdatedAt         time.Time       `json:"updated_at"`
+	RequiredFirstAction *RequiredFirstAction `json:"required_first_action,omitempty"`
+	EventID             string               `json:"event_id"`
+	ExecutionID         string               `json:"execution_id"`
+	ThreadID            string               `json:"thread_id"`
+	ParentExecutionID   string               `json:"parent_execution_id,omitempty"`
+	Status              string               `json:"status"`
+	Reason              string               `json:"reason,omitempty"`
+	Sequence            uint64               `json:"sequence"`
+	Participants        map[string]bool      `json:"participants,omitempty"` // true while that thread is processing
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
 }
 
 // EventLifecycleTransition is returned by Core's durable lifecycle outbox.
@@ -75,7 +76,8 @@ func registerEventExecutionsLocked(c *Config, threadID string, events []Persiste
 		}
 		c.EventExecutions = append(c.EventExecutions, PersistentEventExecution{
 			EventID: event.ID, ExecutionID: event.ExecutionID, ThreadID: threadID,
-			Status: eventExecutionPending, Participants: map[string]bool{threadID: false},
+			RequiredFirstAction: parseRequiredFirstAction(event.Text),
+			Status:              eventExecutionPending, Participants: map[string]bool{threadID: false},
 			CreatedAt: now, UpdatedAt: now,
 		})
 	}

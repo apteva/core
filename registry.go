@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -53,6 +54,7 @@ func normalizeWakeOnResultPolicy(v any) WakeOnResultPolicy {
 
 // ToolDef defines a tool available to threads.
 type ToolDef struct {
+	schemaHash     string
 	native         NativeTool
 	Name           string
 	Description    string // human-readable
@@ -63,6 +65,7 @@ type ToolDef struct {
 	ThreadOnly     bool   // only for sub-threads, not main (reply)
 	SystemOnly     bool   // only for system threads (unconscious)
 	MCP            bool   // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
+	MCPLocalName   string // immutable raw MCP tools/call name
 	MCPServer      string // name of the MCP server that provides this tool
 	MCPApp         bool   // routed through Apteva's authenticated app MCP gateway
 	HandlerContext func(context.Context, map[string]string) ToolResponse
@@ -355,9 +358,13 @@ func (tr *ToolRegistry) registerDefaults() {
 	// instance config when enabled.
 }
 
-func (tr *ToolRegistry) Register(tool *ToolDef) {
+func (tr *ToolRegistry) Register(tool *ToolDef) bool {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
+	if old := tr.tools[tool.Name]; old != nil && (old.MCP || tool.MCP) && (old.MCP != tool.MCP || old.MCPServer != tool.MCPServer || old.MCPLocalName != tool.MCPLocalName) {
+		logMsg("MCP", fmt.Sprintf("refusing conflicting tool identity %q", tool.Name))
+		return false
+	}
 	cloned := *tool
 	nt := NativeTool{Name: tool.Name, Description: tool.Description}
 	if tool.Rules != "" {
@@ -371,7 +378,10 @@ func (tr *ToolRegistry) Register(tool *ToolDef) {
 	raw, _ := json.Marshal(nt)
 	nt.serializedBytes = len(raw)
 	cloned.native = nt
+	sum := sha256.Sum256(raw)
+	cloned.schemaHash = fmt.Sprintf("%x", sum[:])
 	tr.tools[tool.Name] = &cloned
+	return true
 }
 
 func (tr *ToolRegistry) Get(name string) *ToolDef {
@@ -477,21 +487,26 @@ func (tr *ToolRegistry) DispatchContext(ctx context.Context, name string, args m
 	if !exists || (tool.Handler == nil && tool.HandlerContext == nil) {
 		return ToolResponse{}, false
 	}
+	return tr.dispatchDefinition(ctx, tool, args), true
+}
+
+// Dispatch the same immutable definition that was resolved and diagnosed.
+func (tr *ToolRegistry) dispatchDefinition(ctx context.Context, tool *ToolDef, args map[string]string) ToolResponse {
 	if ctx.Err() != nil {
-		return ToolResponse{Text: ctx.Err().Error(), IsError: true}, true
+		return ToolResponse{Text: ctx.Err().Error(), IsError: true}
 	}
 	if tool.MCP && tool.MCPServer != "" {
 		slot, _ := tr.serverSlots.LoadOrStore(tool.MCPServer, make(chan struct{}, 8))
 		release, err := acquireBudget(ctx, slot.(chan struct{}))
 		if err != nil {
-			return ToolResponse{Text: err.Error(), IsError: true}, true
+			return ToolResponse{Text: err.Error(), IsError: true}
 		}
 		defer release()
 	}
 	if tool.HandlerContext != nil {
-		return tool.HandlerContext(ctx, args), true
+		return tool.HandlerContext(ctx, args)
 	}
-	return tool.Handler(args), true
+	return tool.Handler(args)
 }
 
 // AllToolNames returns all non-core tool names (for spawn docs).
@@ -562,6 +577,17 @@ func (tr *ToolRegistry) Counts() (core, rag, total int) {
 func (tr *ToolRegistry) NativeTools(allowlist, active map[string]bool, includeSystemOnly ...bool) []NativeTool {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
+	return tr.nativeToolsLocked(allowlist, active, nil, includeSystemOnly...)
+}
+
+func (tr *ToolRegistry) nativeToolSnapshot(allowlist, active map[string]bool, includeSystemOnly ...bool) ([]NativeTool, map[string]*ToolDef) {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	definitions := map[string]*ToolDef{}
+	return tr.nativeToolsLocked(allowlist, active, definitions, includeSystemOnly...), definitions
+}
+
+func (tr *ToolRegistry) nativeToolsLocked(allowlist, active map[string]bool, definitions map[string]*ToolDef, includeSystemOnly ...bool) []NativeTool {
 	sysOnly := len(includeSystemOnly) > 0 && includeSystemOnly[0]
 	var out []NativeTool
 	for _, name := range tr.sortedToolKeys() {
@@ -571,6 +597,9 @@ func (tr *ToolRegistry) NativeTools(allowlist, active map[string]bool, includeSy
 		}
 
 		nt := tool.native
+		if definitions != nil {
+			definitions[name] = tool
+		}
 		out = append(out, nt)
 	}
 	return out

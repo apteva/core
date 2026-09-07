@@ -122,7 +122,7 @@ func registerSearchTool(r *ToolRegistry) {
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Keywords describing the capability you need.",
+					"description": "An exact tool name (preferred when known), registered alias, or capability description. Exact names never fall back to a different operation.",
 				},
 				"k": map[string]any{
 					"type":        "integer",
@@ -143,6 +143,7 @@ func registerSearchTool(r *ToolRegistry) {
 // turn, so the LLM doesn't need a paragraph of description here —
 // just enough to confirm it found what it was looking for.
 type searchToolsResult struct {
+	Error  string          `json:"error,omitempty"`
 	Query  string          `json:"query"`
 	Hits   []searchToolHit `json:"hits"`
 	Loaded []string        `json:"loaded"` // names whose schemas are now in context
@@ -150,9 +151,11 @@ type searchToolsResult struct {
 }
 
 type searchToolHit struct {
-	Name    string `json:"name"`
-	Server  string `json:"server"`
-	Summary string `json:"summary"`
+	Match   string  `json:"match,omitempty"`
+	Score   float64 `json:"score,omitempty"`
+	Name    string  `json:"name"`
+	Server  string  `json:"server"`
+	Summary string  `json:"summary"`
 }
 
 // applyPreload runs a BM25 search against the thread's DIRECTIVE and
@@ -250,21 +253,26 @@ func (t *Thinker) searchAuthorizedTools(query string, k int, allowNoSpawn bool) 
 	if t == nil || t.toolIndex == nil || k <= 0 {
 		return nil
 	}
-	// Rank the complete authorized candidate set before applying k. Filtering
-	// only the global top-k could hide a lower-ranked granted result behind
-	// higher-ranked tools that belong to other workers' scopes.
-	hits := t.toolIndex.Search(query, t.toolIndex.Count(), allowNoSpawn)
-	out := make([]IndexEntry, 0, k)
-	for _, hit := range hits {
-		if !t.toolAuthorized(hit.Name) {
-			continue
-		}
-		out = append(out, hit)
-		if len(out) == k {
-			break
+	if t.toolAllowlist == nil {
+		return t.toolIndex.Search(query, k, allowNoSpawn)
+	}
+	// Snapshot grants outside the index lock: toolAuthorized also reads it.
+	allowed := make(map[string]bool, len(t.toolAllowlist))
+	for name, enabled := range t.toolAllowlist {
+		if enabled && t.toolAuthorized(name) {
+			allowed[name] = true
 		}
 	}
-	return out
+	for server, enabled := range t.toolMCPScopes {
+		if enabled {
+			for _, name := range t.toolIndex.ToolsForServer(server) {
+				if t.toolAuthorized(name) {
+					allowed[name] = true
+				}
+			}
+		}
+	}
+	return t.toolIndex.search(query, k, allowNoSpawn, func(name string) bool { return allowed[name] })
 }
 
 func (t *Thinker) authorizedActiveTools(active map[string]bool) map[string]bool {
@@ -326,17 +334,40 @@ func countActiveMCPTools(active map[string]bool) int {
 // the current model request (or realtime session configuration). Dispatch
 // consults this snapshot rather than trying to reconstruct visibility from a
 // different subset of tool state.
-func (t *Thinker) recordPresentedTools(tools []NativeTool) {
+func (t *Thinker) recordPresentedTools(tools []NativeTool, snapshots ...map[string]*ToolDef) {
 	if t == nil {
 		return
 	}
 	presented := make(map[string]bool, len(tools))
+	identities := make(map[string]ToolIdentity, len(tools))
+	manifest := make([]ToolIdentity, 0, len(tools))
+	definitions := map[string]*ToolDef{}
 	for _, tool := range tools {
 		presented[tool.Name] = true
+		identity := ToolIdentity{Name: tool.Name}
+		var def *ToolDef
+		if len(snapshots) > 0 {
+			def = snapshots[0][tool.Name]
+		} else if t.registry != nil {
+			def = t.registry.Get(tool.Name)
+		}
+		if def != nil {
+			identity = toolIdentity(def)
+			definitions[tool.Name] = def
+		}
+		identities[tool.Name] = identity
+		manifest = append(manifest, identity)
 	}
 	t.presentedToolsMu.Lock()
 	t.presentedTools = presented
+	t.presentedIdentities = identities
+	t.presentedDefinitions = definitions
+	digest := manifestDigest(manifest)
+	t.toolManifestHash = digest
 	t.presentedToolsMu.Unlock()
+	if t.telemetry != nil && len(tools) > 0 {
+		t.telemetry.Emit("tool.manifest", t.threadID, map[string]any{"iteration": t.iteration, "hash": digest, "tools": manifest})
+	}
 }
 
 // modelToolCallable applies the thread's effective tool set: durable/static
@@ -366,6 +397,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 	if t == nil || t.registry == nil {
 		return nil
 	}
+	t.recordToolCatalog()
 	eager := t.useEagerTools()
 	if eager {
 		t.lastToolMode = "eager"
@@ -382,9 +414,19 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
 	active := t.authorizedActiveTools(t.activeTools)
 	baseline := t.toolIndex.BaselineNames(eager, allowNoSpawn)
+	for name, until := range t.discoveredToolUntil {
+		if t.iteration <= until {
+			baseline = append(baseline, name)
+		} else {
+			delete(t.discoveredToolUntil, name)
+		}
+	}
+	for name := range t.requiredToolNames() {
+		baseline = append(baseline, name)
+	}
 	if len(baseline) > 0 {
 		merged := make(map[string]bool, len(t.activeTools)+len(baseline))
-		for name, enabled := range t.activeTools {
+		for name, enabled := range active {
 			if enabled {
 				merged[name] = true
 			}
@@ -397,8 +439,8 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 		active = merged
 	}
 
-	tools := t.registry.NativeTools(t.authorizedToolAllowlist(t.toolAllowlist), active, t.systemThread)
-	t.recordPresentedTools(tools)
+	tools, definitions := t.registry.nativeToolSnapshot(t.authorizedToolAllowlist(t.toolAllowlist), active, t.systemThread)
+	t.recordPresentedTools(tools, definitions)
 	t.lastNativeToolCount = len(tools)
 	t.lastActiveMCPCount = countActiveMCPTools(active)
 	t.lastAlwaysMCPCount = t.toolIndex.AlwaysCount(allowNoSpawn)
@@ -425,7 +467,12 @@ func (t *Thinker) evictActiveToolsLRU(limit int) {
 	for n := range t.activeTools {
 		all = append(all, aged{n, t.activeToolAge[n]})
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].age < all[j].age })
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].age == all[j].age {
+			return all[i].name < all[j].name
+		}
+		return all[i].age < all[j].age
+	})
 	keep := limit * 7 / 10
 	for i := 0; i < len(all)-keep; i++ {
 		delete(t.activeTools, all[i].name)
@@ -456,18 +503,23 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	}
 	hits := t.searchAuthorizedTools(query, k, allowNoSpawn)
 	res := searchToolsResult{Query: query}
+	if t.discoveredToolUntil == nil {
+		t.discoveredToolUntil = map[string]int{}
+	}
 	for _, h := range hits {
+		t.discoveredToolUntil[h.Name] = t.iteration + 1
 		t.touchActiveTool(h.Name)
 		summary := h.Description
 		if len(summary) > 240 {
 			summary = summary[:237] + "..."
 		}
 		res.Hits = append(res.Hits, searchToolHit{
-			Name: h.Name, Server: h.Server, Summary: summary,
+			Name: h.Name, Server: h.Server, Summary: summary, Match: h.Match, Score: h.Score,
 		})
 		res.Loaded = append(res.Loaded, h.Name)
 	}
 	if len(res.Hits) == 0 {
+		res.Error = "capability_unavailable: no matching authorized tool. Do not substitute another operation; refine discovery or report the missing capability."
 		// Tell the LLM what *is* attached so it can refine the query or
 		// reach for the gateway's install/list_apps tool to add what's
 		// missing. Cheaper than another search round-trip.
@@ -485,6 +537,9 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 		} else {
 			res.Note = "no matches; no MCP servers visible to this thread"
 		}
+	}
+	if t.telemetry != nil {
+		t.telemetry.Emit("tool.discovery", t.threadID, map[string]any{"iteration": t.iteration, "result": res})
 	}
 	out, _ := json.Marshal(res)
 	return string(out)

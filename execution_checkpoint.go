@@ -23,19 +23,20 @@ type ExecutionCheckpointMeta struct {
 
 type executionCheckpoint struct {
 	ExecutionCheckpointMeta
-	messages          []Message
-	activeTools       map[string]bool
-	activeToolAge     map[string]int
-	rate              ThinkRate
-	agentRate         ThinkRate
-	agentSleep        time.Duration
-	model             ModelTier
-	agentModel        ModelTier
-	agentReasoning    ReasoningLevel
-	baselineModel     ModelTier
-	baselineReasoning ReasoningLevel
-	activeWork        bool
-	directive         string
+	messages            []Message
+	activeTools         map[string]bool
+	activeToolAge       map[string]int
+	discoveredToolUntil map[string]int
+	rate                ThinkRate
+	agentRate           ThinkRate
+	agentSleep          time.Duration
+	model               ModelTier
+	agentModel          ModelTier
+	agentReasoning      ReasoningLevel
+	baselineModel       ModelTier
+	baselineReasoning   ReasoningLevel
+	activeWork          bool
+	directive           string
 }
 
 type ExecutionCheckpointStore struct {
@@ -68,19 +69,20 @@ func (s *ExecutionCheckpointStore) Capture(t *Thinker, gate ExecutionGate) *Exec
 			Args:      sanitizeExecutionArgs(gate.Args),
 			CreatedAt: time.Now(),
 		},
-		messages:          cloneMessages(t.messages),
-		activeTools:       copyBoolMap(t.activeTools),
-		activeToolAge:     copyIntMap(t.activeToolAge),
-		rate:              t.rate,
-		agentRate:         t.agentRate,
-		agentSleep:        t.agentSleep,
-		model:             t.model,
-		agentModel:        t.agentModel,
-		agentReasoning:    t.agentReasoning,
-		baselineModel:     t.baselineModel,
-		baselineReasoning: t.baselineReasoning,
-		activeWork:        t.activeWork,
-		directive:         t.directive,
+		messages:            cloneMessages(t.messages),
+		activeTools:         copyBoolMap(t.activeTools),
+		activeToolAge:       copyIntMap(t.activeToolAge),
+		discoveredToolUntil: copyIntMap(t.discoveredToolUntil),
+		rate:                t.rate,
+		agentRate:           t.agentRate,
+		agentSleep:          t.agentSleep,
+		model:               t.model,
+		agentModel:          t.agentModel,
+		agentReasoning:      t.agentReasoning,
+		baselineModel:       t.baselineModel,
+		baselineReasoning:   t.baselineReasoning,
+		activeWork:          t.activeWork,
+		directive:           t.directive,
 	}
 	s.items = append(s.items, cp)
 	if len(s.items) > maxExecutionCheckpoints {
@@ -210,6 +212,7 @@ func (cp *executionCheckpoint) clone() *executionCheckpoint {
 	out.Args = copyStringMap(cp.Args)
 	out.messages = cloneMessages(cp.messages)
 	out.activeTools = copyBoolMap(cp.activeTools)
+	out.discoveredToolUntil = copyIntMap(cp.discoveredToolUntil)
 	out.activeToolAge = copyIntMap(cp.activeToolAge)
 	return &out
 }
