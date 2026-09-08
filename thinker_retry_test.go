@@ -210,11 +210,15 @@ func TestThinkWithProviderPersistsAttributedLLMStart(t *testing.T) {
 	}
 
 	events, _ := thinker.telemetry.Events(0)
-	if len(events) != 1 || events[0].Type != "llm.start" {
-		t.Fatalf("stored events = %#v, want one llm.start", events)
+	if len(events) != 2 || events[0].Type != "llm.request_budget" || events[1].Type != "llm.start" {
+		t.Fatalf("expected request budget followed by attributed llm.start, got %d events", len(events))
+	}
+	var budget requestBudget
+	if err := json.Unmarshal(events[0].Data, &budget); err != nil || budget.OverBudget || budget.InputTokens == 0 {
+		t.Fatalf("invalid preflight budget: %+v, %v", budget, err)
 	}
 	var data map[string]any
-	if err := json.Unmarshal(events[0].Data, &data); err != nil {
+	if err := json.Unmarshal(events[1].Data, &data); err != nil {
 		t.Fatalf("decode llm.start: %v", err)
 	}
 	if data["provider"] != "test-provider" || data["model"] != "test" {

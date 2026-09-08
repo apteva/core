@@ -395,6 +395,9 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	if err != nil {
 		return ChatResponse{}, err
 	}
+	if err := observeProviderRequest(ctx, p.Name(), model, body); err != nil {
+		return ChatResponse{}, err
+	}
 
 	url := p.url
 	if url == "" {

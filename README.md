@@ -50,12 +50,12 @@ Default port: `3210` (set with `API_PORT` env var)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/status` | GET | Uptime, iteration, rate, model, mode, threads, memory |
+| `/status` | GET | Uptime, iteration, rate, model, threads, memory |
 | `/threads` | GET | List all threads with state |
 | `/threads/{id}` | DELETE | Kill a thread |
 | `/events` | GET | SSE stream of telemetry events |
 | `/event` | POST | Inject a message to a thread |
-| `/config` | GET/PUT | Read/update config (directive, mode, MCP servers, computer) |
+| `/config` | GET/PUT | Read/update config (directive, MCP servers, providers) |
 | `/pause` | POST | Toggle pause/resume |
 
 ## Core Tools
@@ -89,17 +89,16 @@ Discoverable (RAG-retrieved when relevant):
 
 All tools support `_reason` — an optional observability field for explaining why the tool is being called.
 
-## Safety Modes
+## Behavior Instructions
 
-No forced approval gates. The agent decides, learns, asks when unsure.
+Core has no built-in behavior modes. Put instructions about when to act, ask for
+approval, or wait in the agent directive, and include the relevant instructions
+in worker directives when spawning them. Update the main directive through
+`PUT /config {"directive": "..."}`. Worker directives are configured separately.
 
-| Mode | Behavior |
-|------|----------|
-| `autonomous` | Acts freely. Learns from feedback. |
-| `cautious` | Asks before risky actions. Learns from answers. |
-| `learn` | Asks about every new tool type. Builds safety profile. |
-
-Set via `PUT /config {"mode": "cautious"}` or the CLI `/mode` command.
+Legacy top-level `mode` fields are ignored on config load and API updates and
+are omitted from core config/status responses and subsequent config saves.
+Execution pause/step controls and tool access restrictions are unchanged.
 
 ## Session Persistence
 
@@ -124,7 +123,6 @@ Conversation history persists across restarts:
 ```json
 {
   "directive": "Your mission here",
-  "mode": "autonomous",
   "provider": {
     "name": "fireworks",
     "models": { "large": "accounts/fireworks/models/kimi-k2p5", "small": "accounts/fireworks/models/kimi-k2p5" }

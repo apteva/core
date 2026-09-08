@@ -2,7 +2,6 @@ package core
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -322,31 +321,6 @@ func TestCollapseWhitespace_Empty(t *testing.T) {
 	}
 }
 
-// --- Config / Supervised Mode Tests ---
-
-func TestConfig_DefaultMode(t *testing.T) {
-	c := &Config{}
-	if c.GetMode() != ModeAutonomous {
-		t.Errorf("expected autonomous, got %s", c.GetMode())
-	}
-}
-
-func TestConfig_SetMode(t *testing.T) {
-	c := &Config{path: filepath.Join(t.TempDir(), "config.json")}
-	c.SetMode(ModeCautious)
-	if c.GetMode() != ModeCautious {
-		t.Errorf("expected cautious, got %s", c.GetMode())
-	}
-	c.SetMode(ModeAutonomous)
-	if c.GetMode() != ModeAutonomous {
-		t.Errorf("expected autonomous, got %s", c.GetMode())
-	}
-	c.SetMode(ModeLearn)
-	if c.GetMode() != ModeLearn {
-		t.Errorf("expected learn, got %s", c.GetMode())
-	}
-}
-
 func TestToolArgsSummary(t *testing.T) {
 	call := toolCall{Name: "web", Args: map[string]string{"url": "https://example.com"}}
 	summary := toolArgsSummary(call)
@@ -450,7 +424,7 @@ func TestDetectImageParts_OnlyImage(t *testing.T) {
 
 func TestExecuteTool_NoBlock(t *testing.T) {
 	bus := NewEventBus()
-	cfg := &Config{Mode: ModeAutonomous, path: "/dev/null"}
+	cfg := &Config{path: "/dev/null"}
 	thinker := &Thinker{
 		bus:       bus,
 		sub:       bus.Subscribe("main", 100),

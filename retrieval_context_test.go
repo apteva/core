@@ -402,7 +402,6 @@ func TestThinkerReusesBoundedMemoryAcrossToolResultContinuations(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Use relevant operating guidance to complete external requests directly.",
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -565,7 +564,6 @@ func TestSpawnedWorkerRecallUsesDirectiveAlongsideVagueParentEvent(t *testing.T)
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Coordinate bounded workers.",
-		Mode:      ModeAutonomous,
 	}
 	parent := NewThinker("", provider, cfg)
 	defer parent.Stop()
@@ -656,7 +654,6 @@ func TestMemoryRecallTelemetryReportsRelevantRecordSkippedBySizeLimit(t *testing
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Coordinate bounded workers.",
-		Mode:      ModeAutonomous,
 	}
 	parent := NewThinker("", provider, cfg)
 	defer func() {
@@ -737,7 +734,6 @@ func TestThinkerRecallIsEphemeralAndReplacedAcrossManyTurns(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Monitor storage uploads and signed URLs.",
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	if _, err := thinker.memory.Remember("Use signed URLs for storage uploads.", []string{"procedure", "storage"}, 0.95); err != nil {

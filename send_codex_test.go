@@ -42,7 +42,6 @@ func TestCodexSendReceiptContinuesWithoutDuplicateSmoke(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate durable operator work.",
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -192,7 +191,6 @@ func TestCodexRootStructuralSendFailureResumesLocalWorkSmoke(t *testing.T) {
 		path: filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Handle bounded external reconciliation work locally. " +
 			"Use the available authoritative read capability, then wait.",
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()

@@ -52,7 +52,6 @@ func TestIntegration_CodexSpawnDirectiveIsFocusedAndSelfContained(t *testing.T) 
 			"# Delegation",
 			"Create focused workers when the operator explicitly asks for one.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -161,7 +160,6 @@ func TestIntegration_CodexWorkerReportsMissingSharedGuidanceOnce(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Coordinate bounded workers without performing their work.",
-		Mode:      ModeAutonomous,
 	}
 	parent := NewThinker("", provider, cfg)
 	defer parent.Stop()

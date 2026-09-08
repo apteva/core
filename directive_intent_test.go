@@ -6,7 +6,7 @@ import (
 )
 
 func TestMainPromptRequiresAutomaticDurableInstructionPersistence(t *testing.T) {
-	prompt := buildSystemPrompt("# Goals\n- Ship", ModeAutonomous, NewToolRegistry("test"), "", nil, nil, nil, nil)
+	prompt := buildSystemPrompt("# Goals\n- Ship", NewToolRegistry("test"), "", nil, nil, nil, nil)
 	for _, want := range []string{
 		"[DIRECTIVE MANAGEMENT]",
 		"TIME, STATE, AND RECURRENCE",
@@ -30,7 +30,7 @@ func TestMainPromptRequiresAutomaticDurableInstructionPersistence(t *testing.T) 
 
 func TestAllTextModelRolesPreserveOptionalToolArgumentPresence(t *testing.T) {
 	prompts := map[string]string{
-		"main":            buildSystemPrompt("# Role\nCoordinate work.", ModeAutonomous, NewToolRegistry("test"), "", nil, nil, nil, nil),
+		"main":            buildSystemPrompt("# Role\nCoordinate work.", NewToolRegistry("test"), "", nil, nil, nil, nil),
 		"worker":          formatThreadBasePrompt(false, false, "worker", "main coordinator"),
 		"leader":          formatThreadBasePrompt(true, false, "leader", "main coordinator"),
 		"realtime worker": formatThreadBasePrompt(false, true, "voice", "main coordinator") + realtimeConversationPrompt,
@@ -40,18 +40,21 @@ func TestAllTextModelRolesPreserveOptionalToolArgumentPresence(t *testing.T) {
 			"Omit optional properties",
 			"JSON Schema constraints, examples, and enum ordering are not defaults",
 			"If false, zero, or an empty string is deliberately required, preserve and send that value",
-			"Sleeping and waiting use no model inference",
-			"Use at least a medium model with auto/medium reasoning for substantial active work",
 		} {
 			if !strings.Contains(prompt, want) {
 				t.Errorf("%s prompt missing %q", name, want)
 			}
 		}
+		// Voice sessions do not manage worker timers or model-tier selection.
+		// Keep that guidance on text roles without priming spoken narration.
+		if name != "realtime worker" && !strings.Contains(prompt, reasoningBaselineContract) {
+			t.Errorf("%s lost its reasoning baseline", name)
+		}
 	}
 }
 
 func TestMainPromptAssignsRecurringWorkByOwnership(t *testing.T) {
-	prompt := buildSystemPrompt("# Schedule\n- cadence: weekly", ModeAutonomous, NewToolRegistry("test"), "", nil, nil, nil, nil)
+	prompt := buildSystemPrompt("# Schedule\n- cadence: weekly", NewToolRegistry("test"), "", nil, nil, nil, nil)
 	for _, want := range []string{
 		"pace sets your next automatic wake",
 		"capped at 24h",

@@ -81,7 +81,6 @@ func runRecurringNotificationUsesSectionEditSmoke(t *testing.T, provider LLMProv
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: original,
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -198,7 +197,7 @@ func runAlreadyCurrentEvolveStillRepliesSmoke(t *testing.T, provider LLMProvider
 			},
 		}}},
 	}
-	cfg := &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive, Mode: ModeAutonomous}
+	cfg := &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: directive}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
 	if err := thinker.threads.SpawnWithOpts("chat-test", "# Role\nRelay confirmations to the operator.", []string{"send", "pace"}, SpawnOpts{DeferRun: true}); err != nil {
@@ -309,7 +308,7 @@ func runBoundedOneOffStaysOnMainSmoke(t *testing.T, provider LLMProvider) {
 		"",
 		"# Goals",
 		"- Produce clear, concise work.",
-	}, "\n"), ModeAutonomous, registry, "", nil, nil, pool, nil)
+	}, "\n"), registry, "", nil, nil, pool, nil)
 	messages := appendEphemeralTurnContext([]Message{
 		{Role: "system", Content: prompt},
 		{Role: "user", Content: "[console] Complete this very small immediately actionable request: turn these three supplied facts into one concise customer update—migration finished, validation passed, no action required—and deliver it with deliver_result. No lookup, waiting, retries, persistent state, or separate ownership is involved."},
@@ -390,7 +389,7 @@ func runRecurringResponsibilitiesScaleOutSmoke(t *testing.T, provider LLMProvide
 		"",
 		"# Responsibilities",
 		"- Produce the closely related KPI summary every Friday.",
-	}, "\n"), ModeAutonomous, registry, "", nil, nil, pool, nil)
+	}, "\n"), registry, "", nil, nil, pool, nil)
 	messages := appendEphemeralTurnContext([]Message{
 		{Role: "system", Content: prompt},
 		{Role: "user", Content: strings.Join([]string{
@@ -452,7 +451,7 @@ func runSubstantialWorkDelegatesSmoke(t *testing.T, provider LLMProvider) {
 		order:     []string{providerName},
 		default_:  providerName,
 	}
-	prompt := buildSystemPrompt("# Role\nCoordinate work and deliver accurate outcomes.", ModeAutonomous, registry, "", nil, nil, pool, nil)
+	prompt := buildSystemPrompt("# Role\nCoordinate work and deliver accurate outcomes.", registry, "", nil, nil, pool, nil)
 	messages := appendEphemeralTurnContext([]Message{
 		{Role: "system", Content: prompt},
 		{Role: "user", Content: strings.Join([]string{
@@ -506,7 +505,6 @@ func runRecurringInstructionUsesMainWakeLoop(t *testing.T, provider LLMProvider)
 			"# Goals",
 			"- Answer affiliate analytics requests accurately.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -641,7 +639,7 @@ func runRecurringCompletionDoesNotEvolveSmoke(t *testing.T, provider LLMProvider
 		default_:  providerName,
 	}
 	registry := NewToolRegistry("")
-	prompt := buildSystemPrompt(directive, ModeAutonomous, registry, "", nil, nil, pool, nil)
+	prompt := buildSystemPrompt(directive, registry, "", nil, nil, pool, nil)
 	messages := appendEphemeralTurnContext([]Message{
 		{Role: "system", Content: prompt},
 		{Role: "user", Content: "[from:report-worker] The weekly affiliate-performance report was delivered successfully for this run."},
@@ -695,7 +693,6 @@ func runDirectiveEditSmoke(t *testing.T, provider LLMProvider) {
 			"# Goals",
 			"- Keep the directive structured.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -748,7 +745,6 @@ func runEmptyDirectiveSectionInitSmoke(t *testing.T, provider LLMProvider) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "",
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -801,7 +797,6 @@ func runRedundantDirectiveHeadingSmoke(t *testing.T, provider LLMProvider) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nMaintain this directive.\n\n# Goals\n- Keep the directive structured.",
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -869,7 +864,6 @@ func runPersistentIntentAutoEvolveSmoke(t *testing.T, provider LLMProvider) {
 			"# Goals",
 			"- Keep the inbox organized.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -922,7 +916,6 @@ func runSubthreadPersistentIntentAutoEvolveSmoke(t *testing.T, provider LLMProvi
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate workers.",
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()
@@ -980,7 +973,7 @@ func runPersistentIntentBoundariesSmoke(t *testing.T, provider LLMProvider) {
 		default_:  providerName,
 	}
 	registry := NewToolRegistry("")
-	prompt := buildSystemPrompt("# Role\nReview inbound work.\n\n# Goals\n- Keep reports accurate.", ModeAutonomous, registry, "", nil, nil, pool, nil)
+	prompt := buildSystemPrompt("# Role\nReview inbound work.\n\n# Goals\n- Keep reports accurate.", registry, "", nil, nil, pool, nil)
 	tools := registry.NativeTools(map[string]bool{"evolve": true}, nil)
 
 	tests := []struct {
@@ -1054,7 +1047,6 @@ func runMarkdownDirectiveRejectsFullReplaceSmoke(t *testing.T, provider LLMProvi
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: original,
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()

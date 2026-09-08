@@ -225,6 +225,12 @@ func (c *ExecutionController) ShouldGate(phase ExecutionPhase) bool {
 }
 
 func (c *ExecutionController) Wait(gate ExecutionGate, quit <-chan struct{}, emit func(string, ExecutionPhaseData)) bool {
+	return c.waitWithRuntimeMutations(gate, quit, emit, nil, nil)
+}
+
+// A paused loop must still service configuration mutations on its owning
+// goroutine. Servicing a mutation does not release or consume the pause gate.
+func (c *ExecutionController) waitWithRuntimeMutations(gate ExecutionGate, quit <-chan struct{}, emit func(string, ExecutionPhaseData), wake <-chan struct{}, apply func()) bool {
 	c.mu.Lock()
 	if !c.shouldGateLocked(gate.Phase) {
 		c.mu.Unlock()
@@ -251,24 +257,30 @@ func (c *ExecutionController) Wait(gate ExecutionGate, quit <-chan struct{}, emi
 		emit("execution.waiting", gate.phaseData())
 	}
 
-	select {
-	case proceed := <-w.release:
-		if proceed {
-			if emit != nil {
-				emit("execution.released", gate.phaseData())
+	for {
+		select {
+		case <-wake:
+			if apply != nil {
+				apply()
 			}
-			return true
+		case proceed := <-w.release:
+			if proceed {
+				if emit != nil {
+					emit("execution.released", gate.phaseData())
+				}
+				return true
+			}
+			if emit != nil {
+				emit("execution.cancelled", gate.phaseData())
+			}
+			return false
+		case <-quit:
+			c.removeWaiter(id)
+			if emit != nil {
+				emit("execution.cancelled", gate.phaseData())
+			}
+			return false
 		}
-		if emit != nil {
-			emit("execution.cancelled", gate.phaseData())
-		}
-		return false
-	case <-quit:
-		c.removeWaiter(id)
-		if emit != nil {
-			emit("execution.cancelled", gate.phaseData())
-		}
-		return false
 	}
 }
 

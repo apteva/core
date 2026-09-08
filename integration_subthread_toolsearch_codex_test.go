@@ -41,7 +41,7 @@ func TestIntegration_CodexSubThreadToolSearchDiscoverAndCall(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Coordinate worker tests.",
-		Mode:      ModeAutonomous,
+
 		MCPServers: []MCPServerConfig{{
 			Name: "catalog", Transport: "http", URL: mcpServer.URL + "/mcp",
 			ToolLoading: &MCPToolLoadingConfig{Default: ToolLoadDeferred},
@@ -181,7 +181,7 @@ func TestIntegration_CodexSubThreadExactToolScopeSmoke(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Coordinate strict worker capability tests.",
-		Mode:      ModeAutonomous,
+
 		MCPServers: []MCPServerConfig{{
 			Name: "tasks", Transport: "http", URL: mcpServer.URL + "/mcp",
 			ToolLoading: &MCPToolLoadingConfig{Default: ToolLoadDeferred},

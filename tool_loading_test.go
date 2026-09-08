@@ -192,16 +192,14 @@ func TestSystemPromptDescribesMixedLoadingAndUsesCurrentChannelsTool(t *testing.
 	}, {
 		Name: "media", ToolCount: 20, AutoCount: 20,
 	}}
-	for _, mode := range []RunMode{ModeAutonomous, ModeCautious, ModeLearn} {
-		prompt := buildSystemPrompt("Help the operator.", mode, nil, "", nil, nil, nil, catalog)
-		if strings.Contains(prompt, "channels_respond") {
-			t.Fatalf("%s prompt still references legacy channels_respond", mode)
-		}
-		if !strings.Contains(prompt, "channels_send") {
-			t.Fatalf("%s prompt does not reference channels_send", mode)
-		}
-		if !strings.Contains(prompt, "4 always") || !strings.Contains(prompt, "Always-loaded MCP tools are already") {
-			t.Fatalf("%s prompt missing mixed loading guidance:\n%s", mode, prompt)
-		}
+	prompt := buildSystemPrompt("Help the operator.", nil, "", nil, nil, nil, catalog)
+	if strings.Contains(prompt, "channels_respond") {
+		t.Fatalf("prompt still references legacy channels_respond")
+	}
+	if !strings.Contains(prompt, "channels_send") {
+		t.Fatalf("prompt does not reference channels_send")
+	}
+	if !strings.Contains(prompt, "4 always") || !strings.Contains(prompt, "Always-loaded MCP tools are already") {
+		t.Fatalf("prompt missing mixed loading guidance:\n%s", prompt)
 	}
 }

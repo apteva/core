@@ -40,7 +40,7 @@ func TestIntegration_CodexHeavyWorkerKeepsStrongQualityBaseline(t *testing.T) {
 
 	provider := NewOpenAICodexProvider(token)
 	messages := []Message{
-		{Role: "system", Content: buildSystemPrompt("# Role\nCoordinate complex analytical work safely.", ModeAutonomous, registry, "", nil, nil, nil, nil)},
+		{Role: "system", Content: buildSystemPrompt("# Role\nCoordinate complex analytical work safely.", registry, "", nil, nil, nil, nil)},
 		{Role: "user", Content: strings.Join([]string{
 			"Create exactly one worker named revenue-risk-auditor; do not perform the audit on main.",
 			"This is substantial work: reconcile 2,000 customer records across billing, CRM, support, and product-usage sources; investigate conflicting identities and amounts; use several read-only tools; preserve an evidence trail; identify financial and compliance risks; and synthesize an operator-facing report with confidence levels and unresolved ambiguities.",

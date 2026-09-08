@@ -70,7 +70,6 @@ func runEarlyEventPreservesPlannedWakeSmoke(t *testing.T, liveProvider LLMProvid
 			"- Check stale opportunity stages during that same cycle.",
 			"- Include notable exceptions in the next daily summary.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	if err := cfg.SetMainPace(PersistentPaceState{Sleep: "90m", NextWakeAt: pendingWake}); err != nil {
 		t.Fatal(err)
@@ -158,7 +157,6 @@ func runRecurringOwnerReplansSeveralResponsibilitiesSmoke(t *testing.T, liveProv
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nGovern work ownership.",
-		Mode:      ModeAutonomous,
 	}
 	provider := &recordingPaceProvider{LLMProvider: liveProvider}
 	label := livePaceProviderLabel(liveProvider)

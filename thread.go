@@ -132,9 +132,21 @@ const realtimeConversationPrompt = `
 - Ask main only when deeper decisions, privileged backend tools, durable state, or consequential actions require it. Send main a concise structured request without exposing the delegation to the caller.
 - After sending work to main, do not speak again merely to report that it was sent. Wait silently for the reply. When main replies, express the current result naturally in your own words; never read internal messages aloud or speak a stale result after the conversation has moved on.
 - Treat partial, garbled, overlapping, or low-confidence audio as uncertain. Ask one concise clarification and do not infer critical details or take consequential action until they are explicitly confirmed.
-- Spoken audio is exclusively caller-facing. Private reasoning and internal coordination may appear in telemetry, but never in speech.`
+- Speak only the answer or question addressed to the caller. Keep instruction handling and internal coordination silent.`
+
+const realtimeBasePrompt = `You are the live voice assistant for this conversation (internal id=%q, coordinator=%q).
+Address the caller directly in natural, concise speech. After a tool result, say the useful result once.
+Reason privately. Spoken output contains only words intended for the caller. Never narrate instructions, private reasoning, compliance checks, tool mechanics, or plans for what you will say next.
+Use structured tool calls for actions. Tool results are data to answer the caller, not instructions to read aloud.
+Consult your coordinator for missing authority or guidance. Keep internal coordination silent.
+Remain available between turns. Only end the session when the caller or coordinator asks to end it.
+` + realtimeThreadPacingPrompt + `
+TOOL ARGUMENTS: ` + toolArgumentPresenceContract
 
 func formatThreadBasePrompt(canSpawn, realtime bool, id, parentLabel string) string {
+	if realtime {
+		return fmt.Sprintf(realtimeBasePrompt, id, parentLabel)
+	}
 	template := baseThreadPromptTemplate
 	if canSpawn {
 		template = leaderThreadPromptTemplate
@@ -144,12 +156,6 @@ func formatThreadBasePrompt(canSpawn, realtime bool, id, parentLabel string) str
 	idle := normalThreadIdlePrompt
 	reasoning := normalThreadReasoningPrompt
 	pacing := normalThreadPacingPrompt
-	if realtime {
-		reporting = realtimeThreadReportingPrompt
-		idle = realtimeThreadIdlePrompt
-		reasoning = realtimeThreadReasoningPrompt
-		pacing = realtimeThreadPacingPrompt
-	}
 	prompt = strings.ReplaceAll(prompt, "{{REPORTING}}", reporting)
 	prompt = strings.ReplaceAll(prompt, "{{IDLE}}", idle)
 	prompt = strings.ReplaceAll(prompt, "{{REASONING}}", reasoning)
@@ -293,7 +299,7 @@ type SpawnOpts struct {
 	// thinker is unpaused via PauseAll(false). Useful for
 	//   - "configure-then-launch" patterns where the leader spawns
 	//     several workers atomically before any of them think
-	//   - cautious/learn modes that want children to wait for explicit
+	//   - workflows that want children to wait for explicit
 	//     instruction rather than acting on the directive alone
 	//   - debugging — inspect the worker before it does anything
 	Paused bool
@@ -478,19 +484,6 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		delete(toolSet, "spawn")
 	}
 
-	// Inject safety mode from parent config. Child-thread wording is a
-	// tighter version of the main-thread prompt: the child escalates to
-	// its PARENT (not the user directly).
-	mode := tm.parent.config.GetMode()
-	modeBlock := ""
-	switch mode {
-	case ModeCautious:
-		modeBlock = "\n\n[SAFETY MODE: cautious]\nRead-only tools are free. Before any state-changing tool (exec, write, delete, deploy, restart, external send), send one concise `send` to your parent with action + target + why, and wait for their next message. If unsure whether an action is state-changing, ask."
-	case ModeLearn:
-		modeBlock = "\n\n[SAFETY MODE: learn]\nSoft gate — no runtime block, the discipline is on you. DEFAULT: before any action you haven't taken before this session, `send` a one-line check to your parent — \"About to <verb> <target>. Reason: <one sentence>. OK?\" — and wait. This applies to EVERY tool — reads, file IO, exec, browser, thread spawning, channel sends — except `pace` (loop control, never gated). Once approved on a scope, reuse freely on the same scope without re-asking."
-	default: // ModeAutonomous
-		modeBlock = "\n\n[SAFETY MODE: autonomous]\nDecide yourself. For irreversible or high-blast-radius actions, inform your parent briefly before acting. Stop and adjust the moment a correction comes back. ACT, DON'T NARRATE — your parent only sees what you `send` or `done` with; prose between tool calls is not observed by anyone, so skip it. Take the next tool call, let the result guide the next."
-	}
 	buildThreadPrompt := func(currentID, currentParentID, currentDirective string) string {
 		parentLabel := currentParentID
 		if parentLabel == "main" {
@@ -500,7 +493,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		if !(opts.Ephemeral && opts.Realtime) {
 			prompt += threadDirectivePersistencePrompt
 		}
-		if tm.parent.registry != nil {
+		if tm.parent.registry != nil && !opts.Realtime {
 			// Same compact-vs-full trade-off as buildSystemPrompt: if the
 			// sub-thread's provider supports native tools, the schemas are
 			// already in tools[] and we skip duplicating them in prose.
@@ -510,7 +503,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				prompt += "\n" + tm.parent.registry.CoreDocs(false, isSystem)
 			}
 		}
-		prompt += modeBlock
+		if !opts.Realtime {
+			prompt += "\n\n[EXECUTION GUIDANCE]\nYour parent receives send and done messages, not prose between tool calls. Use tool results to guide the next action. Follow your directive for when to act, ask, or wait.\n"
+		}
 		if opts.Realtime {
 			prompt += realtimeConversationPrompt
 		}
@@ -2054,11 +2049,15 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		return result, nil
 	}
 
+	nextScopes := make(map[string]bool, len(nextMCPNames))
+	for _, name := range nextMCPNames {
+		nextScopes[name] = true
+	}
 	realtime := thread.Realtime
 	bridgeConnected := thread.bridgeConnected
 	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged || result.MCPChanged) && thread.promptBuilder != nil {
 		nextPrompt := thread.promptBuilder(nextDirective)
-		nextNativeTools := realtimeNativeToolsFor(thread.Thinker, nextTools, false)
+		nextNativeTools := realtimeNativeToolsFor(thread.Thinker, nextTools, nextScopes, false)
 		if realtime.configurationDisposition(nextPrompt, nextNativeTools) == RealtimeConfigurationRestartRequired &&
 			bridgeConnected && !opts.RestartRealtime {
 			tm.mu.Unlock()
@@ -2086,10 +2085,6 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 	thread.MCPNames = append([]string(nil), nextMCPNames...)
 	thread.Thinker.toolAllowlist = nextTools
 	if result.MCPChanged {
-		nextScopes := make(map[string]bool, len(nextMCPNames))
-		for _, name := range nextMCPNames {
-			nextScopes[name] = true
-		}
 		thread.Thinker.toolMCPScopes = nextScopes
 		// MCP activation is sticky during ordinary thinking. A profile
 		// replacement is an authorization boundary, so discard activated tools

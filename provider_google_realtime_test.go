@@ -51,6 +51,9 @@ func TestGoogleLiveSetupUsesNativeProtocol(t *testing.T) {
 	}
 	generation := setup["generationConfig"].(map[string]any)
 	voice := generation["speechConfig"].(map[string]any)["voiceConfig"].(map[string]any)["prebuiltVoiceConfig"].(map[string]any)["voiceName"]
+	if generation["thinkingConfig"].(map[string]any)["includeThoughts"] != false {
+		t.Fatal("voice setup must explicitly disable thought summaries")
+	}
 	if voice != "Aoede" || generation["thinkingConfig"].(map[string]any)["thinkingLevel"] != "medium" {
 		t.Fatalf("generation config = %#v", generation)
 	}
@@ -120,19 +123,36 @@ func TestGoogleRealtimeTranslatesAudioTranscriptsInterruptionAndUsage(t *testing
 	for range 6 {
 		events = append(events, <-session.events)
 	}
-	if events[0].Type != RealtimeEventAudioOut || string(events[0].Audio) != string(pcm) {
-		t.Fatalf("audio = %#v", events[0])
+	var audio, inputFinal, outputFinal RealtimeEvent
+	transcriptBeforeAudio := false
+	for _, event := range events {
+		switch event.Type {
+		case RealtimeEventTranscriptOutput:
+			if !event.Final {
+				transcriptBeforeAudio = true
+			}
+			if event.Final {
+				outputFinal = event
+			}
+		case RealtimeEventTranscriptInput:
+			if event.Final {
+				inputFinal = event
+			}
+		case RealtimeEventAudioOut:
+			if !transcriptBeforeAudio {
+				t.Fatal("audio escaped before its guard-bearing transcript")
+			}
+			audio = event
+		}
 	}
-	if events[3].Type != RealtimeEventTranscriptInput || !events[3].Final || events[3].Transcript != "bonjour" {
-		t.Fatalf("input final = %#v", events[3])
+	if string(audio.Audio) != string(pcm) || inputFinal.Transcript != "bonjour" || outputFinal.Transcript != "salut" {
+		t.Fatalf("events = %#v", events)
 	}
-	if events[4].Type != RealtimeEventTranscriptOutput || !events[4].Final || events[4].Transcript != "salut" {
-		t.Fatalf("output final = %#v", events[4])
-	}
+
 	done := events[5]
-	if events[0].ResponseID == "" || events[0].ItemID != events[0].ResponseID ||
-		events[4].ResponseID != events[0].ResponseID || done.ResponseID != events[0].ResponseID {
-		t.Fatalf("response correlation = audio=%#v transcript=%#v done=%#v", events[0], events[4], done)
+	if audio.ResponseID == "" || audio.ItemID != audio.ResponseID ||
+		outputFinal.ResponseID != audio.ResponseID || done.ResponseID != audio.ResponseID {
+		t.Fatalf("response correlation = audio=%#v transcript=%#v done=%#v", audio, outputFinal, done)
 	}
 	if done.Type != RealtimeEventResponseDone || done.Usage.TextInputTokens != 3 || done.Usage.AudioInputTokens != 10 || done.Usage.TextOutputTokens != 3 || done.Usage.AudioOutputTokens != 5 {
 		t.Fatalf("done = %#v", done)

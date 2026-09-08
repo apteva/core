@@ -197,25 +197,6 @@ func TestAuditRealtimeOverflow(t *testing.T) {
 	}
 }
 
-func TestAuditModeUpdate(t *testing.T) {
-	api, th := newTestAPI()
-	defer th.telemetry.Stop()
-	th.config.Mode = ModeAutonomous
-	th.ReloadDirectiveQuiet()
-	before := th.messages[0].Content
-	w := httptest.NewRecorder()
-	api.config(w, httptest.NewRequest("PUT", "/config", strings.NewReader(`{"mode":"cautious"}`)))
-	if w.Code != 200 {
-		t.Fatal(w.Body.String())
-	}
-	if th.config.GetMode() != ModeCautious {
-		t.Fatal("mode not persisted")
-	}
-	if th.messages[0].Content == before {
-		t.Fatal("config says cautious but model still sees autonomous prompt")
-	}
-}
-
 func TestAuditRejectedConfigPartialWrite(t *testing.T) {
 	api, th := newTestAPI()
 	defer th.telemetry.Stop()

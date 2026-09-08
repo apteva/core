@@ -66,8 +66,14 @@ func (t *Thinker) requiredActions(ids []string) map[string]RequiredFirstAction {
 }
 
 func (t *Thinker) requiredToolName(action RequiredFirstAction) string {
-	hits := t.searchAuthorizedTools(action.Tool, 1, t.threadID == "main" || t.allowNoSpawn)
-	if len(hits) == 1 && (strings.EqualFold(hits[0].Name, action.Tool) || t.toolIndex.isAlias(action.Tool, hits[0].Name)) {
+	return t.requiredToolNameFor(action, t.toolAllowlist, t.toolMCPScopes)
+}
+
+func (t *Thinker) requiredToolNameFor(action RequiredFirstAction, grants, scopes map[string]bool) string {
+	// Required actions accept only exact names or aliases. Authorize after the
+	// index lookup so the predicate cannot recursively acquire the index lock.
+	hits := t.toolIndex.Search(action.Tool, 1, t.threadID == "main" || t.allowNoSpawn)
+	if len(hits) == 1 && t.toolAuthorizedFor(hits[0].Name, grants, scopes) && (strings.EqualFold(hits[0].Name, action.Tool) || t.toolIndex.isAlias(action.Tool, hits[0].Name)) {
 		return hits[0].Name
 	}
 	return ""

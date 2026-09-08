@@ -60,7 +60,7 @@ func TestIntegration_CodexOmitsUnrequestedOptionalToolArguments(t *testing.T) {
 
 	provider := NewOpenAICodexProvider(token)
 	messages := []Message{
-		{Role: "system", Content: buildSystemPrompt("# Role\nCarry out precise browser operations.", ModeAutonomous, NewToolRegistry("test"), "", nil, nil, nil, nil)},
+		{Role: "system", Content: buildSystemPrompt("# Role\nCarry out precise browser operations.", NewToolRegistry("test"), "", nil, nil, nil, nil)},
 		{Role: "user", Content: "Open the saved browser context named customer-portal at https://example.com/account now. Use the available tool. I did not request any server-behavior overrides."},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)

@@ -56,15 +56,6 @@ type PersistentThread struct {
 	Events        []PersistentThreadEvent      `json:"events,omitempty"`         // pending inbox payloads + bounded consumed-ID ledger
 }
 
-// RunMode controls the agent's safety behavior via system prompt guidance.
-type RunMode string
-
-const (
-	ModeAutonomous RunMode = "autonomous" // agent operates freely, asks when it thinks it should
-	ModeCautious   RunMode = "cautious"   // agent asks before destructive/external actions
-	ModeLearn      RunMode = "learn"      // agent actively asks about new tool types, builds safety profile
-)
-
 // ProviderConfig persists a provider and its model selections.
 type ModelReasoningCapability struct {
 	Effort      string `json:"effort"`
@@ -99,11 +90,10 @@ type Config struct {
 	saveMu          sync.Mutex
 	path            string
 	loadErr         error
-	Directive       string  `json:"directive"`
-	Mode            RunMode `json:"mode,omitempty"`
-	Unconscious     bool    `json:"unconscious,omitempty"`      // enable background memory consolidation thread
-	RealtimeEnabled bool    `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
-	RealtimeVoice   string  `json:"realtime_voice,omitempty"`   // dashboard/default realtime voice (provider validates at session open)
+	Directive       string `json:"directive"`
+	Unconscious     bool   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
+	RealtimeEnabled bool   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
+	RealtimeVoice   string `json:"realtime_voice,omitempty"`   // dashboard/default realtime voice (provider validates at session open)
 	// RealtimeVoiceMCP is the operator-selected subset of attached MCP
 	// servers exposed to dashboard voice sessions. It is policy/config only;
 	// realtime execution still uses the normal thread registry and gates.
@@ -223,7 +213,6 @@ func (c *Config) restore(data []byte) {
 	}
 	c.RuntimeSequence = restored.RuntimeSequence
 	c.Directive = restored.Directive
-	c.Mode = restored.Mode
 	c.Unconscious = restored.Unconscious
 	c.RealtimeEnabled = restored.RealtimeEnabled
 	c.RealtimeVoice = restored.RealtimeVoice
@@ -425,19 +414,6 @@ func (c *Config) GetMCPServers() []MCPServerConfig {
 	out := make([]MCPServerConfig, len(c.MCPServers))
 	copy(out, c.MCPServers)
 	return out
-}
-
-func (c *Config) GetMode() RunMode {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.Mode == "" {
-		return ModeAutonomous
-	}
-	return c.Mode
-}
-
-func (c *Config) SetMode(m RunMode) error {
-	return c.update(func() { c.Mode = m })
 }
 
 func (c *Config) GetExecutionControl() ExecutionControlConfig {

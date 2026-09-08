@@ -154,7 +154,7 @@ func TestActiveThreadsInjectedInDynamicContext(t *testing.T) {
 		},
 	}
 
-	prompt := buildSystemPrompt("Test directive", ModeAutonomous, reg, "", nil, threads, nil, nil)
+	prompt := buildSystemPrompt("Test directive", reg, "", nil, threads, nil, nil)
 	// Note: the literal string "[ACTIVE THREADS]" appears inside the
 	// evolve tool's description (it's documented as a section name the
 	// agent must avoid touching). The test for "section gone" is

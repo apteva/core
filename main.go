@@ -206,8 +206,8 @@ func runCore() error {
 	for _, t := range cfg.GetThreads() {
 		threadNames = append(threadNames, t.ID)
 	}
-	logMsg("BOOT", fmt.Sprintf("provider=%s mode=%s mcp=[%s] threads=[%s] directive=%d chars",
-		provider.Name(), cfg.GetMode(), joinOrNone(mcpNames), joinOrNone(threadNames), len(cfg.GetDirective())))
+	logMsg("BOOT", fmt.Sprintf("provider=%s mcp=[%s] threads=[%s] directive=%d chars",
+		provider.Name(), joinOrNone(mcpNames), joinOrNone(threadNames), len(cfg.GetDirective())))
 
 	defer apiListener.Close()
 	server, err := newCoreHTTPServer(thinker)

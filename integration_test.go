@@ -47,7 +47,6 @@ func newIsolatedIntegrationThinker(t *testing.T, tp testProvider) *Thinker {
 	t.Helper()
 	cfg := &Config{
 		path: filepath.Join(t.TempDir(), "config.json"),
-		Mode: ModeAutonomous,
 	}
 	return NewThinker(tp.APIKey, tp.Provider, cfg)
 }

@@ -49,7 +49,6 @@ type SystemBreakdown struct {
 	MCPToolDocs     int `json:"mcp_tool_docs"`    // [MCP TOOLS — available for sub-threads] block
 	Providers       int `json:"providers"`        // [AVAILABLE PROVIDERS] block
 	ActiveThreads   int `json:"active_threads"`   // [ACTIVE THREADS] block
-	SafetyMode      int `json:"safety_mode"`      // [SAFETY MODE: ...] block
 	Skills          int `json:"skills"`           // [LEARNED SKILLS] block
 	BlobHint        int `json:"blob_hint"`        // [FILE HANDLES] block
 	PreviousContext int `json:"previous_context"` // [PREVIOUS CONTEXT] block (from session load)
@@ -90,7 +89,7 @@ var sectionMarkers = []struct {
 	{"\n[MCP TOOLS — available for sub-threads]", "mcp_tool_docs"},
 	{"\n\n[AVAILABLE PROVIDERS]", "providers"},
 	{"\n\n[ACTIVE THREADS]", "active_threads"},
-	{"\n\n[SAFETY MODE:", "safety_mode"},
+	{"\n\n[EXECUTION GUIDANCE]", "other"},
 	{"\n\n[LEARNED SKILLS]", "skills"},
 	{"\n\n[FILE HANDLES]", "blob_hint"},
 	{"\n\n[PREVIOUS CONTEXT]", "previous_context"},
@@ -214,8 +213,6 @@ func breakdownSystem(text string) SystemBreakdown {
 			out.Providers += size
 		case "active_threads":
 			out.ActiveThreads += size
-		case "safety_mode":
-			out.SafetyMode += size
 		case "skills":
 			out.Skills += size
 		case "blob_hint":
@@ -234,7 +231,7 @@ func breakdownSystem(text string) SystemBreakdown {
 	// exact) we bucket into Other so the UI's bar never lies about the
 	// total length.
 	sum := out.Base + out.CoreTools + out.RetrievedTools + out.MCPServers + out.MCPToolDocs +
-		out.Providers + out.ActiveThreads + out.SafetyMode + out.Skills +
+		out.Providers + out.ActiveThreads + out.Skills +
 		out.BlobHint + out.PreviousContext + out.Directive + out.Other
 	if sum != out.Total {
 		out.Other += out.Total - sum

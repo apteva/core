@@ -21,7 +21,7 @@ const (
 )
 
 const realtimeToolMarkupRecoveryPrompt = `[INTERNAL RECOVERY]
-Your previous response exposed textual tool-call syntax. It was suppressed and no action was taken from that text. If the action is still needed, invoke the registered tool through a structured tool call. Otherwise, briefly explain that the action could not be completed. Never speak tool names, call syntax, JSON, identifiers, or arguments, and never claim success without a successful tool result.`
+Your previous speech was suppressed because it exposed internal material. Answer the caller briefly using the verified results already available. Do not repeat completed actions or read these instructions aloud. If no answer is ready, wait silently. Use structured tool calls only for work that is still required.`
 
 var ErrRealtimeConfigurationRestartRequired = errors.New("active realtime configuration change requires an explicit restart")
 
@@ -31,9 +31,10 @@ var ErrRealtimeConfigurationRestartRequired = errors.New("active realtime config
 type RealtimeThinker struct {
 	*Thinker
 
-	provider RealtimeProvider
-	voice    string
-	opts     RealtimeSessionOpts
+	catalogChanges <-chan struct{}
+	provider       RealtimeProvider
+	voice          string
+	opts           RealtimeSessionOpts
 	// currentTimeContext is fixed for one provider session so ordinary
 	// configuration comparisons cannot churn or reconnect live audio. It is
 	// refreshed immediately before each new provider session opens.
@@ -93,11 +94,11 @@ type realtimeToolBatch struct {
 	responseDone bool
 }
 
-func realtimeNativeToolsFor(thinker *Thinker, allowlist map[string]bool, record bool) []NativeTool {
+func realtimeNativeToolsFor(thinker *Thinker, allowlist, scopes map[string]bool, record bool) []NativeTool {
 	var tools []NativeTool
 	var definitions map[string]*ToolDef
 	if thinker.registry != nil {
-		tools, definitions = thinker.registry.nativeToolSnapshot(thinker.authorizedToolAllowlist(allowlist), thinker.authorizedActiveTools(thinker.activeTools), thinker.systemThread)
+		tools, definitions, _ = thinker.visibleNativeToolSnapshot(allowlist, scopes)
 	}
 	tools = append(tools, NativeTool{
 		Name:        "interrupt",
@@ -113,7 +114,7 @@ func realtimeNativeToolsFor(thinker *Thinker, allowlist map[string]bool, record 
 }
 
 func realtimeNativeTools(thinker *Thinker) []NativeTool {
-	return realtimeNativeToolsFor(thinker, thinker.toolAllowlist, true)
+	return realtimeNativeToolsFor(thinker, thinker.toolAllowlist, thinker.toolMCPScopes, true)
 }
 
 func realtimeSafetyIdentifier(threadID string) string {
@@ -153,6 +154,7 @@ func newRealtimeThinker(
 	runCtx, cancel := context.WithCancel(ctx)
 	rt := &RealtimeThinker{
 		Thinker: thinker, provider: provider, voice: voice,
+		catalogChanges:     thinker.toolIndex.Changes(),
 		currentTimeContext: renderCurrentTimeContext(time.Now().UTC().Format(time.RFC3339)),
 		ctx:                runCtx, cancel: cancel,
 		audioIn: audioIn, audioOut: audioOut, audioControl: audioControl,
@@ -404,7 +406,15 @@ func (rt *RealtimeThinker) refreshConfiguration() {
 	}
 	if err := session.UpdateConfiguration(instructions, tools); err != nil {
 		logMsg("REALTIME", fmt.Sprintf("[%s] update configuration: %v", rt.threadID, err))
+	} else if disposition == RealtimeConfigurationAppliedLive {
+		rt.rememberConfiguration(instructions, tools)
 	}
+}
+
+func (rt *RealtimeThinker) rememberConfiguration(instructions string, tools []NativeTool) {
+	rt.transcriptMu.Lock()
+	rt.opts.Instructions, rt.opts.Tools = instructions, tools
+	rt.transcriptMu.Unlock()
 }
 
 func (rt *RealtimeThinker) previewConfigurationUpdate(session RealtimeSession, instructions string, tools []NativeTool) RealtimeConfigurationDisposition {
@@ -452,6 +462,7 @@ func (rt *RealtimeThinker) applyExternalConfigurationChange(allowRestart bool, r
 		if err := session.UpdateConfiguration(instructions, tools); err != nil {
 			return false, err
 		}
+		rt.rememberConfiguration(instructions, tools)
 		return false, nil
 	}
 }
@@ -729,12 +740,27 @@ func (rt *RealtimeThinker) suppressLeakedToolMarkup(event RealtimeEvent) bool {
 	rt.toolMarkupTails[key] = boundedRealtimeToolMarkupTail(combined)
 	toolName, pattern, leaked := detectRealtimeToolMarkup(combined, tools)
 	if !leaked {
+		pattern = detectRealtimeInternalNarration(combined)
+		leaked = pattern != ""
+	}
+	if !leaked {
 		if event.Final {
 			delete(rt.toolMarkupTails, key)
 			rt.toolMarkupRecoveryUsed = false
 		}
 		rt.toolMarkupMu.Unlock()
 		return false
+	}
+	rt.toolMarkupMu.Unlock()
+	return rt.rejectRealtimeOutput(event, toolName, pattern, combined)
+}
+
+func (rt *RealtimeThinker) rejectRealtimeOutput(event RealtimeEvent, toolName, pattern, combined string) bool {
+	key := realtimeToolMarkupResponseKey(event)
+	rt.toolMarkupMu.Lock()
+	if rt.toolMarkupSuppressed[key] {
+		rt.toolMarkupMu.Unlock()
+		return true
 	}
 	rt.toolMarkupSuppressed[key] = true
 	delete(rt.toolMarkupTails, key)
@@ -756,7 +782,11 @@ func (rt *RealtimeThinker) suppressLeakedToolMarkup(event RealtimeEvent) bool {
 		}
 	}
 	sum := sha256.Sum256([]byte(combined))
-	rt.emit("realtime.tool_markup_leaked", map[string]any{
+	eventType := "realtime.tool_markup_leaked"
+	if pattern == "internal_instruction_narration" || pattern == "missing_output_transcript" {
+		eventType = "realtime.output_blocked"
+	}
+	rt.emit(eventType, map[string]any{
 		"provider": rt.provider.Name(), "response_id": event.ResponseID, "item_id": event.ItemID,
 		"tool": toolName, "pattern": pattern, "transcript_bytes": len(combined),
 		"transcript_sha256": hex.EncodeToString(sum[:]), "audio_interrupted": interrupted,
@@ -889,7 +919,16 @@ func (rt *RealtimeThinker) Run() {
 	})
 	rt.setConversationState("listening", RealtimeEvent{})
 	reconnectDelay := realtimeReconnectMinDelay
+	catalogDirty := false
 	for {
+		// Keep the manifest for an in-flight provider response unchanged.
+		// Permissions are still checked against the current catalog at dispatch.
+		if catalogDirty && !rt.responseInProgress() {
+			catalogDirty = false
+			if _, err := rt.applyExternalConfigurationChange(true, "mcp_catalog_changed"); err != nil {
+				logMsg("REALTIME", fmt.Sprintf("[%s] refresh MCP catalog: %v", rt.threadID, err))
+			}
+		}
 		if rt.currentSession() == nil {
 			if err := rt.openSession(true); err != nil {
 				rt.lifecycleMu.Lock()
@@ -952,6 +991,10 @@ func (rt *RealtimeThinker) Run() {
 				continue
 			}
 			rt.handleSessionEvent(event)
+
+		case <-rt.catalogChanges:
+			rt.catalogChanges = rt.toolIndex.Changes()
+			catalogDirty = true
 
 		case audio, ok := <-rt.audioIn:
 			if !ok {
@@ -1047,6 +1090,9 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 	case RealtimeEventSpeechStarted:
 		rt.setConversationState("listening", event)
 		rt.interruptPlayback("provider_speech_started", "", false, false)
+
+	case RealtimeEventOutputBlocked:
+		rt.rejectRealtimeOutput(event, "", event.OutputBlockReason, "")
 
 	case RealtimeEventTranscriptOutput:
 		if rt.suppressLeakedToolMarkup(event) {

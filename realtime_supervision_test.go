@@ -255,7 +255,7 @@ func TestGoogleMainLeavesConfiguredRealtimeThreadAlone(t *testing.T) {
 	}
 	systemPrompt := buildSystemPrompt(
 		"# Role\nGovern active work without disrupting live calls.",
-		ModeAutonomous,
+
 		registry,
 		"",
 		nil,

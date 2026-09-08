@@ -89,7 +89,6 @@ func TestCodexPendingToolSurvivesHistoryCheckpointSmoke(t *testing.T) {
 			"- After its successful result, never acknowledge again; call checkpoint_tasks_list exactly once.",
 			"- After the list result, reply exactly CHECKPOINT_HISTORY_OK and wait.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()

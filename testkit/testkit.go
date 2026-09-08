@@ -1060,7 +1060,6 @@ func (s *Session) createFreshInstance(c Config) (int64, error) {
 	body := map[string]any{
 		"name":                  name,
 		"directive":             placeholder,
-		"mode":                  "autonomous",
 		"project_id":            s.projectID,
 		"include_apteva_server": c.IncludeAptevaServer,
 		"include_channels":      c.IncludeChannels,

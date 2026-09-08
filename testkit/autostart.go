@@ -465,10 +465,10 @@ func bootstrap(p *serverProc, setupToken string) error {
 	// caller wants a specific one, they can still create more via the
 	// dashboard API after New() returns.
 	providerSeeds := []struct {
-		envKey     string
-		typ        string
-		name       string
-		typeID     int64
+		envKey string
+		typ    string
+		name   string
+		typeID int64
 	}{
 		{"FIREWORKS_API_KEY", "fireworks", "Fireworks", 1},
 		{"ANTHROPIC_API_KEY", "anthropic", "Anthropic", 0},
@@ -481,9 +481,9 @@ func bootstrap(p *serverProc, setupToken string) error {
 			continue
 		}
 		provBody, _ := json.Marshal(map[string]any{
-			"type": ps.typ,
-			"name": ps.name,
-			"data": map[string]string{ps.envKey: key},
+			"type":             ps.typ,
+			"name":             ps.name,
+			"data":             map[string]string{ps.envKey: key},
 			"provider_type_id": ps.typeID,
 		})
 		req, _ := http.NewRequest("POST", p.URL+"/api/providers", bytes.NewReader(provBody))
@@ -515,9 +515,8 @@ func bootstrap(p *serverProc, setupToken string) error {
 	// start-instance. We'll just start it now with a minimal
 	// directive so the agent is live when the first test runs.
 	instBody, _ := json.Marshal(map[string]any{
-		"name":      "testkit-" + randHex(4),
-		"directive": "Idle. Waiting for test directives.",
-		"mode":      "autonomous",
+		"name":       "testkit-" + randHex(4),
+		"directive":  "Idle. Waiting for test directives.",
 		"project_id": p.ProjectID,
 		// Skip the two system MCPs; tests that need them will enable
 		// explicitly via the System MCPs UI equivalent API.

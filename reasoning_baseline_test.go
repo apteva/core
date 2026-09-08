@@ -114,7 +114,7 @@ func TestReasoningQualityFloorNeverDowngradesHigherEffort(t *testing.T) {
 func TestExternalEventUsesBaselineThroughActualProviderCall(t *testing.T) {
 	t.Chdir(t.TempDir())
 	provider := &qualityCaptureProvider{requests: make(chan capturedQualityRequest, 2)}
-	cfg := &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "Handle external work accurately.", Mode: ModeAutonomous}
+	cfg := &Config{path: filepath.Join(t.TempDir(), "config.json"), Directive: "Handle external work accurately."}
 	thinker := NewThinker("", provider, cfg)
 	thinker.agentModel = ModelSmall
 	thinker.agentReasoning = ReasoningLow

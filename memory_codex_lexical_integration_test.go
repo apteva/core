@@ -174,7 +174,6 @@ func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
 			"- Resolve heliotrope operation questions accurately.",
 			"- Do not spawn workers.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()

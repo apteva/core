@@ -502,11 +502,11 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 	thinker.activeTools = map[string]bool{}
 	thinker.directive = directive
 
-	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", nil, nil, pool, nil)}
+	thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, thinker.registry, "", nil, nil, pool, nil)}
 
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
-		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil, thinker.pool, thinker.mcpCatalog)
+		return buildSystemPrompt(cfg.GetDirective(), thinker.registry, toolDocs, thinker.mcpServers, nil, thinker.pool, thinker.mcpCatalog)
 	}
 
 	// Mirror production MCP wiring (thinker.go::Run init): every MCP
@@ -523,7 +523,7 @@ func newScenarioThinker(t *testing.T, apiKey, directive string, mcpServers []MCP
 			}
 		})
 		// Rebuild messages[0] now that mcpServers + index are populated.
-		thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, ModeAutonomous, thinker.registry, "", thinker.mcpServers, nil, pool, thinker.mcpCatalog)}
+		thinker.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, thinker.registry, "", thinker.mcpServers, nil, pool, thinker.mcpCatalog)}
 	}
 
 	return thinker

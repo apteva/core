@@ -68,7 +68,6 @@ func TestIntegration_CodexMultiSkillToolCycleKeepsMemoryAndCacheStable(t *testin
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Supervise the live memory/cache verification worker without doing its work.",
-		Mode:      ModeAutonomous,
 	}
 	parent := NewThinker("", provider, cfg)
 	defer parent.Stop()

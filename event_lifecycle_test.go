@@ -232,7 +232,7 @@ func TestEventLifecycleWaitsForCausalWorker(t *testing.T) {
 func TestPostEventTrackedMainIsDurableIdempotentAndAckable(t *testing.T) {
 	t.Chdir(t.TempDir())
 	provider := newRecordingThreadEventProvider()
-	cfg := &Config{path: configFile, Directive: "Handle incoming events.", Mode: ModeAutonomous}
+	cfg := &Config{path: configFile, Directive: "Handle incoming events."}
 	thinker := NewThinker("", provider, cfg)
 	api := &APIServer{thinker: thinker}
 	t.Cleanup(func() {
@@ -336,7 +336,7 @@ func TestEventLifecycleOutboxAndActiveExecutionSurviveRestart(t *testing.T) {
 
 func TestEventLifecycleRestartErrorsWhenEphemeralParticipantDisappears(t *testing.T) {
 	t.Chdir(t.TempDir())
-	cfg := &Config{path: configFile, Directive: "Handle tracked work.", Mode: ModeAutonomous}
+	cfg := &Config{path: configFile, Directive: "Handle tracked work."}
 	event := PersistentThreadEvent{
 		ID: "ephemeral-restart-event", Text: "coordinate temporary work",
 		Hash:           threadEventHash("coordinate temporary work", nil),

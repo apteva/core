@@ -54,7 +54,7 @@ func TestAuditCodexParallelWorkersAndMain(t *testing.T) {
 			t.Chdir(t.TempDir())
 			base := &fixedModelProvider{LLMProvider: NewOpenAICodexProvider(token), model: "gpt-5.6-terra"}
 			p := &auditCountingProvider{LLMProvider: base}
-			cfg := &Config{path: "config.json", Directive: "Three workers return authoritative markers via done. Once all three worker completions are present, call audit_report exactly once with result containing all three exact markers. Do not spawn, send, or call audit_lookup. After audit_report succeeds, call pace with clear_wake=true and wait.", Mode: ModeAutonomous}
+			cfg := &Config{path: "config.json", Directive: "Three workers return authoritative markers via done. Once all three worker completions are present, call audit_report exactly once with result containing all three exact markers. Do not spawn, send, or call audit_lookup. After audit_report succeeds, call pace with clear_wake=true and wait."}
 			if err := cfg.Save(); err != nil {
 				t.Fatal(err)
 			}

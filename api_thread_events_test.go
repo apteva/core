@@ -366,7 +366,7 @@ func TestThreadEventsConcurrentRetryQueuesOnce(t *testing.T) {
 func TestPersistentPendingThreadEventRestoresAndRunsOnce(t *testing.T) {
 	t.Chdir(t.TempDir())
 	provider := newRecordingThreadEventProvider()
-	cfg := &Config{path: configFile, Directive: "Coordinate events.", Mode: ModeAutonomous}
+	cfg := &Config{path: configFile, Directive: "Coordinate events."}
 	parent := NewThinker("", provider, cfg)
 	if err := parent.threads.SpawnWithOpts("restart-event", "Handle the event.", nil, SpawnOpts{DeferRun: true}); err != nil {
 		t.Fatal(err)

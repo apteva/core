@@ -379,6 +379,9 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		responsesURL = "https://api.openai.com/v1/responses"
 	}
 	doRequest := func(payload []byte) (*http.Response, error) {
+		if err := observeProviderRequest(ctx, p.Name(), model, payload); err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err

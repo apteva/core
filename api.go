@@ -188,7 +188,6 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 		"memories":              a.thinker.memory.Count(),
 		"paused":                status.Paused,
 		"llm_active":            status.LLMActive,
-		"mode":                  a.thinker.config.GetMode(),
 		"execution_control":     a.thinker.executionStatus(),
 		"execution_checkpoints": a.thinker.executionCheckpointMeta(),
 	})
@@ -1252,7 +1251,6 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, map[string]any{
 			"directive":             a.thinker.config.GetDirective(),
-			"mode":                  a.thinker.config.GetMode(),
 			"provider":              providerInfo,
 			"providers":             a.thinker.config.GetProviders(),
 			"mcp_servers":           mcpInfo,
@@ -1265,7 +1263,6 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		var body struct {
 			Directive        string                  `json:"directive,omitempty"`
-			Mode             RunMode                 `json:"mode,omitempty"`
 			Provider         *ProviderConfig         `json:"provider,omitempty"`
 			Providers        []ProviderConfig        `json:"providers,omitempty"`
 			Computer         json.RawMessage         `json:"computer,omitempty"`
@@ -1286,10 +1283,6 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(body.Computer) > 0 {
 			http.Error(w, "core computer config has been removed; use the Computer app MCP tools instead", http.StatusGone)
-			return
-		}
-		if body.Mode != "" && body.Mode != ModeAutonomous && body.Mode != ModeCautious && body.Mode != ModeLearn {
-			http.Error(w, "invalid mode", http.StatusBadRequest)
 			return
 		}
 		for _, server := range body.MCPServers {
@@ -1350,9 +1343,6 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 				if body.Directive != "" {
 					cfg.Directive = body.Directive
 				}
-				if body.Mode != "" {
-					cfg.Mode = body.Mode
-				}
 				if body.Execution != nil {
 					cfg.Execution = *body.Execution
 				}
@@ -1389,14 +1379,11 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		if body.Execution != nil && a.thinker.execution != nil {
 			a.thinker.execution.ApplyConfig(*body.Execution)
 		}
-		if body.Directive != "" || body.Mode != "" || providerChanged || body.MCPServers != nil {
+		if body.Directive != "" || providerChanged || body.MCPServers != nil {
 			a.thinker.reloadDirectiveNow()
 		}
 		a.thinker.publishRuntimeStatus()
 		a.thinker.publishContextStatus()
-		if body.Mode != "" && a.thinker.telemetry != nil {
-			a.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(body.Mode)})
-		}
 
 		var resetResult *contextResetResult
 		if body.Reset != nil {

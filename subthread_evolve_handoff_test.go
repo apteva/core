@@ -153,7 +153,6 @@ func runSubthreadMainEvolveConfirmationWorkflow(t *testing.T, provider LLMProvid
 			"# Operating Rules",
 			"Reply to a waiting requester after durable work succeeds.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer thinker.Stop()

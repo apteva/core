@@ -49,7 +49,7 @@ func (c *ConsoleLogger) Run() {
 func (c *ConsoleLogger) render(ev TelemetryEvent) {
 	switch ev.Type {
 	case "llm.done", "llm.error", "tool.call", "tool.result", "tool.pending", "tool.approved", "tool.rejected",
-		"thread.spawn", "thread.done", "event.received", "instance.paused", "instance.resumed", "mode.changed":
+		"thread.spawn", "thread.done", "event.received", "instance.paused", "instance.resumed":
 		// Render these
 	default:
 		return
@@ -235,14 +235,6 @@ func (c *ConsoleLogger) render(ev TelemetryEvent) {
 			ansiCyan, icon, ansiReset,
 			ansiDim, source, ansiReset,
 			msg, ansiReset,
-		)
-
-	case "mode.changed":
-		mode := conGetString(data, "mode")
-		fmt.Fprintf(os.Stderr, "  %s%s │%s %s◆%s  mode → %s%s%s\n",
-			ansiDim, ts, ansiReset,
-			ansiBlue, ansiReset,
-			ansiBold, mode, ansiReset,
 		)
 	}
 }

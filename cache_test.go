@@ -61,10 +61,9 @@ func renderContext(s string, offset, radius int) string {
 
 func TestPromptStability(t *testing.T) {
 	directive := "You are a coordinating agent. Spawn workers when needed."
-	mode := ModeAutonomous
 
 	// State A: fresh session, no per-turn context.
-	promptA := buildSystemPrompt(directive, mode, nil, "", nil, nil, nil, nil)
+	promptA := buildSystemPrompt(directive, nil, "", nil, nil, nil, nil)
 
 	// After the cache fix, buildSystemPrompt no longer renders activeThreads
 	// or extraToolDocs — those moved to buildDynamicTurnContext. So
@@ -85,14 +84,14 @@ func TestPromptStability(t *testing.T) {
 			SubThreads: 0,
 		},
 	}
-	promptB := buildSystemPrompt(directive, mode, nil, "", nil, activeThreads, nil, nil)
+	promptB := buildSystemPrompt(directive, nil, "", nil, activeThreads, nil, nil)
 
 	activeThreadsC := []ThreadInfo{activeThreads[0]}
 	activeThreadsC[0].Started = now.Add(-35 * time.Second)
 	activeThreadsC[0].Iteration = 6
-	promptC := buildSystemPrompt(directive, mode, nil, "", nil, activeThreadsC, nil, nil)
+	promptC := buildSystemPrompt(directive, nil, "", nil, activeThreadsC, nil, nil)
 
-	promptD := buildSystemPrompt(directive, mode, nil, "[CANDIDATE TOOL]\nfoo: …", nil, activeThreads, nil, nil)
+	promptD := buildSystemPrompt(directive, nil, "[CANDIDATE TOOL]\nfoo: …", nil, activeThreads, nil, nil)
 
 	report := func(label, base, variant string) {
 		baseLen := len(base)
@@ -154,7 +153,7 @@ func TestBuildSystemPrompt_CodexVisibleActivity(t *testing.T) {
 	directive := "Idle."
 	mcpCatalog := []MCPServerInfo{{Name: "channels", ToolCount: 3}}
 	codexPool := &ProviderPool{default_: "openai-codex"}
-	codexPrompt := buildSystemPrompt(directive, ModeAutonomous, nil, "", nil, nil, codexPool, mcpCatalog)
+	codexPrompt := buildSystemPrompt(directive, nil, "", nil, nil, codexPool, mcpCatalog)
 	if !strings.Contains(codexPrompt, "[CODEX VISIBLE ACTIVITY]") {
 		t.Fatal("Codex prompt missing visible activity guidance")
 	}
@@ -163,7 +162,7 @@ func TestBuildSystemPrompt_CodexVisibleActivity(t *testing.T) {
 	}
 
 	kimiPool := &ProviderPool{default_: "fireworks"}
-	kimiPrompt := buildSystemPrompt(directive, ModeAutonomous, nil, "", nil, nil, kimiPool, mcpCatalog)
+	kimiPrompt := buildSystemPrompt(directive, nil, "", nil, nil, kimiPool, mcpCatalog)
 	if strings.Contains(kimiPrompt, "[CODEX VISIBLE ACTIVITY]") {
 		t.Fatal("non-Codex prompt should not include Codex visible activity guidance")
 	}

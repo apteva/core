@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -29,6 +30,11 @@ func contextChars(messages []Message) int {
 	n := 0
 	for _, msg := range messages {
 		n += len(msg.Role) + len(msg.Content) + len(msg.Reasoning)
+		if msg.ProviderState != nil {
+			for _, raw := range msg.ProviderState.Items {
+				n += len(raw)
+			}
+		}
 		for _, part := range msg.Parts {
 			n += len(part.Type) + len(part.Text)
 			if part.ImageURL != nil {
@@ -62,6 +68,21 @@ func estimatedContextTokens(messages []Message) int {
 	textChars := 0
 	imageTokens := 0
 	for _, msg := range messages {
+		// Opaque Responses items may contain much more than the visible text.
+		// Count the larger representation without double-counting replayed calls.
+		if msg.ProviderState != nil && len(msg.ProviderState.Items) > 0 {
+			raw, _ := json.Marshal(msg.ProviderState.Items)
+			copy := msg
+			copy.ProviderState = nil
+			visible := estimatedContextTokens([]Message{copy})
+			rawTokens := (len(raw) + 3) / 4
+			if rawTokens > visible {
+				textChars += rawTokens * 4
+			} else {
+				textChars += visible * 4
+			}
+			continue
+		}
 		textChars += len(msg.Role) + len(msg.Content) + len(msg.Reasoning)
 		for _, part := range msg.Parts {
 			textChars += len(part.Type) + len(part.Text)

@@ -151,7 +151,7 @@ func TestDiscoveryCodexProductionCatalog(t *testing.T) {
 			}
 			instruction += " This is retrieval only. Never complete, update, recover, create, fail, or assign a Tasks record. If no authorized reader is available, call verification_report with result capability_unavailable. Do not substitute a mutation. Do not spawn or send. After verification_report, call pace clear_wake=true and wait."
 			provider := &fixedModelProvider{LLMProvider: NewOpenAICodexProvider(token), model: "gpt-5.6-terra"}
-			cfg := &Config{path: "config.json", Directive: instruction, Mode: ModeAutonomous, MCPServers: f.configs()}
+			cfg := &Config{path: "config.json", Directive: instruction, MCPServers: f.configs()}
 			if err := cfg.Save(); err != nil {
 				t.Fatal(err)
 			}

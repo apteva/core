@@ -57,7 +57,6 @@ func runCodexThreadRosterCase(t *testing.T, token string, large bool) {
 			"# Operating rules",
 			"Wait for operator events. Reuse existing ownership whenever it exists.",
 		}, "\n"),
-		Mode: ModeAutonomous,
 	}
 	thinker := NewThinker("", NewOpenAICodexProvider(token), cfg)
 	defer thinker.Stop()

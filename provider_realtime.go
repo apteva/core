@@ -373,6 +373,7 @@ const (
 	RealtimeEventSpeechStarted    RealtimeEventType = "speech_started"
 	RealtimeEventRateLimits       RealtimeEventType = "rate_limits"
 	RealtimeEventSessionEnded     RealtimeEventType = "session_ended"
+	RealtimeEventOutputBlocked    RealtimeEventType = "output_blocked"
 	RealtimeEventError            RealtimeEventType = "error"
 )
 
@@ -395,13 +396,14 @@ type RealtimeEvent struct {
 
 	// Response/audio item metadata. ItemID + AudioEndMS let the caller
 	// truncate unplayed audio correctly on barge-in.
-	ResponseID   string
-	ItemID       string
-	Phase        string // provider output phase, e.g. commentary or final_answer
-	AudioStartMS int
-	AudioEndMS   int
-	Usage        RealtimeUsage
-	DroppedAudio uint64
+	ResponseID        string
+	ItemID            string
+	Phase             string // provider output phase, e.g. commentary or final_answer
+	AudioStartMS      int
+	AudioEndMS        int
+	Usage             RealtimeUsage
+	DroppedAudio      uint64
+	OutputBlockReason string // RealtimeEventOutputBlocked; no leaked content
 
 	// Error (RealtimeEventError)
 	Err error

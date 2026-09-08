@@ -244,7 +244,6 @@ func runRecursiveSelfImprovementSmoke(t *testing.T, provider LLMProvider) {
 	cfg := &Config{
 		path:      filepath.Join(workDir, "config.json"),
 		Directive: recursiveImprovementDirective,
-		Mode:      ModeAutonomous,
 	}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)

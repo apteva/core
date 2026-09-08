@@ -362,6 +362,9 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	}
 
 	doRequest := func(payload []byte) (*http.Response, error) {
+		if err := observeProviderRequest(ctx, p.Name(), model, payload); err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, "POST", p.url, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err

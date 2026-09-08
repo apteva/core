@@ -43,7 +43,7 @@ func TestCodexTerraOneShotWorkerReturnsFinalThroughDoneSmoke(t *testing.T) {
 		LLMProvider: NewOpenAICodexProvider(token),
 		model:       "gpt-5.6-terra",
 	}
-	thinker := NewThinker("", provider, &Config{Directive: "Coordinate worker ownership.", Mode: ModeAutonomous})
+	thinker := NewThinker("", provider, &Config{Directive: "Coordinate worker ownership."})
 	defer thinker.Stop()
 	defer thinker.threads.KillAll()
 

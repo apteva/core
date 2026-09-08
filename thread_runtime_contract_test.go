@@ -284,7 +284,7 @@ func TestOneShotDoneReturnsFinalOnceWhilePersistentWorkerStaysAlive(t *testing.T
 func TestDoneRuntimeRecordsResultBeforeParentDeliveryAndThreadDone(t *testing.T) {
 	t.Chdir(t.TempDir())
 	provider := &terminalDoneProvider{recordingThreadEventProvider: newRecordingThreadEventProvider()}
-	config := &Config{path: "config.json", Directive: "Coordinate workers.", Mode: ModeAutonomous}
+	config := &Config{path: "config.json", Directive: "Coordinate workers."}
 	parent := NewThinker("", provider, config)
 	defer parent.Stop()
 	defer parent.threads.KillAll()

@@ -97,7 +97,7 @@ func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit fu
 	if t.toolIndex != nil {
 		t.toolIndex.mu.Lock()
 		t.toolIndex.entries = append(t.toolIndex.entries, stagedIndex.entries...)
-		t.toolIndex.revision++
+		t.toolIndex.changedLocked()
 		t.toolIndex.rebuildNamesLocked()
 		t.toolIndex.mu.Unlock()
 		for _, c := range desired {

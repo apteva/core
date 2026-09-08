@@ -164,7 +164,6 @@ const (
 	priceOutputPerToken = 3.00 / 1_000_000
 )
 
-
 type panelMode int
 
 const (
@@ -195,7 +194,7 @@ type sidebarItem struct {
 	label   string
 	panel   panelMode
 	section sidebarSection
-	action  string // non-panel actions: "provider", "model", "mode"
+	action  string // non-panel actions: "provider", "model"
 }
 
 var sidebarItems = []sidebarItem{
@@ -209,7 +208,6 @@ var sidebarItems = []sidebarItem{
 	// Settings section
 	{label: "Provider", section: sidebarSettings, action: "provider"},
 	{label: "Model", section: sidebarSettings, action: "model"},
-	{label: "Mode", section: sidebarSettings, action: "mode"},
 	{label: "Directive", panel: panelDirective, section: sidebarSettings},
 }
 
@@ -217,10 +215,9 @@ var sidebarItems = []sidebarItem{
 type pickerMode int
 
 const (
-	pickerNone     pickerMode = iota
+	pickerNone pickerMode = iota
 	pickerProvider
 	pickerModel
-	pickerMode_
 )
 
 // Command palette
@@ -240,11 +237,11 @@ type threadView struct {
 	contextMsgs  int
 	contextChars int
 	// Per-thread cost tracking
-	cost         float64
-	iterations   int
-	started      time.Time
-	lastThought  time.Time
-	sleepDur     time.Duration // current sleep duration for this thread
+	cost        float64
+	iterations  int
+	started     time.Time
+	lastThought time.Time
+	sleepDur    time.Duration // current sleep duration for this thread
 }
 
 type model struct {
@@ -260,14 +257,14 @@ type model struct {
 	inputActive  bool
 	inputMode    inputMode
 
-	consoleHistory []string
-	busLog         []string // recent bus events for display
-	telemetryLog   []string // recent telemetry events for display
+	consoleHistory  []string
+	busLog          []string // recent bus events for display
+	telemetryLog    []string // recent telemetry events for display
 	telemetryCursor int
-	memoryCount    int
-	threadCount    int
+	memoryCount     int
+	threadCount     int
 
-	// Supervised mode approval
+	// Tool approval telemetry
 	pendingApproval *ToolCallData
 
 	panel        panelMode
@@ -275,13 +272,13 @@ type model struct {
 	threadCursor int
 
 	// Directive editing
-	directiveLines []string
+	directiveLines  []string
 	directiveCursor int
 
 	// Tab system
-	activeTab    string
-	tabs         []string
-	threadViews  map[string]*threadView
+	activeTab   string
+	tabs        []string
+	threadViews map[string]*threadView
 
 	totalPromptTokens     int
 	totalCachedTokens     int
@@ -291,7 +288,7 @@ type model struct {
 	// Sidebar navigation
 	sidebarCursor int
 
-	// Picker (provider/model/mode selection)
+	// Picker (provider/model selection)
 	picker       pickerMode
 	pickerCursor int
 	pickerItems  []string
@@ -422,15 +419,6 @@ func (m *model) openPicker(mode pickerMode) {
 			}
 			m.pickerItems = items
 		}
-	case pickerMode_:
-		current := string(m.thinker.config.GetMode())
-		m.pickerItems = []string{"autonomous", "supervised"}
-		for i, item := range m.pickerItems {
-			if item == current {
-				m.pickerItems[i] = item + " ●"
-				m.pickerCursor = i
-			}
-		}
 	}
 }
 
@@ -468,9 +456,6 @@ func (m *model) executeSidebarItem(item sidebarItem) tea.Cmd {
 		return nil
 	case "model":
 		m.openPicker(pickerModel)
-		return nil
-	case "mode":
-		m.openPicker(pickerMode_)
 		return nil
 	default:
 		if item.panel == panelDirective {
@@ -530,7 +515,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// ── Picker mode (provider/model/mode selection) ──
+		// ── Picker mode (provider/model selection) ──
 		if m.picker != pickerNone {
 			switch msg.String() {
 			case "esc", "q":
@@ -565,15 +550,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.thinker.config.SetProviderModel("small", models[m.pickerCursor])
 							m.consoleHistory = append(m.consoleHistory, fmt.Sprintf("model → %s (saved)", models[m.pickerCursor]))
 						}
-					}
-				case pickerMode_:
-					modes := []RunMode{ModeAutonomous, ModeCautious, ModeLearn}
-					if m.pickerCursor < len(modes) {
-						m.thinker.config.SetMode(modes[m.pickerCursor])
-						if m.thinker.telemetry != nil {
-							m.thinker.telemetry.Emit("mode.changed", "main", map[string]string{"mode": string(modes[m.pickerCursor])})
-						}
-						m.consoleHistory = append(m.consoleHistory, fmt.Sprintf("mode → %s", modes[m.pickerCursor]))
 					}
 				}
 				m.picker = pickerNone
@@ -651,7 +627,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 		}
-
 
 		// ── Normal mode: sidebar + global keys ──
 		switch msg.String() {
@@ -1033,7 +1008,6 @@ func (m model) renderThoughts(maxWidth int) string {
 
 	return sb.String()
 }
-
 
 // styleThoughtContent applies different colors to tool calls (→) and results (←).
 func styleThoughtContent(content string, width int) string {
@@ -1483,12 +1457,6 @@ func (m model) renderSidebar(width, height int) string {
 				}
 				label += helpStyle.Render(" " + val)
 			}
-		case "mode":
-			val := string(m.thinker.config.GetMode())
-			if len(val) > maxVal {
-				val = val[:maxVal]
-			}
-			label += helpStyle.Render(" " + val)
 		}
 
 		// Mark active panel
@@ -1552,8 +1520,6 @@ func (m model) renderPicker(width, height int) string {
 		title = "Select Provider"
 	case pickerModel:
 		title = "Select Model"
-	case pickerMode_:
-		title = "Select Mode"
 	}
 
 	titleLine := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Padding(0, 1).Render(title)

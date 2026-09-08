@@ -57,7 +57,6 @@ func TestCodexAPIThreadStartsWithIdempotentEventSmoke(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "Coordinate API-created threads.",
-		Mode:      ModeAutonomous,
 	}
 	thinker := NewThinker("", provider, cfg)
 	defer func() {

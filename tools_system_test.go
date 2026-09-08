@@ -21,7 +21,7 @@ func TestSkillWriteIsNotACoreToolAndSkillFilesAreNotPromptLoaded(t *testing.T) {
 	if err := os.WriteFile(filepath.Join("skills", "server-owned.md"), []byte("SERVER_SKILL_SENTINEL"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	prompt := buildSystemPrompt("Idle.", ModeAutonomous, registry, "", nil, nil, nil, nil)
+	prompt := buildSystemPrompt("Idle.", registry, "", nil, nil, nil, nil)
 	if strings.Contains(prompt, "SERVER_SKILL_SENTINEL") || strings.Contains(prompt, "[LEARNED SKILLS") {
 		t.Fatalf("server-owned skill file leaked into core prompt: %q", prompt)
 	}

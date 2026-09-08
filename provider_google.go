@@ -480,6 +480,9 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 	if err != nil {
 		return ChatResponse{}, err
 	}
+	if err := observeProviderRequest(ctx, p.Name(), model, body); err != nil {
+		return ChatResponse{}, err
+	}
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", model, p.apiKey)
 

@@ -534,8 +534,8 @@ func TestAPI_Config_Get(t *testing.T) {
 	if body["directive"] != "test directive" {
 		t.Errorf("expected 'test directive', got %v", body["directive"])
 	}
-	if body["mode"] != "autonomous" {
-		t.Errorf("expected default mode 'autonomous', got %v", body["mode"])
+	if _, exists := body["mode"]; exists {
+		t.Error("core config must not expose behavior modes")
 	}
 }
 
@@ -696,49 +696,6 @@ func TestAPI_FullServer(t *testing.T) {
 	}
 
 	t.Log("All endpoints working via real HTTP server")
-}
-
-// --- Supervised Mode Tests ---
-
-func TestAPI_Status_IncludesMode(t *testing.T) {
-	api, _ := newTestAPI()
-	req := httptest.NewRequest("GET", "/status", nil)
-	w := httptest.NewRecorder()
-	api.status(w, req)
-
-	var body map[string]any
-	json.Unmarshal(w.Body.Bytes(), &body)
-	if body["mode"] != "autonomous" {
-		t.Errorf("expected default mode 'autonomous', got %v", body["mode"])
-	}
-}
-
-func TestAPI_Config_SetMode(t *testing.T) {
-	api, thinker := newTestAPI()
-
-	// Set to cautious
-	payload, _ := json.Marshal(map[string]string{"mode": "cautious"})
-	req := httptest.NewRequest("PUT", "/config", bytes.NewReader(payload))
-	w := httptest.NewRecorder()
-	api.config(w, req)
-
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-	if thinker.config.GetMode() != ModeCautious {
-		t.Errorf("expected cautious, got %s", thinker.config.GetMode())
-	}
-
-	// Verify via GET
-	req = httptest.NewRequest("GET", "/config", nil)
-	w = httptest.NewRecorder()
-	api.config(w, req)
-
-	var body map[string]any
-	json.Unmarshal(w.Body.Bytes(), &body)
-	if body["mode"] != "cautious" {
-		t.Errorf("expected cautious, got %v", body["mode"])
-	}
 }
 
 // --- Multimodal API Tests ---

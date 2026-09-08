@@ -142,6 +142,7 @@ func TestGoogleRealtimeLiveMCPThread(t *testing.T) {
 		t.Skip("GOOGLE_API_KEY not set")
 	}
 
+	t.Setenv("APTEVA_TOOL_SEARCH", "on")
 	t.Chdir(t.TempDir())
 	var mcpCalls atomic.Int64
 	mcpReceived := make(chan geminiLiveMCPCall, 2)
@@ -149,15 +150,16 @@ func TestGoogleRealtimeLiveMCPThread(t *testing.T) {
 	defer mcpServer.Close()
 
 	cfg := &Config{
-		path:            filepath.Join(t.TempDir(), "config.json"),
-		Directive:       "Coordinate the live integration test.",
-		Mode:            ModeAutonomous,
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: "Coordinate the live integration test.",
+
 		RealtimeEnabled: true,
 		Providers: []ProviderConfig{{
 			Name: "google-realtime", Default: true,
 		}},
 		MCPServers: []MCPServerConfig{{
 			Name: "liveprobe", Transport: "http", URL: mcpServer.URL + "/mcp",
+			ToolLoading: &MCPToolLoadingConfig{Default: ToolLoadAlways},
 		}},
 	}
 	parent := NewThinker("", &inertRealtimeTextProvider{}, cfg)
@@ -189,7 +191,7 @@ func TestGoogleRealtimeLiveMCPThread(t *testing.T) {
 For the caller's first request, call liveprobe_lookup_code exactly once with the requested code.
 Wait for the real tool result, then say the returned marker clearly.
 Never invent the marker, expose tool mechanics, or call done. Keep the live conversation open.`,
-		[]string{"liveprobe_lookup_code"},
+		nil, // Whole-MCP grant only: an exact grant would mask baseline-loading bugs.
 		SpawnOpts{
 			Realtime:       true,
 			Ephemeral:      true,
@@ -204,6 +206,16 @@ Never invent the marker, expose tool mechanics, or call done. Keep the live conv
 	if err != nil {
 		t.Fatalf("spawn Gemini Live thread: %v", err)
 	}
+	parent.threads.mu.RLock()
+	child := parent.threads.threads[threadID]
+	parent.threads.mu.RUnlock()
+	if child.Tools["liveprobe_lookup_code"] || !child.Thinker.toolMCPScopes["liveprobe"] {
+		t.Fatal("live regression must exercise a whole-MCP grant without an exact grant")
+	}
+	if !nativeToolSet(child.Realtime.realtimeToolSchemas())["liveprobe_lookup_code"] {
+		t.Fatal("Google session configuration is missing the always-loaded MCP tool")
+	}
+	t.Logf("provider=google-realtime model=%s grant=mcp:liveprobe loading=always discovery=on", parent.pool.RealtimeByName("google-realtime").Models()[ModelLarge])
 	parent.threads.realtimeBridgeConnected(threadID)
 
 	trace := []string{"USER: " + userTurn}
@@ -262,6 +274,9 @@ Never invent the marker, expose tool mechanics, or call done. Keep the live conv
 			}
 
 			assistantText := strings.Join(assistantTurns, " ")
+			if pattern := detectRealtimeInternalNarration(assistantText); pattern != "" {
+				t.Fatalf("internal narration reached caller-facing transcript: %s\n%s", pattern, strings.Join(trace, "\n"))
+			}
 			// Spoken underscores have no canonical acoustic representation.
 			// Gemini's output transcription may render the same marker as
 			// GEMINI\_MCP\_OK or GEMINI-MCP-OK. Preserve the raw transcript

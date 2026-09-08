@@ -33,6 +33,7 @@ type ToolIndex struct {
 	aliases           map[string]string
 	revision          uint64
 	diagnosedRevision uint64
+	changed           chan struct{}
 }
 
 // IndexEntry is one tool's worth of searchable metadata.
@@ -65,7 +66,7 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loadin
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.revision++
+	ix.changedLocked()
 	// Drop existing entries from this server first
 	filtered := ix.entries[:0]
 	for _, e := range ix.entries {
@@ -121,7 +122,7 @@ func (ix *ToolIndex) UpdatePolicy(server string, noSpawn bool, loading *MCPToolL
 	cfg := MCPServerConfig{Name: server, ToolLoading: loading}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.revision++
+	ix.changedLocked()
 	for i := range ix.entries {
 		if ix.entries[i].Server != server {
 			continue
@@ -139,7 +140,7 @@ func (ix *ToolIndex) Remove(server string) {
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.revision++
+	ix.changedLocked()
 	filtered := ix.entries[:0]
 	for _, e := range ix.entries {
 		if e.Server != server {
@@ -381,7 +382,7 @@ func (ix *ToolIndex) Search(query string, k int, allowNoSpawn bool) []IndexEntry
 func (ix *ToolIndex) RegisterAlias(alias, canonical string) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.revision++
+	ix.changedLocked()
 	alias = strings.ToLower(strings.TrimSpace(alias))
 	if alias == "" || len(toolNameTokens(alias)) != 1 || toolNameTokens(alias)[0] != alias {
 		return fmt.Errorf("invalid tool alias %q", alias)
@@ -619,4 +620,26 @@ func (ix *ToolIndex) rebuildNamesLocked() {
 		ix.byName[strings.ToLower(e.Name)] = i
 		ix.serverPrefixes[strings.ToLower(e.Server)+"_"] = true
 	}
+}
+
+// Changes broadcasts catalog revisions without one goroutine or queue per
+// subscriber. Subscribe before resolving schemas to avoid missing a change.
+func (ix *ToolIndex) Changes() <-chan struct{} {
+	if ix == nil {
+		return nil
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.changed == nil {
+		ix.changed = make(chan struct{})
+	}
+	return ix.changed
+}
+
+func (ix *ToolIndex) changedLocked() {
+	ix.revision++
+	if ix.changed != nil {
+		close(ix.changed)
+	}
+	ix.changed = make(chan struct{})
 }

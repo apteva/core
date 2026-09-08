@@ -342,12 +342,20 @@ func TestAPIEphemeralThreadNeverEntersPersistentConfig(t *testing.T) {
 	if threadThinker == nil {
 		t.Fatal("ephemeral thread disappeared before evolve check")
 	}
-	_, _, results := threadThinker.handleTools(threadThinker, []toolCall{{
-		Name:     "evolve",
-		Args:     map[string]string{"directive": "Evolved temporary conversation."},
-		Raw:      "evolve",
-		NativeID: "ephemeral-evolve",
-	}}, nil)
+	var results []ToolResult
+	// The API starts this worker's Run loop. Invoke the synthetic evolve on
+	// its owner, just like a real tool response, rather than racing that loop.
+	if err := threadThinker.mutateRuntime(func() error {
+		_, _, results = threadThinker.handleTools(threadThinker, []toolCall{{
+			Name:     "evolve",
+			Args:     map[string]string{"directive": "Evolved temporary conversation."},
+			Raw:      "evolve",
+			NativeID: "ephemeral-evolve",
+		}}, nil)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if len(results) != 1 || results[0].IsError {
 		t.Fatalf("ephemeral evolve failed: %#v", results)
 	}

@@ -292,9 +292,9 @@ func runRealtimeReceptionistDifficulty(
 	defer mcpServer.Close()
 
 	cfg := &Config{
-		path:            filepath.Join(t.TempDir(), "config.json"),
-		Directive:       "Coordinate the difficult-caller realtime test.",
-		Mode:            ModeAutonomous,
+		path:      filepath.Join(t.TempDir(), "config.json"),
+		Directive: "Coordinate the difficult-caller realtime test.",
+
 		RealtimeEnabled: true,
 		Providers:       []ProviderConfig{{Name: providerName, Default: true}},
 		MCPServers: []MCPServerConfig{{

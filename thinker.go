@@ -295,7 +295,7 @@ const mainDirectivePersistencePrompt = `
 // (MCP connections rarely change at runtime). `extraToolDocs` is kept
 // only to avoid an awkward signature break — the production caller
 // passes "" now.
-func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo, pool *ProviderPool, mcpCatalog []MCPServerInfo) string {
+func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs string, servers []MCPConn, activeThreads []ThreadInfo, pool *ProviderPool, mcpCatalog []MCPServerInfo) string {
 	coreDocs := ""
 	if registry != nil {
 		// Prefer the compact summary when the thread's provider receives
@@ -393,43 +393,7 @@ func buildSystemPrompt(directive string, mode RunMode, registry *ToolRegistry, e
 	// because some callers still pass empty slices; the body is a no-op.
 	_ = activeThreads
 
-	// Safety guidance based on mode
-	prompt += "\n\n[SAFETY MODE: " + string(mode) + "]\n"
-	switch mode {
-	case ModeCautious:
-		prompt += `You act carefully. Read-only tools (screenshot, list, query, read_file, web search, memory_scan) are free — use them at will.
-
-Before any STATE-CHANGING tool (exec, write, delete, deploy, restart, purchase, send-as-user, browser actions on logged-in sites):
-- Send one concise channels_send explaining action + target + why (one sentence each).
-- Wait for the user's next message before executing. Don't chain tool calls.
-- If unsure whether an action is state-changing, ask. Asking is cheap; undoing is expensive.
-
-When the user corrects or pushes back, stop and adjust immediately — don't argue.`
-	case ModeLearn:
-		prompt += `You are learning the user's preferences. Soft gate — nothing blocks you at runtime. The quality of this mode depends on YOU actually pausing and asking.
-
-DEFAULT: BEFORE ANY ACTION YOU HAVEN'T TAKEN BEFORE THIS SESSION, send ONE short channels_send:
-  "About to <verb> <target>. Reason: <one sentence>. OK?"
-Then wait for the user's answer before proceeding.
-
-This applies to EVERY tool — read tools, file IO, exec, browser actions, thread spawning, MCP activation, channel sends, EVERYTHING. The cost of asking is one short message. The cost of misreading the situation is unrecoverable.
-
-NEVER ASK FOR:
-- pace (loop control, not an action)
-
-ONCE APPROVED, REUSE FREELY:
-After the user approves a tool + scope ("read files under /work", "spawn sub-threads up to 3 deep", "exec on the dev server"), don't re-ask for the same combination on the same scope.
-
-When the user pushes back ("no", "don't", "stop", "I didn't want that"), stop and adjust immediately — don't argue.`
-	default: // ModeAutonomous
-		prompt += `You operate independently and are trusted to act. Use that trust to get things done.
-
-- For irreversible or high-blast-radius actions (mass delete, publish externally, spend money, send as user), tell the user briefly before acting — don't ask, inform.
-- Assess risk honestly. If genuinely unsure, ask.
-- When the user corrects or pushes back, stop and adjust immediately — don't argue.
-
-ACT, DON'T NARRATE. You have no live audience between thoughts — every tool result comes back as structured input, not as something a human is watching scroll by. Skip the "let me think about this, I'll take a screenshot to see what's there, then I'll consider the options before..." prose. Take the next tool call. The tool's output is your feedback; react to it on the next iteration. Reserve natural-language output for channels_send (actually talking to the user). Thoughts that produce only prose and no tool call waste a round-trip.`
-	}
+	prompt += "\n\n[EXECUTION GUIDANCE]\nUse tool results to choose the next action. Prose between tool calls does not deliver a message to the user; use channels_send for user communication. Follow the directive for when to act, ask, or wait.\n"
 
 	if pool != nil && pool.DefaultName() == "openai-codex" {
 		prompt += `
@@ -1340,7 +1304,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		pool:     pool,
 		provider: activeProvider,
 		messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), nil, "", nil, nil, nil, nil)},
+			{Role: "system", Content: buildSystemPrompt(config.GetDirective(), nil, "", nil, nil, nil, nil)},
 		},
 		config:                 config,
 		bus:                    bus,
@@ -1400,7 +1364,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	registerSystemTools(t.registry, t.memory)
 
 	// Rebuild system prompt now that registry exists (with core tool docs)
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", nil, nil, t.pool, nil)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", nil, nil, t.pool, nil)}
 
 	// Main thread hooks
 	t.handleTools = mainToolHandler(t)
@@ -1411,7 +1375,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	// The string arg is unused; kept for back-compat with the function
 	// type signature used by sub-thread instantiation.
 	t.rebuildPrompt = func(_ string) string {
-		return buildSystemPrompt(t.config.GetDirective(), t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)
+		return buildSystemPrompt(t.config.GetDirective(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)
 	}
 
 	// Connect every configured MCP server up-front and register their
@@ -1424,7 +1388,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		t.mcpServers = connectAndRegisterMCP(config.MCPServers, t.registry, t.toolIndex, t.blobs)
 		t.mcpCatalog = computeMCPCatalog(t.toolIndex)
 		// Rebuild prompt with catalog
-		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
+		t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(config.GetDirective(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 	}
 
 	// Load conversation history from persistent session
@@ -1620,11 +1584,17 @@ func (t *Thinker) executionGate(phase ExecutionPhase, meta ExecutionGate) bool {
 	if t.checkpoints != nil && t.execution.ShouldGate(phase) {
 		t.checkpoints.Capture(t, meta)
 	}
-	return t.execution.Wait(meta, t.quit, func(eventType string, data ExecutionPhaseData) {
+	t.mutationMu.Lock()
+	if t.mutationWake == nil {
+		t.mutationWake = make(chan struct{}, 1)
+	}
+	wake := t.mutationWake
+	t.mutationMu.Unlock()
+	return t.execution.waitWithRuntimeMutations(meta, t.quit, func(eventType string, data ExecutionPhaseData) {
 		if t.telemetry != nil {
 			t.telemetry.Emit(eventType, data.ThreadID, data)
 		}
-	})
+	}, wake, func() { t.applyRuntimeMutations() })
 }
 
 func (t *Thinker) executionCheckpointMeta() []ExecutionCheckpointMeta {
@@ -2196,7 +2166,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							addResult(fmt.Sprintf("error: persist directive: %v", err))
 						} else {
 							t.directive = d
-							t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
+							t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(d, t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 							t.resetPromptCache("directive_evolved")
 							t.logAPI(APIEvent{Type: "evolved", ThreadID: "main", Message: d})
 							if t.telemetry != nil {
@@ -2834,7 +2804,7 @@ func (t *Thinker) Run() {
 		)
 		requestMessages = t.prepareToolResultRequest(requestMessages)
 		// messages[0] is no longer rewritten per-iteration. It only
-		// changes when the directive, mode, or static config (MCPs,
+		// changes when the directive or static config (MCPs,
 		// providers) does — handled at the call sites of buildSystemPrompt.
 
 		// Hand the just-drained event text to applyPreload so BM25 can
@@ -2850,21 +2820,8 @@ func (t *Thinker) Run() {
 		}
 		t.lastInboundForPreload = strings.Join(preloadEvents, "\n")
 
-		if shouldCompactBeforeLLM(t.modelID(), requestMessages) {
-			t.compactForContextPressure("pre_llm", TokenUsage{}, emptyLLMResponses)
-			// Compaction resets request-only snapshots. Reattach the current
-			// retrieval-cycle memory exactly once to the new provider prefix.
-			dynCtx = buildDynamicTurnContextView(activeThreads, recallContext, rosterForTurn)
-			dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
-			requestMessages = t.requestContext.prepare(
-				t.messages,
-				dynCtx,
-				nowUTC,
-				!hadEvents && len(toolResults) == 0,
-				true,
-			)
-			requestMessages = t.prepareToolResultRequest(requestMessages)
-		}
+		// Full-budget preflight and bounded recovery run after tool schemas are
+		// selected, immediately before the provider call.
 
 		start := time.Now()
 		if !t.executionGate(ExecutionPhaseLLMStart, ExecutionGate{Summary: fmt.Sprintf("Calling %s", t.modelID())}) {
@@ -2886,7 +2843,7 @@ func (t *Thinker) Run() {
 			if runCtx.Err() != nil {
 				return
 			}
-			t.failEventExecutions("provider_retry_budget_exhausted")
+			t.failEventExecutions(providerExecutionFailureReason(err))
 			// Stay available for updated configuration or a new instruction.
 			select {
 			case <-t.quit:
@@ -3396,7 +3353,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	// always/deferred policy wins; auto tools follow the global eager-vs-
 	// discovery threshold. This keeps behavior identical across providers.
 	var nativeTools []NativeTool
-	if t.provider != nil && t.provider.SupportsNativeTools() && t.registry != nil {
+	if provider.SupportsNativeTools() && t.registry != nil {
 		nativeTools = t.prepareNativeTools(provider.Name())
 	} else {
 		t.recordPresentedTools(nil)
@@ -3425,6 +3382,12 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	}
 
 	modelID := modelIDForProvider(provider, t.model)
+	budget := estimatePreparedRequest(provider.Name(), modelID, messages, nativeTools)
+	t.emitRequestBudget(budget)
+	if budget.OverBudget {
+		return ChatResponse{Provider: provider.Name(), Model: modelID}, &contextBudgetError{Budget: budget}
+	}
+	ctx = context.WithValue(ctx, requestObserverKey{}, requestObserver(func(b requestBudget) { t.emitRequestBudget(b) }))
 
 	// Persist llm.start before entering the provider so an interrupted or
 	// indefinitely slow request remains diagnosable even when no done/error
@@ -3455,7 +3418,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	}()
 	callStart := time.Now()
 	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat enter model=%s msgs=%d tools=%d",
-		t.threadID, t.modelID(), len(messages), len(nativeTools)))
+		t.threadID, modelID, len(messages), len(nativeTools)))
 	// TODO: thread a cancellable ctx here (from a thinker-scoped run ctx or
 	// a user-abort channel) so a slow stream can be unblocked from outside.
 	// For now context.Background() preserves prior behaviour — the request
@@ -3475,7 +3438,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 		resp.RequestedReasoningEffort = requestedReasoning
 	}
 	logMsg("THINK", fmt.Sprintf("[%s] provider.Chat exit model=%s dur=%s tool_calls=%d err=%v",
-		t.threadID, t.modelID(), time.Since(callStart).Round(time.Millisecond), len(resp.ToolCalls), err))
+		t.threadID, modelID, time.Since(callStart).Round(time.Millisecond), len(resp.ToolCalls), err))
 	return resp, err
 }
 
@@ -3500,9 +3463,15 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 	defer cancelBudget()
 	attempt := 0
 	attachmentRecoveryUsed := false
+	permanentFallbacks := map[string]error{}
 	for {
 		primary := t.provider
-		resp, err := t.thinkWithProviderMessages(ctx, primary, messages)
+		resp, nextMessages, err := t.callProviderWithContextRecovery(ctx, primary, messages)
+		messages = nextMessages
+		primaryErr := err
+		if err != nil && t.telemetry != nil {
+			t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": resp.Provider, "model": resp.Model, "error": err.Error(), "role": "primary", "iteration": t.iteration})
+		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
 			var count int
 			messages, count = projectTransientAttachmentsFromMessages(messages)
@@ -3516,18 +3485,30 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 			logMsg("ATTACHMENT", fmt.Sprintf("[%s] quarantined %d rejected attachments; retrying prepared turn without them", t.threadID, count))
 			continue
 		}
-		if err != nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
+		if err != nil && !isContextLengthError(err) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
 			if fallback := t.pool.Fallback(primary.Name()); fallback != nil {
 				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), err, fallback.Name()))
-				if fallbackResp, fallbackErr := t.thinkWithProviderMessages(ctx, fallback, messages); fallbackErr == nil {
+				fallbackErr := permanentFallbacks[fallback.Name()]
+				var fallbackResp ChatResponse
+				if fallbackErr == nil {
+					fallbackResp, messages, fallbackErr = t.callProviderWithContextRecovery(ctx, fallback, messages)
+					if fallbackErr != nil {
+						if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
+							permanentFallbacks[fallback.Name()] = fallbackErr
+						}
+						if t.telemetry != nil {
+							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": modelIDForProvider(fallback, t.model), "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
+						}
+					}
+				}
+				if fallbackErr == nil {
 					if count := consumeTransientAttachments(t.messages); count > 0 {
 						t.emitAttachmentLifecycle("attachment.consumed", count, fallback.Name(), "provider_request_completed")
 					}
 					return fallbackResp, nil
-				} else {
-					resp = fallbackResp
-					err = fmt.Errorf("primary %s: %v; fallback %s: %w", primary.Name(), err, fallback.Name(), fallbackErr)
 				}
+				err = &providerChainError{PrimaryName: primary.Name(), FallbackName: fallback.Name(), Primary: primaryErr, Fallback: fallbackErr}
+
 			}
 		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
@@ -3585,14 +3566,14 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 				Iteration:      t.iteration,
 			})
 		}
-		if attempt >= 4 || permanentProviderError(err) {
+		if attempt >= 4 || permanentProviderError(primaryErr) || isContextLengthError(primaryErr) {
 			return resp, err
 		}
 		delayFn := t.retryDelay
 		if delayFn == nil {
 			delayFn = providerRetryDelay
 		}
-		delay := delayFn(err, attempt)
+		delay := delayFn(primaryErr, attempt)
 		if t.retryDelay == nil {
 			delay = delay * time.Duration(80+time.Now().UnixNano()%41) / 100
 		}
@@ -3912,7 +3893,7 @@ func (t *Thinker) ReloadDirectiveQuiet() {
 func (t *Thinker) reloadDirectiveNow() {
 	directive := t.config.GetDirective()
 	t.directive = directive
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.config.GetMode(), t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
+	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 	t.resetPromptCache("directive_reloaded")
 	t.publishContextStatus()
 }

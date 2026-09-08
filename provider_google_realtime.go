@@ -138,9 +138,11 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 			},
 		},
 	}
+	thinking := map[string]any{"includeThoughts": false}
 	if level := googleLiveThinkingLevel(opts.Reasoning); level != "" {
-		generation["thinkingConfig"] = map[string]any{"thinkingLevel": level}
+		thinking["thinkingLevel"] = level
 	}
+	generation["thinkingConfig"] = thinking
 	normalizedTurnDetection, err := opts.TurnDetection.normalized()
 	if err != nil {
 		return nil, fmt.Errorf("google-realtime turn detection: %w", err)
@@ -286,6 +288,7 @@ type googleRealtimeSession struct {
 	dropped   atomic.Uint64
 
 	inputRate int
+	speech    googleSpeechGate // owned by translate/readLoop
 
 	mu                  sync.Mutex
 	currentResponseID   string
@@ -503,30 +506,11 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 	if message.ServerContent != nil {
 		content := message.ServerContent
 		if content.Interrupted {
+			s.speech = googleSpeechGate{}
 			s.emitControl(RealtimeEvent{Type: RealtimeEventSpeechStarted})
 		}
 		responseID := s.currentOrNextResponseID()
-		if content.ModelTurn != nil {
-			for _, part := range content.ModelTurn.Parts {
-				if part.Thought {
-					continue
-				}
-				if part.InlineData != nil && strings.HasPrefix(strings.ToLower(part.InlineData.MimeType), "audio/") {
-					pcm, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
-					if err != nil {
-						s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime audio: %w", err)})
-						continue
-					}
-					s.mu.Lock()
-					s.turnOutputSinceTool = true
-					s.mu.Unlock()
-					s.emitAudio(RealtimeEvent{
-						Type: RealtimeEventAudioOut, Audio: pcm,
-						ResponseID: responseID, ItemID: responseID,
-					})
-				}
-			}
-		}
+
 		if content.InputTranscription != nil && content.InputTranscription.Text != "" {
 			s.mu.Lock()
 			s.inputTranscript = appendGoogleTranscript(s.inputTranscript, content.InputTranscription.Text)
@@ -543,10 +527,36 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 			partial := s.outputTranscript
 			s.turnOutputSinceTool = true
 			s.mu.Unlock()
-			s.emitAudio(RealtimeEvent{
-				Type: RealtimeEventTranscriptOutput, Transcript: partial,
-				ResponseID: responseID, ItemID: responseID,
-			})
+			if pattern := detectRealtimeInternalNarration(partial); pattern != "" {
+				s.rejectSpeech(responseID, pattern)
+			} else if !s.speech.rejected {
+				// Guard-bearing transcripts cannot be dropped under audio backpressure.
+				s.emitControl(RealtimeEvent{Type: RealtimeEventTranscriptOutput, Transcript: partial, ResponseID: responseID, ItemID: responseID})
+				if len(strings.TrimSpace(partial)) >= 32 || strings.ContainsAny(partial, ".?!") {
+					s.releaseSpeechAudio()
+				}
+			}
+		}
+		if content.ModelTurn != nil {
+			for _, part := range content.ModelTurn.Parts {
+				if part.Thought {
+					continue
+				}
+				if part.InlineData != nil && strings.HasPrefix(strings.ToLower(part.InlineData.MimeType), "audio/") {
+					pcm, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
+					if err != nil {
+						s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime audio: %w", err)})
+						continue
+					}
+					s.mu.Lock()
+					s.turnOutputSinceTool = true
+					s.mu.Unlock()
+					s.queueSpeechAudio(RealtimeEvent{
+						Type: RealtimeEventAudioOut, Audio: pcm,
+						ResponseID: responseID, ItemID: responseID,
+					})
+				}
+			}
 		}
 		if content.TurnComplete {
 			s.finishTurn()
@@ -590,12 +600,20 @@ func (s *googleRealtimeSession) finishTurn() {
 			ResponseID: responseID, ItemID: responseID,
 		})
 	}
-	if output != "" {
+	if !s.speech.rejected {
+		if output == "" && s.speech.bytes > 0 {
+			s.rejectSpeech(responseID, "missing_output_transcript")
+		} else {
+			s.releaseSpeechAudio()
+		}
+	}
+	if output != "" && !s.speech.rejected {
 		s.emitControl(RealtimeEvent{
 			Type: RealtimeEventTranscriptOutput, Transcript: output, Final: true,
 			ResponseID: responseID, ItemID: responseID,
 		})
 	}
+	s.speech = googleSpeechGate{}
 	s.emitControl(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: responseID, Usage: usage})
 	if restart {
 		_ = s.Close()

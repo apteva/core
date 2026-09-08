@@ -225,28 +225,7 @@ func (t *Thinker) toolAuthorized(name string) bool {
 	if t == nil {
 		return false
 	}
-	if t.toolAllowlist == nil {
-		return true
-	}
-	if t.toolAllowlist[name] {
-		// Exact grants remain subject to the server's no_spawn boundary unless
-		// this is an authenticated platform-created thread. This also protects
-		// runtime update paths that modify a worker's exact tool list.
-		if t.toolIndex != nil {
-			if entry, ok := t.toolIndex.Get(name); ok && entry.NoSpawn && !t.allowNoSpawn {
-				return false
-			}
-		}
-		return true
-	}
-	if t.toolIndex == nil {
-		return false
-	}
-	entry, ok := t.toolIndex.Get(name)
-	if !ok || !t.toolMCPScopes[entry.Server] {
-		return false
-	}
-	return t.allowNoSpawn || !entry.NoSpawn
+	return t.toolAuthorizedFor(name, t.toolAllowlist, t.toolMCPScopes)
 }
 
 func (t *Thinker) searchAuthorizedTools(query string, k int, allowNoSpawn bool) []IndexEntry {
@@ -412,34 +391,13 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 	}
 
 	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
-	active := t.authorizedActiveTools(t.activeTools)
-	baseline := t.toolIndex.BaselineNames(eager, allowNoSpawn)
+	// Expiration is per-turn bookkeeping, not part of visibility resolution.
 	for name, until := range t.discoveredToolUntil {
-		if t.iteration <= until {
-			baseline = append(baseline, name)
-		} else {
+		if t.iteration > until {
 			delete(t.discoveredToolUntil, name)
 		}
 	}
-	for name := range t.requiredToolNames() {
-		baseline = append(baseline, name)
-	}
-	if len(baseline) > 0 {
-		merged := make(map[string]bool, len(t.activeTools)+len(baseline))
-		for name, enabled := range active {
-			if enabled {
-				merged[name] = true
-			}
-		}
-		for _, name := range baseline {
-			if t.toolAuthorized(name) {
-				merged[name] = true
-			}
-		}
-		active = merged
-	}
-
-	tools, definitions := t.registry.nativeToolSnapshot(t.authorizedToolAllowlist(t.toolAllowlist), active, t.systemThread)
+	tools, definitions, active := t.visibleNativeToolSnapshot(t.toolAllowlist, t.toolMCPScopes)
 	t.recordPresentedTools(tools, definitions)
 	t.lastNativeToolCount = len(tools)
 	t.lastActiveMCPCount = countActiveMCPTools(active)

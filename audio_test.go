@@ -172,7 +172,6 @@ func TestAudioViaParts(t *testing.T) {
 
 	cfg := &Config{
 		Directive: "You are an audio analyst. When you receive audio, describe what you hear in 1-2 sentences.",
-		Mode:      ModeAutonomous,
 	}
 
 	thinker := NewThinker("", provider, cfg)
@@ -181,7 +180,7 @@ func TestAudioViaParts(t *testing.T) {
 	thinker.registry = NewToolRegistry("")
 	thinker.handleTools = mainToolHandler(thinker)
 	thinker.rebuildPrompt = func(toolDocs string) string {
-		return buildSystemPrompt(cfg.GetDirective(), ModeAutonomous, thinker.registry, toolDocs, thinker.mcpServers, nil, nil, nil)
+		return buildSystemPrompt(cfg.GetDirective(), thinker.registry, toolDocs, thinker.mcpServers, nil, nil, nil)
 	}
 
 	// Parse the audio URL into media parts (same as send tool does)

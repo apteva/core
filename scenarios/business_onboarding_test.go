@@ -23,7 +23,6 @@ should already know who this business is and how they talk.`,
 				injected := false
 				return func(t *testing.T, dir string, th *Thinker) bool {
 					if !injected {
-						th.Config().SetMode(ModeLearn)
 						th.InjectConsole("Hey — I'm setting you up as the assistant for my bakery. We're called 'Crumb & Co.', based in Brooklyn. We specialize in long-fermented sourdough and rye, and our signature product is a 50-hour fermented country loaf.")
 						injected = true
 					}

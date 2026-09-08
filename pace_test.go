@@ -137,7 +137,7 @@ func TestParseSleepDurationRejectsWeekUnit(t *testing.T) {
 func TestMainPacePersistsCadenceAndPendingWakeAcrossRestart(t *testing.T) {
 	t.Chdir(t.TempDir())
 	path := filepath.Join(t.TempDir(), "config.json")
-	cfg := &Config{path: path, Directive: "# Role\nCoordinate work.", Mode: ModeAutonomous}
+	cfg := &Config{path: path, Directive: "# Role\nCoordinate work."}
 	provider := newParkedAPIProvider()
 	thinker := NewThinker("", provider, cfg)
 	defer func() {
@@ -178,7 +178,7 @@ func TestMainPacePersistsCadenceAndPendingWakeAcrossRestart(t *testing.T) {
 func TestPersistentThreadPaceSurvivesRestart(t *testing.T) {
 	t.Chdir(t.TempDir())
 	path := filepath.Join(t.TempDir(), "config.json")
-	cfg := &Config{path: path, Directive: "# Role\nCoordinate work.", Mode: ModeAutonomous}
+	cfg := &Config{path: path, Directive: "# Role\nCoordinate work."}
 	provider := newParkedAPIProvider()
 	parent := NewThinker("", provider, cfg)
 	defer func() {
@@ -250,7 +250,6 @@ func TestRestoredWakeWaitsButInboxEventResumesEarly(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate work.",
-		Mode:      ModeAutonomous,
 	}
 	if err := cfg.SetMainPace(PersistentPaceState{
 		Sleep:      "1h",
@@ -323,7 +322,6 @@ func TestFiredWakeIsConsumedWithoutAutomaticAdvance(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate work.",
-		Mode:      ModeAutonomous,
 	}
 	provider := newParkedAPIProvider()
 	thinker := NewThinker("", provider, cfg)
@@ -462,7 +460,6 @@ func TestClearedWakeRestartsEventOnlyUntilAnEventArrives(t *testing.T) {
 	cfg := &Config{
 		path:      path,
 		Directive: "# Role\nCoordinate work.",
-		Mode:      ModeAutonomous,
 	}
 	setupProvider := newParkedAPIProvider()
 	setup := NewThinker("", setupProvider, cfg)
@@ -515,7 +512,6 @@ func TestToolResultWakePreservesPendingDeadlineAndExposesState(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate work.",
-		Mode:      ModeAutonomous,
 	}
 	if err := cfg.SetMainPace(PersistentPaceState{Sleep: "1h", NextWakeAt: pendingWake}); err != nil {
 		t.Fatal(err)
@@ -575,7 +571,6 @@ func TestTimerWakeIsConsumedAndDoesNotInventRecurrence(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate work.",
-		Mode:      ModeAutonomous,
 	}
 	if err := cfg.SetMainPace(PersistentPaceState{
 		Sleep:      "1h",
@@ -633,7 +628,6 @@ func TestEventProcessingThatCrossesDeadlineImmediatelyDeliversTimerWake(t *testi
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nCoordinate work.",
-		Mode:      ModeAutonomous,
 	}
 	if err := cfg.SetMainPace(PersistentPaceState{Sleep: "1h", NextWakeAt: pendingWake}); err != nil {
 		t.Fatal(err)
@@ -702,7 +696,6 @@ func TestDueTimerAndTaskEventAreDeliveredInOneTurn(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nHandle the directive timer and every ready task independently.",
-		Mode:      ModeAutonomous,
 	}
 	if err := cfg.SetMainPace(PersistentPaceState{Sleep: "1h", NextWakeAt: pendingWake}); err != nil {
 		t.Fatal(err)
@@ -760,7 +753,6 @@ func TestPersistentWorkerEarlyEventPreservesItsOwnPendingWake(t *testing.T) {
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
 		Directive: "# Role\nGovern work ownership.",
-		Mode:      ModeAutonomous,
 	}
 	provider := newPacingTestProvider(1)
 	parent := NewThinker("", provider, cfg)
