@@ -14,12 +14,13 @@ const configFile = "config.json"
 
 // PersistentPaceState is runtime scheduling state, not directive content.
 // Sleep records the duration used for the last timing decision; NextWakeAt is
-// the single agent-owned pending timer. A zero NextWakeAt means event-only
-// waiting. A future deadline remains capped by the runtime's 24-hour maximum
+// the single pending timer. WaitForEvents records an explicit agent decision
+// to wait without a timer. A future deadline remains capped by the runtime's 24-hour maximum
 // when restored.
 type PersistentPaceState struct {
-	Sleep      string    `json:"sleep,omitempty"`
-	NextWakeAt time.Time `json:"next_wake_at,omitempty"`
+	WaitForEvents bool      `json:"wait_for_events,omitempty"` // recorded by pace(clear_wake), not an operator setting
+	Sleep         string    `json:"sleep,omitempty"`
+	NextWakeAt    time.Time `json:"next_wake_at,omitempty"`
 }
 
 // PersistentThreadEvent is an idempotent API-created inbox event. Pending

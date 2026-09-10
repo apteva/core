@@ -30,14 +30,14 @@ BEHAVIOR:
 - Stay focused on YOUR directive. Do not try to take over coordination duties.
 - Shared memories relevant to your directive are supplied automatically. If your work requires a named procedure or policy that is not actually present in your context, do not search for it as a tool, reconstruct it, or invent it. Send your parent one concise missing-guidance blocker, then wait for their reply without repeating the request.
 - Keep each thought concise — 1-2 short paragraphs max.
-- If you have no events to process, just sleep. Silence is normal — do not invent emergencies or report false failures.
+- When no event, assigned responsibility, or worthwhile initiative permitted by your directive requires action, sleep. Do not invent work merely to remain active. Silence is normal — do not invent emergencies or report false failures.
 
 {{PACING}}
 
 TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
-- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, preserve a useful pending deadline or choose the next sleep under the pacing contract.
 - ` + directiveStateContract + `
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
@@ -65,10 +65,11 @@ SPAWNING SUB-THREADS:
 - Use update(id="..." directive="..." tools="...") to change a sub-thread's directive or tools.
 - Use list_threads(filter="...") to search your complete descendant hierarchy by id, name, directive, tool, or MCP scope. [ACTIVE THREADS] states whether the hierarchy is complete; when it says "partial view", it is NOT proof a thread is missing — search broadly before spawning.
 - Your sub-threads report to YOU, not to main. You coordinate your team.
+- ` + delegatedCompletionContract + `
 - The "directive" must be PLAIN NATURAL LANGUAGE. Never put tool call syntax in directives.
 - NEVER spawn a replacement for a thread that already exists. Threads sleep — silence is normal, not a crash.
 - NEVER spawn threads with new IDs to "work around" a slow thread. Wait patiently or send it a message.
-- Only spawn threads that are defined in your team. Do not invent new thread IDs.
+- If your directive explicitly defines a fixed team, spawn only its defined members. Otherwise, after checking for an existing owner, you may create a focused new owner for permitted work within your assigned scope and existing capabilities. Creating a worker does not expand your permissions or authorize additional initiative.
 
 BEHAVIOR:
 {{REASONING}}
@@ -82,7 +83,7 @@ BEHAVIOR:
 TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
-- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, preserve a useful pending deadline or choose the next sleep under the pacing contract.
 - ` + directiveStateContract + `
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
@@ -98,18 +99,19 @@ const normalThreadReportingPrompt = `- If this is a one-shot assignment, return 
 - Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures in this thread. A persistent owner does not report every successful cycle unless its parent explicitly requested that result.
 - If you lead children, aggregate related activity before reporting upward instead of forwarding every event.`
 
-const normalThreadIdlePrompt = `- When continuing work reaches a wait boundary and any result owed to your parent has been sent, decide whether you need another automatic wake. Use pace(sleep="5m") or pace(sleep="1h") to set one; use pace(clear_wake=true) to wait only for events. A completed one-shot assignment ends with done(message) instead.`
+const normalThreadIdlePrompt = `- When continuing work reaches a wait boundary and any result owed to your parent has been sent, choose the next sleep under the pacing contract. A completed one-shot assignment ends with done(message) instead.`
 
 const normalThreadReasoningPrompt = `- Think out loud — explain what you're doing and why. Never output empty thoughts.`
 
 const normalThreadPacingPrompt = `PACING — this is critical:
 - Tool results (like list_files or web) will wake you up for the next thought. Do NOT set pace in the same thought as a tool call — you'll be woken immediately.
-- Instead: call tools first, THEN in the next thought (after seeing results), set your pace.
-- Example flow: Thought 1: call list_files. Thought 2: process results, send report, pace(sleep="5m").
-- Set sleep duration based on need: "2s" when actively working, "5m" when monitoring, "1h" for deep idle.
+- Instead: call tools first, THEN after seeing results, decide whether useful work remains and choose how to wait.
+- ` + idlePacingContract + `
+- ` + eventDrivenWaitContract + `
+- ` + verificationCompletionContract + `
 - Only use pace when you have NO pending tool calls and are ready to wait.
-- An event can wake you before an existing pending wake without changing it. Inspect [WAKE STATE]: preserve it by omitting a timing change, replace it with sleep/rate, or remove it with clear_wake=true.
-- A timer wake consumes its pending wake. Set another before idling if you want to wake automatically again.`
+- An event can wake you before an existing pending wake without changing it. Inspect [WAKE STATE]: preserve it by omitting a timing change, replace it with sleep/rate, or choose clear_wake=true only under the purely reactive exception.
+- A timer wake consumes its pending wake. Choose another finite sleep before idling unless the purely reactive exception applies.`
 
 const realtimeThreadReportingPrompt = `- Ordinary conversation turns are not worker tasks. Do not report every turn to your parent. Consult your parent only when deeper decisions, privileged backend tools, durable state, or consequential actions are required.`
 
@@ -694,6 +696,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		nextWakeAt:             initialWake,
 		resumeWakeAt:           initialWake,
 		paceDurable:            opts.Pace != nil,
+		waitForEvents:          opts.Pace != nil && opts.Pace.WaitForEvents && initialWake.IsZero(),
 		wakeReason:             "startup",
 		model:                  initialModel,
 		agentModel:             initialModel,
@@ -1837,8 +1840,9 @@ func persistentThreadStateBase(thread *Thread) PersistentThread {
 		state.Reasoning = status.BaselineReasoning.String()
 		if status.PaceDurable {
 			state.Pace = &PersistentPaceState{
-				Sleep:      formatPaceDuration(status.Sleep),
-				NextWakeAt: status.NextWakeAt,
+				Sleep:         formatPaceDuration(status.Sleep),
+				NextWakeAt:    status.NextWakeAt,
+				WaitForEvents: status.WaitForEvents,
 			}
 		}
 		if !thread.IsRealtime && status.Provider != "" {
@@ -2069,6 +2073,9 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		persisted := persistentThreadState(thread)
 		persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
 		persisted.MCPNames = append([]string(nil), nextMCPNames...)
+		if result.DirectiveChanged && persisted.Pace != nil {
+			persisted.Pace.WaitForEvents = false
+		}
 		if err := tm.parent.config.SaveThread(persisted); err != nil {
 			tm.mu.Unlock()
 			return ThreadUpdateResult{}, fmt.Errorf("persist thread update: %w", err)
@@ -2080,6 +2087,10 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 	}
 	thread.Name = nextName
 	thread.Directive = nextDirective
+	if result.DirectiveChanged {
+		thread.Thinker.waitForEvents = false
+		thread.Thinker.publishRuntimeStatus()
+	}
 	thread.Tools = nextTools
 	thread.cachedToolNames = nil
 	thread.MCPNames = append([]string(nil), nextMCPNames...)

@@ -566,7 +566,7 @@ func TestToolResultWakePreservesPendingDeadlineAndExposesState(t *testing.T) {
 	}
 }
 
-func TestTimerWakeIsConsumedAndDoesNotInventRecurrence(t *testing.T) {
+func TestTimerWakeWithoutTimingGetsFiniteIdleFallback(t *testing.T) {
 	t.Chdir(t.TempDir())
 	cfg := &Config{
 		path:      filepath.Join(t.TempDir(), "config.json"),
@@ -612,8 +612,8 @@ func TestTimerWakeIsConsumedAndDoesNotInventRecurrence(t *testing.T) {
 	}
 	provider.release(1)
 	waitForPacingThinkDone(t, observer, "main")
-	if state := cfg.GetMainPace(); state == nil || !state.NextWakeAt.IsZero() {
-		t.Fatalf("timer completion invented another wake: %#v", state)
+	if state := cfg.GetMainPace(); state == nil || !state.NextWakeAt.After(time.Now()) || state.Sleep != "30m" {
+		t.Fatalf("timer completion did not install finite fallback: %#v", state)
 	}
 	select {
 	case call := <-provider.started:
@@ -685,8 +685,8 @@ func TestEventProcessingThatCrossesDeadlineImmediatelyDeliversTimerWake(t *testi
 	}
 	provider.release(2)
 	waitForPacingThinkDone(t, observer, "main")
-	if state := cfg.GetMainPace(); state == nil || !state.NextWakeAt.IsZero() {
-		t.Fatalf("completed timer wake was not consumed: %#v", state)
+	if state := cfg.GetMainPace(); state == nil || !state.NextWakeAt.After(time.Now()) || state.Sleep != "30m" {
+		t.Fatalf("completed timer wake did not rearm finite fallback: %#v", state)
 	}
 }
 
@@ -742,8 +742,8 @@ func TestDueTimerAndTaskEventAreDeliveredInOneTurn(t *testing.T) {
 	}
 	provider.release(1)
 	waitForPacingThinkDone(t, observer, "main")
-	if state := cfg.GetMainPace(); state == nil || !state.NextWakeAt.IsZero() {
-		t.Fatalf("combined turn did not consume timer: %#v", state)
+	if state := cfg.GetMainPace(); state == nil || !state.NextWakeAt.After(time.Now()) || state.Sleep != "30m" {
+		t.Fatalf("combined turn did not rearm finite fallback: %#v", state)
 	}
 }
 
