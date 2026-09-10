@@ -45,6 +45,7 @@ type RealtimeThinker struct {
 
 	sessionMu sync.RWMutex
 	rtSession RealtimeSession
+	recovery  realtimeRecovery
 
 	audioIn      <-chan []byte
 	audioOut     chan RealtimeAudioFrame
@@ -92,6 +93,7 @@ type realtimeToolBatch struct {
 	session      RealtimeSession
 	pending      int
 	responseDone bool
+	names        map[string]bool
 }
 
 func realtimeNativeToolsFor(thinker *Thinker, allowlist, scopes map[string]bool, record bool) []NativeTool {
@@ -162,6 +164,9 @@ func newRealtimeThinker(
 		toolMarkupTails: map[string]string{}, toolMarkupSuppressed: map[string]bool{},
 		terminalReason: "server_shutdown",
 	}
+	rt.recovery.wake = make(chan struct{}, 1)
+	rt.recovery.toolNames = map[string]bool{}
+	rt.recovery.blockedTools = map[string]bool{}
 	reasoning := thinker.agentReasoning.String()
 	if reasoning == "" || reasoning == "auto" {
 		if defaults, ok := provider.(realtimeReasoningDefaultProvider); ok {
@@ -253,23 +258,30 @@ func (rt *RealtimeThinker) replaceSession(next RealtimeSession) {
 		rt.responseActive = false
 		rt.responsePending = false
 		rt.responseMu.Unlock()
-		rt.toolBatchMu.Lock()
-		rt.toolBatches = map[string]*realtimeToolBatch{}
-		rt.toolCallBatches = map[string]string{}
-		rt.toolBatchMu.Unlock()
+		// In-flight tools keep their original session ownership until their
+		// result arrives. Recovery consumes those outcomes before reopening.
 		_ = previous.Close()
 	}
+	rt.wakeRecovery()
 }
 
 func (rt *RealtimeThinker) beginToolCall(event RealtimeEvent, session RealtimeSession) {
+	rt.recovery.Lock()
+	if event.ToolName != "" {
+		rt.recovery.toolNames[event.ToolName] = true
+	}
+	rt.recovery.Unlock()
 	batchID := event.ResponseID
 	rt.toolBatchMu.Lock()
 	batch := rt.toolBatches[batchID]
 	if batch == nil {
-		batch = &realtimeToolBatch{session: session}
+		batch = &realtimeToolBatch{session: session, names: map[string]bool{}}
 		rt.toolBatches[batchID] = batch
 	}
 	batch.pending++
+	if event.ToolName != "" {
+		batch.names[event.ToolName] = true
+	}
 	rt.toolCallBatches[event.ToolCallID] = batchID
 	rt.toolBatchMu.Unlock()
 }
@@ -288,10 +300,14 @@ func (rt *RealtimeThinker) completeToolCall(callID string) {
 				continueSession = batch.session
 				delete(rt.toolBatches, batchID)
 			}
+			if batch.pending == 0 && batch.session != rt.currentSession() {
+				delete(rt.toolBatches, batchID)
+			}
 		}
 	}
 	rt.toolBatchMu.Unlock()
-	if continueSession != nil {
+	rt.wakeRecovery()
+	if continueSession != nil && continueSession == rt.currentSession() {
 		rt.setConversationState("thinking", RealtimeEvent{})
 		_ = rt.requestProviderResponse(continueSession)
 	}
@@ -317,7 +333,7 @@ func (rt *RealtimeThinker) completeToolResponse(responseID string) bool {
 		}
 	}
 	rt.toolBatchMu.Unlock()
-	if continueSession != nil {
+	if continueSession != nil && continueSession == rt.currentSession() {
 		rt.setConversationState("thinking", RealtimeEvent{ResponseID: responseID})
 		_ = rt.requestProviderResponse(continueSession)
 	}
@@ -325,8 +341,26 @@ func (rt *RealtimeThinker) completeToolResponse(responseID string) bool {
 }
 
 func (rt *RealtimeThinker) submitToolResult(session RealtimeSession, callID, result string, isError bool) {
+	rt.toolBatchMu.Lock()
+	if batchID, ok := rt.toolCallBatches[callID]; ok {
+		if batch := rt.toolBatches[batchID]; batch != nil {
+			session = batch.session
+		}
+	}
+	rt.toolBatchMu.Unlock()
+	if session == nil || session != rt.currentSession() {
+		rt.completeToolCall(callID)
+		rt.recovery.Lock()
+		rt.recovery.want = true
+		rt.recovery.resume = nil
+		rt.recovery.Unlock()
+		rt.wakeRecovery()
+		return
+	}
 	if err := session.SendToolResult(callID, result, isError); err != nil {
 		logMsg("REALTIME", fmt.Sprintf("[%s] send tool result %s: %v", rt.threadID, callID, err))
+		rt.completeToolCall(callID)
+		rt.closeForRecovery(session, false, "tool_result_delivery_failed")
 		return
 	}
 	rt.completeToolCall(callID)
@@ -341,6 +375,9 @@ func (rt *RealtimeThinker) boundedTranscript() []Message {
 	}
 	eligible := make([]Message, 0, len(rt.messages)-start)
 	for _, msg := range rt.messages[start:] {
+		for _, result := range msg.ToolResults {
+			eligible = append(eligible, Message{Role: "user", Content: fmt.Sprintf("[Internal completed tool result. This operation already ran; do not repeat it.] %s (call %s): %s", result.ToolName, result.CallID, result.Content)})
+		}
 		if (msg.Role == "user" || msg.Role == "assistant") && strings.TrimSpace(msg.Content) != "" {
 			eligible = append(eligible, Message{Role: msg.Role, Content: msg.Content})
 		}
@@ -352,36 +389,69 @@ func (rt *RealtimeThinker) boundedTranscript() []Message {
 }
 
 func (rt *RealtimeThinker) openSession(restore bool) error {
-	rt.refreshCurrentTimeContext()
 	instructions, tools := rt.configurationSnapshot()
 	rt.transcriptMu.Lock()
 	rt.opts.Instructions, rt.opts.Tools = instructions, tools
 	opts := rt.opts
 	rt.transcriptMu.Unlock()
-	session, err := rt.provider.Open(rt.ctx, opts)
-	if err != nil {
-		return err
-	}
 	var history []Message
 	if restore {
 		history = rt.boundedTranscript()
 	}
-	// Called even for a new/empty session. Most providers treat this as a
-	// no-op; Gemini Live uses it to finish its initial history-seeding phase
-	// before accepting normal realtime input.
-	if err := session.RestoreConversation(history); err != nil {
-		_ = session.Close()
-		return fmt.Errorf("restore conversation: %w", err)
+	opts.RestoreHistory = len(history) > 0
+	rt.recovery.Lock()
+	previous := rt.recovery.resume
+	rt.recovery.resume = nil
+	rt.recovery.Unlock()
+	var session RealtimeSession
+	resumed := false
+	if resumer, ok := previous.(RealtimeSessionResumer); restore && ok {
+		var err error
+		session, err = resumer.Resume(rt.ctx, opts)
+		resumed = err == nil && session != nil
+		if err != nil && !errors.Is(err, ErrRealtimeResumeUnavailable) {
+			rt.emit("realtime.resume_failed", map[string]any{"error": err.Error(), "fallback": "fresh_session"})
+		}
 	}
+	if !resumed {
+		rt.refreshCurrentTimeContext()
+		opts.Instructions, opts.Tools = rt.configurationSnapshot()
+		var err error
+		session, err = rt.provider.Open(rt.ctx, opts)
+		if err != nil {
+			return err
+		}
+		if err := session.RestoreConversation(history); err != nil {
+			_ = session.Close()
+			return fmt.Errorf("restore conversation: %w", err)
+		}
+	}
+	rt.rememberConfiguration(opts.Instructions, opts.Tools)
 	rt.replaceSession(session)
+	rt.recovery.Lock()
+	rt.recovery.opened = time.Now()
+	continueTurn := rt.recovery.continueTurn && len(rt.recovery.input) == 0 && len(rt.recovery.audio) == 0
+	rt.recovery.continueTurn = false
+	rt.recovery.hadInput = false
+	rt.recovery.want = false
+	rt.recovery.deadline = time.Time{}
+	rt.recovery.Unlock()
 	rt.lifecycleMu.Lock()
 	rt.sessionGeneration++
 	generation := rt.sessionGeneration
 	rt.lifecycleMu.Unlock()
 	rt.emit("realtime.session_opened", map[string]any{
-		"generation": generation, "restored": restore,
+		"generation": generation, "restored": restore && !resumed, "resumed": resumed,
 	})
-	rt.requestInitialMessageIfNeeded()
+	if !resumed {
+		rt.requestInitialMessageIfNeeded()
+	}
+	if !resumed && continueTurn {
+		if err := rt.requestTextResponse("[Internal connection recovery] Finish the interrupted reply using the restored conversation and completed tool results. Do not repeat completed operations or a greeting. If there is no pending reply, wait silently."); err != nil {
+			rt.closeForRecovery(session, false, "recovery_continuation_failed")
+			return err
+		}
+	}
 	return nil
 }
 
@@ -480,6 +550,7 @@ func (rt *RealtimeThinker) audioBridgeConnected() {
 		rt.bridgeConnectedAt = time.Now()
 	}
 	rt.lifecycleMu.Unlock()
+	rt.wakeRecovery()
 	rt.requestInitialMessageIfNeeded()
 }
 
@@ -487,6 +558,10 @@ func (rt *RealtimeThinker) audioBridgeDisconnected() {
 	rt.lifecycleMu.Lock()
 	rt.bridgeConnected = false
 	rt.lifecycleMu.Unlock()
+	if ender, ok := rt.currentSession().(RealtimeInputEnder); ok {
+		_ = ender.EndAudioInput()
+	}
+	rt.wakeRecovery()
 }
 
 func (rt *RealtimeThinker) requestInitialMessageIfNeeded() {
@@ -583,7 +658,7 @@ func (rt *RealtimeThinker) setConversationState(state string, event RealtimeEven
 }
 
 func (rt *RealtimeThinker) requestProviderResponse(session RealtimeSession) error {
-	if session == nil {
+	if session == nil || session != rt.currentSession() {
 		return errors.New("realtime session unavailable")
 	}
 	rt.responseMu.Lock()
@@ -815,6 +890,7 @@ func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int) {
 		rt.playedMS = audioEndMS
 	}
 	rt.playbackTracked = true
+	rt.wakeRecovery()
 }
 
 func (rt *RealtimeThinker) discardQueuedOutput() (frames, bytes int) {
@@ -897,6 +973,14 @@ func (rt *RealtimeThinker) rendererPlaybackOverflow(itemID string) {
 // Run survives normal provider-enforced session endings. Only explicit thread
 // stop/cancellation ends the worker and invokes the normal cleanup path.
 func (rt *RealtimeThinker) Run() {
+	// Stop also cancels an Open/Resume currently waiting on the provider.
+	go func() {
+		select {
+		case <-rt.quit:
+			rt.cancel()
+		case <-rt.ctx.Done():
+		}
+	}()
 	defer func() {
 		rt.lifecycleMu.Lock()
 		terminalReason := rt.terminalReason
@@ -918,96 +1002,100 @@ func (rt *RealtimeThinker) Run() {
 		"turn_detection": rt.opts.TurnDetection.telemetryData(),
 	})
 	rt.setConversationState("listening", RealtimeEvent{})
-	reconnectDelay := realtimeReconnectMinDelay
 	catalogDirty := false
 	for {
-		// Keep the manifest for an in-flight provider response unchanged.
-		// Permissions are still checked against the current catalog at dispatch.
-		if catalogDirty && !rt.responseInProgress() {
+		if catalogDirty && !rt.responseInProgress() && !rt.pendingToolWork() {
 			catalogDirty = false
 			if _, err := rt.applyExternalConfigurationChange(true, "mcp_catalog_changed"); err != nil {
 				logMsg("REALTIME", fmt.Sprintf("[%s] refresh MCP catalog: %v", rt.threadID, err))
 			}
 		}
-		if rt.currentSession() == nil {
-			if err := rt.openSession(true); err != nil {
-				rt.lifecycleMu.Lock()
-				nextGeneration := rt.sessionGeneration + 1
-				reconnectReason := rt.pendingReconnectReason
-				reconnectPlanned := rt.pendingReconnectPlanned
-				rt.lifecycleMu.Unlock()
-				if reconnectReason == "" {
-					reconnectReason = "provider_session_closed"
-				}
-				rt.emit("realtime.reconnect", map[string]any{
-					"success": false, "error": err.Error(), "delay_ms": reconnectDelay.Milliseconds(),
-					"reason": reconnectReason, "planned": reconnectPlanned, "generation": nextGeneration,
-				})
-				select {
-				case <-rt.quit:
-					return
-				case <-rt.ctx.Done():
-					return
-				case <-time.After(reconnectDelay):
-				}
-				reconnectDelay = min(realtimeReconnectMaxDelay, reconnectDelay*2)
-				continue
-			}
-			rt.lifecycleMu.Lock()
-			generation := rt.sessionGeneration
-			reconnectReason := rt.pendingReconnectReason
-			reconnectPlanned := rt.pendingReconnectPlanned
-			rt.pendingReconnectReason = ""
-			rt.pendingReconnectPlanned = false
-			rt.lifecycleMu.Unlock()
-			if reconnectReason == "" {
-				reconnectReason = "provider_session_closed"
-			}
-			rt.emit("realtime.reconnect", map[string]any{
-				"success": true, "turn_detection": rt.opts.TurnDetection.telemetryData(),
-				"reason": reconnectReason, "planned": reconnectPlanned, "generation": generation,
-			})
-			reconnectDelay = realtimeReconnectMinDelay
-		}
-
 		session := rt.currentSession()
-		events := session.Events()
+		rt.recovery.Lock()
+		deadline := rt.recovery.deadline
+		rt.recovery.Unlock()
+		if session != nil && !deadline.IsZero() &&
+			((!rt.responseInProgress() && !rt.pendingToolWork() && rt.playbackSettled()) || !time.Now().Before(deadline)) {
+			rt.closeForRecovery(session, true, "provider_goaway")
+			session = nil
+		}
+		var retryAt time.Time
+		if session == nil && rt.needsSession() && !rt.pendingToolWork() {
+			rt.recovery.Lock()
+			retryAt = rt.recovery.retryAt
+			rt.recovery.Unlock()
+			if !time.Now().Before(retryAt) {
+				if err := rt.openSession(true); err != nil {
+					rt.recovery.Lock()
+					delay := rt.recovery.retry.failed()
+					rt.recovery.retryAt = time.Now().Add(delay)
+					rt.recovery.Unlock()
+					rt.emit("realtime.reconnect", map[string]any{"success": false, "error": err.Error(), "delay_ms": delay.Milliseconds()})
+					continue
+				}
+				rt.lifecycleMu.Lock()
+				generation, reason, planned := rt.sessionGeneration, rt.pendingReconnectReason, rt.pendingReconnectPlanned
+				rt.pendingReconnectReason, rt.pendingReconnectPlanned = "", false
+				rt.lifecycleMu.Unlock()
+				rt.emit("realtime.reconnect", map[string]any{"success": true, "generation": generation, "reason": reason, "planned": planned})
+				rt.flushRecoveryInput()
+				session = rt.currentSession()
+			}
+		}
+		if session == nil && !rt.needsSession() {
+			rt.setConversationState("waiting", RealtimeEvent{})
+		}
+		var events <-chan RealtimeEvent
+		if session != nil {
+			events = session.Events()
+		}
+		var timer *time.Timer
+		var tick <-chan time.Time
+		next := deadline
+		if session == nil {
+			next = retryAt
+		}
+		if !next.IsZero() && (session != nil || rt.needsSession() && !rt.pendingToolWork()) {
+			delay := time.Until(next)
+			if delay < 0 {
+				delay = 0
+			}
+			timer = time.NewTimer(delay)
+			tick = timer.C
+		}
 		select {
 		case event, ok := <-events:
 			if !ok {
-				logMsg("REALTIME", fmt.Sprintf("[%s] provider session closed; renewing", rt.threadID))
 				rt.lifecycleMu.Lock()
-				generation := rt.sessionGeneration
-				if rt.pendingReconnectReason == "" {
-					rt.pendingReconnectReason = "provider_session_closed"
-					rt.pendingReconnectPlanned = false
-				}
-				reconnectReason := rt.pendingReconnectReason
+				planned, reason := rt.pendingReconnectPlanned, rt.pendingReconnectReason
 				rt.lifecycleMu.Unlock()
-				rt.emit("realtime.session_closed", map[string]any{
-					"reason": reconnectReason, "generation": generation,
-				})
-				rt.replaceSession(nil)
-				continue
+				if reason == "" {
+					reason = "provider_session_closed"
+				}
+				rt.closeForRecovery(session, planned, reason)
+			} else {
+				rt.handleSessionEvent(event)
 			}
-			rt.handleSessionEvent(event)
-
+		case <-rt.recovery.wake:
+		case <-tick:
 		case <-rt.catalogChanges:
 			rt.catalogChanges = rt.toolIndex.Changes()
 			catalogDirty = true
-
 		case audio, ok := <-rt.audioIn:
 			if !ok {
 				rt.audioIn = nil
-				continue
+				break
 			}
-			if rt.paused {
-				continue
+			if rt.paused || len(audio) == 0 {
+				break
 			}
-			if err := session.SendAudio(audio); err != nil {
-				logMsg("REALTIME", fmt.Sprintf("[%s] send audio: %v", rt.threadID, err))
+			rt.recordRealtimeInput(len(audio))
+			if session == nil {
+				rt.queueRecoveryAudio(audio)
+			} else if err := session.SendAudio(audio); err != nil {
+				rt.queueRecoveryAudio(audio)
+				rt.closeForRecovery(session, false, "audio_delivery_failed")
 			}
-
 		case <-rt.sub.Wake:
 			for _, event := range rt.sub.DrainTargeted() {
 				if event.ToolGeneration != nil && *event.ToolGeneration != rt.toolGeneration.Load() {
@@ -1015,18 +1103,28 @@ func (rt *RealtimeThinker) Run() {
 				}
 				rt.handleBusEvent(event)
 			}
-
 		case paused := <-rt.pause:
 			rt.paused = paused
-			if paused {
+			if paused && session != nil {
 				_ = session.Interrupt()
+				if ender, ok := session.(RealtimeInputEnder); ok {
+					_ = ender.EndAudioInput()
+				}
 			}
 			rt.publishRuntimeStatus()
-
 		case <-rt.quit:
+			if timer != nil {
+				timer.Stop()
+			}
 			return
 		case <-rt.ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
 			return
+		}
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 }
@@ -1044,7 +1142,24 @@ func (rt *RealtimeThinker) appendTranscript(role, transcript string) {
 }
 
 func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
+	if event.Type == RealtimeEventAudioOut || event.Type == RealtimeEventTranscriptOutput {
+		if !event.Final {
+			rt.responseStarted()
+		}
+		rt.recovery.Lock()
+		rt.recovery.lastOutput = time.Now()
+		rt.recovery.outputBytes += uint64(len(event.Audio))
+		rt.recovery.Unlock()
+	}
 	switch event.Type {
+	case RealtimeEventSessionExpiring:
+		deadline := time.Now().Add(event.TimeLeft)
+		rt.recovery.Lock()
+		if rt.recovery.deadline.IsZero() || deadline.Before(rt.recovery.deadline) {
+			rt.recovery.deadline = deadline
+		}
+		rt.recovery.Unlock()
+		rt.emit("realtime.reconnect_planned", map[string]any{"reason": "provider_goaway", "planned": true, "time_left_ms": event.TimeLeft.Milliseconds()})
 	case RealtimeEventAudioOut:
 		if rt.paused {
 			return
@@ -1103,6 +1218,17 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 
 	case RealtimeEventTranscriptInput:
+		if strings.TrimSpace(event.Transcript) != "" {
+			rt.recovery.Lock()
+			newInput := event.ItemID != "" && event.ItemID != rt.recovery.inputItem
+			if newInput {
+				rt.recovery.inputItem = event.ItemID
+			}
+			rt.recovery.Unlock()
+			if newInput && (!event.Final || !rt.pendingToolWork() && !rt.responseInProgress()) {
+				rt.newRealtimeCallerTurn()
+			}
+		}
 		if event.Final && strings.TrimSpace(event.Transcript) != "" {
 			rt.resetToolMarkupTurn()
 			rt.appendTranscript("user", event.Transcript)
@@ -1118,6 +1244,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.setConversationState("thinking", event)
 
 	case RealtimeEventToolCall:
+		rt.responseStarted()
 		if rt.paused {
 			if session := rt.currentSession(); session != nil {
 				rt.beginToolCall(event, session)
@@ -1129,6 +1256,12 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.dispatchToolCall(event)
 
 	case RealtimeEventResponseDone:
+		rt.recovery.Lock()
+		if rt.recovery.hadInput {
+			rt.recovery.retry = realtimeRecoveryRetry{}
+			rt.recovery.retryAt = time.Time{}
+		}
+		rt.recovery.Unlock()
 		hadToolBatch := rt.completeToolResponse(event.ResponseID)
 		rt.responseFinished(rt.currentSession())
 		rt.finishToolMarkupResponse(event.ResponseID)
@@ -1166,6 +1299,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 			"dropped_audio_events": event.DroppedAudio,
 			"reason":               "provider_session_ended",
 			"generation":           generation,
+			"close_code":           event.CloseCode, "close_reason": event.CloseReason,
 		})
 	}
 }
@@ -1178,7 +1312,20 @@ func (rt *RealtimeThinker) dispatchToolCall(event RealtimeEvent) {
 	if session == nil {
 		return
 	}
+	rt.toolBatchMu.Lock()
+	_, duplicate := rt.toolCallBatches[event.ToolCallID]
+	rt.toolBatchMu.Unlock()
+	if duplicate {
+		return
+	}
+	rt.recovery.Lock()
+	blocked := rt.recovery.blockedTools[event.ToolName]
+	rt.recovery.Unlock()
 	rt.beginToolCall(event, session)
+	if blocked {
+		rt.submitToolResult(session, event.ToolCallID, "This tool already ran before connection recovery. Use the restored operation results; do not repeat it. Wait for a new caller instruction if further action is needed.", true)
+		return
+	}
 	if event.ToolName == "interrupt" {
 		if err := session.Interrupt(); err != nil {
 			rt.submitToolResult(session, event.ToolCallID, "interrupt failed: "+err.Error(), true)
@@ -1200,6 +1347,7 @@ func (rt *RealtimeThinker) dispatchToolCall(event RealtimeEvent) {
 		Tool: call.Name, CallID: call.NativeID,
 		Summary: toolSummary(call.Name, call.Args), Args: call.Args,
 	}) {
+		rt.submitToolResult(session, call.NativeID, "tool execution was not authorized", true)
 		return
 	}
 	callMessage := Message{Role: "assistant", ToolCalls: []NativeToolCall{{
@@ -1274,10 +1422,13 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	}
 	rt.Thinker.addEventExecutions(event.ExecutionIDs)
 	session := rt.currentSession()
-	if session == nil {
-		return
-	}
 	if event.ToolResult != nil {
+		rt.toolBatchMu.Lock()
+		_, known := rt.toolCallBatches[event.ToolResult.CallID]
+		rt.toolBatchMu.Unlock()
+		if !known {
+			return
+		} // Duplicate/stale completions never target a new socket.
 		message := rt.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{*event.ToolResult}})
 		rt.transcriptMu.Lock()
 		rt.messages = append(rt.messages, message)
@@ -1296,12 +1447,34 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	if strings.TrimSpace(note) == "" {
 		return
 	}
-	if err := rt.requestTextResponse(note); err != nil {
-		logMsg("REALTIME", fmt.Sprintf("[%s] inject text: %v", rt.threadID, err))
+	if session == nil {
+		rt.recovery.Lock()
+		rt.recovery.input = append(rt.recovery.input, event)
+		rt.recovery.want = true
+		rt.recovery.Unlock()
+		rt.wakeRecovery()
 		return
 	}
-	if event.ID != "" {
+	if err := session.SendText("user", note); err != nil {
+		logMsg("REALTIME", fmt.Sprintf("[%s] inject text: %v", rt.threadID, err))
+		rt.recovery.Lock()
+		rt.recovery.input = append(rt.recovery.input, event)
+		rt.recovery.want = true
+		rt.recovery.Unlock()
+		rt.closeForRecovery(session, false, "text_delivery_failed")
+		return
+	}
+	rt.recordRealtimeInput(0)
+	if event.From == "" || event.From == "api" || event.From == "tui" || event.From == "user" {
+		rt.newRealtimeCallerTurn()
+	}
+	rt.setConversationState("thinking", RealtimeEvent{})
+	responseErr := rt.requestProviderResponse(session)
+	{
 		message := Message{Role: "user", Content: note, EventIDs: []string{event.ID}}
+		if event.ID == "" {
+			message.EventIDs = nil
+		}
 		rt.transcriptMu.Lock()
 		rt.messages = append(rt.messages, message)
 		rt.publishContextStatus()
@@ -1314,11 +1487,14 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 				persisted = true
 			}
 		}
-		if persisted && rt.Thinker.ackInboxEvents != nil {
+		if event.ID != "" && persisted && rt.Thinker.ackInboxEvents != nil {
 			if err := rt.Thinker.ackInboxEvents([]string{event.ID}); err != nil {
 				logMsg("SESSION", fmt.Sprintf("[%s] acknowledge realtime inbox event: %v", rt.threadID, err))
 			}
 		}
+	}
+	if responseErr != nil {
+		rt.closeForRecovery(session, false, "response_request_failed")
 	}
 }
 

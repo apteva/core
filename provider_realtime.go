@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // RealtimeProvider is the parallel of LLMProvider for bidirectional,
@@ -237,6 +239,9 @@ type RealtimeSessionOpts struct {
 	TranscribeInput    bool
 	TranscriptionModel string // empty = provider default
 	TurnDetection      RealtimeTurnDetectionConfig
+	// RestoreHistory asks immutable providers to accept an initial history seed.
+	// Fresh sessions must not synthesize an empty completed conversation turn.
+	RestoreHistory bool
 }
 
 // RealtimePricing supports dollars per one million tokens plus optional
@@ -359,6 +364,20 @@ type RealtimeConfigurationPreviewer interface {
 	PreviewConfigurationUpdate(instructions string, tools []NativeTool) RealtimeConfigurationDisposition
 }
 
+// RealtimeSessionResumer is an optional provider capability. The opaque
+// checkpoint stays in the adapter, never in telemetry or persisted config.
+// Resume must reject an unsafe checkpoint or incompatible options.
+type RealtimeSessionResumer interface {
+	Resume(context.Context, RealtimeSessionOpts) (RealtimeSession, error)
+}
+
+// RealtimeInputEnder distinguishes a stopped microphone from quiet PCM input.
+type RealtimeInputEnder interface {
+	EndAudioInput() error
+}
+
+var ErrRealtimeResumeUnavailable = errors.New("realtime resumption unavailable")
+
 // RealtimeEventType discriminates the union of events a session can
 // emit. Receivers should switch on Type before reading fields.
 type RealtimeEventType string
@@ -375,6 +394,7 @@ const (
 	RealtimeEventSessionEnded     RealtimeEventType = "session_ended"
 	RealtimeEventOutputBlocked    RealtimeEventType = "output_blocked"
 	RealtimeEventError            RealtimeEventType = "error"
+	RealtimeEventSessionExpiring  RealtimeEventType = "session_expiring"
 )
 
 // RealtimeEvent is a single event from a session. Only the fields
@@ -407,4 +427,8 @@ type RealtimeEvent struct {
 
 	// Error (RealtimeEventError)
 	Err error
+	// Lifecycle metadata contains no provider credentials or resumption handles.
+	TimeLeft    time.Duration
+	CloseCode   int
+	CloseReason string
 }
