@@ -603,7 +603,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 		preview = preview[:200] + "..."
 	}
 	logMsg("GEMINI", fmt.Sprintf("done tokens_in=%d tokens_out=%d len=%d tools=%d response=%q", usage.PromptTokens, usage.CompletionTokens, len(response), len(toolCalls), preview))
-	return ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage}, nil
+	return validateProviderToolOutput(ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage})
 }
 
 // audioMimeTypes maps file extensions to MIME types for audio.

@@ -252,7 +252,7 @@ func toOpenAIMessages(messages []Message) []any {
 		if len(m.ToolCalls) > 0 {
 			toolCalls := make([]map[string]any, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
-				argsJSON, _ := json.Marshal(tc.Args)
+				argsJSON := toolCallArguments(tc)
 				toolCalls[i] = map[string]any{
 					"id":   tc.ID,
 					"type": "function",
@@ -660,13 +660,13 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 
 	timing.CompletionMs = elapsedMs()
 	timing.TerminalPhase = "completed"
-	return ChatResponse{
+	return validateProviderToolOutput(ChatResponse{
 		Text:           full.String(),
 		Reasoning:      fullReasoning.String(),
 		ToolCalls:      toolCalls,
 		Usage:          usage,
 		ProviderTiming: timing,
-	}, nil
+	})
 }
 
 // --- Factory functions ---

@@ -190,33 +190,55 @@ func (tm *ThreadManager) QueueEvents(id string, incoming []PersistentThreadEvent
 	}
 	owner, _ := tm.findManagedThread(id)
 	if owner == nil {
-		return result, fmt.Errorf("thread %q not found", id)
+		return result, &threadNotFoundError{id: id}
 	}
 	owner.mu.RLock()
 	thread := owner.threads[id]
 	if thread == nil {
 		owner.mu.RUnlock()
-		return result, fmt.Errorf("thread %q not found", id)
+		return result, &threadNotFoundError{id: id}
 	}
 	thread.inboxMu.Lock()
-	if err := validateInboxCapacity(thread.inboxEvents, incoming); err != nil {
+	next, acceptedEvents, result, err := stageThreadEvents(thread, incoming)
+	if err != nil {
 		thread.inboxMu.Unlock()
 		owner.mu.RUnlock()
-		return result, err
+		return ThreadEventQueueResult{}, err
+	}
+
+	if len(acceptedEvents) > 0 && !thread.Ephemeral {
+		state := persistentThreadStateBase(thread)
+		state.Events = clonePersistentThreadEvents(next)
+		if err := tm.parent.config.saveThreadAndRegisterEventExecutions(state, acceptedEvents); err != nil {
+			thread.inboxMu.Unlock()
+			owner.mu.RUnlock()
+			return ThreadEventQueueResult{}, fmt.Errorf("persist thread events: %w", err)
+		}
+	}
+	thread.inboxEvents = next
+	thread.inboxMu.Unlock()
+	owner.mu.RUnlock()
+
+	publishThreadInboxEvents(tm.parent.bus, id, acceptedEvents)
+	return result, nil
+}
+
+// stageThreadEvents validates and deduplicates without changing live or durable
+// state. Callers hold inboxMu and the owning manager lock until commit.
+func stageThreadEvents(thread *Thread, incoming []PersistentThreadEvent) ([]PersistentThreadEvent, []PersistentThreadEvent, ThreadEventQueueResult, error) {
+	var result ThreadEventQueueResult
+	if err := validateInboxCapacity(thread.inboxEvents, incoming); err != nil {
+		return nil, nil, result, err
 	}
 	for _, event := range incoming {
 		if event.TrackLifecycle && thread.Ephemeral {
-			thread.inboxMu.Unlock()
-			owner.mu.RUnlock()
-			return result, &ThreadEventValidationError{Message: "lifecycle tracking requires a durable thread; ephemeral threads cannot retain execution state across restart"}
+			return nil, nil, result, &ThreadEventValidationError{Message: "lifecycle tracking requires a durable thread; ephemeral threads cannot retain execution state across restart"}
 		}
 	}
 	if thread.IsRealtime {
 		for _, event := range incoming {
 			if len(event.Parts) > 0 {
-				thread.inboxMu.Unlock()
-				owner.mu.RUnlock()
-				return result, &ThreadEventValidationError{Message: "multimodal events are not supported for realtime threads; send text or use the audio bridge"}
+				return nil, nil, result, &ThreadEventValidationError{Message: "multimodal events are not supported for realtime threads; send text or use the audio bridge"}
 			}
 		}
 	}
@@ -230,30 +252,25 @@ func (tm *ThreadManager) QueueEvents(id string, incoming []PersistentThreadEvent
 	batch := map[string]string{}
 	for _, event := range incoming {
 		if hash, ok := existing[event.ID]; ok && hash != event.Hash {
-			thread.inboxMu.Unlock()
-			owner.mu.RUnlock()
-			return result, &ThreadEventConflictError{ID: event.ID}
+			return nil, nil, result, &ThreadEventConflictError{ID: event.ID}
 		}
 		if persisted, ok := existingEvents[event.ID]; ok && persisted.TrackLifecycle != event.TrackLifecycle {
-			thread.inboxMu.Unlock()
-			owner.mu.RUnlock()
-			return result, &ThreadEventConflictError{ID: event.ID}
+			return nil, nil, result, &ThreadEventConflictError{ID: event.ID}
 		}
 		if hash, ok := batch[event.ID]; ok && hash != event.Hash {
-			thread.inboxMu.Unlock()
-			owner.mu.RUnlock()
-			return result, &ThreadEventConflictError{ID: event.ID}
+			return nil, nil, result, &ThreadEventConflictError{ID: event.ID}
 		}
 		batch[event.ID] = event.Hash
 	}
 
-	before := clonePersistentThreadEvents(thread.inboxEvents)
+	next := clonePersistentThreadEvents(thread.inboxEvents)
+	incoming = clonePersistentThreadEvents(incoming)
 	prepareTrackedEventExecutions(incoming)
 	acceptedEvents := make([]PersistentThreadEvent, 0, len(incoming))
 	for _, event := range incoming {
 		if _, ok := existing[event.ID]; ok {
 			result.Duplicate = append(result.Duplicate, event.ID)
-			for _, persisted := range thread.inboxEvents {
+			for _, persisted := range next {
 				if persisted.ID == event.ID && persisted.ExecutionID != "" {
 					if result.Executions == nil {
 						result.Executions = map[string]string{}
@@ -266,7 +283,7 @@ func (tm *ThreadManager) QueueEvents(id string, incoming []PersistentThreadEvent
 		}
 		event.Consumed = false
 		event.Parts = cloneContentParts(event.Parts)
-		thread.inboxEvents = append(thread.inboxEvents, event)
+		next = append(next, event)
 		existing[event.ID] = event.Hash
 		acceptedEvents = append(acceptedEvents, event)
 		result.Accepted = append(result.Accepted, event.ID)
@@ -278,21 +295,7 @@ func (tm *ThreadManager) QueueEvents(id string, incoming []PersistentThreadEvent
 		}
 	}
 
-	if len(acceptedEvents) > 0 && !thread.Ephemeral {
-		state := persistentThreadStateBase(thread)
-		state.Events = clonePersistentThreadEvents(thread.inboxEvents)
-		if err := tm.parent.config.saveThreadAndRegisterEventExecutions(state, acceptedEvents); err != nil {
-			thread.inboxEvents = before
-			thread.inboxMu.Unlock()
-			owner.mu.RUnlock()
-			return ThreadEventQueueResult{}, fmt.Errorf("persist thread events: %w", err)
-		}
-	}
-	thread.inboxMu.Unlock()
-	owner.mu.RUnlock()
-
-	publishThreadInboxEvents(tm.parent.bus, id, acceptedEvents)
-	return result, nil
+	return next, acceptedEvents, result, nil
 }
 
 // QueueMainEvents gives main the same durable/idempotent inbox contract as

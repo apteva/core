@@ -256,6 +256,9 @@ func (s *Session) archiveEntriesForDurability(entries []SessionEntry) ([]Session
 
 // AppendMessage is a convenience to append a Message as a SessionEntry.
 func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) error {
+	if err := validateToolHistory([]Message{msg}); err != nil {
+		return err
+	}
 	entry := SessionEntry{
 		Timestamp:     time.Now(),
 		Role:          msg.Role,
@@ -464,25 +467,23 @@ func sanitizeToolPairs(messages []Message, pendingIDs ...map[string]bool) []Mess
 	if len(pendingIDs) > 0 && pendingIDs[0] != nil {
 		pending = pendingIDs[0]
 	}
-	toolUseIDs := make(map[string]bool)
-	toolResultIDs := make(map[string]bool)
-	for _, m := range messages {
-		for _, tc := range m.ToolCalls {
-			toolUseIDs[tc.ID] = true
-		}
-		for _, tr := range m.ToolResults {
-			toolResultIDs[tr.CallID] = true
+	messages, _ = projectMalformedToolHistory(messages)
+	pairedCalls, pairedResults := matchToolPairs(messages)
+	latest := map[string]toolPosition{}
+	for i, m := range messages {
+		for j, call := range m.ToolCalls {
+			latest[call.ID] = toolPosition{i, j}
 		}
 	}
 
 	var result []Message
 	removed := 0
-	for _, m := range messages {
-		// Drop orphaned tool_results (no matching tool_use anywhere).
+	for i, m := range messages {
+		// Drop results without a preceding unmatched call occurrence.
 		if len(m.ToolResults) > 0 {
 			var valid []ToolResult
-			for _, tr := range m.ToolResults {
-				if toolUseIDs[tr.CallID] {
+			for j, tr := range m.ToolResults {
+				if _, paired := pairedResults[toolPosition{i, j}]; paired {
 					valid = append(valid, tr)
 				}
 			}
@@ -496,8 +497,10 @@ func sanitizeToolPairs(messages []Message, pendingIDs ...map[string]bool) []Mess
 		// Drop orphaned tool_uses (no matching tool_result + not pending).
 		if len(m.ToolCalls) > 0 && m.Role == "assistant" {
 			var valid []NativeToolCall
-			for _, tc := range m.ToolCalls {
-				if toolResultIDs[tc.ID] || pending[tc.ID] {
+			for j, tc := range m.ToolCalls {
+				position := toolPosition{i, j}
+				_, paired := pairedCalls[position]
+				if paired || (pending[tc.ID] && latest[tc.ID] == position) {
 					valid = append(valid, tc)
 				}
 			}

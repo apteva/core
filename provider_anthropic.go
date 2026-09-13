@@ -290,11 +290,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
 			}
 			for _, tc := range m.ToolCalls {
-				input := map[string]any{}
-				for k, v := range tc.Args {
-					input[k] = v
-				}
-				inputJSON, _ := json.Marshal(input)
+				inputJSON := toolCallArguments(tc)
 				blocks = append(blocks, anthropicContentBlock{
 					Type:  "tool_use",
 					ID:    sanitizeToolID(tc.ID),
@@ -611,12 +607,12 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	if !completedStream {
 		return ChatResponse{}, fmt.Errorf("Anthropic stream ended before message_stop")
 	}
-	return ChatResponse{
+	return validateProviderToolOutput(ChatResponse{
 		Text:          full.String(),
 		ToolCalls:     toolCalls,
 		ServerResults: serverResults,
 		Usage:         usage,
-	}, nil
+	})
 }
 
 // toAnthropicBlocks converts our ContentParts to Anthropic content blocks.

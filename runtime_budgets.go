@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -49,6 +50,10 @@ func (t *Thinker) acquireExecutionBudget(ctx context.Context) (func(), error) {
 func permanentProviderError(err error) bool {
 	if err == nil {
 		return false
+	}
+	var invalid *toolNameError
+	if errors.As(err, &invalid) {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	for _, code := range []string{"api error 400:", "api error 401:", "api error 403:", "api error 404:", "api error 422:", "invalid_api_key", "invalid api key"} {

@@ -609,7 +609,7 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			}
 			// Then add each tool call as its original output item
 			for _, tc := range m.ToolCalls {
-				argsJSON, _ := json.Marshal(tc.Args)
+				argsJSON := toolCallArguments(tc)
 				items = append(items, oaiInputItem{
 					Type:      "function_call",
 					CallID:    tc.ID,
@@ -926,13 +926,13 @@ streamLoop:
 			Items:    providerItems,
 		}
 	}
-	return ChatResponse{
+	return validateProviderToolOutput(ChatResponse{
 		Text:          response,
 		ToolCalls:     toolCalls,
 		Reasoning:     fullReasoning.String(),
 		ProviderState: providerState,
 		Usage:         usage,
-	}, nil
+	})
 }
 
 func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {

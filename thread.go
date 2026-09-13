@@ -176,6 +176,7 @@ const threadDirectivePersistencePrompt = `
 - For authority-based changes, copy the parent's durable intent without adding operational details they did not state. Patch only the relevant Markdown section, remove obsolete conflicts, and call evolve once for one authoritative instruction. If evolve rejects the arguments, correct them and retry once; a rejected call did not persist the instruction.`
 
 type ThreadInfo struct {
+	Inference       InferenceHealth
 	ID              string
 	Name            string // human-readable display label; empty = render id
 	System          bool   // platform-managed; hidden from and immutable by agent tools
@@ -203,6 +204,7 @@ type ThreadInfo struct {
 }
 
 type Thread struct {
+	profileUpdateMu sync.Mutex // serializes profile reconciliation through event acceptance
 	cachedToolNames []string
 	ID              string
 	Name            string // human-readable label, separate from ID. ID is immutable;
@@ -1655,6 +1657,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			subCount = t.Children.Count()
 		}
 		infos = append(infos, ThreadInfo{
+			Inference:       t.Thinker.inferenceSnapshot(),
 			ID:              t.ID,
 			Name:            t.Name,
 			System:          t.System,
@@ -1931,6 +1934,7 @@ type ThreadUpdateOptions struct {
 }
 
 type ThreadUpdateResult struct {
+	Events            ThreadEventQueueResult
 	Changed           bool
 	NameChanged       bool
 	DirectiveChanged  bool
@@ -1993,28 +1997,62 @@ func (tm *ThreadManager) Update(id, name, directive string, tools []string) erro
 }
 
 func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []string, opts ThreadUpdateOptions) (ThreadUpdateResult, error) {
+	return tm.UpdateWithEvents(id, name, directive, tools, opts, nil)
+}
+
+// UpdateWithEvents coordinates profile reconciliation with event acceptance.
+// No-op profiles retain the advisory semantics of QueueEvents. Changed profiles
+// publish their committed events inside the mutation, before its acknowledgement
+// releases either the caller or the thinker's next iteration.
+func (tm *ThreadManager) UpdateWithEvents(id, name, directive string, tools []string, opts ThreadUpdateOptions, incoming []PersistentThreadEvent) (ThreadUpdateResult, error) {
 	owner, thread := tm.findManagedThread(id)
 	if owner == nil {
-		return ThreadUpdateResult{}, fmt.Errorf("thread %q not found", id)
+		return ThreadUpdateResult{}, &threadNotFoundError{id: id}
+	}
+	thread.profileUpdateMu.Lock()
+	defer thread.profileUpdateMu.Unlock()
+	owner.mu.RLock()
+	if owner.threads[id] != thread {
+		owner.mu.RUnlock()
+		return ThreadUpdateResult{}, &threadNotFoundError{id: id}
+	}
+	plan := planThreadProfile(thread, name, directive, tools, opts)
+	owner.mu.RUnlock()
+	if !plan.result.Changed {
+		events, err := owner.QueueEvents(id, incoming)
+		plan.result.Events = events
+		return plan.result, err
+	}
+	// Reject invalid/conflicting events before canceling any inference. Repeat
+	// staging at commit because independent event deliveries may race this check.
+	owner.mu.RLock()
+	thread.inboxMu.Lock()
+	_, _, _, validationErr := stageThreadEvents(thread, incoming)
+	thread.inboxMu.Unlock()
+	owner.mu.RUnlock()
+	if validationErr != nil {
+		return ThreadUpdateResult{}, validationErr
 	}
 	var result ThreadUpdateResult
 	err := thread.Thinker.mutateRuntime(func() error {
 		var err error
-		result, err = owner.updateWithOptsNow(id, name, directive, tools, opts)
+		result, err = owner.updateWithOptsNow(id, name, directive, tools, opts, incoming)
 		return err
 	})
 	return result, err
 }
-func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []string, opts ThreadUpdateOptions) (ThreadUpdateResult, error) {
-	var result ThreadUpdateResult
-	tm.mu.Lock()
-	tm.order = nil
-	thread, exists := tm.threads[id]
-	if !exists {
-		tm.mu.Unlock()
-		return result, fmt.Errorf("thread %q not found", id)
-	}
 
+type threadProfileUpdate struct {
+	result          ThreadUpdateResult
+	name, directive string
+	tools           map[string]bool
+	mcp             []string
+}
+
+// planThreadProfile uses the same normalization for preflight and commit.
+// The caller holds the owning manager's lock.
+func planThreadProfile(thread *Thread, name, directive string, tools []string, opts ThreadUpdateOptions) threadProfileUpdate {
+	var result ThreadUpdateResult
 	nextName := thread.Name
 	if name != "" {
 		nextName = name
@@ -2048,9 +2086,28 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 	}
 	result.MCPChanged = !sameStringSliceSet(nextMCPNames, thread.MCPNames)
 	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged || result.MCPChanged
+	return threadProfileUpdate{result: result, name: nextName, directive: nextDirective, tools: nextTools, mcp: nextMCPNames}
+}
+
+func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []string, opts ThreadUpdateOptions, incoming []PersistentThreadEvent) (ThreadUpdateResult, error) {
+	var result ThreadUpdateResult
+	tm.mu.Lock()
+	tm.order = nil
+	thread, exists := tm.threads[id]
+	if !exists {
+		tm.mu.Unlock()
+		return result, &threadNotFoundError{id: id}
+	}
+
+	plan := planThreadProfile(thread, name, directive, tools, opts)
+	result = plan.result
+	nextName, nextDirective, nextTools, nextMCPNames := plan.name, plan.directive, plan.tools, plan.mcp
+
 	if !result.Changed {
 		tm.mu.Unlock()
-		return result, nil
+		var err error
+		result.Events, err = tm.QueueEvents(id, incoming)
+		return result, err
 	}
 
 	nextScopes := make(map[string]bool, len(nextMCPNames))
@@ -2069,18 +2126,30 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		}
 	}
 
+	thread.inboxMu.Lock()
+	nextEvents, acceptedEvents, receipt, err := stageThreadEvents(thread, incoming)
+	if err != nil {
+		thread.inboxMu.Unlock()
+		tm.mu.Unlock()
+		return ThreadUpdateResult{}, err
+	}
 	if !thread.Ephemeral {
-		persisted := persistentThreadState(thread)
+		persisted := persistentThreadStateBase(thread)
 		persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
 		persisted.MCPNames = append([]string(nil), nextMCPNames...)
+		persisted.Events = clonePersistentThreadEvents(nextEvents)
 		if result.DirectiveChanged && persisted.Pace != nil {
 			persisted.Pace.WaitForEvents = false
 		}
-		if err := tm.parent.config.SaveThread(persisted); err != nil {
+		if err := tm.parent.config.saveThreadProfileAndEvents(persisted, acceptedEvents); err != nil {
+			thread.inboxMu.Unlock()
 			tm.mu.Unlock()
 			return ThreadUpdateResult{}, fmt.Errorf("persist thread update: %w", err)
 		}
 	}
+	thread.inboxEvents = nextEvents
+	thread.inboxMu.Unlock()
+	result.Events = receipt
 
 	if realtime != nil {
 		realtime.transcriptMu.Lock()
@@ -2125,6 +2194,7 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		realtime.transcriptMu.Unlock()
 	}
 	tm.mu.Unlock()
+	publishThreadInboxEvents(tm.parent.bus, id, acceptedEvents)
 
 	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged || result.MCPChanged) {
 		restarted, err := realtime.applyExternalConfigurationChange(opts.RestartRealtime || !bridgeConnected, "parent_configuration_update")

@@ -794,6 +794,8 @@ type APIEvent struct {
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 type Thinker struct {
+	inferenceMu      sync.Mutex
+	inferenceHealth  InferenceHealth
 	shuttingDown     atomic.Bool
 	compactionActive atomic.Bool
 	mutationMu       sync.Mutex
@@ -3344,6 +3346,10 @@ func (t *Thinker) toolCallIDsProtectedFromSanitization(extra []toolCall) map[str
 }
 
 func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMProvider, messages []Message) (ChatResponse, error) {
+	messages, _ = projectMalformedToolHistory(messages)
+	if err := validateToolHistory(messages); err != nil {
+		return ChatResponse{}, err
+	}
 	if provider == nil {
 		return ChatResponse{}, fmt.Errorf("no provider configured")
 	}
@@ -3442,6 +3448,9 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	}
 	defer releaseBudget()
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
+	if err == nil {
+		resp, err = validateProviderToolOutput(resp)
+	}
 	resp.Provider = provider.Name()
 	resp.Model = modelID
 	if resp.RequestedReasoningEffort == "" {
@@ -3468,7 +3477,12 @@ func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 	return t.callLLMWithRetryMessages(ctx, t.messages)
 }
 
-func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Message) (ChatResponse, error) {
+func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Message) (response ChatResponse, inferenceErr error) {
+	defer func() { t.recordInferenceOutcome(inferenceErr) }()
+	messages, _ = projectMalformedToolHistory(messages)
+	if err := validateToolHistory(messages); err != nil {
+		return ChatResponse{}, err
+	}
 	ctx, cancelBudget := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancelBudget()
 	attempt := 0
@@ -3479,6 +3493,9 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 		resp, nextMessages, err := t.callProviderWithContextRecovery(ctx, primary, messages)
 		messages = nextMessages
 		primaryErr := err
+		if isInvalidToolHistory(err) {
+			return resp, err
+		}
 		if err != nil && t.telemetry != nil {
 			t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": resp.Provider, "model": resp.Model, "error": err.Error(), "role": "primary", "iteration": t.iteration})
 		}
@@ -3510,6 +3527,9 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": modelIDForProvider(fallback, t.model), "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
 						}
 					}
+				}
+				if isInvalidToolHistory(fallbackErr) {
+					return fallbackResp, fallbackErr
 				}
 				if fallbackErr == nil {
 					if count := consumeTransientAttachments(t.messages); count > 0 {

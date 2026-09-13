@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,7 +91,7 @@ func TestCodexAPIThreadStartsWithIdempotentEventSmoke(t *testing.T) {
 			"",
 			"# Workflow",
 			"- When the event containing 'Codex event payload 7F31' arrives, call thread_event_probe exactly once with that exact text.",
-			"- Wait for its real result. After success, reply exactly THREAD_EVENT_CODEX_OK, then wait for future events.",
+			"- Wait for its real result. After success, call pace(clear_wake=true) and wait for future events.",
 		}, "\n"),
 		"tools": []string{"thread_event_probe"},
 		"events": []any{map[string]any{
@@ -113,29 +112,27 @@ func TestCodexAPIThreadStartsWithIdempotentEventSmoke(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(150 * time.Second)
-	sawFinal := false
+	settled := false
 	for time.Now().Before(deadline) {
 		if probeCalls.Load() > 1 {
 			t.Fatalf("Codex repeated event tool call: %d", probeCalls.Load())
 		}
-		events, _ := thinker.telemetry.StoredEvents(0)
-		for _, event := range events {
-			if event.ThreadID != "codex-event-thread" || event.Type != "llm.done" {
-				continue
-			}
-			var data LLMDoneData
-			if json.Unmarshal(event.Data, &data) == nil && strings.Contains(data.Message, "THREAD_EVENT_CODEX_OK") {
-				sawFinal = true
+		// Settling is the delivery contract. An exact prose acknowledgement
+		// is stochastic and is not required for a successfully handled event.
+		for _, transition := range thinker.eventLifecycle.PendingTransitions() {
+			if transition.ExecutionID == executionID && transition.Type == eventSettled {
+				settled = true
 				break
 			}
 		}
-		if probeCalls.Load() == 1 && sawFinal {
+		if probeCalls.Load() == 1 && settled {
 			break
 		}
+
 		time.Sleep(100 * time.Millisecond)
 	}
-	if probeCalls.Load() != 1 || !sawFinal {
-		t.Fatalf("Codex workflow incomplete: probe_calls=%d final=%v", probeCalls.Load(), sawFinal)
+	if probeCalls.Load() != 1 || !settled {
+		t.Fatalf("Codex workflow incomplete: probe_calls=%d settled=%v", probeCalls.Load(), settled)
 	}
 	if text, _ := probeText.Load().(string); text != eventText {
 		t.Fatalf("probe text=%q want %q", text, eventText)
