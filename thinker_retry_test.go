@@ -244,6 +244,18 @@ func TestCallLLMWithRetryFallbackDoesNotBecomePermanent(t *testing.T) {
 	}
 }
 
+func TestPinnedExperimentDisablesFallback(t *testing.T) {
+	primary := &scriptedRetryProvider{name: "primary", failures: 100, failureErr: errors.New("API error 400: invalid model")}
+	fallback := &scriptedRetryProvider{name: "fallback", response: ChatResponse{Text: "wrong model"}}
+	thinker := retryTestThinker(primary)
+	thinker.config = &Config{DisableProviderFallback: true}
+	thinker.pool = &ProviderPool{providers: map[string]LLMProvider{"primary": primary, "fallback": fallback}, order: []string{"primary", "fallback"}, default_: "primary"}
+	_, err := thinker.callLLMWithRetry(context.Background())
+	if err == nil || fallback.calls != 0 {
+		t.Fatalf("err=%v fallback calls=%d", err, fallback.calls)
+	}
+}
+
 func TestStopCancelsInFlightProviderCall(t *testing.T) {
 	provider := &scriptedRetryProvider{name: "blocking", block: true, started: make(chan struct{})}
 	thinker := retryTestThinker(provider)

@@ -3478,6 +3478,7 @@ func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 }
 
 func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Message) (response ChatResponse, inferenceErr error) {
+	ctx = t.providerSessionContext(ctx, "inference")
 	defer func() { t.recordInferenceOutcome(inferenceErr) }()
 	messages, _ = projectMalformedToolHistory(messages)
 	if err := validateToolHistory(messages); err != nil {
@@ -3512,7 +3513,7 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 			logMsg("ATTACHMENT", fmt.Sprintf("[%s] quarantined %d rejected attachments; retrying prepared turn without them", t.threadID, count))
 			continue
 		}
-		if err != nil && !isContextLengthError(err) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
+		if err != nil && !isContextLengthError(err) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 && !t.config.ProviderFallbackDisabled() {
 			if fallback := t.pool.Fallback(primary.Name()); fallback != nil {
 				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), err, fallback.Name()))
 				fallbackErr := permanentFallbacks[fallback.Name()]
@@ -3999,6 +4000,7 @@ func (t *Thinker) summarizePersistentSession(text string) (string, error) {
 		{Role: "user", Content: "Older persisted history to summarize:\n\n" + text},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), semanticCompactionTimeout)
+	ctx = t.providerSessionContext(ctx, "session-compaction")
 	defer cancel()
 	ctx = withOpenAIPromptCacheScope(ctx, openAIPromptCacheScope{
 		Identity: t.promptCacheIdentity() + "/session-compaction",

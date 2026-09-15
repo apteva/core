@@ -1251,28 +1251,30 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSON(w, map[string]any{
-			"directive":             a.thinker.config.GetDirective(),
-			"provider":              providerInfo,
-			"providers":             a.thinker.config.GetProviders(),
-			"mcp_servers":           mcpInfo,
-			"execution_control":     a.thinker.executionStatus(),
-			"execution_checkpoints": a.thinker.executionCheckpointMeta(),
-			"realtime_enabled":      a.thinker.config.RealtimeEnabledFlag(),
-			"realtime_voice":        a.thinker.config.GetRealtimeVoice(),
-			"realtime_voice_mcp":    a.thinker.config.GetRealtimeVoiceMCP(),
+			"directive":                 a.thinker.config.GetDirective(),
+			"provider":                  providerInfo,
+			"providers":                 a.thinker.config.GetProviders(),
+			"disable_provider_fallback": a.thinker.config.ProviderFallbackDisabled(),
+			"mcp_servers":               mcpInfo,
+			"execution_control":         a.thinker.executionStatus(),
+			"execution_checkpoints":     a.thinker.executionCheckpointMeta(),
+			"realtime_enabled":          a.thinker.config.RealtimeEnabledFlag(),
+			"realtime_voice":            a.thinker.config.GetRealtimeVoice(),
+			"realtime_voice_mcp":        a.thinker.config.GetRealtimeVoiceMCP(),
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive        string                  `json:"directive,omitempty"`
-			Provider         *ProviderConfig         `json:"provider,omitempty"`
-			Providers        []ProviderConfig        `json:"providers,omitempty"`
-			Computer         json.RawMessage         `json:"computer,omitempty"`
-			MCPServers       []MCPServerConfig       `json:"mcp_servers,omitempty"`
-			Execution        *ExecutionControlConfig `json:"execution_control,omitempty"`
-			RealtimeEnabled  *bool                   `json:"realtime_enabled,omitempty"`
-			RealtimeVoice    *string                 `json:"realtime_voice,omitempty"`
-			RealtimeVoiceMCP *[]string               `json:"realtime_voice_mcp,omitempty"`
-			Reset            *struct {
+			Directive               string                  `json:"directive,omitempty"`
+			DisableProviderFallback *bool                   `json:"disable_provider_fallback,omitempty"`
+			Provider                *ProviderConfig         `json:"provider,omitempty"`
+			Providers               []ProviderConfig        `json:"providers,omitempty"`
+			Computer                json.RawMessage         `json:"computer,omitempty"`
+			MCPServers              []MCPServerConfig       `json:"mcp_servers,omitempty"`
+			Execution               *ExecutionControlConfig `json:"execution_control,omitempty"`
+			RealtimeEnabled         *bool                   `json:"realtime_enabled,omitempty"`
+			RealtimeVoice           *string                 `json:"realtime_voice,omitempty"`
+			RealtimeVoiceMCP        *[]string               `json:"realtime_voice_mcp,omitempty"`
+			Reset                   *struct {
 				History bool `json:"history,omitempty"`
 				Memory  bool `json:"memory,omitempty"`
 				Threads bool `json:"threads,omitempty"`
@@ -1341,6 +1343,9 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 		commit := func(mcp []MCPServerConfig) error {
 			return cfg.update(func() {
+				if body.DisableProviderFallback != nil {
+					cfg.DisableProviderFallback = *body.DisableProviderFallback
+				}
 				if body.Directive != "" {
 					cfg.Directive = body.Directive
 				}
