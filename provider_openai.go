@@ -729,7 +729,8 @@ func NewOpenCodeGoProvider(apiKey string) LLMProvider {
 			cachedCost: 0,
 			outputCost: 0,
 		},
-		support: newOpenCodeGoReasoningSupport(),
+		support:   newOpenCodeGoReasoningSupport(),
+		sessionID: newOpenCodeGoSessionID(),
 	}
 }
 

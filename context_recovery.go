@@ -256,6 +256,7 @@ func (t *Thinker) callProviderWithContextRecovery(ctx context.Context, provider 
 // Batch complete messages instead of silently excerpting them. The caller's
 // request deadline bounds the entire recovery, including every summary call.
 func (t *Thinker) summarizeRecoveryPrefix(ctx context.Context, provider LLMProvider, messages []Message) (string, error) {
+	ctx = t.providerSessionContext(ctx, "recovery-compaction")
 	batches := [][]Message{}
 	batch := []Message{}
 	size := 0

@@ -86,15 +86,16 @@ type ProviderConfig struct {
 }
 
 type Config struct {
-	RuntimeSequence uint64 `json:"runtime_sequence,omitempty"`
-	mu              sync.RWMutex
-	saveMu          sync.Mutex
-	path            string
-	loadErr         error
-	Directive       string `json:"directive"`
-	Unconscious     bool   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
-	RealtimeEnabled bool   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
-	RealtimeVoice   string `json:"realtime_voice,omitempty"`   // dashboard/default realtime voice (provider validates at session open)
+	DisableProviderFallback bool   `json:"disable_provider_fallback,omitempty"`
+	RuntimeSequence         uint64 `json:"runtime_sequence,omitempty"`
+	mu                      sync.RWMutex
+	saveMu                  sync.Mutex
+	path                    string
+	loadErr                 error
+	Directive               string `json:"directive"`
+	Unconscious             bool   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
+	RealtimeEnabled         bool   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
+	RealtimeVoice           string `json:"realtime_voice,omitempty"`   // dashboard/default realtime voice (provider validates at session open)
 	// RealtimeVoiceMCP is the operator-selected subset of attached MCP
 	// servers exposed to dashboard voice sessions. It is policy/config only;
 	// realtime execution still uses the normal thread registry and gates.
@@ -214,6 +215,7 @@ func (c *Config) restore(data []byte) {
 	}
 	c.RuntimeSequence = restored.RuntimeSequence
 	c.Directive = restored.Directive
+	c.DisableProviderFallback = restored.DisableProviderFallback
 	c.Unconscious = restored.Unconscious
 	c.RealtimeEnabled = restored.RealtimeEnabled
 	c.RealtimeVoice = restored.RealtimeVoice
@@ -233,6 +235,15 @@ func (c *Config) GetDirective() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Directive
+}
+
+func (c *Config) ProviderFallbackDisabled() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.DisableProviderFallback
 }
 
 // RealtimeEnabledFlag returns whether realtime (voice/audio) threads
