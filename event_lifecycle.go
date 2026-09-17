@@ -93,6 +93,14 @@ func upsertPersistentThreadLocked(c *Config, pt PersistentThread) {
 	c.Threads = append(c.Threads, pt)
 }
 
+// A profile change and its accepted events must survive or fail together.
+func (c *Config) saveThreadProfileAndEvents(pt PersistentThread, accepted []PersistentThreadEvent) error {
+	return c.update(func() {
+		upsertPersistentThreadLocked(c, pt)
+		registerEventExecutionsLocked(c, pt.ID, accepted)
+	})
+}
+
 func (c *Config) saveThreadAndRegisterEventExecutions(pt PersistentThread, accepted []PersistentThreadEvent) error {
 	c.mu.RLock()
 	exists := false

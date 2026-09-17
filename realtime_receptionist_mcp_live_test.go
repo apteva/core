@@ -382,6 +382,13 @@ func (trace *receptionistLiveTrace) collect(parent *Thinker, threadID string) {
 					trace.lines = append(trace.lines, "RECEPTIONIST: "+text)
 				}
 			}
+		case "realtime.user":
+			var data map[string]any
+			if json.Unmarshal(event.Data, &data) == nil {
+				if text, ok := data["text"].(string); ok {
+					trace.lines = append(trace.lines, "HEARD CALLER: "+text)
+				}
+			}
 		case "realtime.error":
 			var data map[string]any
 			_ = json.Unmarshal(event.Data, &data)

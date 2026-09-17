@@ -43,6 +43,26 @@ func TestGeminiToolParametersAddsArrayItems(t *testing.T) {
 	}
 }
 
+func TestGeminiToolParametersDropsUnsupportedJSONSchemaKeywords(t *testing.T) {
+	schema := map[string]any{
+		"type": "object", "additionalProperties": false,
+		"properties": map[string]any{
+			"value": map[string]any{"type": "object", "additionalProperties": false,
+				"properties": map[string]any{"nested": map[string]any{"type": "array", "items": map[string]any{"type": "object", "additionalProperties": false}}}},
+		},
+	}
+	normalized := geminiToolParameters(schema)
+	raw := mustJSON(t, normalized)
+	for _, keyword := range []string{"additionalProperties", "$schema", "$defs", "definitions"} {
+		if strings.Contains(string(raw), keyword) {
+			t.Fatalf("Gemini schema retained unsupported keyword %q: %s", keyword, raw)
+		}
+	}
+	if _, ok := schema["additionalProperties"]; !ok {
+		t.Fatal("normalization mutated original schema")
+	}
+}
+
 func TestParseGeminiStreamReturnsScannerError(t *testing.T) {
 	stream := strings.NewReader("data: " + strings.Repeat("x", 1024*1024+1))
 	_, err := parseGeminiStream(stream, nil, nil)

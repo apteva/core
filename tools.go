@@ -9,6 +9,7 @@ import (
 )
 
 type toolCall struct {
+	trace             *toolTrace
 	prerequisites     map[string]RequiredFirstAction
 	prerequisiteNames map[string]string
 	definition        *ToolDef
@@ -66,6 +67,13 @@ func toolArgsSummary(call toolCall) string {
 }
 
 func executeTool(t *Thinker, call toolCall) {
+	t.queueToolTrace(&call)
+	launched := false
+	defer func() {
+		if !launched {
+			call.trace.finish("cancelled")
+		}
+	}()
 	// Extract _reason before dispatch (observability field, not passed to handler)
 	reason := call.Args["_reason"]
 	delete(call.Args, "_reason")
@@ -97,9 +105,9 @@ func executeTool(t *Thinker, call toolCall) {
 
 	// Telemetry: tool.call
 	if t.telemetry != nil {
-		t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+		t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
 			ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: executionIDs,
-		})
+		}))
 	}
 
 	// Track pending async tool call. Value carries the tool name so the
@@ -110,7 +118,9 @@ func executeTool(t *Thinker, call toolCall) {
 		t.pendingTools.Store(call.NativeID, call.Name)
 	}
 
+	launched = true
 	go func() {
+		defer call.trace.finish("cancelled")
 		defer t.releaseToolSlot()
 		defer t.asyncToolsActive.Add(-1)
 		ctx, cancel := context.WithTimeout(t.toolContext(), 3*time.Minute)
@@ -138,6 +148,7 @@ func executeTool(t *Thinker, call toolCall) {
 		}()
 		defer func() {
 			if r := recover(); r != nil {
+				call.trace.finish("failed")
 				logMsg("TOOL", fmt.Sprintf("PANIC %s: %v", call.Name, r))
 				t.publishToolFailure(call, generation, executionIDs, fmt.Sprintf("panic: %v", r))
 				if t.telemetry != nil {
@@ -147,16 +158,20 @@ func executeTool(t *Thinker, call toolCall) {
 						result, result, 0,
 					)
 					data.ExecutionIDs = executionIDs
-					t.telemetry.Emit("tool.result", t.threadID, data)
+					t.telemetry.Emit("tool.result", t.threadID, call.trace.data(data))
 				}
 			}
 		}()
 		releaseBudget, budgetErr := t.acquireExecutionBudget(ctx)
 		if budgetErr != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				call.trace.finish("timeout")
+			}
 			t.publishToolFailure(call, generation, executionIDs, budgetErr.Error())
 			return
 		}
 		defer releaseBudget()
+		call.trace.start()
 		wakePolicy := WakeOnResultAlways
 		if t.registry != nil {
 			if def := t.registry.Get(call.Name); def != nil && def.WakeOnResult != "" {
@@ -180,14 +195,14 @@ func executeTool(t *Thinker, call toolCall) {
 			if blocked != nil {
 				resp = ToolResponse{Text: blocked.Error(), IsError: true}
 				if t.telemetry != nil {
-					t.telemetry.Emit("tool.blocked", t.threadID, map[string]any{"id": call.NativeID, "name": call.Name, "manifest_hash": call.manifestHash, "reason": blocked.Error()})
+					t.telemetry.Emit("tool.blocked", t.threadID, call.trace.data(map[string]any{"id": call.NativeID, "name": call.Name, "manifest_hash": call.manifestHash, "reason": blocked.Error()}))
 				}
 			} else {
 				dispatchArgs := toolDispatchArgs(t, call)
 				if t.telemetry != nil && def.MCP {
 					typedArgs := mcpArgumentsFromStrings(dispatchArgs, def.InputSchema)
-					t.telemetry.Emit("tool.arguments", t.threadID, newToolArgumentsData(call.NativeID, call.Name, "mcp_typed", typedArgs))
-					t.telemetry.Emit("tool.dispatch", t.threadID, map[string]any{"id": call.NativeID, "manifest_hash": call.manifestHash, "resolved": toolIdentity(def), "arguments": newToolArgumentsData(call.NativeID, call.Name, "dispatched", typedArgs)})
+					t.telemetry.Emit("tool.arguments", t.threadID, call.trace.data(newToolArgumentsData(call.NativeID, call.Name, "mcp_typed", typedArgs)))
+					t.telemetry.Emit("tool.dispatch", t.threadID, call.trace.data(map[string]any{"id": call.NativeID, "manifest_hash": call.manifestHash, "resolved": toolIdentity(def), "arguments": newToolArgumentsData(call.NativeID, call.Name, "dispatched", typedArgs)}))
 				}
 				resp = t.registry.dispatchDefinition(ctx, def, dispatchArgs)
 				if def.MCP && generation == t.toolGeneration.Load() {
@@ -200,6 +215,16 @@ func executeTool(t *Thinker, call toolCall) {
 				}
 			}
 		}
+		outcome := "success"
+		if resp.IsError || inlineToolResultIsError(resp.Text) {
+			outcome = "failed"
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			outcome = "timeout"
+		} else if ctx.Err() != nil || generation != t.toolGeneration.Load() {
+			outcome = "cancelled"
+		}
+		call.trace.finish(outcome)
 		if generation != t.toolGeneration.Load() || t.toolContext().Err() != nil {
 			return
 		}
@@ -213,7 +238,7 @@ func executeTool(t *Thinker, call toolCall) {
 				resp.Text, resp.Text, len(resp.Image),
 			)
 			data.ExecutionIDs = executionIDs
-			t.telemetry.Emit("tool.result", t.threadID, data)
+			t.telemetry.Emit("tool.result", t.threadID, call.trace.data(data))
 		}
 
 		// Emit visual chunk for TUI

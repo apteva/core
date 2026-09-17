@@ -248,7 +248,7 @@ func prepareComputerScreenshotTail(messages []Message) []Message {
 		RequestContext: true,
 		Parts: []ContentPart{
 			{Type: "text", Text: fmt.Sprintf("%s\nSource computer tool call: %s", computerScreenshotTailHeader, latestCallID)},
-			{Type: "image_url", ImageURL: &ImageURL{URL: imageURL, Detail: "original"}},
+			{Type: "image_url", ImageURL: &ImageURL{URL: imageURL, Detail: "high"}},
 		},
 	})
 	return projected
@@ -446,6 +446,7 @@ func (t *Thinker) semanticCompactContext(reason string) (semanticCompactionResul
 
 	prompt := buildSemanticCompactionPrompt(reason, old)
 	ctx, cancel := context.WithTimeout(context.Background(), semanticCompactionTimeout)
+	ctx = t.providerSessionContext(ctx, "context-compaction")
 	ctx = withOpenAIPromptCacheScope(ctx, openAIPromptCacheScope{
 		Identity: t.promptCacheIdentity() + "/context-compaction",
 		Epoch:    t.promptCacheEpoch,

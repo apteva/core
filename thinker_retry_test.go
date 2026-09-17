@@ -209,7 +209,13 @@ func TestThinkWithProviderPersistsAttributedLLMStart(t *testing.T) {
 		t.Fatalf("response attribution = provider %q model %q", resp.Provider, resp.Model)
 	}
 
-	events, _ := thinker.telemetry.Events(0)
+	allEvents, _ := thinker.telemetry.Events(0)
+	var events []TelemetryEvent
+	for _, event := range allEvents {
+		if event.Type == "llm.request_budget" || event.Type == "llm.start" {
+			events = append(events, event)
+		}
+	}
 	if len(events) != 2 || events[0].Type != "llm.request_budget" || events[1].Type != "llm.start" {
 		t.Fatalf("expected request budget followed by attributed llm.start, got %d events", len(events))
 	}

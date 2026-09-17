@@ -167,7 +167,7 @@ func managedCoreProcess() bool {
 
 func (a *APIServer) health(w http.ResponseWriter, r *http.Request) {
 	logMsg("API", "GET /health")
-	writeJSON(w, map[string]bool{"ok": true})
+	writeJSON(w, map[string]bool{"ok": true, "workflow_healthy": a.thinker.workflowHealthy()})
 }
 
 func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +177,8 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, map[string]any{
 		"uptime_seconds":        int(elapsed.Seconds()),
+		"inference":             a.thinker.inferenceSnapshot(),
+		"workflow_healthy":      a.thinker.workflowHealthy(),
 		"core_version":          Version,
 		"core_build_time":       BuildTime,
 		"iteration":             status.Iteration,
@@ -194,23 +196,24 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 }
 
 type threadJSON struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name,omitempty"`
-	ParentID   string   `json:"parent_id,omitempty"`
-	Depth      int      `json:"depth"`
-	Directive  string   `json:"directive,omitempty"`
-	Tools      []string `json:"tools,omitempty"`
-	MCPNames   []string `json:"mcp_names,omitempty"`
-	Iteration  int      `json:"iteration"`
-	Rate       string   `json:"rate"`
-	NextWakeAt string   `json:"next_wake_at,omitempty"`
-	Model      string   `json:"model"`
-	Reasoning  string   `json:"reasoning,omitempty"`
-	Age        string   `json:"age"`
-	Realtime   bool     `json:"realtime,omitempty"`
-	Ephemeral  bool     `json:"ephemeral,omitempty"`
-	Voice      string   `json:"voice,omitempty"`
-	Provider   string   `json:"provider,omitempty"`
+	Inference  InferenceHealth `json:"inference"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name,omitempty"`
+	ParentID   string          `json:"parent_id,omitempty"`
+	Depth      int             `json:"depth"`
+	Directive  string          `json:"directive,omitempty"`
+	Tools      []string        `json:"tools,omitempty"`
+	MCPNames   []string        `json:"mcp_names,omitempty"`
+	Iteration  int             `json:"iteration"`
+	Rate       string          `json:"rate"`
+	NextWakeAt string          `json:"next_wake_at,omitempty"`
+	Model      string          `json:"model"`
+	Reasoning  string          `json:"reasoning,omitempty"`
+	Age        string          `json:"age"`
+	Realtime   bool            `json:"realtime,omitempty"`
+	Ephemeral  bool            `json:"ephemeral,omitempty"`
+	Voice      string          `json:"voice,omitempty"`
+	Provider   string          `json:"provider,omitempty"`
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +229,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	mainMCPs := append([]string(nil), status.MCPNames...)
 	// Always include main
 	out := []threadJSON{{
+		Inference:  a.thinker.inferenceSnapshot(),
 		ID:         "main",
 		Directive:  a.thinker.config.GetDirective(),
 		MCPNames:   mainMCPs,
@@ -242,6 +246,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	collectThreads = func(tm *ThreadManager) {
 		for _, t := range tm.List() {
 			out = append(out, threadJSON{
+				Inference:  t.Inference,
 				ID:         t.ID,
 				Name:       t.Name,
 				ParentID:   t.ParentID,
@@ -491,23 +496,17 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 	if body.Tools != nil {
 		tools = *body.Tools
 	}
-	result, err := a.thinker.threads.UpdateWithOpts(id, "", directive, tools, ThreadUpdateOptions{
+	result, err := a.thinker.threads.UpdateWithEvents(id, "", directive, tools, ThreadUpdateOptions{
 		RestartRealtime: body.RestartRealtime,
 		ReplaceTools:    body.Tools != nil,
 		MCPNames:        body.MCP,
-	})
+	}, normalizedEvents)
 	if err != nil {
-		// Update returns "thread not found" for unknown ids.
-		status := http.StatusNotFound
 		if errors.Is(err, ErrRealtimeConfigurationRestartRequired) {
-			status = http.StatusConflict
+			http.Error(w, err.Error(), http.StatusConflict)
+		} else {
+			writeThreadEventQueueError(w, err)
 		}
-		http.Error(w, err.Error(), status)
-		return
-	}
-	eventResult, err := a.thinker.threads.QueueEvents(id, normalizedEvents)
-	if err != nil {
-		writeThreadEventQueueError(w, err)
 		return
 	}
 	// Nudge the thread the same way the LLM-driven update tool does when the
@@ -522,7 +521,7 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		"id":     id, "realtime_restarted": result.RealtimeRestarted,
 	}
 	if body.Events != nil {
-		response["events"] = threadEventsResponse(eventResult)
+		response["events"] = threadEventsResponse(result.Events)
 	}
 	writeJSON(w, response)
 }
@@ -643,6 +642,8 @@ func writeThreadEventQueueError(w http.ResponseWriter, err error) {
 	var conflict *ThreadEventConflictError
 	var validation *ThreadEventValidationError
 	switch {
+	case isThreadNotFound(err):
+		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.As(err, &conflict):
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.As(err, &validation):
@@ -1250,28 +1251,30 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSON(w, map[string]any{
-			"directive":             a.thinker.config.GetDirective(),
-			"provider":              providerInfo,
-			"providers":             a.thinker.config.GetProviders(),
-			"mcp_servers":           mcpInfo,
-			"execution_control":     a.thinker.executionStatus(),
-			"execution_checkpoints": a.thinker.executionCheckpointMeta(),
-			"realtime_enabled":      a.thinker.config.RealtimeEnabledFlag(),
-			"realtime_voice":        a.thinker.config.GetRealtimeVoice(),
-			"realtime_voice_mcp":    a.thinker.config.GetRealtimeVoiceMCP(),
+			"automatic_tool_loading": a.thinker.config.GetAutomaticToolLoading(),
+			"directive":              a.thinker.config.GetDirective(),
+			"provider":               providerInfo,
+			"providers":              a.thinker.config.GetProviders(),
+			"mcp_servers":            mcpInfo,
+			"execution_control":      a.thinker.executionStatus(),
+			"execution_checkpoints":  a.thinker.executionCheckpointMeta(),
+			"realtime_enabled":       a.thinker.config.RealtimeEnabledFlag(),
+			"realtime_voice":         a.thinker.config.GetRealtimeVoice(),
+			"realtime_voice_mcp":     a.thinker.config.GetRealtimeVoiceMCP(),
 		})
 	case http.MethodPut:
 		var body struct {
-			Directive        string                  `json:"directive,omitempty"`
-			Provider         *ProviderConfig         `json:"provider,omitempty"`
-			Providers        []ProviderConfig        `json:"providers,omitempty"`
-			Computer         json.RawMessage         `json:"computer,omitempty"`
-			MCPServers       []MCPServerConfig       `json:"mcp_servers,omitempty"`
-			Execution        *ExecutionControlConfig `json:"execution_control,omitempty"`
-			RealtimeEnabled  *bool                   `json:"realtime_enabled,omitempty"`
-			RealtimeVoice    *string                 `json:"realtime_voice,omitempty"`
-			RealtimeVoiceMCP *[]string               `json:"realtime_voice_mcp,omitempty"`
-			Reset            *struct {
+			AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
+			Directive            string                      `json:"directive,omitempty"`
+			Provider             *ProviderConfig             `json:"provider,omitempty"`
+			Providers            []ProviderConfig            `json:"providers,omitempty"`
+			Computer             json.RawMessage             `json:"computer,omitempty"`
+			MCPServers           []MCPServerConfig           `json:"mcp_servers,omitempty"`
+			Execution            *ExecutionControlConfig     `json:"execution_control,omitempty"`
+			RealtimeEnabled      *bool                       `json:"realtime_enabled,omitempty"`
+			RealtimeVoice        *string                     `json:"realtime_voice,omitempty"`
+			RealtimeVoiceMCP     *[]string                   `json:"realtime_voice_mcp,omitempty"`
+			Reset                *struct {
 				History bool `json:"history,omitempty"`
 				Memory  bool `json:"memory,omitempty"`
 				Threads bool `json:"threads,omitempty"`
@@ -1279,6 +1282,10 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if err := validateAutomaticToolLoading(body.AutomaticToolLoading); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		if len(body.Computer) > 0 {
@@ -1340,6 +1347,9 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 		commit := func(mcp []MCPServerConfig) error {
 			return cfg.update(func() {
+				if body.AutomaticToolLoading != nil {
+					cfg.AutomaticToolLoading = body.AutomaticToolLoading
+				}
 				if body.Directive != "" {
 					cfg.Directive = body.Directive
 				}

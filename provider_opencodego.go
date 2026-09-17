@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/rand"
 	"strings"
 	"sync"
 )
@@ -15,6 +16,9 @@ type OpenCodeGoProvider struct {
 	compat    *OpenAICompatProvider
 	reasoning ReasoningSettings
 	support   *openCodeGoReasoningSupport
+	// Standalone callers use a session shared by provider clones. Thinker
+	// requests override it with their durable conversation identity.
+	sessionID string
 }
 
 type openCodeGoReasoningSupport struct {
@@ -83,18 +87,33 @@ func (p *OpenCodeGoProvider) Chat(ctx context.Context, messages []Message, model
 	requested := normalizeReasoningLevel(p.reasoning.Level).String()
 	effort := openCodeGoReasoningEffort(model, p.reasoning.Level)
 
-	if p.support.accepts(model) {
-		ctx = withOpenAICompatRequestOptions(ctx, openAICompatRequestOptions{
-			OptionalFields: map[string]openAICompatOptionalField{
-				"reasoning_effort": {
-					Value: effort,
-					OnUnsupported: func() {
-						p.support.markUnsupported(model)
-					},
-				},
-			},
-		})
+	options := openAICompatRequestOptionsFromContext(ctx)
+	headers := make(map[string]string, len(options.Headers)+2)
+	for k, v := range options.Headers {
+		if !strings.EqualFold(k, "x-opencode-session") && !strings.EqualFold(k, "User-Agent") {
+			headers[k] = v
+		}
 	}
+	sessionID := providerSessionFromContext(ctx)
+	if sessionID == "" {
+		sessionID = p.sessionID
+	}
+	headers["x-opencode-session"] = sessionID
+	headers["User-Agent"] = "apteva-core/" + Version
+	options.Headers = headers
+	optional := make(map[string]openAICompatOptionalField, len(options.OptionalFields)+1)
+	for k, v := range options.OptionalFields {
+		optional[k] = v
+	}
+	options.OptionalFields = optional
+	if p.support.accepts(model) {
+		options.OptionalFields["reasoning_effort"] = openAICompatOptionalField{
+			Value:         effort,
+			OnUnsupported: func() { p.support.markUnsupported(model) },
+		}
+	}
+	// Required routing headers survive retries and remembered model policy.
+	ctx = withOpenAICompatRequestOptions(ctx, options)
 
 	resp, err := p.compat.Chat(ctx, messages, model, tools, onChunk, onThinking, onToolChunk)
 	resp.RequestedReasoningEffort = requested
@@ -129,3 +148,5 @@ func openCodeGoReasoningEffort(model string, level ReasoningLevel) string {
 
 var _ LLMProvider = (*OpenCodeGoProvider)(nil)
 var _ ReasoningProvider = (*OpenCodeGoProvider)(nil)
+
+func newOpenCodeGoSessionID() string { return "apteva-" + rand.Text() }

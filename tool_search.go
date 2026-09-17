@@ -122,7 +122,7 @@ func registerSearchTool(r *ToolRegistry) {
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "An exact tool name (preferred when known), registered alias, or capability description. Exact names never fall back to a different operation.",
+					"description": "An exact tool name (preferred when known), registered alias, or capability description. Unambiguous local names resolve to canonical tools. Unresolved names are reported separately from descriptive suggestions; suggestions are not equivalent replacements.",
 				},
 				"k": map[string]any{
 					"type":        "integer",
@@ -143,11 +143,14 @@ func registerSearchTool(r *ToolRegistry) {
 // turn, so the LLM doesn't need a paragraph of description here —
 // just enough to confirm it found what it was looking for.
 type searchToolsResult struct {
-	Error  string          `json:"error,omitempty"`
-	Query  string          `json:"query"`
-	Hits   []searchToolHit `json:"hits"`
-	Loaded []string        `json:"loaded"` // names whose schemas are now in context
-	Note   string          `json:"note,omitempty"`
+	Unresolved  []string            `json:"unresolved_names,omitempty"`
+	Ambiguous   map[string][]string `json:"ambiguous_names,omitempty"`
+	Suggestions []searchToolHit     `json:"suggestions,omitempty"`
+	Error       string              `json:"error,omitempty"`
+	Query       string              `json:"query"`
+	Hits        []searchToolHit     `json:"hits"`
+	Loaded      []string            `json:"loaded"` // names whose schemas are now in context
+	Note        string              `json:"note,omitempty"`
 }
 
 type searchToolHit struct {
@@ -158,44 +161,11 @@ type searchToolHit struct {
 	Summary string  `json:"summary"`
 }
 
-// applyPreload runs a BM25 search against the thread's DIRECTIVE and
-// stickily activates up to k matching tools — they join t.activeTools
-// and stay (subject to the LRU cap). Called every turn in discovery
-// mode, but idempotent after the first.
-//
-// Two design choices, both for prompt caching:
-//
-//  1. STICKY, not transient. An early draft merged the preload
-//     transiently each turn — that churned the `tools` array, which
-//     sits in the cacheable prompt prefix, busting the cache wholesale
-//     (~0.1% hit measured).
-//  2. DIRECTIVE-ONLY query, not directive+lastUserText. The directive
-//     is stable; the last user turn is not. Including the user turn
-//     made preload surface different tools every turn, so the active
-//     set never stopped growing and the array never stabilised — even
-//     sticky, monotonic growth still busts the cache each turn it
-//     grows. With a directive-only query the set seeds once and then
-//     holds: same query → same hits → already-active → no-op. The
-//     array goes stable as soon as explicit search_tools calls stop,
-//     and from there every turn caches.
-//
-// The cost of (2): per-turn task adaptivity moves to search_tools — if
-// the agent needs something the directive doesn't imply, it searches.
-// A bounded one-time round-trip per new capability beats a permanent
-// per-turn cache bust.
-//
-// Sub-threads run with allowNoSpawn=false (their thread-id is not
-// "main"); main runs with allowNoSpawn=true.
-//
-// extraQuery is the text of any events drained THIS iteration (user
-// message, peer send, etc.). Appending it lets BM25 surface tools
-// the user asked for — "send a pushover test" preloads pushover_*
-// the same turn the agent first sees the request, no `search_tools`
-// round-trip. Cache cost: the turn after a fresh event already busts
-// the prompt prefix (new user content in messages), so widening
-// preload that turn is free. On subsequent quiet turns extraQuery
-// is "", we revert to directive-only, and the active set stabilises
-// so the prefix caches again.
+// applyPreload searches the directive and events drained this iteration, then
+// stickily activates a bounded set. Quiet turns use only the directive. Schema
+// changes can invalidate the provider's cacheable prefix even on user turns;
+// keeping existing selections avoids needless reshuffling. Unresolved exact
+// names never automatically activate descriptive suggestions here.
 func (t *Thinker) applyPreload(k int, extraQuery string) {
 	if t == nil || t.toolIndex == nil {
 		return
@@ -229,11 +199,15 @@ func (t *Thinker) toolAuthorized(name string) bool {
 }
 
 func (t *Thinker) searchAuthorizedTools(query string, k int, allowNoSpawn bool) []IndexEntry {
+	return t.searchAuthorizedToolsDetailed(query, k, allowNoSpawn).Hits
+}
+
+func (t *Thinker) searchAuthorizedToolsDetailed(query string, k int, allowNoSpawn bool) indexSearchResult {
 	if t == nil || t.toolIndex == nil || k <= 0 {
-		return nil
+		return indexSearchResult{}
 	}
 	if t.toolAllowlist == nil {
-		return t.toolIndex.Search(query, k, allowNoSpawn)
+		return t.toolIndex.searchDetailed(query, k, allowNoSpawn, nil)
 	}
 	// Snapshot grants outside the index lock: toolAuthorized also reads it.
 	allowed := make(map[string]bool, len(t.toolAllowlist))
@@ -251,7 +225,7 @@ func (t *Thinker) searchAuthorizedTools(query string, k int, allowNoSpawn bool) 
 			}
 		}
 	}
-	return t.toolIndex.search(query, k, allowNoSpawn, func(name string) bool { return allowed[name] })
+	return t.toolIndex.searchDetailed(query, k, allowNoSpawn, func(name string) bool { return allowed[name] })
 }
 
 func (t *Thinker) authorizedActiveTools(active map[string]bool) map[string]bool {
@@ -378,7 +352,10 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 	}
 	t.recordToolCatalog()
 	eager := t.useEagerTools()
+	automatic := t.config.GetAutomaticToolLoading()
+	var overlay map[string]bool
 	if eager {
+		t.automaticTools = automaticToolSelection{}
 		t.lastToolMode = "eager"
 	} else {
 		t.lastToolMode = "discovery"
@@ -386,7 +363,12 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 		if providerName == "openai-codex" {
 			preloadK = 3
 		}
-		t.applyPreload(preloadK, t.lastInboundForPreload)
+		if automatic.Enabled {
+			overlay = t.prepareAutomaticTools(automatic)
+		} else {
+			t.automaticTools = automaticToolSelection{}
+			t.applyPreload(preloadK, t.lastInboundForPreload)
+		}
 		t.evictActiveToolsLRU(activeToolsCap)
 	}
 
@@ -397,7 +379,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 			delete(t.discoveredToolUntil, name)
 		}
 	}
-	tools, definitions, active := t.visibleNativeToolSnapshot(t.toolAllowlist, t.toolMCPScopes)
+	tools, definitions, active := t.visibleNativeToolSnapshot(t.toolAllowlist, t.toolMCPScopes, overlay)
 	t.recordPresentedTools(tools, definitions)
 	t.lastNativeToolCount = len(tools)
 	t.lastActiveMCPCount = countActiveMCPTools(active)
@@ -459,8 +441,9 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	if t.toolIndex == nil {
 		return `{"error":"tool index not initialised — no MCPs attached"}`
 	}
-	hits := t.searchAuthorizedTools(query, k, allowNoSpawn)
-	res := searchToolsResult{Query: query}
+	found := t.searchAuthorizedToolsDetailed(query, k, allowNoSpawn)
+	res := searchToolsResult{Query: query, Unresolved: found.Unresolved, Ambiguous: found.Ambiguous}
+	hits := append(found.Hits, found.Suggestions...)
 	if t.discoveredToolUntil == nil {
 		t.discoveredToolUntil = map[string]int{}
 	}
@@ -471,12 +454,15 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 		if len(summary) > 240 {
 			summary = summary[:237] + "..."
 		}
-		res.Hits = append(res.Hits, searchToolHit{
-			Name: h.Name, Server: h.Server, Summary: summary, Match: h.Match, Score: h.Score,
-		})
+		hit := searchToolHit{Name: h.Name, Server: h.Server, Summary: summary, Match: h.Match, Score: h.Score}
+		if h.Match == "descriptive_suggestion" {
+			res.Suggestions = append(res.Suggestions, hit)
+		} else {
+			res.Hits = append(res.Hits, hit)
+		}
 		res.Loaded = append(res.Loaded, h.Name)
 	}
-	if len(res.Hits) == 0 {
+	if len(res.Hits) == 0 && len(res.Suggestions) == 0 {
 		res.Error = "capability_unavailable: no matching authorized tool. Do not substitute another operation; refine discovery or report the missing capability."
 		// Tell the LLM what *is* attached so it can refine the query or
 		// reach for the gateway's install/list_apps tool to add what's
@@ -495,6 +481,9 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 		} else {
 			res.Note = "no matches; no MCP servers visible to this thread"
 		}
+	}
+	if len(res.Unresolved) > 0 || len(res.Ambiguous) > 0 {
+		res.Note = strings.TrimSpace(res.Note + " Requested names were unresolved or ambiguous. Descriptive suggestions, if present, have schemas loaded for inspection but are not exact matches or equivalent replacements. Confirm their documented operation before use; do not infer that a capability is unsupported from a failed name lookup.")
 	}
 	if t.telemetry != nil {
 		t.telemetry.Emit("tool.discovery", t.threadID, map[string]any{"iteration": t.iteration, "result": res})

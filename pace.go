@@ -150,6 +150,7 @@ func (t *Thinker) completeFiredWake(revisionAtStart uint64) {
 // This prevents a bad sleep such as "7d" from silently changing the model or
 // reasoning while leaving the prior cadence active.
 func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
+	previousWaitForEvents := t.waitForEvents
 	previousSleep := t.agentSleep
 	previousRate := t.agentRate
 	previousModel := t.agentModel
@@ -160,6 +161,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 	previousRevision := t.paceRevision
 	previousFired := t.wakeDeadlineFired
 
+	nextWaitForEvents := t.waitForEvents
 	nextSleep := t.agentSleep
 	nextRate := t.agentRate
 	nextModel := t.agentModel
@@ -186,6 +188,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 		nextWake = time.Time{}
 		nextFired = false
 		nextRevision++
+		nextWaitForEvents = true
 		parts = append(parts, "cleared pending wake")
 	case rawSleep != "":
 		parsed, err := parseSleepDurationDetailed(rawSleep)
@@ -199,6 +202,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 			sleepPart += " (" + parsed.clamped + ")"
 		}
 		parts = append(parts, sleepPart)
+		nextWaitForEvents = false
 		nextWake = now.Add(parsed.duration)
 		nextFired = false
 		nextRevision++
@@ -216,6 +220,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 		if effectiveSleep <= 0 {
 			effectiveSleep = nextRate.Delay()
 		}
+		nextWaitForEvents = false
 		nextWake = now.Add(effectiveSleep)
 		nextFired = false
 		nextRevision++
@@ -240,6 +245,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 		}
 	}
 
+	t.waitForEvents = nextWaitForEvents
 	t.agentSleep = nextSleep
 	t.agentRate = nextRate
 	t.agentModel = nextModel
@@ -251,7 +257,10 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 	t.wakeDeadlineFired = nextFired
 	t.publishRuntimeStatus()
 	if t.persistPace != nil {
-		if err := t.persistPace(paceState(nextSleep, nextWake)); err != nil {
+		state := paceState(nextSleep, nextWake)
+		state.WaitForEvents = nextWaitForEvents
+		if err := t.persistPace(state); err != nil {
+			t.waitForEvents = previousWaitForEvents
 			t.agentSleep = previousSleep
 			t.agentRate = previousRate
 			t.agentModel = previousModel

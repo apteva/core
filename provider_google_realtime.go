@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -181,10 +182,9 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 			"turnCoverage":               "TURN_INCLUDES_ONLY_ACTIVITY",
 		},
 		"contextWindowCompression": map[string]any{"slidingWindow": map[string]any{}},
-		// Every session begins in history-seeding mode. RealtimeThinker calls
-		// RestoreConversation even for an empty initial history to unlock live
-		// input after setupComplete.
-		"historyConfig": map[string]any{"initialHistoryInClientContent": true},
+	}
+	if opts.RestoreHistory {
+		setup["historyConfig"] = map[string]any{"initialHistoryInClientContent": true}
 	}
 	if tools := googleLiveTools(opts.Tools); len(tools) > 0 {
 		setup["tools"] = tools
@@ -300,7 +300,11 @@ type googleRealtimeSession struct {
 	configFingerprint   string
 	restartAfterTurn    bool
 	turnOutputSinceTool bool
+	historySeeding      bool
+	sessionID           uint64
 }
+
+var googleRealtimeSessionSequence atomic.Uint64
 
 func openGoogleRealtimeSession(ctx context.Context, provider *GoogleRealtimeProvider, opts RealtimeSessionOpts) (*googleRealtimeSession, error) {
 	setup, err := buildGoogleLiveSetup(opts, provider.DefaultVoice())
@@ -318,7 +322,8 @@ func openGoogleRealtimeSession(ctx context.Context, provider *GoogleRealtimeProv
 	dialer := ws.Dialer{Timeout: 10 * time.Second}
 	conn, _, _, err := dialer.Dial(ctx, endpoint.String())
 	if err != nil {
-		return nil, fmt.Errorf("google-realtime dial: %w", err)
+		// net/url errors can contain the credential-bearing websocket URL.
+		return nil, fmt.Errorf("google-realtime dial: %s", strings.ReplaceAll(err.Error(), endpoint.String(), "[endpoint]"))
 	}
 	inputRate := opts.AudioInRate
 	if inputRate == 0 {
@@ -329,6 +334,8 @@ func openGoogleRealtimeSession(ctx context.Context, provider *GoogleRealtimeProv
 		outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), done: make(chan struct{}), ready: make(chan error, 1),
 		inputRate: inputRate, callNames: map[string]string{},
 		configFingerprint: googleRealtimeConfigFingerprint(opts.Instructions, opts.Tools),
+		historySeeding:    opts.RestoreHistory,
+		sessionID:         googleRealtimeSessionSequence.Add(1),
 	}
 	s.outbox <- realtimeOutboundFrame{op: ws.OpText, data: setup}
 	s.lifecycle.start(s.events, s.readLoop, s.writeLoop, s.pingLoop)
@@ -370,7 +377,7 @@ func (s *googleRealtimeSession) signalReady(err error) {
 }
 
 func (s *googleRealtimeSession) nextResponseID() string {
-	return fmt.Sprintf("gemini_live_%d", s.seq.Add(1))
+	return fmt.Sprintf("gemini_live_%d_%d", s.sessionID, s.seq.Add(1))
 }
 
 func (s *googleRealtimeSession) currentOrNextResponseID() string {
@@ -463,7 +470,12 @@ func (s *googleRealtimeSession) readLoop() {
 			signalErr := fmt.Errorf("google-realtime read: %w", err)
 			s.signalReady(signalErr)
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: signalErr})
-			s.emitControl(RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.dropped.Load()})
+			ended := RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.dropped.Load()}
+			var closed wsutil.ClosedError
+			if errors.As(err, &closed) {
+				ended.CloseCode, ended.CloseReason = int(closed.Code), closed.Reason
+			}
+			s.emitControl(ended)
 			_ = s.Close()
 			return
 		}
@@ -482,6 +494,14 @@ func (s *googleRealtimeSession) readLoop() {
 }
 
 func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
+	if message.GoAway != nil {
+		left, err := time.ParseDuration(message.GoAway.TimeLeft)
+		if err == nil && left >= 0 {
+			s.emitControl(RealtimeEvent{Type: RealtimeEventSessionExpiring, TimeLeft: left})
+		} else {
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime: invalid GoAway duration")})
+		}
+	}
 	if message.Error != nil {
 		err := fmt.Errorf("google-realtime: %s/%d: %s", message.Error.Status, message.Error.Code, message.Error.Message)
 		s.signalReady(err)
@@ -778,6 +798,16 @@ func (s *googleRealtimeSession) PreviewConfigurationUpdate(instructions string, 
 }
 
 func (s *googleRealtimeSession) RestoreConversation(messages []Message) error {
+	s.mu.Lock()
+	seeding := s.historySeeding
+	s.historySeeding = false
+	s.mu.Unlock()
+	if !seeding {
+		if len(messages) == 0 {
+			return nil
+		}
+		return fmt.Errorf("google-realtime: history seeding was not requested at setup")
+	}
 	turns := make([]map[string]any, 0, len(messages))
 	for _, message := range messages {
 		text := strings.TrimSpace(message.Content)
@@ -799,6 +829,13 @@ func (s *googleRealtimeSession) RestoreConversation(messages []Message) error {
 		content["turns"] = turns
 	}
 	return s.enqueue(map[string]any{"clientContent": content})
+}
+
+// Google native resumption is intentionally not exposed as a capability.
+// Live validation repeated prior replies/lookups after an accepted checkpoint.
+// Core restores verified conversation and tool receipts on a fresh connection.
+func (s *googleRealtimeSession) EndAudioInput() error {
+	return s.enqueue(map[string]any{"realtimeInput": map[string]any{"audioStreamEnd": true}})
 }
 
 // Gemini interrupts output automatically when new realtime activity begins.

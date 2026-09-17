@@ -237,27 +237,38 @@ func TestWorkerExactToolGrantCannotDiscoverOrExecuteSiblingTool(t *testing.T) {
 }
 
 func TestWorkerEventPreloadActivatesAndExecutesTool(t *testing.T) {
-	const toolName = "billing_upload_invoice_pdf"
-	fixture := newWorkerToolDiscoveryFixture(
-		t, "billing", "upload_invoice_pdf",
-		"Upload an invoice PDF document to the billing folder.",
-		false, nil, "billing",
-	)
-	worker := fixture.thread.Thinker
-	worker.directive = ""
-	worker.lastInboundForPreload = "Please upload the invoice PDF document to the billing folder."
+	for _, legacy := range []bool{false, true} {
+		name := "automatic_default"
+		if legacy {
+			name = "legacy_opt_out"
+		}
+		t.Run(name, func(t *testing.T) {
+			const toolName = "billing_upload_invoice_pdf"
+			fixture := newWorkerToolDiscoveryFixture(
+				t, "billing", "upload_invoice_pdf",
+				"Upload an invoice PDF document to the billing folder.",
+				false, nil, "billing",
+			)
+			worker := fixture.thread.Thinker
+			if legacy {
+				worker.config.AutomaticToolLoading = &AutomaticToolLoadingConfig{Enabled: false}
+			}
+			worker.directive = ""
+			worker.lastInboundForPreload = "Please upload the invoice PDF document to the billing folder."
 
-	presented := nativeToolNames(worker.prepareNativeTools("openai-codex"))
-	if !presented[toolName] || !worker.activeTools[toolName] {
-		t.Fatalf("event preload did not present/activate %s: presented=%v active=%v", toolName, presented, worker.activeTools)
-	}
-	threadToolHandler(fixture.thread, fixture.parent.threads)(worker, []toolCall{{
-		Name: toolName, Args: map[string]string{"input": "invoice.pdf"},
-		Raw: toolName, NativeID: "preload-call",
-	}}, nil)
-	result := waitForWorkerToolResult(t, worker, "preload-call")
-	if result.IsError || fixture.calls.Load() != 1 {
-		t.Fatalf("preloaded worker result=%+v calls=%d", result, fixture.calls.Load())
+			presented := nativeToolNames(worker.prepareNativeTools("openai-codex"))
+			if !presented[toolName] || (legacy && !worker.activeTools[toolName]) || (!legacy && !containsString(worker.automaticTools.names, toolName)) {
+				t.Fatalf("event preload did not present/activate %s: presented=%v active=%v", toolName, presented, worker.activeTools)
+			}
+			threadToolHandler(fixture.thread, fixture.parent.threads)(worker, []toolCall{{
+				Name: toolName, Args: map[string]string{"input": "invoice.pdf"},
+				Raw: toolName, NativeID: "preload-call",
+			}}, nil)
+			result := waitForWorkerToolResult(t, worker, "preload-call")
+			if result.IsError || fixture.calls.Load() != 1 {
+				t.Fatalf("preloaded worker result=%+v calls=%d", result, fixture.calls.Load())
+			}
+		})
 	}
 }
 

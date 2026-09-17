@@ -59,6 +59,10 @@ func isContextLengthError(err error) bool {
 	return false
 }
 func providerExecutionFailureReason(err error) string {
+	var invalid *toolNameError
+	if errors.As(err, &invalid) {
+		return err.Error()
+	}
 	var management *contextManagementError
 	if errors.As(err, &management) || isContextLengthError(err) {
 		return "context_management_failed: " + err.Error()
@@ -118,14 +122,18 @@ type requestObserver func(requestBudget)
 // The adapter calls this on the exact bytes immediately before HTTP submission,
 // after schemas, provider state, images and provider-specific options are added.
 func observeProviderRequest(ctx context.Context, provider, model string, body []byte) error {
-	observer, ok := ctx.Value(requestObserverKey{}).(requestObserver)
-	if !ok {
-		return nil
-	} // Independent provider clients keep their existing API.
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil {
 		return err
 	}
+	if err := validateWireToolNames(root, "history"); err != nil {
+		return err
+	}
+	observer, ok := ctx.Value(requestObserverKey{}).(requestObserver)
+	if !ok {
+		return nil
+	}
+
 	b := requestBudget{Provider: provider, Model: model, Stage: "serialized", SerializedBytes: len(body), Fingerprint: requestFingerprint(body)}
 	// Walk provider structures rather than dividing base64 media bytes by four.
 	// A base64 string inside ordinary tool arguments IS text and is counted.

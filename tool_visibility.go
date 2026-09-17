@@ -16,7 +16,7 @@ func (t *Thinker) toolAuthorizedFor(name string, grants, scopes map[string]bool)
 // visibleNativeToolSnapshot is shared by text requests and realtime session
 // setup, refresh, and previews. It has no activation/LRU or manifest side effects.
 // Loading policy grants visibility only within the supplied authorization scope.
-func (t *Thinker) visibleNativeToolSnapshot(grants, scopes map[string]bool) ([]NativeTool, map[string]*ToolDef, map[string]bool) {
+func (t *Thinker) visibleNativeToolSnapshot(grants, scopes map[string]bool, overlays ...map[string]bool) ([]NativeTool, map[string]*ToolDef, map[string]bool) {
 	if t == nil || t.registry == nil {
 		return nil, nil, nil
 	}
@@ -33,6 +33,13 @@ func (t *Thinker) visibleNativeToolSnapshot(grants, scopes map[string]bool) ([]N
 	add := func(name string) {
 		if t.toolAuthorizedFor(name, grants, scopes) {
 			active[name] = true
+		}
+	}
+	for _, overlay := range overlays {
+		for name, enabled := range overlay {
+			if enabled {
+				add(name)
+			}
 		}
 	}
 	for name, enabled := range t.activeTools {

@@ -262,7 +262,7 @@ type oaiContentBlock struct {
 	Type     string `json:"type"` // "input_text", "input_image", "input_file"
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"` // data:image/png;base64,...
-	Detail   string `json:"detail,omitempty"`    // "original", "high", "low"
+	Detail   string `json:"detail,omitempty"`    // "high", "low", "auto" — never "original" (not in the schema)
 	FileURL  string `json:"file_url,omitempty"`  // URL or data URI for audio/files
 }
 
@@ -391,7 +391,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		if accountID := p.account(); p.Name() == "openai-codex" && accountID != "" {
 			req.Header.Set("ChatGPT-Account-ID", accountID)
 		}
-		return llmHTTPClient.Do(req)
+		return tracedProviderHTTP(req)
 	}
 
 	resp, err := doRequest(body)
@@ -582,7 +582,7 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 						CallID: tr.CallID,
 						Output: []oaiContentBlock{
 							{Type: "input_text", Text: tr.Content},
-							{Type: "input_image", ImageURL: imageURL, Detail: "original"},
+							{Type: "input_image", ImageURL: imageURL, Detail: "high"},
 						},
 					})
 				} else {
@@ -609,7 +609,7 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			}
 			// Then add each tool call as its original output item
 			for _, tc := range m.ToolCalls {
-				argsJSON, _ := json.Marshal(tc.Args)
+				argsJSON := toolCallArguments(tc)
 				items = append(items, oaiInputItem{
 					Type:      "function_call",
 					CallID:    tc.ID,
@@ -636,7 +636,7 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 					blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: part.Text})
 				case "image_url":
 					if part.ImageURL != nil {
-						blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: part.ImageURL.URL, Detail: "original"})
+						blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: part.ImageURL.URL, Detail: "high"})
 					}
 				case "audio_url", "input_audio":
 					// OpenAI Responses API does not support audio input — skip silently
@@ -926,13 +926,13 @@ streamLoop:
 			Items:    providerItems,
 		}
 	}
-	return ChatResponse{
+	return validateProviderToolOutput(ChatResponse{
 		Text:          response,
 		ToolCalls:     toolCalls,
 		Reasoning:     fullReasoning.String(),
 		ProviderState: providerState,
 		Usage:         usage,
-	}, nil
+	})
 }
 
 func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {

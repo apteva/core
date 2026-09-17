@@ -15,7 +15,14 @@ func queueTool(t *Thinker, call toolCall) {
 			for {
 				select {
 				case <-t.toolContext().Done():
-					return
+					for {
+						select {
+						case pending := <-t.toolQueue:
+							pending.trace.finish("cancelled")
+						default:
+							return
+						}
+					}
 				case next := <-t.toolQueue:
 					executeTool(t, next)
 				}
@@ -27,14 +34,17 @@ func queueTool(t *Thinker, call toolCall) {
 	call.Args = copyStringMap(call.Args)
 	call.executionIDs = t.currentEventExecutions()
 	t.resolveToolCall(&call)
+	t.queueToolTrace(&call)
 	if call.NativeID != "" {
 		t.pendingTools.Store(call.NativeID, call.Name)
 	}
 	select {
 	case <-t.toolContext().Done():
+		call.trace.finish("cancelled")
 		t.pendingTools.Delete(call.NativeID)
 	case t.toolQueue <- call:
 	default:
+		call.trace.finish("rejected")
 		t.pendingTools.Delete(call.NativeID)
 		result := ToolResult{CallID: call.NativeID, ToolName: call.Name, IsError: true, Content: "Tool queue is full; wait for current work before retrying."}
 		t.bus.Publish(Event{Type: EventInbox, To: t.threadID, ToolResult: &result, ExecutionIDs: call.executionIDs})

@@ -608,6 +608,7 @@ func TestRealtimeRenewsEndedSessionAndRestoresBoundedTranscript(t *testing.T) {
 	}
 	rt.appendTranscript("user", "hello")
 	rt.appendTranscript("assistant", "hi")
+	rt.audioBridgeConnected() // This regression models an active call.
 	done := make(chan struct{})
 	go func() {
 		rt.Run()

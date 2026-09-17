@@ -30,14 +30,14 @@ BEHAVIOR:
 - Stay focused on YOUR directive. Do not try to take over coordination duties.
 - Shared memories relevant to your directive are supplied automatically. If your work requires a named procedure or policy that is not actually present in your context, do not search for it as a tool, reconstruct it, or invent it. Send your parent one concise missing-guidance blocker, then wait for their reply without repeating the request.
 - Keep each thought concise — 1-2 short paragraphs max.
-- If you have no events to process, just sleep. Silence is normal — do not invent emergencies or report false failures.
+- When no event, assigned responsibility, or worthwhile initiative permitted by your directive requires action, sleep. Do not invent work merely to remain active. Silence is normal — do not invent emergencies or report false failures.
 
 {{PACING}}
 
 TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
-- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, preserve a useful pending deadline or choose the next sleep under the pacing contract.
 - ` + directiveStateContract + `
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
@@ -65,10 +65,11 @@ SPAWNING SUB-THREADS:
 - Use update(id="..." directive="..." tools="...") to change a sub-thread's directive or tools.
 - Use list_threads(filter="...") to search your complete descendant hierarchy by id, name, directive, tool, or MCP scope. [ACTIVE THREADS] states whether the hierarchy is complete; when it says "partial view", it is NOT proof a thread is missing — search broadly before spawning.
 - Your sub-threads report to YOU, not to main. You coordinate your team.
+- ` + delegatedCompletionContract + `
 - The "directive" must be PLAIN NATURAL LANGUAGE. Never put tool call syntax in directives.
 - NEVER spawn a replacement for a thread that already exists. Threads sleep — silence is normal, not a crash.
 - NEVER spawn threads with new IDs to "work around" a slow thread. Wait patiently or send it a message.
-- Only spawn threads that are defined in your team. Do not invent new thread IDs.
+- If your directive explicitly defines a fixed team, spawn only its defined members. Otherwise, after checking for an existing owner, you may create a focused new owner for permitted work within your assigned scope and existing capabilities. Creating a worker does not expand your permissions or authorize additional initiative.
 
 BEHAVIOR:
 {{REASONING}}
@@ -82,7 +83,7 @@ BEHAVIOR:
 TIME AND STATE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
-- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, preserve a useful pending deadline or choose the next sleep under the pacing contract.
 - ` + directiveStateContract + `
 - If your directive assigns continuing work, you own its operational state, cadence, retries, and backoff. Perform the domain work and use pace between cycles; do not become a timer that merely waits.
 
@@ -98,18 +99,19 @@ const normalThreadReportingPrompt = `- If this is a one-shot assignment, return 
 - Keep routine tool results, heartbeats, intermediate progress, and locally recoverable failures in this thread. A persistent owner does not report every successful cycle unless its parent explicitly requested that result.
 - If you lead children, aggregate related activity before reporting upward instead of forwarding every event.`
 
-const normalThreadIdlePrompt = `- When continuing work reaches a wait boundary and any result owed to your parent has been sent, decide whether you need another automatic wake. Use pace(sleep="5m") or pace(sleep="1h") to set one; use pace(clear_wake=true) to wait only for events. A completed one-shot assignment ends with done(message) instead.`
+const normalThreadIdlePrompt = `- When continuing work reaches a wait boundary and any result owed to your parent has been sent, choose the next sleep under the pacing contract. A completed one-shot assignment ends with done(message) instead.`
 
 const normalThreadReasoningPrompt = `- Think out loud — explain what you're doing and why. Never output empty thoughts.`
 
 const normalThreadPacingPrompt = `PACING — this is critical:
 - Tool results (like list_files or web) will wake you up for the next thought. Do NOT set pace in the same thought as a tool call — you'll be woken immediately.
-- Instead: call tools first, THEN in the next thought (after seeing results), set your pace.
-- Example flow: Thought 1: call list_files. Thought 2: process results, send report, pace(sleep="5m").
-- Set sleep duration based on need: "2s" when actively working, "5m" when monitoring, "1h" for deep idle.
+- Instead: call tools first, THEN after seeing results, decide whether useful work remains and choose how to wait.
+- ` + idlePacingContract + `
+- ` + eventDrivenWaitContract + `
+- ` + verificationCompletionContract + `
 - Only use pace when you have NO pending tool calls and are ready to wait.
-- An event can wake you before an existing pending wake without changing it. Inspect [WAKE STATE]: preserve it by omitting a timing change, replace it with sleep/rate, or remove it with clear_wake=true.
-- A timer wake consumes its pending wake. Set another before idling if you want to wake automatically again.`
+- An event can wake you before an existing pending wake without changing it. Inspect [WAKE STATE]: preserve it by omitting a timing change, replace it with sleep/rate, or choose clear_wake=true only under the purely reactive exception.
+- A timer wake consumes its pending wake. Choose another finite sleep before idling unless the purely reactive exception applies.`
 
 const realtimeThreadReportingPrompt = `- Ordinary conversation turns are not worker tasks. Do not report every turn to your parent. Consult your parent only when deeper decisions, privileged backend tools, durable state, or consequential actions are required.`
 
@@ -174,6 +176,7 @@ const threadDirectivePersistencePrompt = `
 - For authority-based changes, copy the parent's durable intent without adding operational details they did not state. Patch only the relevant Markdown section, remove obsolete conflicts, and call evolve once for one authoritative instruction. If evolve rejects the arguments, correct them and retry once; a rejected call did not persist the instruction.`
 
 type ThreadInfo struct {
+	Inference       InferenceHealth
 	ID              string
 	Name            string // human-readable display label; empty = render id
 	System          bool   // platform-managed; hidden from and immutable by agent tools
@@ -201,6 +204,7 @@ type ThreadInfo struct {
 }
 
 type Thread struct {
+	profileUpdateMu sync.Mutex // serializes profile reconciliation through event acceptance
 	cachedToolNames []string
 	ID              string
 	Name            string // human-readable label, separate from ID. ID is immutable;
@@ -271,6 +275,7 @@ func NewThreadManager(parent *Thinker) *ThreadManager {
 
 // SpawnOpts holds optional parameters for spawning a thread.
 type SpawnOpts struct {
+	ParentTrace     *toolTrace // immutable origin snapshot for worker telemetry
 	MediaParts      []ContentPart
 	ProviderName    string // override provider from pool (empty = inherit parent)
 	Model           string // starting model tier (empty = default large)
@@ -362,7 +367,7 @@ func (tm *ThreadManager) SpawnWithOpts(id, directive string, tools []string, opt
 	return tm.spawnInternal(id, directive, tools, opts)
 }
 
-func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opts SpawnOpts) error {
+func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opts SpawnOpts) (spawnErr error) {
 	logMsg("SPAWN", fmt.Sprintf("enter id=%q parent=%q depth=%d tools=%v mcps=%v", id, opts.ParentID, opts.Depth, tools, opts.MCPNames))
 	if err := validateThreadID(id); err != nil {
 		return err
@@ -388,6 +393,23 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	logMsg("SPAWN", fmt.Sprintf("passed existence checks id=%q", id))
 
+	parentTrace := tm.parent.tracing().snapshot()
+	if opts.ParentTrace != nil {
+		parentTrace = opts.ParentTrace.ids
+	}
+	workerTrace := &executionTrace{created: time.Now(), ids: traceIDs{WorkerRunID: newTraceID("run"), ParentWorkerRunID: parentTrace.WorkerRunID, ParentRequestID: parentTrace.RequestID, ExecutionIDs: append([]string(nil), opts.ExecutionIDs...)}}
+	if opts.ParentTrace != nil {
+		workerTrace.ids.ParentToolSpanID = opts.ParentTrace.id
+	}
+	if tm.parent.telemetry != nil {
+		tm.parent.telemetry.Emit("worker.created", id, withTrace(map[string]any{"parent_thread_id": opts.ParentID}, workerTrace.ids))
+	}
+	defer func() {
+		if spawnErr != nil && tm.parent.telemetry != nil {
+			defer tm.parent.telemetry.traces.CompareAndDelete(id, workerTrace)
+			tm.parent.telemetry.Emit("worker.finished", id, withTrace(map[string]any{"outcome": "failed", "error": spawnErr.Error(), "elapsed_ms": time.Since(workerTrace.created).Milliseconds()}, workerTrace.ids))
+		}
+	}()
 	// Realtime: pre-validate provider availability. Actual session
 	// opening + RealtimeThinker construction happens after the
 	// regular Thinker is built (we reuse its registry, bus
@@ -694,6 +716,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		nextWakeAt:             initialWake,
 		resumeWakeAt:           initialWake,
 		paceDurable:            opts.Pace != nil,
+		waitForEvents:          opts.Pace != nil && opts.Pace.WaitForEvents && initialWake.IsZero(),
 		wakeReason:             "startup",
 		model:                  initialModel,
 		agentModel:             initialModel,
@@ -728,6 +751,8 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			return thread.promptBuilder(thread.Directive)
 		},
 	}
+	thinker.trace = workerTrace
+	thinker.tracing()
 	thinker.addEventExecutions(opts.ExecutionIDs)
 	if thinker.eventLifecycle != nil {
 		thinker.addEventExecutions(thinker.eventLifecycle.ActiveForThread(id))
@@ -1091,6 +1116,12 @@ func (thread *Thread) tagThreadMessage(msg string) string {
 // threadToolHandler returns a ToolHandler scoped to a thread's allowed tools.
 func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 	return func(t *Thinker, calls []toolCall, _ []string) ([]string, []string, []ToolResult) {
+		var inlineSpans []*toolTrace
+		defer func() {
+			for _, span := range inlineSpans {
+				span.finish("failed")
+			}
+		}()
 		var replies []string
 		var toolNames []string
 		var results []ToolResult
@@ -1115,29 +1146,34 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			if t.telemetry != nil {
 				isError := inlineToolResultIsError(content)
 				data := newToolResultData(
-					call.NativeID, call.Name, 0, !isError, content, content, 0,
+					call.NativeID, call.Name, call.trace.duration(), !isError, content, content, 0,
 				)
 				data.ExecutionIDs = t.currentEventExecutions()
 				if len(durable) > 0 && durable[0] {
-					if err := t.telemetry.EmitDurable("tool.result", t.threadID, data); err != nil {
+					if err := t.telemetry.EmitDurable("tool.result", t.threadID, call.trace.data(data)); err != nil {
+						call.trace.finish("failed")
 						return err
 					}
 				} else {
-					t.telemetry.Emit("tool.result", t.threadID, data)
+					t.telemetry.Emit("tool.result", t.threadID, call.trace.data(data))
 				}
 			}
+			call.trace.result(content)
 			addResult(call.NativeID, call.Name, content)
 			return nil
 		}
 
 		for _, call := range calls {
 			if !t.modelToolCallable(call.Name, thread.Tools) {
+				t.queueToolTrace(&call)
+				inlineSpans = append(inlineSpans, call.trace)
+				call.trace.start()
 				reason := call.Args["_reason"]
 				delete(call.Args, "_reason")
 				if t.telemetry != nil {
-					t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+					t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
 						ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
-					})
+					}))
 				}
 				emitResult(call, fmt.Sprintf(
 					"error: tool %q is not available to this thread in the current model turn; use an exposed tool or search_tools, then retry on the next turn",
@@ -1155,15 +1191,20 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				isInline = false // executeTool handles _reason and telemetry
 			}
 
+			if isInline {
+				t.queueToolTrace(&call)
+				inlineSpans = append(inlineSpans, call.trace)
+				call.trace.start()
+			}
 			reason := ""
 			if isInline {
 				reason = call.Args["_reason"]
 				delete(call.Args, "_reason")
 			}
 			if isInline && t.telemetry != nil {
-				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+				t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
 					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
-				})
+				}))
 			}
 			switch call.Name {
 			case "send":
@@ -1274,6 +1315,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						MCPNames:     mcpNames,
 						BuiltinTools: builtinTools,
 						Paused:       paused,
+						ParentTrace:  call.trace,
 						ExecutionIDs: t.currentEventExecutions(),
 					})
 					if err != nil {
@@ -1458,6 +1500,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				}
 			}
 
+			t.workerMilestone("finished", "completed")
 			t.settleEventExecutions("thread_done")
 			if thread.Realtime != nil {
 				thread.Realtime.setTerminalReason("caller_done")
@@ -1490,6 +1533,7 @@ func (tm *ThreadManager) KillWithReason(id, reason string) {
 	}
 	if reason != "server_shutdown" {
 		if reason == "caller_done" {
+			thread.Thinker.workerMilestone("finished", "completed")
 			thread.Thinker.settleEventExecutions("thread_done")
 		} else {
 			thread.Thinker.failEventExecutions(reason)
@@ -1652,6 +1696,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			subCount = t.Children.Count()
 		}
 		infos = append(infos, ThreadInfo{
+			Inference:       t.Thinker.inferenceSnapshot(),
 			ID:              t.ID,
 			Name:            t.Name,
 			System:          t.System,
@@ -1837,8 +1882,9 @@ func persistentThreadStateBase(thread *Thread) PersistentThread {
 		state.Reasoning = status.BaselineReasoning.String()
 		if status.PaceDurable {
 			state.Pace = &PersistentPaceState{
-				Sleep:      formatPaceDuration(status.Sleep),
-				NextWakeAt: status.NextWakeAt,
+				Sleep:         formatPaceDuration(status.Sleep),
+				NextWakeAt:    status.NextWakeAt,
+				WaitForEvents: status.WaitForEvents,
 			}
 		}
 		if !thread.IsRealtime && status.Provider != "" {
@@ -1927,6 +1973,7 @@ type ThreadUpdateOptions struct {
 }
 
 type ThreadUpdateResult struct {
+	Events            ThreadEventQueueResult
 	Changed           bool
 	NameChanged       bool
 	DirectiveChanged  bool
@@ -1989,28 +2036,62 @@ func (tm *ThreadManager) Update(id, name, directive string, tools []string) erro
 }
 
 func (tm *ThreadManager) UpdateWithOpts(id, name, directive string, tools []string, opts ThreadUpdateOptions) (ThreadUpdateResult, error) {
+	return tm.UpdateWithEvents(id, name, directive, tools, opts, nil)
+}
+
+// UpdateWithEvents coordinates profile reconciliation with event acceptance.
+// No-op profiles retain the advisory semantics of QueueEvents. Changed profiles
+// publish their committed events inside the mutation, before its acknowledgement
+// releases either the caller or the thinker's next iteration.
+func (tm *ThreadManager) UpdateWithEvents(id, name, directive string, tools []string, opts ThreadUpdateOptions, incoming []PersistentThreadEvent) (ThreadUpdateResult, error) {
 	owner, thread := tm.findManagedThread(id)
 	if owner == nil {
-		return ThreadUpdateResult{}, fmt.Errorf("thread %q not found", id)
+		return ThreadUpdateResult{}, &threadNotFoundError{id: id}
+	}
+	thread.profileUpdateMu.Lock()
+	defer thread.profileUpdateMu.Unlock()
+	owner.mu.RLock()
+	if owner.threads[id] != thread {
+		owner.mu.RUnlock()
+		return ThreadUpdateResult{}, &threadNotFoundError{id: id}
+	}
+	plan := planThreadProfile(thread, name, directive, tools, opts)
+	owner.mu.RUnlock()
+	if !plan.result.Changed {
+		events, err := owner.QueueEvents(id, incoming)
+		plan.result.Events = events
+		return plan.result, err
+	}
+	// Reject invalid/conflicting events before canceling any inference. Repeat
+	// staging at commit because independent event deliveries may race this check.
+	owner.mu.RLock()
+	thread.inboxMu.Lock()
+	_, _, _, validationErr := stageThreadEvents(thread, incoming)
+	thread.inboxMu.Unlock()
+	owner.mu.RUnlock()
+	if validationErr != nil {
+		return ThreadUpdateResult{}, validationErr
 	}
 	var result ThreadUpdateResult
 	err := thread.Thinker.mutateRuntime(func() error {
 		var err error
-		result, err = owner.updateWithOptsNow(id, name, directive, tools, opts)
+		result, err = owner.updateWithOptsNow(id, name, directive, tools, opts, incoming)
 		return err
 	})
 	return result, err
 }
-func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []string, opts ThreadUpdateOptions) (ThreadUpdateResult, error) {
-	var result ThreadUpdateResult
-	tm.mu.Lock()
-	tm.order = nil
-	thread, exists := tm.threads[id]
-	if !exists {
-		tm.mu.Unlock()
-		return result, fmt.Errorf("thread %q not found", id)
-	}
 
+type threadProfileUpdate struct {
+	result          ThreadUpdateResult
+	name, directive string
+	tools           map[string]bool
+	mcp             []string
+}
+
+// planThreadProfile uses the same normalization for preflight and commit.
+// The caller holds the owning manager's lock.
+func planThreadProfile(thread *Thread, name, directive string, tools []string, opts ThreadUpdateOptions) threadProfileUpdate {
+	var result ThreadUpdateResult
 	nextName := thread.Name
 	if name != "" {
 		nextName = name
@@ -2044,9 +2125,28 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 	}
 	result.MCPChanged = !sameStringSliceSet(nextMCPNames, thread.MCPNames)
 	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged || result.MCPChanged
+	return threadProfileUpdate{result: result, name: nextName, directive: nextDirective, tools: nextTools, mcp: nextMCPNames}
+}
+
+func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []string, opts ThreadUpdateOptions, incoming []PersistentThreadEvent) (ThreadUpdateResult, error) {
+	var result ThreadUpdateResult
+	tm.mu.Lock()
+	tm.order = nil
+	thread, exists := tm.threads[id]
+	if !exists {
+		tm.mu.Unlock()
+		return result, &threadNotFoundError{id: id}
+	}
+
+	plan := planThreadProfile(thread, name, directive, tools, opts)
+	result = plan.result
+	nextName, nextDirective, nextTools, nextMCPNames := plan.name, plan.directive, plan.tools, plan.mcp
+
 	if !result.Changed {
 		tm.mu.Unlock()
-		return result, nil
+		var err error
+		result.Events, err = tm.QueueEvents(id, incoming)
+		return result, err
 	}
 
 	nextScopes := make(map[string]bool, len(nextMCPNames))
@@ -2065,21 +2165,40 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		}
 	}
 
+	thread.inboxMu.Lock()
+	nextEvents, acceptedEvents, receipt, err := stageThreadEvents(thread, incoming)
+	if err != nil {
+		thread.inboxMu.Unlock()
+		tm.mu.Unlock()
+		return ThreadUpdateResult{}, err
+	}
 	if !thread.Ephemeral {
-		persisted := persistentThreadState(thread)
+		persisted := persistentThreadStateBase(thread)
 		persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
 		persisted.MCPNames = append([]string(nil), nextMCPNames...)
-		if err := tm.parent.config.SaveThread(persisted); err != nil {
+		persisted.Events = clonePersistentThreadEvents(nextEvents)
+		if result.DirectiveChanged && persisted.Pace != nil {
+			persisted.Pace.WaitForEvents = false
+		}
+		if err := tm.parent.config.saveThreadProfileAndEvents(persisted, acceptedEvents); err != nil {
+			thread.inboxMu.Unlock()
 			tm.mu.Unlock()
 			return ThreadUpdateResult{}, fmt.Errorf("persist thread update: %w", err)
 		}
 	}
+	thread.inboxEvents = nextEvents
+	thread.inboxMu.Unlock()
+	result.Events = receipt
 
 	if realtime != nil {
 		realtime.transcriptMu.Lock()
 	}
 	thread.Name = nextName
 	thread.Directive = nextDirective
+	if result.DirectiveChanged {
+		thread.Thinker.waitForEvents = false
+		thread.Thinker.publishRuntimeStatus()
+	}
 	thread.Tools = nextTools
 	thread.cachedToolNames = nil
 	thread.MCPNames = append([]string(nil), nextMCPNames...)
@@ -2114,6 +2233,7 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		realtime.transcriptMu.Unlock()
 	}
 	tm.mu.Unlock()
+	publishThreadInboxEvents(tm.parent.bus, id, acceptedEvents)
 
 	if realtime != nil && (result.DirectiveChanged || result.ToolsChanged || result.MCPChanged) {
 		restarted, err := realtime.applyExternalConfigurationChange(opts.RestartRealtime || !bridgeConnected, "parent_configuration_update")
@@ -2330,11 +2450,19 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 	tm.parent.bus.Unsubscribe(id)
 	tm.parent.logAPI(APIEvent{Type: "thread_done", ThreadID: id})
 
+	if thread != nil {
+		thread.Thinker.workerMilestone("finished", "cancelled")
+	}
 	// Telemetry: thread.done
 	if tm.parent.telemetry != nil {
-		tm.parent.telemetry.Emit("thread.done", id, ThreadDoneData{
-			ParentID: parentID,
-		})
+		data := any(ThreadDoneData{ParentID: parentID})
+		if thread != nil {
+			data = withTrace(data, thread.Thinker.tracing().snapshot())
+		}
+		tm.parent.telemetry.Emit("thread.done", id, data)
+		if thread != nil {
+			tm.parent.telemetry.traces.CompareAndDelete(id, thread.Thinker.tracing())
+		}
 	}
 }
 

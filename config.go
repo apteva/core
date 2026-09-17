@@ -14,12 +14,13 @@ const configFile = "config.json"
 
 // PersistentPaceState is runtime scheduling state, not directive content.
 // Sleep records the duration used for the last timing decision; NextWakeAt is
-// the single agent-owned pending timer. A zero NextWakeAt means event-only
-// waiting. A future deadline remains capped by the runtime's 24-hour maximum
+// the single pending timer. WaitForEvents records an explicit agent decision
+// to wait without a timer. A future deadline remains capped by the runtime's 24-hour maximum
 // when restored.
 type PersistentPaceState struct {
-	Sleep      string    `json:"sleep,omitempty"`
-	NextWakeAt time.Time `json:"next_wake_at,omitempty"`
+	WaitForEvents bool      `json:"wait_for_events,omitempty"` // recorded by pace(clear_wake), not an operator setting
+	Sleep         string    `json:"sleep,omitempty"`
+	NextWakeAt    time.Time `json:"next_wake_at,omitempty"`
 }
 
 // PersistentThreadEvent is an idempotent API-created inbox event. Pending
@@ -85,15 +86,16 @@ type ProviderConfig struct {
 }
 
 type Config struct {
-	RuntimeSequence uint64 `json:"runtime_sequence,omitempty"`
-	mu              sync.RWMutex
-	saveMu          sync.Mutex
-	path            string
-	loadErr         error
-	Directive       string `json:"directive"`
-	Unconscious     bool   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
-	RealtimeEnabled bool   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
-	RealtimeVoice   string `json:"realtime_voice,omitempty"`   // dashboard/default realtime voice (provider validates at session open)
+	AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
+	RuntimeSequence      uint64                      `json:"runtime_sequence,omitempty"`
+	mu                   sync.RWMutex
+	saveMu               sync.Mutex
+	path                 string
+	loadErr              error
+	Directive            string `json:"directive"`
+	Unconscious          bool   `json:"unconscious,omitempty"`      // enable background memory consolidation thread
+	RealtimeEnabled      bool   `json:"realtime_enabled,omitempty"` // master switch for realtime (voice/audio) threads; off = main never sees the capability and spawn rejects realtime=true
+	RealtimeVoice        string `json:"realtime_voice,omitempty"`   // dashboard/default realtime voice (provider validates at session open)
 	// RealtimeVoiceMCP is the operator-selected subset of attached MCP
 	// servers exposed to dashboard voice sessions. It is policy/config only;
 	// realtime execution still uses the normal thread registry and gates.
@@ -142,6 +144,9 @@ func (c *Config) load() error {
 		if err := validateMCPToolLoading(server); err != nil {
 			return err
 		}
+	}
+	if err := validateAutomaticToolLoading(c.AutomaticToolLoading); err != nil {
+		return err
 	}
 	return c.loadRuntimeJournalLocked()
 }
@@ -211,6 +216,7 @@ func (c *Config) restore(data []byte) {
 	if err := json.Unmarshal(data, &restored); err != nil {
 		return
 	}
+	c.AutomaticToolLoading = restored.AutomaticToolLoading
 	c.RuntimeSequence = restored.RuntimeSequence
 	c.Directive = restored.Directive
 	c.Unconscious = restored.Unconscious

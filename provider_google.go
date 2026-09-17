@@ -202,6 +202,14 @@ func normalizeGeminiSchema(name string, v any) any {
 	case map[string]any:
 		out := make(map[string]any, len(x)+1)
 		for k, val := range x {
+			// Gemini's Schema proto rejects JSON-Schema keywords that are
+			// valid for OpenAI/MCP schemas. Drop them at every nesting
+			// level rather than sending a request that Gemini rejects with
+			// INVALID_ARGUMENT (notably additionalProperties).
+			switch k {
+			case "additionalProperties", "$schema", "$defs", "definitions", "unevaluatedProperties", "dependentSchemas":
+				continue
+			}
 			if k == "properties" {
 				props, ok := val.(map[string]any)
 				if !ok {
@@ -492,7 +500,7 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := llmHTTPClient.Do(req)
+	resp, err := tracedProviderHTTP(req)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -603,7 +611,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 		preview = preview[:200] + "..."
 	}
 	logMsg("GEMINI", fmt.Sprintf("done tokens_in=%d tokens_out=%d len=%d tools=%d response=%q", usage.PromptTokens, usage.CompletionTokens, len(response), len(toolCalls), preview))
-	return ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage}, nil
+	return validateProviderToolOutput(ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage})
 }
 
 // audioMimeTypes maps file extensions to MIME types for audio.

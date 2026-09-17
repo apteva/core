@@ -231,7 +231,7 @@ const baseSystemPrompt = `You are the main coordinating thread of a continuous t
 ROLE AND LOOP:
 - Every thought has at least one short sentence of reasoning. Never output only tool calls.
 - [console] is an external event or command. [from:id] is an ordinary thread message. [thread:id done] means a thread terminated.
-- Never fabricate events. Process real events first; otherwise continue supervisory or lightweight standing work from your directive. If nothing is actionable, pace and sleep.
+- Never fabricate events. Process real events first; otherwise continue supervisory or lightweight standing work from your directive. If nothing is actionable, choose an appropriate sleep under the pacing contract.
 - You may perform only very small work directly when it is bounded, immediately actionable, and creating a separate owner would add more overhead than value.
 - Outside the small number of lightweight recurring responsibilities explicitly kept on main, delegate work whenever it requires distinct ownership or operational state, substantial context, parallelism, waiting or retries, continued operation, or independent failure handling.
 - When work contains multiple independent units, coordinate their ownership; do not begin the first domain unit on main and let convenience turn main into the worker.
@@ -239,7 +239,10 @@ ROLE AND LOOP:
 TIME, STATE, AND RECURRENCE:
 - Every wake includes a fresh [CURRENT TIME] in UTC. Use it directly.
 - [WAKE STATE] shows why you woke and your currently pending automatic wake, if any.
-- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, set, replace, preserve, or clear the pending wake according to what should happen next.
+- pace controls one pending automatic wake and is capped at 24h. Events wake you early without changing it. A timer wake consumes it; after handling any wake, preserve a useful pending deadline or choose the next sleep under the pacing contract.
+- ` + idlePacingContract + `
+- ` + eventDrivenWaitContract + `
+- ` + verificationCompletionContract + `
 - ` + directiveStateContract + `
 - ` + recurringDirectiveContract + `
 - Decide what is due from current time plus execution history. Main may own a small number of lightweight, closely related recurring responsibilities.
@@ -253,6 +256,7 @@ OWNERSHIP AND DELEGATION:
 - For multiple independent work units, assign the units to focused owners instead of executing the first unit on main.
 - For batches of independent repeated work, especially tool-heavy or waiting/polling work, coordinate focused workers. Consolidate closely related continuing responsibilities under one owner instead of creating one thread per schedule.
 - Temporary and continuing workers are the same thread type. A one-shot worker owns one clear unit of work, uses the smallest required tool set, and returns its final result exactly once with done(message). A persistent owner sends requested reports, uses pace between cycles, and remains active.
+- ` + delegatedCompletionContract + `
 - tools= is a hard exact capability grant. ALWAYS include EVERY exact tool the worker needs; a missing tool cannot be discovered or called unless its server is explicitly granted through mcp=. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
 - mcp= grants a complete server discovery scope. Use it only when the worker may discover/use that server's broader surface; naming one exact tool in tools= never grants its sibling tools.
 - Capability alone does not determine ownership: do not keep work on main merely because main can complete it. Keep only the very-small-work fast path local.
@@ -260,7 +264,7 @@ OWNERSHIP AND DELEGATION:
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
   GOOD: directive="Check for new support tickets periodically. Report findings to main."
 - provider= (optional) picks a specific LLM; omit to inherit. Use a stronger provider for complex tasks, a cheaper one for coordination. See [AVAILABLE PROVIDERS].
-- Never short-sleep to check on a worker; replies wake you. Do not create a child merely to avoid a very small immediately completing action.
+- Do not create a child merely to avoid a very small immediately completing action.
 
 REPORTING:
 - Routine tool results, heartbeats, intermediate progress, and locally recoverable failures stay with the owning thread.
@@ -415,7 +419,7 @@ Codex may not expose provider reasoning summaries. When you call tools, include 
 		prompt += blobPromptHint
 	}
 
-	prompt += "\n\n[DIRECTIVE — EXECUTE ON STARTUP]\nThe following is your mission. On your FIRST thought, take any actions needed to fulfill it (spawn threads, etc). This overrides default idle behavior.\nWhen using `evolve` to update your directive, submit ONLY the text between [BEGIN DIRECTIVE] and [END DIRECTIVE] — never the framework rules above this block.\n\n[BEGIN DIRECTIVE]\n" + directive + "\n[END DIRECTIVE]"
+	prompt += "\n\n[DIRECTIVE — STARTUP]\nThe following is your mission. On your FIRST thought, begin actionable assigned work and handle due standing responsibilities, spawning focused owners under the ownership rules above. Apply those same ownership rules to permitted unsolicited initiative: delegate multi-step domain investigation or work requiring separate operational state before starting its domain actions on main. Any unsolicited initiative must satisfy your directive's initiative and approval rules. Startup itself is not a new assignment; if nothing permitted requires action, wait.\nWhen using `evolve` to update your directive, submit ONLY the text between [BEGIN DIRECTIVE] and [END DIRECTIVE] — never the framework rules above this block.\n\n[BEGIN DIRECTIVE]\n" + directive + "\n[END DIRECTIVE]"
 	return prompt
 }
 
@@ -790,6 +794,10 @@ type APIEvent struct {
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 type Thinker struct {
+	traceOnce        sync.Once
+	trace            *executionTrace
+	inferenceMu      sync.Mutex
+	inferenceHealth  InferenceHealth
 	shuttingDown     atomic.Bool
 	compactionActive atomic.Bool
 	mutationMu       sync.Mutex
@@ -819,6 +827,7 @@ type Thinker struct {
 	agentSleep       time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
 	nextWakeAt       time.Time     // one pending agent-owned timer persisted by pace
 	resumeWakeAt     time.Time     // one-shot startup gate restored from config
+	waitForEvents    bool          // explicit pace(clear_wake) decision, renewed after the next input
 	paceDurable      bool          // true after an explicit or restored pace
 	paceRevision     uint64        // increments only when the agent replaces or clears its pending wake
 	wakeReason       string        // reason supplied to the next request-context snapshot
@@ -954,10 +963,10 @@ type Thinker struct {
 	// lastInboundForPreload carries the text of events drained on
 	// THIS iteration through to applyPreload's BM25 query. Set in
 	// Run() before think(); cleared after think() returns. Lets BM25
-	// preload include the user's just-arrived message (one cache-bust
-	// per fresh event, which already busts anyway) without permanently
+	// preload include the user's just-arrived message without permanently
 	// destabilising the active-tools set on quiet turns.
 	lastInboundForPreload string
+	automaticTools        automaticToolSelection
 	// MCP server catalog — lightweight metadata for prompt (name +
 	// tool count). Derived from toolIndex; kept as a Thinker field
 	// for buildSystemPrompt back-compat.
@@ -1178,6 +1187,7 @@ type thinkerRuntimeStatus struct {
 	Sleep             time.Duration
 	NextWakeAt        time.Time
 	PaceDurable       bool
+	WaitForEvents     bool
 	ProviderModels    map[ModelTier]string
 	MCPNames          []string
 }
@@ -1217,6 +1227,7 @@ func (t *Thinker) publishRuntimeStatus() {
 		Sleep:             t.agentSleep,
 		NextWakeAt:        t.nextWakeAt,
 		PaceDurable:       t.paceDurable,
+		WaitForEvents:     t.waitForEvents,
 		ProviderModels:    providerModels,
 		MCPNames:          mcpNames,
 	})
@@ -1317,6 +1328,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 		nextWakeAt:             mainWake,
 		resumeWakeAt:           mainWake,
 		paceDurable:            mainPace != nil,
+		waitForEvents:          mainPace != nil && mainPace.WaitForEvents && mainWake.IsZero(),
 		wakeReason:             "startup",
 		agentReasoning:         ReasoningAuto,
 		baselineModel:          ModelLarge,
@@ -1818,6 +1830,12 @@ func findThreadManager(root *ThreadManager, parentID string) *ThreadManager {
 // mainToolHandler returns the tool handler for the main coordinating thread.
 func mainToolHandler(t *Thinker) ToolHandler {
 	return func(_ *Thinker, calls []toolCall, consumed []string) ([]string, []string, []ToolResult) {
+		var inlineSpans []*toolTrace
+		defer func() {
+			for _, span := range inlineSpans {
+				span.finish("failed")
+			}
+		}()
 		var replies []string
 		var toolNames []string
 		var results []ToolResult
@@ -1845,11 +1863,16 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				delete(call.Args, "_reason")
 			}
 
+			if isInline {
+				t.queueToolTrace(&call)
+				inlineSpans = append(inlineSpans, call.trace)
+				call.trace.start()
+			}
 			// Emit tool.call telemetry only for inline tools
 			if isInline && t.telemetry != nil {
-				t.telemetry.Emit("tool.call", t.threadID, ToolCallData{
+				t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
 					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
-				})
+				}))
 			}
 			// Helper to add inline tool result + emit telemetry
 			addResult := func(content string) {
@@ -1859,11 +1882,12 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				}
 				if t.telemetry != nil {
 					data := newToolResultData(
-						call.NativeID, call.Name, 0, !isError, content, content, 0,
+						call.NativeID, call.Name, call.trace.duration(), !isError, content, content, 0,
 					)
 					data.ExecutionIDs = t.currentEventExecutions()
-					t.telemetry.Emit("tool.result", t.threadID, data)
+					t.telemetry.Emit("tool.result", t.threadID, call.trace.data(data))
 				}
+				call.trace.result(content)
 			}
 
 			switch call.Name {
@@ -1993,6 +2017,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						Voice:         voice,
 						TurnDetection: turnDetection,
 						ExecutionIDs:  t.currentEventExecutions(),
+						ParentTrace:   call.trace,
 					})
 					if err != nil {
 						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
@@ -2339,74 +2364,69 @@ func mainToolHandler(t *Thinker) ToolHandler {
 	}
 }
 
-// waitForRestoredWake restores the agent's single pending wake exactly. An
-// early event resumes the thread without consuming or moving that deadline. A
-// durable state with no deadline is event-only and therefore remains dormant
-// until an event arrives.
+// waitForRestoredWake preserves the last explicit agent timing decision.
+// Legacy empty deadlines without an explicit event-only decision are repaired.
 func (t *Thinker) waitForRestoredWake() bool {
-	wake := t.resumeWakeAt
 	t.resumeWakeAt = time.Time{}
-	if wake.IsZero() {
-		if !t.paceDurable {
-			t.wakeReason = "startup"
+	if t.nextWakeAt.IsZero() && !t.paceDurable {
+		t.wakeReason = "startup"
+		return true
+	}
+	for {
+		if err := t.ensureIdleWake(time.Now()); err != nil {
+			t.recordPersistenceFailure(err)
+			return false
+		}
+		wake := t.nextWakeAt
+		if !wake.IsZero() && !wake.After(time.Now()) {
+			t.wakeDeadlineFired = true
+			t.wakeReason = "timer"
 			return true
 		}
-		logMsg("RUN", fmt.Sprintf("[%s] restored event-only wait", t.threadID))
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if !wake.IsZero() {
+			delay := time.Until(wake)
+			if delay > maxSleep {
+				delay = maxSleep
+			}
+			timer = time.NewTimer(delay)
+			timerC = timer.C
+			logMsg("RUN", fmt.Sprintf("[%s] restoring paced wake in %s", t.threadID, formatSleep(delay)))
+		} else {
+			logMsg("RUN", fmt.Sprintf("[%s] restored event-only wait", t.threadID))
+		}
+		recheck := false
+		proceed := true
 		select {
+		case <-timerC:
+			t.wakeDeadlineFired = true
+			t.wakeReason = "timer"
 		case <-t.mutationWake:
 			t.applyRuntimeMutations()
+			recheck = true
 		case <-t.sub.Wake:
 			t.wakeReason = "event"
-			return true
 		case paused := <-t.pause:
 			t.paused = paused
 			t.wakeReason = "resume"
-			return true
 		case <-t.quit:
-			return false
+			proceed = false
 		}
-	}
-	if !wake.After(time.Now()) {
-		t.wakeDeadlineFired = true
-		t.wakeReason = "timer"
-		return true
-	}
-
-	delay := time.Until(wake)
-	if delay > maxSleep {
-		delay = maxSleep
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	logMsg("RUN", fmt.Sprintf("[%s] restoring paced wake in %s", t.threadID, formatSleep(delay)))
-
-	select {
-	case <-timer.C:
-		t.wakeDeadlineFired = true
-		t.wakeReason = "timer"
-		logMsg("RUN", fmt.Sprintf("[%s] restored timer expired", t.threadID))
-		return true
-	case <-t.mutationWake:
-		t.applyRuntimeMutations()
-		return t.waitForRestoredWake()
-	case <-t.sub.Wake:
-		// The event remains on the bus for the first iteration. The pending
-		// timer is deliberately untouched.
-		t.wakeReason = "event"
-		logMsg("RUN", fmt.Sprintf("[%s] restored timer interrupted by event", t.threadID))
-		return true
-	case paused := <-t.pause:
-		t.paused = paused
-		t.wakeReason = "resume"
-		return true
-	case <-t.quit:
-		return false
+		if timer != nil {
+			timer.Stop()
+		}
+		if !recheck {
+			return proceed
+		}
 	}
 }
 
 func (t *Thinker) Run() {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
+	t.workerMilestone("ready", "")
+	defer t.workerMilestone("finished", "cancelled")
 	t.beginRuntime()
 	defer t.endRuntime()
 	runCtx, cancelRun := context.WithCancel(context.Background())
@@ -2421,6 +2441,7 @@ func (t *Thinker) Run() {
 		}
 		t.runContextMu.Unlock()
 		if r := recover(); r != nil {
+			t.workerMilestone("finished", "failed")
 			memoryCount := 0
 			if t.memory != nil {
 				memoryCount = t.memory.Count()
@@ -2509,6 +2530,12 @@ func (t *Thinker) Run() {
 
 		if t.paused {
 			continue
+		}
+		// An explicit event-only decision lasts until the next input/resume.
+		// The agent must reassess its directive and choose how to wait again.
+		if err := t.consumeEventOnlyWait(); err != nil {
+			t.recordPersistenceFailure(err)
+			return
 		}
 		// A deadline may become due just before an event/resume iteration
 		// starts. Deliver both facts in one model turn rather than running a
@@ -2794,6 +2821,7 @@ func (t *Thinker) Run() {
 		// the same anchor so selected memory remains visible without duplication.
 		dynCtx := buildDynamicTurnContextView(activeThreads, recallContext, rosterForTurn)
 		dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
+		dynCtx += "\n" + idlePacingContract
 		refreshRequestContext := recallRefreshed || hasExternalEvent || (!hadEvents && len(toolResults) == 0)
 		requestMessages := t.requestContext.prepare(
 			t.messages,
@@ -3077,17 +3105,21 @@ func (t *Thinker) Run() {
 		t.applyActiveModelFloor()
 		t.publishRuntimeStatus()
 
-		// Compute actual sleep duration: agentSleep takes priority, else rate enum
-		sleepDur := t.agentSleep
-		if sleepDur <= 0 {
-			sleepDur = t.rate.Delay()
-		}
-
 		// A fired one-shot wake is part of this turn's input. Consume it after
 		// all model-selected tools (including a replacement pace call) have
 		// run, but before publishing turn completion so observers, runtime
 		// status, and persisted state agree at that boundary.
 		t.completeFiredWake(paceRevisionAtStart)
+		if !t.kickNextTurn {
+			if err := t.ensureIdleWake(time.Now()); err != nil {
+				t.recordPersistenceFailure(err)
+				return
+			}
+		}
+		sleepDur := t.agentSleep
+		if sleepDur <= 0 {
+			sleepDur = t.rate.Delay()
+		}
 
 		// Thread count (0 if no thread manager)
 		threadCount := 0
@@ -3209,9 +3241,7 @@ func (t *Thinker) Run() {
 			t.publishRuntimeStatus()
 		}
 
-		// Core owns no recurrence policy. It waits for the agent's one pending
-		// wake, using only the remaining duration, or waits event-only when the
-		// agent left no timer.
+		// Core supplies a fallback only when the agent left no timing decision. Existing deadlines retain their remaining duration.
 		delay, armed := pendingWakeDelay(t.nextWakeAt, time.Now())
 		if armed && delay == 0 {
 			t.wakeDeadlineFired = true
@@ -3333,12 +3363,22 @@ func (t *Thinker) toolCallIDsProtectedFromSanitization(extra []toolCall) map[str
 	return protected
 }
 
-func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMProvider, messages []Message) (ChatResponse, error) {
+func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMProvider, messages []Message) (response ChatResponse, requestErr error) {
+	var request *requestTrace
+	if provider != nil {
+		request = t.queueRequestTrace(provider.Name(), modelIDForProvider(provider, t.model))
+		defer func() { request.finish(response, requestErr) }()
+	}
+	messages, _ = projectMalformedToolHistory(messages)
+	if err := validateToolHistory(messages); err != nil {
+		return ChatResponse{}, err
+	}
 	if provider == nil {
 		return ChatResponse{}, fmt.Errorf("no provider configured")
 	}
 
 	onChunk := func(chunk string) {
+		request.output("text", chunk != "")
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
 		if t.telemetry != nil && chunk != "" {
 			t.telemetry.EmitLive("llm.chunk", t.threadID, LLMChunkData{
@@ -3365,6 +3405,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	}
 
 	onThinking := func(chunk string) {
+		request.output("reasoning", chunk != "")
 		if t.telemetry != nil && chunk != "" {
 			t.telemetry.EmitLive("llm.thinking", t.threadID, map[string]any{
 				"text": chunk, "iteration": t.iteration,
@@ -3373,6 +3414,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	}
 
 	onToolChunk := func(toolName, callID, chunk string) {
+		request.output("tool", toolName != "" || chunk != "")
 		t.bus.Publish(Event{Type: EventToolChunk, From: t.threadID, Text: chunk, ToolName: toolName, Iteration: t.iteration})
 		if t.telemetry != nil {
 			t.telemetry.EmitLive("llm.tool_chunk", t.threadID, map[string]any{
@@ -3426,12 +3468,19 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 	requestedReasoning := t.effectiveReasoningLevel().String()
 	chatProvider := providerWithReasoning(provider, t.effectiveReasoningLevel())
 	ctx = t.preparePromptCacheContext(ctx, messages, nativeTools)
+	ctx = t.providerSessionContext(ctx, "inference")
+	request.wait()
 	releaseBudget, budgetErr := t.acquireLLMBudget(ctx)
 	if budgetErr != nil {
 		return ChatResponse{}, budgetErr
 	}
 	defer releaseBudget()
+	request.start()
+	ctx = context.WithValue(ctx, requestTraceKey{}, request)
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
+	if err == nil {
+		resp, err = validateProviderToolOutput(resp)
+	}
 	resp.Provider = provider.Name()
 	resp.Model = modelID
 	if resp.RequestedReasoningEffort == "" {
@@ -3458,7 +3507,13 @@ func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 	return t.callLLMWithRetryMessages(ctx, t.messages)
 }
 
-func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Message) (ChatResponse, error) {
+func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Message) (response ChatResponse, inferenceErr error) {
+	defer func() { t.recordInferenceOutcome(inferenceErr) }()
+	t.beginTraceTurn()
+	messages, _ = projectMalformedToolHistory(messages)
+	if err := validateToolHistory(messages); err != nil {
+		return ChatResponse{}, err
+	}
 	ctx, cancelBudget := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancelBudget()
 	attempt := 0
@@ -3469,6 +3524,9 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 		resp, nextMessages, err := t.callProviderWithContextRecovery(ctx, primary, messages)
 		messages = nextMessages
 		primaryErr := err
+		if isInvalidToolHistory(err) {
+			return resp, err
+		}
 		if err != nil && t.telemetry != nil {
 			t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": resp.Provider, "model": resp.Model, "error": err.Error(), "role": "primary", "iteration": t.iteration})
 		}
@@ -3500,6 +3558,9 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": modelIDForProvider(fallback, t.model), "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
 						}
 					}
+				}
+				if isInvalidToolHistory(fallbackErr) {
+					return fallbackResp, fallbackErr
 				}
 				if fallbackErr == nil {
 					if count := consumeTransientAttachments(t.messages); count > 0 {
@@ -3578,13 +3639,17 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 			delay = delay * time.Duration(80+time.Now().UnixNano()%41) / 100
 		}
 		logMsg("RUN", fmt.Sprintf("[%s] LLM attempt %d failed; retrying same prepared turn in %s: %v", t.threadID, attempt, delay, err))
+		finishBackoff := t.traceRetry(attempt, delay, err)
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
+			finishBackoff("elapsed")
 		case <-ctx.Done():
+			finishBackoff("cancelled")
 			stopRetryTimer(timer)
 			return resp, ctx.Err()
 		case <-t.quit:
+			finishBackoff("cancelled")
 			stopRetryTimer(timer)
 			return resp, context.Canceled
 		}
@@ -3725,6 +3790,7 @@ func (t *Thinker) waitForPendingTools(
 		return
 	}
 	start := time.Now()
+	urgentInterruption := false
 
 	deadlineCh := time.After(deadline)
 	for {
@@ -3745,6 +3811,9 @@ func (t *Thinker) waitForPendingTools(
 				}
 				if ev.Text != "" {
 					*consumed = append(*consumed, ev.Text)
+					if isUrgentPendingToolInterruption(ev) {
+						urgentInterruption = true
+					}
 				}
 				if len(ev.Parts) > 0 {
 					*mediaParts = append(*mediaParts, ev.Parts...)
@@ -3755,7 +3824,11 @@ func (t *Thinker) waitForPendingTools(
 			*toolResults = append(*toolResults, silentResults...)
 			logMsg("RUN", fmt.Sprintf("[%s] drained %d silent tool results while waiting for pending tools", t.threadID, len(silentResults)))
 		}
-		if len(*consumed) > 0 && len(*toolResults) == 0 {
+		// Routine workflow notifications and late-result text must not bypass
+		// the pending-tool barrier: a fast tool can publish its structured
+		// result milliseconds after that text. Preserve the historical
+		// immediate wake behavior for explicit user/control interruptions.
+		if urgentInterruption && len(*consumed) > 0 && len(*toolResults) == 0 {
 			return
 		}
 		if t.pendingToolCount() == 0 {
@@ -3775,6 +3848,22 @@ func (t *Thinker) waitForPendingTools(
 		case <-t.quit:
 			return
 		}
+	}
+}
+
+func isUrgentPendingToolInterruption(ev Event) bool {
+	text := strings.TrimSpace(ev.Text)
+	if text == "" || strings.HasPrefix(text, "[late-result]") || strings.HasPrefix(text, "[tool:") {
+		return false
+	}
+	// Empty From is retained for API/backwards-compatible events and tests.
+	// Named integration/app sources are advisory unless they explicitly use
+	// one of the operator-facing sources below.
+	switch strings.ToLower(strings.TrimSpace(ev.From)) {
+	case "", "api", "user", "operator", "tui", "console", "conversation":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -3892,6 +3981,12 @@ func (t *Thinker) ReloadDirectiveQuiet() {
 }
 func (t *Thinker) reloadDirectiveNow() {
 	directive := t.config.GetDirective()
+	if directive != t.directive {
+		if err := t.consumeEventOnlyWait(); err != nil {
+			t.recordPersistenceFailure(err)
+			return
+		}
+	}
 	t.directive = directive
 	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
 	t.resetPromptCache("directive_reloaded")
@@ -3968,6 +4063,7 @@ func (t *Thinker) summarizePersistentSession(text string) (string, error) {
 		Identity: t.promptCacheIdentity() + "/session-compaction",
 		Epoch:    t.promptCacheEpoch,
 	})
+	ctx = t.providerSessionContext(ctx, "session-compaction")
 	resp, err := t.provider.Chat(ctx, prompt, model, nil, nil, nil, nil)
 	if err != nil {
 		return "", err

@@ -60,8 +60,8 @@ func TestGoogleLiveSetupUsesNativeProtocol(t *testing.T) {
 	if setup["inputAudioTranscription"] == nil || setup["outputAudioTranscription"] == nil {
 		t.Fatalf("transcription config = %#v", setup)
 	}
-	if setup["historyConfig"].(map[string]any)["initialHistoryInClientContent"] != true {
-		t.Fatalf("history config = %#v", setup["historyConfig"])
+	if setup["historyConfig"] != nil {
+		t.Fatal("fresh setup must not enter empty history seeding")
 	}
 	tools := setup["tools"].([]any)
 	declarations := tools[0].(map[string]any)["functionDeclarations"].([]any)
@@ -205,6 +205,7 @@ func TestGoogleRealtimeBatchesToolResultsUntilContinuation(t *testing.T) {
 
 func TestGoogleRealtimeRestoresHistoryAndQueuesRealtimeInput(t *testing.T) {
 	session := newGoogleRealtimeTestSession()
+	session.historySeeding = true
 	if err := session.RestoreConversation([]Message{
 		{Role: "user", Content: "bonjour"},
 		{Role: "assistant", Content: "salut"},
@@ -297,7 +298,7 @@ func TestAppendGoogleTranscriptHandlesDeltasAndCumulativeUpdates(t *testing.T) {
 	}
 }
 
-func TestGoogleRealtimeOpenWaitsForSetupAndUnlocksHistory(t *testing.T) {
+func TestGoogleRealtimeOpenWaitsForSetupAndSkipsEmptyHistory(t *testing.T) {
 	serverErr := make(chan error, 1)
 	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -332,11 +333,6 @@ func TestGoogleRealtimeOpenWaitsForSetupAndUnlocksHistory(t *testing.T) {
 		}
 		if err := wsutil.WriteServerMessage(conn, ws.OpBinary, []byte(`{"setupComplete":{}}`)); err != nil {
 			serverErr <- err
-			return
-		}
-		history, err := readObject()
-		if err != nil || history["clientContent"].(map[string]any)["turnComplete"] != true {
-			serverErr <- fmt.Errorf("history unlock: %v %#v", err, history)
 			return
 		}
 		input, err := readObject()

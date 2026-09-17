@@ -29,6 +29,7 @@ type TelemetryEvent struct {
 
 // Telemetry collects events and forwards them to the server.
 type Telemetry struct {
+	traces           sync.Map // thread id -> current executionTrace; payloads may override with an origin snapshot
 	logBase          int
 	liveBase         int
 	mu               sync.Mutex
@@ -172,6 +173,9 @@ func (t *Telemetry) emit(eventType, threadID string, data any, store bool) {
 }
 
 func (t *Telemetry) newEvent(eventType, threadID string, data any) TelemetryEvent {
+	if tr, ok := t.traces.Load(threadID); ok {
+		data = withTrace(data, tr.(*executionTrace).snapshot())
+	}
 	dataJSON, _ := json.Marshal(data)
 	return TelemetryEvent{
 		ID:         t.generateID(),

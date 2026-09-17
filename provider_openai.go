@@ -208,7 +208,10 @@ func toOpenAIMessages(messages []Message) []any {
 			for _, tr := range m.ToolResults {
 				if tr.Image != nil {
 					// Tool result with image (screenshot) — send as multimodal content
-					// Use "original" detail for computer use to preserve full resolution
+					// Use "high" detail for computer use: it is the OpenAI spec's maximum-
+					// fidelity setting. Do NOT use "original" — it is not in the schema.
+					// api.openai.com silently ignores unknown detail values, but strict
+					// OpenAI-compatible gateways (opencode-go) reject the request with 400.
 					out = append(out, map[string]any{
 						"role":         "tool",
 						"tool_call_id": tr.CallID,
@@ -216,7 +219,7 @@ func toOpenAIMessages(messages []Message) []any {
 							{"type": "text", "text": tr.Content},
 							{"type": "image_url", "image_url": map[string]any{
 								"url":    "data:image/png;base64," + base64Encode(tr.Image),
-								"detail": "original",
+								"detail": "high",
 							}},
 						},
 					})
@@ -252,7 +255,7 @@ func toOpenAIMessages(messages []Message) []any {
 		if len(m.ToolCalls) > 0 {
 			toolCalls := make([]map[string]any, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
-				argsJSON, _ := json.Marshal(tc.Args)
+				argsJSON := toolCallArguments(tc)
 				toolCalls[i] = map[string]any{
 					"id":   tc.ID,
 					"type": "function",
@@ -378,7 +381,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 				req.Header.Set(key, value)
 			}
 		}
-		return llmHTTPClient.Do(req)
+		return tracedProviderHTTP(req)
 	}
 
 	var resp *http.Response
@@ -660,13 +663,13 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 
 	timing.CompletionMs = elapsedMs()
 	timing.TerminalPhase = "completed"
-	return ChatResponse{
+	return validateProviderToolOutput(ChatResponse{
 		Text:           full.String(),
 		Reasoning:      fullReasoning.String(),
 		ToolCalls:      toolCalls,
 		Usage:          usage,
 		ProviderTiming: timing,
-	}, nil
+	})
 }
 
 // --- Factory functions ---
@@ -729,7 +732,8 @@ func NewOpenCodeGoProvider(apiKey string) LLMProvider {
 			cachedCost: 0,
 			outputCost: 0,
 		},
-		support: newOpenCodeGoReasoningSupport(),
+		support:   newOpenCodeGoReasoningSupport(),
+		sessionID: newOpenCodeGoSessionID(),
 	}
 }
 

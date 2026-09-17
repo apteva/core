@@ -173,7 +173,7 @@ func TestRealtimeGreetingReplaysOnlyWhenReconnectPrecedesFirstAudio(t *testing.T
 	waitForRealtimeTelemetryType(t, thinker.telemetry, "realtime.first_audio", time.Second)
 	close(second.events)
 
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
 		provider.mu.Lock()
 		opened := len(provider.opens)

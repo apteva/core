@@ -30,6 +30,7 @@ type ToolIndex struct {
 	entries           []IndexEntry
 	byName            map[string]int
 	serverPrefixes    map[string]bool
+	localNames        map[string][]int
 	aliases           map[string]string
 	revision          uint64
 	diagnosedRevision uint64
@@ -48,9 +49,11 @@ type IndexEntry struct {
 	Score       float64
 	// Full-description term frequencies and separate name terms are computed
 	// at registration. Descriptive ranking uses BM25 with a distinct name boost.
-	tokens     map[string]int
-	nameTokens map[string]int
-	tokenCount int
+	tokens       map[string]int
+	nameTokens   map[string]int
+	serverTokens map[string]int
+	schemaTokens map[string]int
+	tokenCount   int
 }
 
 // NewToolIndex returns an empty index.
@@ -94,14 +97,20 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loadin
 	for _, t := range tools {
 		full := server + "_" + t.Name
 		e := IndexEntry{
-			Server:      server,
-			LocalName:   t.Name,
-			Name:        full,
-			Description: t.Description,
-			NoSpawn:     noSpawn,
-			LoadMode:    cfg.toolLoadMode(t.Name),
-			tokens:      indexTokens(t.Description),
-			nameTokens:  indexTokens(full),
+			Server:       server,
+			LocalName:    t.Name,
+			Name:         full,
+			Description:  t.Description,
+			NoSpawn:      noSpawn,
+			LoadMode:     cfg.toolLoadMode(t.Name),
+			tokens:       discoveryTokens(t.Description),
+			nameTokens:   discoveryTokens(t.Name),
+			serverTokens: discoveryTokens(server),
+			schemaTokens: schemaDiscoveryTokens(t.InputSchema),
+		}
+		// Server vocabulary is a weak namespace hint, not an operation match.
+		for term := range e.serverTokens {
+			delete(e.nameTokens, term)
 		}
 		for _, count := range e.tokens {
 			e.tokenCount += count
@@ -416,66 +425,119 @@ func toolNameTokens(query string) []string {
 	})
 }
 
+// indexSearchResult separates exact identities from suggestions. Preload and
+// legacy Search consume only Hits; suggestions require a model-visible warning.
+type indexSearchResult struct {
+	Hits        []IndexEntry
+	Suggestions []IndexEntry
+	Unresolved  []string
+	Ambiguous   map[string][]string
+}
+
 func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized func(string) bool) []IndexEntry {
+	return ix.searchDetailed(query, k, allowNoSpawn, authorized).Hits
+}
+
+func (ix *ToolIndex) searchDetailed(query string, k int, allowNoSpawn bool, authorized func(string) bool) indexSearchResult {
+	result := indexSearchResult{}
 	if ix == nil || k <= 0 {
-		return nil
+		return result
 	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	allowed := func(e IndexEntry) bool {
 		return (allowNoSpawn || !e.NoSpawn) && (authorized == nil || authorized(e.Name))
 	}
-	requested := map[string]int{}
+	requested := map[string]bool{}
+	unresolved := map[string]bool{}
+	var descriptive []string
+	tokens := toolNameTokens(query)
 	explicit := false
-	for pos, token := range toolNameTokens(query) {
+	for _, token := range tokens {
 		canonical := token
-		if _, exists := ix.byName[canonical]; !exists {
+		_, known := ix.byName[canonical]
+		if !known {
 			if target, ok := ix.aliases[token]; ok {
 				canonical = strings.ToLower(target)
-				explicit = true
+				_, known = ix.byName[canonical]
+			} else if strings.Contains(token, "_") || len(tokens) == 1 {
+				// Resolve local names against the entire catalog, before permissions.
+				// A restricted worker must not silently disambiguate a shared identity.
+				local := ix.localNames[token]
+				if len(local) == 1 {
+					canonical = strings.ToLower(ix.entries[local[0]].Name)
+					known = true
+				} else if len(local) > 1 {
+					if result.Ambiguous == nil {
+						result.Ambiguous = map[string][]string{}
+					}
+					result.Ambiguous[token] = []string{}
+					for _, i := range local {
+						if allowed(ix.entries[i]) {
+							result.Ambiguous[token] = append(result.Ambiguous[token], ix.entries[i].Name)
+						}
+					}
+					sort.Strings(result.Ambiguous[token])
+					explicit = true
+					continue
+				}
 			}
 		}
-		if _, exists := ix.byName[canonical]; exists {
-			if _, seen := requested[canonical]; !seen {
-				requested[canonical] = pos
-			}
+		if known {
 			explicit = true
-		}
-		for prefix := range ix.serverPrefixes {
-			if strings.HasPrefix(token, prefix) {
-				explicit = true
-				break
+			e := ix.entries[ix.byName[canonical]]
+			if !allowed(e) {
+				if !unresolved[token] {
+					result.Unresolved = append(result.Unresolved, token)
+					unresolved[token] = true
+				}
+			} else if !requested[canonical] {
+				e.Match = "exact_or_alias"
+				result.Hits = append(result.Hits, e)
+				requested[canonical] = true
 			}
+			continue
+		}
+		nameLike := strings.Contains(token, "_")
+		for prefix := range ix.serverPrefixes {
+			nameLike = nameLike || strings.HasPrefix(token, prefix)
+		}
+		if nameLike {
+			explicit = true
+			if !unresolved[token] {
+				result.Unresolved = append(result.Unresolved, token)
+				unresolved[token] = true
+			}
+		} else {
+			descriptive = append(descriptive, token)
 		}
 	}
-	if strings.Contains(strings.TrimSpace(query), "_") && len(strings.Fields(query)) == 1 {
-		explicit = true
+	if len(result.Hits) > k {
+		result.Hits = result.Hits[:k]
+	}
+	// Known names (including denied names) never substitute another operation.
+	// Only genuinely unknown names plus descriptive words receive suggestions.
+	if explicit && (len(result.Unresolved) == 0 || len(result.Hits) > 0 || len(result.Ambiguous) > 0) {
+		return result
 	}
 	if explicit {
-		var out []IndexEntry
-		for canonical := range requested {
-			e := ix.entries[ix.byName[canonical]]
-			if allowed(e) {
-				e.Match = "exact_or_alias"
-				out = append(out, e)
+		for _, token := range result.Unresolved {
+			if _, known := ix.byName[token]; known {
+				return result
+			}
+			if _, known := ix.aliases[token]; known {
+				return result
+			}
+			if len(ix.localNames[token]) > 0 {
+				return result
 			}
 		}
-		sort.Slice(out, func(i, j int) bool {
-			a, b := requested[strings.ToLower(out[i].Name)], requested[strings.ToLower(out[j].Name)]
-			if a != b {
-				return a < b
-			}
-			return out[i].Name < out[j].Name
-		})
-		if len(out) > k {
-			out = out[:k]
-		}
-		return out
 	}
-	terms := indexQueryTokens(query)
+	terms := discoveryQueryTokens(strings.Join(descriptive, " "))
 	if len(terms) == 0 {
-		return nil
+		return result
 	}
+
 	var candidates []IndexEntry
 	totalLength := 0
 	df := map[string]int{}
@@ -486,7 +548,7 @@ func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized f
 		candidates = append(candidates, e)
 		totalLength += e.tokenCount
 		for _, term := range terms {
-			if e.tokens[term] > 0 || e.nameTokens[term] > 0 {
+			if e.tokens[term] > 0 || e.nameTokens[term] > 0 || e.schemaTokens[term] > 0 || e.serverTokens[term] > 0 {
 				df[term]++
 			}
 		}
@@ -505,7 +567,13 @@ func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized f
 		for _, term := range terms {
 			idf := math.Log1p((float64(len(candidates)-df[term]) + 0.5) / (float64(df[term]) + 0.5))
 			if e.nameTokens[term] > 0 {
-				score += 8 * idf
+				score += 3 * idf
+			}
+			if e.schemaTokens[term] > 0 {
+				score += 2 * idf
+			}
+			if e.serverTokens[term] > 0 {
+				score += 0.25 * idf
 			}
 			tf := float64(e.tokens[term])
 			if tf > 0 {
@@ -531,7 +599,15 @@ func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized f
 		out[i].Match = "bm25"
 		out[i].Score = h.score
 	}
-	return out
+	if explicit {
+		for i := range out {
+			out[i].Match = "descriptive_suggestion"
+		}
+		result.Suggestions = out
+	} else {
+		result.Hits = out
+	}
+	return result
 }
 
 // indexTokens lowercases s, splits on non-alphanumeric, and returns a
@@ -616,8 +692,10 @@ func (ix *ToolIndex) replaceServerAliases(server string, aliases map[string]stri
 func (ix *ToolIndex) rebuildNamesLocked() {
 	ix.byName = make(map[string]int, len(ix.entries))
 	ix.serverPrefixes = map[string]bool{}
+	ix.localNames = map[string][]int{}
 	for i, e := range ix.entries {
 		ix.byName[strings.ToLower(e.Name)] = i
+		ix.localNames[strings.ToLower(e.LocalName)] = append(ix.localNames[strings.ToLower(e.LocalName)], i)
 		ix.serverPrefixes[strings.ToLower(e.Server)+"_"] = true
 	}
 }

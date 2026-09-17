@@ -23,7 +23,7 @@ func (t *Thinker) startBackgroundCompaction() {
 	if model == "" {
 		model = t.modelID()
 	}
-	parent := t.toolContext()
+	parent := t.providerSessionContext(t.toolContext(), "background-compaction")
 	go func() {
 		defer t.compactionActive.Store(false)
 		defer func() { <-compactionSlots }()
