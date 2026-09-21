@@ -413,6 +413,9 @@ func createProviderByName(name string) LLMProvider {
 		}
 	case "openai":
 		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+			if openAIUsesChatCompletions() {
+				return NewOpenAIProvider(key)
+			}
 			return NewOpenAINativeProvider(key)
 		}
 	case "openai-codex":
