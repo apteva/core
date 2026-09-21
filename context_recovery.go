@@ -133,7 +133,7 @@ func (s *Session) checkpointRecoveredContext(messages []Message) (string, error)
 	return archived.ArchiveRef, nil
 }
 
-func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvider, messages []Message, reason error, pass int) ([]Message, error) {
+func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvider, messages []Message, reason error, pass int, tier ModelTier) ([]Message, error) {
 	if t.session == nil || t.session.archive == nil {
 		return nil, fmt.Errorf("cannot preserve context: durable session archive unavailable")
 	}
@@ -219,7 +219,7 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 	t.messages = durable
 	t.advancePromptCacheEpoch("context_recovery", true, nil)
 	if t.telemetry != nil {
-		t.telemetry.Emit("llm.context_recovery", t.threadID, map[string]any{"provider": provider.Name(), "model": modelIDForProvider(provider, t.model), "iteration": t.iteration, "reason": reason.Error(), "pass": pass, "before_tokens_est": before, "after_tokens_est": estimatedContextTokens(next), "archive_ref": ref, "history_archive_ref": historyRef, "before_fingerprint": requestFingerprint(raw)})
+		t.telemetry.Emit("llm.context_recovery", t.threadID, map[string]any{"provider": provider.Name(), "model": modelIDForProvider(provider, tier), "iteration": t.iteration, "reason": reason.Error(), "pass": pass, "before_tokens_est": before, "after_tokens_est": estimatedContextTokens(next), "archive_ref": ref, "history_archive_ref": historyRef, "before_fingerprint": requestFingerprint(raw)})
 	}
 	return next, nil
 }
@@ -231,8 +231,12 @@ func (t *Thinker) emitRequestBudget(b requestBudget) {
 }
 
 func (t *Thinker) callProviderWithContextRecovery(ctx context.Context, provider LLMProvider, messages []Message) (ChatResponse, []Message, error) {
+	return t.callProviderWithContextRecoveryAtTier(ctx, provider, messages, t.model)
+}
+
+func (t *Thinker) callProviderWithContextRecoveryAtTier(ctx context.Context, provider LLMProvider, messages []Message, tier ModelTier) (ChatResponse, []Message, error) {
 	for pass := 0; ; pass++ {
-		resp, err := t.thinkWithProviderMessages(ctx, provider, messages)
+		resp, err := t.thinkWithProviderMessagesAtTier(ctx, provider, messages, tier)
 		if err == nil || !isContextLengthError(err) {
 			return resp, messages, err
 		}
@@ -245,12 +249,47 @@ func (t *Thinker) callProviderWithContextRecovery(ctx context.Context, provider 
 		if pass >= 3 {
 			return resp, messages, &contextManagementError{Cause: err}
 		}
-		next, recoveryErr := t.recoverOversizedRequest(ctx, provider, messages, err, pass)
+		next, recoveryErr := t.recoverOversizedRequest(ctx, provider, messages, err, pass, tier)
 		if recoveryErr != nil {
 			return resp, messages, &contextManagementError{Cause: fmt.Errorf("%w; recovery: %v", err, recoveryErr)}
 		}
 		messages = next
 	}
+}
+
+// callProviderWithOverloadRecovery keeps the configured model tier stable but
+// lets this request move to another concrete model from the same provider when
+// the selected model is overloaded. Cross-provider fallback remains the
+// caller's responsibility.
+func (t *Thinker) callProviderWithOverloadRecovery(ctx context.Context, provider LLMProvider, messages []Message, selected ModelTier) (ChatResponse, []Message, error) {
+	resp, messages, err := t.callProviderWithContextRecoveryAtTier(ctx, provider, messages, selected)
+	if !isProviderOverloadError(err) || ctx.Err() != nil {
+		return resp, messages, err
+	}
+
+	fromTier := selected
+	for _, tier := range overloadFallbackTiers(provider, selected) {
+		fromModel := modelIDForProvider(provider, fromTier)
+		toModel := modelIDForProvider(provider, tier)
+		logMsg("FALLBACK", fmt.Sprintf("[%s] %s model %s overloaded (%v), trying %s", t.threadID, provider.Name(), fromModel, err, toModel))
+		if t.telemetry != nil {
+			t.telemetry.Emit("llm.model_fallback", t.threadID, map[string]any{
+				"provider":   provider.Name(),
+				"from_tier":  fromTier.String(),
+				"from_model": fromModel,
+				"to_tier":    tier.String(),
+				"to_model":   toModel,
+				"error":      err.Error(),
+				"iteration":  t.iteration,
+			})
+		}
+		resp, messages, err = t.callProviderWithContextRecoveryAtTier(ctx, provider, messages, tier)
+		if err == nil || !isProviderOverloadError(err) || ctx.Err() != nil {
+			return resp, messages, err
+		}
+		fromTier = tier
+	}
+	return resp, messages, err
 }
 
 // Batch complete messages instead of silently excerpting them. The caller's

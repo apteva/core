@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -45,6 +46,8 @@ type IndexEntry struct {
 	Description string
 	NoSpawn     bool // sub-threads cannot see this tool in search
 	LoadMode    ToolLoadMode
+	Access      ToolAccessClass
+	SchemaCost  int // approximate native-schema tokens, computed once at registration
 	Match       string
 	Score       float64
 	// Full-description term frequencies and separate name terms are computed
@@ -103,6 +106,8 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loadin
 			Description:  t.Description,
 			NoSpawn:      noSpawn,
 			LoadMode:     cfg.toolLoadMode(t.Name),
+			Access:       classifyToolAccess(t),
+			SchemaCost:   toolSchemaTokenCost(server+"_"+t.Name, t.Description, t.InputSchema),
 			tokens:       discoveryTokens(t.Description),
 			nameTokens:   discoveryTokens(t.Name),
 			serverTokens: discoveryTokens(server),
@@ -118,6 +123,24 @@ func (ix *ToolIndex) Add(server string, tools []mcpToolDef, noSpawn bool, loadin
 		ix.entries = append(ix.entries, e)
 	}
 	ix.rebuildNamesLocked()
+}
+
+func toolSchemaTokenCost(name, description string, schema map[string]any) int {
+	raw, err := json.Marshal(map[string]any{"name": name, "description": description, "parameters": schema})
+	if err != nil {
+		return 1
+	}
+	return max(1, (len(raw)+3)/4)
+}
+
+// Revision identifies an immutable catalog snapshot for discovery responses.
+func (ix *ToolIndex) Revision() uint64 {
+	if ix == nil {
+		return 0
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return ix.revision
 }
 
 // UpdatePolicy changes only prompt visibility metadata. MCP connections and
@@ -434,11 +457,20 @@ type indexSearchResult struct {
 	Ambiguous   map[string][]string
 }
 
+type indexSearchOptions struct {
+	Servers map[string]bool
+	Access  DiscoveryAccess
+}
+
 func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized func(string) bool) []IndexEntry {
 	return ix.searchDetailed(query, k, allowNoSpawn, authorized).Hits
 }
 
 func (ix *ToolIndex) searchDetailed(query string, k int, allowNoSpawn bool, authorized func(string) bool) indexSearchResult {
+	return ix.searchDetailedWithOptions(query, k, allowNoSpawn, authorized, indexSearchOptions{})
+}
+
+func (ix *ToolIndex) searchDetailedWithOptions(query string, k int, allowNoSpawn bool, authorized func(string) bool, options indexSearchOptions) indexSearchResult {
 	result := indexSearchResult{}
 	if ix == nil || k <= 0 {
 		return result
@@ -446,7 +478,13 @@ func (ix *ToolIndex) searchDetailed(query string, k int, allowNoSpawn bool, auth
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	allowed := func(e IndexEntry) bool {
-		return (allowNoSpawn || !e.NoSpawn) && (authorized == nil || authorized(e.Name))
+		if !allowNoSpawn && e.NoSpawn || authorized != nil && !authorized(e.Name) {
+			return false
+		}
+		if len(options.Servers) > 0 && !options.Servers[strings.ToLower(e.Server)] {
+			return false
+		}
+		return options.Access != DiscoveryAccessReadOnly || e.Access == ToolAccessRead
 	}
 	requested := map[string]bool{}
 	unresolved := map[string]bool{}
@@ -579,6 +617,9 @@ func (ix *ToolIndex) searchDetailed(query string, k int, allowNoSpawn bool, auth
 			if tf > 0 {
 				score += idf * tf * 2.2 / (tf + 1.2*(0.25+0.75*float64(e.tokenCount)/avgLength))
 			}
+		}
+		if options.Access == DiscoveryAccessPreferRead && e.Access == ToolAccessRead {
+			score += 1
 		}
 		if score > 0 {
 			hits = append(hits, scored{e, score})

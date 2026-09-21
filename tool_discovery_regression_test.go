@@ -64,7 +64,7 @@ func TestDiscoveryExactUnavailableNeverSubstitutes(t *testing.T) {
 	}
 	th := &Thinker{threadID: "worker", toolIndex: ix, toolAllowlist: map[string]bool{"tasks_complete": true}, activeTools: map[string]bool{}}
 	result := runSearchTools(th, map[string]string{"query": "tasks_get", "k": "1"}, false)
-	if !strings.Contains(result, "capability_unavailable") || len(th.activeTools) != 0 {
+	if !strings.Contains(result, "unavailable_in_scope") || strings.Contains(result, "capability_unavailable") || len(th.activeTools) != 0 {
 		t.Fatalf("unauthorized exact request substituted a mutation: %s", result)
 	}
 }

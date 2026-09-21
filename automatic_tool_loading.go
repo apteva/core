@@ -186,66 +186,56 @@ func (t *Thinker) prepareAutomaticTools(c AutomaticToolLoadingConfig) map[string
 	if previous.policy != policy {
 		previous = automaticToolSelection{}
 	}
-	selected := map[string]bool{}
-	reasons := map[string]string{}
-	var order []string
-	tokens, skippedBudget := 0, 0
-	add := func(name, reason string) {
-		if selected[name] {
-			return
-		}
-		entry, ok := t.toolIndex.Get(name)
-		if !ok || (!(t.threadID == "main" || t.allowNoSpawn) && entry.NoSpawn) || !t.toolAuthorized(name) {
-			return
-		}
-		def := t.registry.Get(name)
-		if def == nil || !def.MCP || (def.SystemOnly && !t.systemThread) {
-			return
-		}
-		// Measure the actual cached native schema, including Core's injected fields.
-		raw, err := json.Marshal(def.native)
-		if err != nil {
-			return
-		}
-		cost := (len(raw) + 3) / 4
-		if len(order) >= c.MaxTools || tokens+cost > c.MaxSchemaTokens {
-			skippedBudget++
-			return
-		}
-		selected[name], reasons[name] = true, reason
-		order = append(order, name)
-		tokens += cost
-	}
+	normalize := t.automaticQueryNormalizer()
+	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
+	available := t.authorizedDiscoveryServers(allowNoSpawn)
+	var intents []DiscoveryIntent
 	for _, name := range c.WorkflowTools {
-		add(name, "workflow")
+		if _, ok := t.toolIndex.Get(name); !ok {
+			continue
+		}
+		intents = append(intents, compileDiscoveryIntent(name, nil, DiscoveryAccessAny, 1, "workflow", 100, available)...)
+	}
+	for _, q := range queries {
+		priority := 70
+		if q.Source == "memory" {
+			priority = 20
+		}
+		intents = append(intents, compileDiscoveryIntent(normalize(q.Text), nil, DiscoveryAccessPreferRead, c.MaxTools, q.Source, priority, available)...)
 	}
 	if previous.context == contextKey {
 		for _, name := range previous.names {
-			add(name, previous.reasons[name])
+			reason := previous.reasons[name]
+			priority := 60
+			if reason == "workflow" {
+				priority = 100
+			}
+			intents = append(intents, compileDiscoveryIntent(name, nil, DiscoveryAccessAny, 1, reason, priority, available)...)
 		}
 	}
-	// Round-robin sources so a long directive cannot consume all slots before
-	// current task/memory relevance is considered. Search only authorized hits;
-	// unresolved-name suggestions never become silent automatic replacements.
-	normalize := t.automaticQueryNormalizer()
-	ranked := make([][]IndexEntry, len(queries))
-	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
-	for i, q := range queries {
-		ranked[i] = t.searchAuthorizedTools(normalize(q.Text), c.MaxTools, allowNoSpawn)
+	memoryMax := c.MaxTools / 4
+	if memoryMax < 1 {
+		memoryMax = 1
 	}
-	for rank := 0; rank < c.MaxTools; rank++ {
-		for i, q := range queries {
-			if rank < len(ranked[i]) {
-				add(ranked[i][rank].Name, q.Source)
+	memorySchemaMax := c.MaxSchemaTokens / 4
+	if memorySchemaMax < 1 {
+		memorySchemaMax = 1
+	}
+	discovery := t.discoverTools(DiscoveryRequest{Intents: intents, AllowNoSpawn: allowNoSpawn, MaxTools: c.MaxTools, MaxSchemaTokens: c.MaxSchemaTokens, MemoryMaxTools: memoryMax, MemoryMaxSchemaTokens: memorySchemaMax})
+	selected, reasons := map[string]bool{}, map[string]string{}
+	for _, name := range discovery.Loaded {
+		selected[name] = true
+	}
+	for _, group := range discovery.Results {
+		for _, candidate := range group.Candidates {
+			if candidate.Loaded && reasons[candidate.Name] == "" {
+				reasons[candidate.Name] = group.Source
 			}
 		}
 	}
-	for _, name := range previous.names {
-		add(name, "retained")
-	}
-	t.automaticTools = automaticToolSelection{policy: policy, context: contextKey, names: order, reasons: reasons}
+	t.automaticTools = automaticToolSelection{policy: policy, context: contextKey, names: append([]string(nil), discovery.Loaded...), reasons: reasons}
 	if t.telemetry != nil {
-		t.telemetry.Emit("tool.autoload", t.threadID, map[string]any{"iteration": t.iteration, "selected": order, "reasons": reasons, "schema_tokens_est": tokens, "max_tools": c.MaxTools, "max_schema_tokens": c.MaxSchemaTokens, "skipped_budget": skippedBudget, "duration_us": time.Since(started).Microseconds(), "context_hash": contextKey})
+		t.telemetry.Emit("tool.autoload", t.threadID, map[string]any{"iteration": t.iteration, "selected": discovery.Loaded, "reasons": reasons, "schema_tokens_est": discovery.SchemaTokens, "max_tools": c.MaxTools, "max_schema_tokens": c.MaxSchemaTokens, "skipped_budget": discovery.SkippedBudget, "catalog_revision": discovery.CatalogRevision, "duration_us": time.Since(started).Microseconds(), "context_hash": contextKey})
 	}
 	return selected
 }

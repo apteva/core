@@ -3364,9 +3364,13 @@ func (t *Thinker) toolCallIDsProtectedFromSanitization(extra []toolCall) map[str
 }
 
 func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMProvider, messages []Message) (response ChatResponse, requestErr error) {
+	return t.thinkWithProviderMessagesAtTier(ctx, provider, messages, t.model)
+}
+
+func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider LLMProvider, messages []Message, tier ModelTier) (response ChatResponse, requestErr error) {
 	var request *requestTrace
 	if provider != nil {
-		request = t.queueRequestTrace(provider.Name(), modelIDForProvider(provider, t.model))
+		request = t.queueRequestTrace(provider.Name(), modelIDForProvider(provider, tier))
 		defer func() { request.finish(response, requestErr) }()
 	}
 	messages, _ = projectMalformedToolHistory(messages)
@@ -3423,7 +3427,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 		}
 	}
 
-	modelID := modelIDForProvider(provider, t.model)
+	modelID := modelIDForProvider(provider, tier)
 	budget := estimatePreparedRequest(provider.Name(), modelID, messages, nativeTools)
 	t.emitRequestBudget(budget)
 	if budget.OverBudget {
@@ -3502,6 +3506,53 @@ func modelIDForProvider(provider LLMProvider, tier ModelTier) string {
 	return models[ModelLarge]
 }
 
+// overloadFallbackTiers returns distinct concrete models to try when the
+// selected model is temporarily unavailable. Prefer less expensive/capacity-
+// friendly tiers first; a small selection can only move upward. Providers
+// commonly map multiple tiers to the same model, so duplicate IDs are skipped.
+func overloadFallbackTiers(provider LLMProvider, selected ModelTier) []ModelTier {
+	if provider == nil {
+		return nil
+	}
+	orders := map[ModelTier][]ModelTier{
+		ModelLarge:  {ModelMedium, ModelSmall},
+		ModelMedium: {ModelSmall, ModelLarge},
+		ModelSmall:  {ModelMedium, ModelLarge},
+	}
+	models := provider.Models()
+	seen := map[string]bool{modelIDForProvider(provider, selected): true}
+	var tiers []ModelTier
+	for _, tier := range orders[selected] {
+		model := models[tier]
+		if model == "" || seen[model] {
+			continue
+		}
+		seen[model] = true
+		tiers = append(tiers, tier)
+	}
+	return tiers
+}
+
+func isProviderOverloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, signal := range []string{
+		" 429", "error 429", "status 429", "status=429", "status_code\":429",
+		" 503", "error 503", "status 503", "status=503", "status_code\":503",
+		" 529", "error 529", "status 529", "status=529", "status_code\":529",
+		"rate limit", "rate_limit", "too many requests", "overload", "at capacity",
+		"capacity exceeded", "resource exhausted", "resource_exhausted",
+		"service unavailable", "temporarily unavailable",
+	} {
+		if strings.Contains(msg, signal) {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 	t.sanitizeConversationMessages()
 	return t.callLLMWithRetryMessages(ctx, t.messages)
@@ -3521,7 +3572,7 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 	permanentFallbacks := map[string]error{}
 	for {
 		primary := t.provider
-		resp, nextMessages, err := t.callProviderWithContextRecovery(ctx, primary, messages)
+		resp, nextMessages, err := t.callProviderWithOverloadRecovery(ctx, primary, messages, t.model)
 		messages = nextMessages
 		primaryErr := err
 		if isInvalidToolHistory(err) {
@@ -3549,13 +3600,17 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 				fallbackErr := permanentFallbacks[fallback.Name()]
 				var fallbackResp ChatResponse
 				if fallbackErr == nil {
-					fallbackResp, messages, fallbackErr = t.callProviderWithContextRecovery(ctx, fallback, messages)
+					fallbackResp, messages, fallbackErr = t.callProviderWithOverloadRecovery(ctx, fallback, messages, t.model)
 					if fallbackErr != nil {
 						if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
 							permanentFallbacks[fallback.Name()] = fallbackErr
 						}
 						if t.telemetry != nil {
-							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": modelIDForProvider(fallback, t.model), "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
+							model := fallbackResp.Model
+							if model == "" {
+								model = modelIDForProvider(fallback, t.model)
+							}
+							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": model, "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
 						}
 					}
 				}
