@@ -2,7 +2,6 @@ package core
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -107,15 +106,14 @@ func poolUsesEagerTools(pool *ProviderPool, toolCount int) bool {
 func registerSearchTool(r *ToolRegistry) {
 	r.Register(&ToolDef{
 		Name: "search_tools",
-		Description: "Search within this thread's explicitly granted MCP server scopes and load matching tool schemas into your context. " +
-			"Use when you need a capability you don't currently have visible — file upload, " +
-			"posting to a channel, fetching from an integration, etc. Returns up to k matches " +
+		Description: "Search the authorized MCP catalog by capability and load matching tool schemas. Use one structured query per capability; name servers when known and set access=read_only for inspection-only work. " +
+			"Compound legacy queries are split by named server so one large integration cannot crowd out another. Returns bounded matches " +
 			"with name + summary; their full schemas become available for you to call on the " +
 			"next turn. It cannot expand tools= exact grants or reach ungranted servers. Use search_tools only in a discovery-only turn: you may call multiple " +
 			"search_tools in parallel, but do not call any other tool until you have received " +
 			"the search results on the next turn.",
-		Syntax: `[[search_tools query="upload file" k="5"]]`,
-		Rules:  `query is required; k defaults to 5 and caps at 20. Search never widens this thread's spawn capabilities. Loaded tools persist for the rest of this thread's conversation (subject to compaction). Schemas appear on the next thinking turn — call only search_tools during discovery, then wait for that turn before calling any execution, reporting, messaging, pacing, or completion tool.`,
+		Syntax: `[[search_tools queries='[{"query":"list repository files","servers":["code"],"access":"read_only","limit":5},{"query":"top traffic","servers":["analytics"],"access":"read_only","limit":5}]']]`,
+		Rules:  `Provide query or queries (at most 16). access is any, prefer_read, or read_only. k defaults to 5 and total loading caps at 20. Search never widens this thread's spawn capabilities. A lexical miss is not proof that a capability is unavailable. Schemas appear on the next thinking turn — call only search_tools during discovery, then wait for that turn before calling any execution, reporting, messaging, pacing, or completion tool.`,
 		Core:   true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -124,12 +122,29 @@ func registerSearchTool(r *ToolRegistry) {
 					"type":        "string",
 					"description": "An exact tool name (preferred when known), registered alias, or capability description. Unambiguous local names resolve to canonical tools. Unresolved names are reported separately from descriptive suggestions; suggestions are not equivalent replacements.",
 				},
+				"queries": map[string]any{
+					"type":        "array",
+					"description": "Independent capability searches. Each item may be a string or an object with query, servers, access, and limit.",
+					"maxItems":    16,
+					"items": map[string]any{"oneOf": []any{
+						map[string]any{"type": "string"},
+						map[string]any{"type": "object", "properties": map[string]any{
+							"query":   map[string]any{"type": "string"},
+							"servers": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+							"access":  map[string]any{"type": "string", "enum": []string{"any", "prefer_read", "read_only"}},
+							"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
+						}, "required": []string{"query"}},
+					}},
+				},
+				"server_names": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional hard server scope for the scalar query."},
+				"access":       map[string]any{"type": "string", "enum": []string{"any", "prefer_read", "read_only"}},
 				"k": map[string]any{
 					"type":        "integer",
 					"description": "Maximum number of tools to load (default 5, max 20).",
 				},
+				"max_schema_tokens": map[string]any{"type": "integer", "minimum": 1, "maximum": 16000},
 			},
-			"required": []string{"query"},
+			"anyOf": []any{map[string]any{"required": []string{"query"}}, map[string]any{"required": []string{"queries"}}},
 		},
 		// Handler is intentionally nil — search_tools runs as an inline
 		// tool through main/threadToolHandler because it mutates the
@@ -143,14 +158,19 @@ func registerSearchTool(r *ToolRegistry) {
 // turn, so the LLM doesn't need a paragraph of description here —
 // just enough to confirm it found what it was looking for.
 type searchToolsResult struct {
-	Unresolved  []string            `json:"unresolved_names,omitempty"`
-	Ambiguous   map[string][]string `json:"ambiguous_names,omitempty"`
-	Suggestions []searchToolHit     `json:"suggestions,omitempty"`
-	Error       string              `json:"error,omitempty"`
-	Query       string              `json:"query"`
-	Hits        []searchToolHit     `json:"hits"`
-	Loaded      []string            `json:"loaded"` // names whose schemas are now in context
-	Note        string              `json:"note,omitempty"`
+	Unresolved       []string                `json:"unresolved_names,omitempty"`
+	Ambiguous        map[string][]string     `json:"ambiguous_names,omitempty"`
+	Suggestions      []searchToolHit         `json:"suggestions,omitempty"`
+	Error            string                  `json:"error,omitempty"`
+	Query            string                  `json:"query"`
+	Hits             []searchToolHit         `json:"hits"`
+	Loaded           []string                `json:"loaded"` // names whose schemas are now in context
+	Note             string                  `json:"note,omitempty"`
+	CatalogRevision  uint64                  `json:"catalog_revision,omitempty"`
+	AvailableServers []string                `json:"available_servers,omitempty"`
+	Results          []DiscoveryIntentResult `json:"results,omitempty"`
+	SchemaTokens     int                     `json:"schema_tokens_est,omitempty"`
+	SkippedBudget    int                     `json:"skipped_budget,omitempty"`
 }
 
 type searchToolHit struct {
@@ -425,9 +445,9 @@ func (t *Thinker) evictActiveToolsLRU(limit int) {
 // false for sub-threads (they cannot see no_spawn-flagged servers)
 // and true for main.
 func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) string {
-	query := args["query"]
-	if query == "" {
-		return `{"error":"query is required"}`
+	query, rawQueries := strings.TrimSpace(args["query"]), strings.TrimSpace(args["queries"])
+	if query == "" && rawQueries == "" {
+		return `{"error":"query or queries is required"}`
 	}
 	k := 5
 	if raw, ok := args["k"]; ok && raw != "" {
@@ -441,45 +461,104 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	if t.toolIndex == nil {
 		return `{"error":"tool index not initialised — no MCPs attached"}`
 	}
-	found := t.searchAuthorizedToolsDetailed(query, k, allowNoSpawn)
-	res := searchToolsResult{Query: query, Unresolved: found.Unresolved, Ambiguous: found.Ambiguous}
-	hits := append(found.Hits, found.Suggestions...)
+	maxSchemaTokens := 16000
+	if raw := args["max_schema_tokens"]; raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 16000 {
+			maxSchemaTokens = n
+		}
+	}
+	available := t.authorizedDiscoveryServers(allowNoSpawn)
+	defaultAccess := normalizeDiscoveryAccess(DiscoveryAccess(args["access"]))
+	defaultServers := parseStringList(args["server_names"])
+	var intents []DiscoveryIntent
+	maxTools := k
+	if rawQueries != "" {
+		inputs, err := parseDiscoveryQueries(rawQueries)
+		if err != nil {
+			return `{"error":"queries must be a JSON array of strings or query objects"}`
+		}
+		if len(inputs) > 16 {
+			return `{"error":"queries exceeds the 16-intent limit"}`
+		}
+		if args["k"] == "" {
+			maxTools = 20
+		}
+		for _, input := range inputs {
+			if strings.TrimSpace(input.Query) == "" {
+				continue
+			}
+			access := input.Access
+			if access == "" {
+				access = defaultAccess
+			}
+			servers := input.Servers
+			if len(servers) == 0 {
+				servers = defaultServers
+			}
+			limit := input.Limit
+			if limit <= 0 || limit > 20 {
+				limit = k
+			}
+			if len(servers) > 0 {
+				intents = append(intents, DiscoveryIntent{Query: strings.TrimSpace(input.Query), Servers: sortedSet(stringSetLower(servers)), Access: normalizeDiscoveryAccess(access), Limit: limit, Source: "explicit", Priority: 90})
+			} else {
+				intents = append(intents, compileDiscoveryIntent(input.Query, nil, access, limit, "explicit", 90, available)...)
+			}
+		}
+	} else {
+		if len(defaultServers) > 0 {
+			intents = []DiscoveryIntent{{Query: query, Servers: sortedSet(stringSetLower(defaultServers)), Access: defaultAccess, Limit: k, Source: "explicit", Priority: 90}}
+		} else {
+			intents = compileDiscoveryIntent(query, nil, defaultAccess, k, "explicit", 90, available)
+		}
+	}
+	if len(intents) == 0 {
+		return `{"error":"at least one non-empty query is required"}`
+	}
+	discovery := t.discoverTools(DiscoveryRequest{Intents: intents, AllowNoSpawn: allowNoSpawn, AllowSuggestions: true, MaxTools: maxTools, MaxSchemaTokens: maxSchemaTokens, Activate: true})
+	res := searchToolsResult{Query: query, Loaded: discovery.Loaded, CatalogRevision: discovery.CatalogRevision, AvailableServers: available, Results: discovery.Results, SchemaTokens: discovery.SchemaTokens, SkippedBudget: discovery.SkippedBudget}
 	if t.discoveredToolUntil == nil {
 		t.discoveredToolUntil = map[string]int{}
 	}
-	for _, h := range hits {
-		t.discoveredToolUntil[h.Name] = t.iteration + 1
-		t.touchActiveTool(h.Name)
-		summary := h.Description
-		if len(summary) > 240 {
-			summary = summary[:237] + "..."
-		}
-		hit := searchToolHit{Name: h.Name, Server: h.Server, Summary: summary, Match: h.Match, Score: h.Score}
-		if h.Match == "descriptive_suggestion" {
-			res.Suggestions = append(res.Suggestions, hit)
-		} else {
-			res.Hits = append(res.Hits, hit)
-		}
-		res.Loaded = append(res.Loaded, h.Name)
+	for _, name := range discovery.Loaded {
+		t.discoveredToolUntil[name] = t.iteration + 1
 	}
-	if len(res.Hits) == 0 && len(res.Suggestions) == 0 {
-		res.Error = "capability_unavailable: no matching authorized tool. Do not substitute another operation; refine discovery or report the missing capability."
-		// Tell the LLM what *is* attached so it can refine the query or
-		// reach for the gateway's install/list_apps tool to add what's
-		// missing. Cheaper than another search round-trip.
-		servers := t.toolIndex.Servers()
-		var visible []string
-		for _, s := range servers {
-			// Reuse capability-scoped search so a worker cannot infer server
-			// names outside its exact grants or explicit MCP scopes.
-			if hits := t.searchAuthorizedTools(s, 1, allowNoSpawn); len(hits) > 0 {
-				visible = append(visible, s)
+	seenHits, seenSuggestions := map[string]bool{}, map[string]bool{}
+	coverageUnavailable := false
+	for _, group := range discovery.Results {
+		res.Unresolved = append(res.Unresolved, group.Unresolved...)
+		if len(group.Ambiguous) > 0 {
+			if res.Ambiguous == nil {
+				res.Ambiguous = map[string][]string{}
+			}
+			for name, matches := range group.Ambiguous {
+				res.Ambiguous[name] = matches
 			}
 		}
-		if len(visible) > 0 {
-			res.Note = fmt.Sprintf("no matches; attached servers: %v", visible)
+		coverageUnavailable = coverageUnavailable || group.Coverage == "unavailable_in_scope"
+		for _, candidate := range group.Candidates {
+			hit := searchToolHit{Name: candidate.Name, Server: candidate.Server, Summary: candidate.Summary, Match: candidate.Match, Score: candidate.Score}
+			if candidate.Suggestion {
+				if !seenSuggestions[candidate.Name] {
+					res.Suggestions = append(res.Suggestions, hit)
+					seenSuggestions[candidate.Name] = true
+				}
+			} else if !seenHits[candidate.Name] {
+				res.Hits = append(res.Hits, hit)
+				seenHits[candidate.Name] = true
+			}
+		}
+	}
+	if len(res.Hits) == 0 && len(res.Suggestions) == 0 {
+		if coverageUnavailable {
+			res.Error = "unavailable_in_scope: no matching tool is authorized in the requested server scope; do not substitute another operation."
 		} else {
-			res.Note = "no matches; no MCP servers visible to this thread"
+			res.Error = "lexical_miss: no indexed terms matched. This does not prove the capability is unavailable; refine the query or inspect available_servers."
+		}
+		if len(available) > 0 {
+			res.Note = "no lexical matches; available_servers: " + strings.Join(available, ", ") + "; refine the query"
+		} else {
+			res.Note = "no MCP servers visible to this thread"
 		}
 	}
 	if len(res.Unresolved) > 0 || len(res.Ambiguous) > 0 {

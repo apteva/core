@@ -257,8 +257,8 @@ OWNERSHIP AND DELEGATION:
 - For batches of independent repeated work, especially tool-heavy or waiting/polling work, coordinate focused workers. Consolidate closely related continuing responsibilities under one owner instead of creating one thread per schedule.
 - Temporary and continuing workers are the same thread type. A one-shot worker owns one clear unit of work, uses the smallest required tool set, and returns its final result exactly once with done(message). A persistent owner sends requested reports, uses pace between cycles, and remains active.
 - ` + delegatedCompletionContract + `
-- tools= is a hard exact capability grant. ALWAYS include EVERY exact tool the worker needs; a missing tool cannot be discovered or called unless its server is explicitly granted through mcp=. Use FULL prefixed names exactly as shown in [available tools] (e.g. "schedule_get_schedule", NOT "get_schedule").
-- mcp= grants a complete server discovery scope. Use it only when the worker may discover/use that server's broader surface; naming one exact tool in tools= never grants its sibling tools.
+- Omit tools= and mcp= for normal spawning. The worker automatically inherits your effective delegable capability ceiling; its directive drives initial tool discovery and it can use search_tools for the rest.
+- Legacy tools= and mcp= remain strict narrowing overrides. They can reduce a child's exact tools or MCP server scopes, but can never grant anything outside your own ceiling.
 - Capability alone does not determine ownership: do not keep work on main merely because main can complete it. Keep only the very-small-work fast path local.
 - directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
   BAD:  directive="Call helpdesk_list_tickets to check for tickets"
@@ -332,7 +332,7 @@ func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs s
 		prompt += "- The directive and tools shown for an active realtime thread are its already-applied configuration. Leave them alone unless a real durable change is required: never call update merely to restate its role, instructions, or tools. Use send for temporary call context. A provider that cannot apply a real change live requires the explicit restart_realtime=true option because reconnecting can interrupt speech.\n"
 		prompt += "- Scope tools tightly at creation. Give the realtime worker the tools it needs to complete safe in-conversation actions directly; retain privileged or cross-domain decisions with the appropriate owner. Ephemeral realtime workers cannot evolve their caller-owned session directive.\n"
 		prompt += fmt.Sprintf("- Available realtime providers: %s. Set provider=\"<name>\" when spawning; default is used otherwise. Voice via voice=\"<id>\" (e.g. voice=\"alloy\").\n", voiceList)
-		prompt += "- Example: spawn(id=\"appointment-call\", realtime=true, voice=\"alloy\", directive=\"Handle the appointment conversation naturally. Use the scoped booking capability, escalate consequential ambiguity, and end when the conversation is complete.\", tools=\"booking_create\")\n"
+		prompt += "- Example: spawn(id=\"appointment-call\", realtime=true, voice=\"alloy\", directive=\"Handle the appointment conversation naturally. Use the available booking capability, escalate consequential ambiguity, and end when the conversation is complete.\")\n"
 	}
 
 	// Inject the lightweight MCP server catalog — names + tool counts.
@@ -360,7 +360,7 @@ func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs s
 			prompt += "Always and automatic MCP tools are already in your tool list. Explicitly deferred tools require search_tools. Never search for a tool that is already visible.\n\n"
 		} else {
 			prompt += "Always-loaded MCP tools are already in your tool list. Automatic and deferred tools require search_tools unless preloaded for the current task. Never search for a tool that is already visible. Repeat uses stay loaded.\n"
-			prompt += "When a worker may discover/use a server's full surface, grant that scope explicitly: spawn(id=\"ops\", directive=\"Manage inventory\", mcps=\"store\", tools=\"\"). For least privilege, prefer exact tools= grants.\n\n"
+			prompt += "New workers inherit your effective delegable MCP catalog automatically; their directive drives initial loading and search_tools can discover the rest. Legacy tools/mcp spawn fields are strict narrowing overrides only.\n\n"
 		}
 		for _, info := range mcpCatalog {
 			autoCount := info.AutoCount
@@ -885,14 +885,14 @@ type Thinker struct {
 	handleTools   ToolHandler
 	rebuildPrompt func(toolDocs string) string // rebuild system prompt with current tool docs
 	onStop        func()
-	// toolAllowlist is the exact capability grant for a worker. It contains
-	// the tools requested at spawn plus Core's managed scaffolding. It is a
-	// hard authorization boundary: discovery may load schemas only from this
-	// set or from an explicitly granted MCP scope below.
+	// toolAllowlist is the exact portion of a worker's capability ceiling. It
+	// contains inherited or strictly narrowed tools plus Core's managed
+	// scaffolding. Discovery may load schemas only from this set or the MCP
+	// scopes below.
 	toolAllowlist map[string]bool // nil = all tools allowed (main thread)
-	// toolMCPScopes contains server names explicitly granted through mcp=.
-	// A scoped worker may discover tools from these servers; an exact tools=
-	// grant never implies a whole-server scope.
+	// toolMCPScopes contains inherited or explicitly narrowed MCP server scopes.
+	// A worker may discover tools from these servers; an exact legacy tools=
+	// profile never implies a whole-server scope.
 	toolMCPScopes map[string]bool
 	systemThread  bool
 	allowNoSpawn  bool // privileged API/system-created thread with explicit no_spawn grants
@@ -1455,40 +1455,50 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 			continue
 		}
 		if parentID == "" || parentID == "main" {
+			capabilityMode := SpawnCapabilitiesExplicit
+			if pt.InheritCapabilities {
+				capabilityMode = SpawnCapabilitiesInherit
+			}
 			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-				ProviderName:  pt.Provider,
-				ParentID:      "main",
-				Depth:         pt.Depth,
-				DeferRun:      true,
-				MCPNames:      pt.MCPNames,
-				Model:         pt.Model,
-				Reasoning:     ptReasoning,
-				Realtime:      pt.Realtime,
-				BypassNoSpawn: allowNoSpawn,
-				Voice:         pt.Voice,
-				TurnDetection: realtimeTurnDetectionValue(pt.TurnDetection),
-				System:        pt.System,
-				Pace:          pt.Pace,
-				Events:        pt.Events,
+				ProviderName:   pt.Provider,
+				ParentID:       "main",
+				Depth:          pt.Depth,
+				DeferRun:       true,
+				MCPNames:       pt.MCPNames,
+				CapabilityMode: capabilityMode,
+				Model:          pt.Model,
+				Reasoning:      ptReasoning,
+				Realtime:       pt.Realtime,
+				BypassNoSpawn:  allowNoSpawn,
+				Voice:          pt.Voice,
+				TurnDetection:  realtimeTurnDetectionValue(pt.TurnDetection),
+				System:         pt.System,
+				Pace:           pt.Pace,
+				Events:         pt.Events,
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
 			if mgr != nil {
+				capabilityMode := SpawnCapabilitiesExplicit
+				if pt.InheritCapabilities {
+					capabilityMode = SpawnCapabilitiesInherit
+				}
 				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-					ProviderName:  pt.Provider,
-					ParentID:      parentID,
-					Depth:         pt.Depth,
-					DeferRun:      true,
-					MCPNames:      pt.MCPNames,
-					Model:         pt.Model,
-					Reasoning:     ptReasoning,
-					Realtime:      pt.Realtime,
-					BypassNoSpawn: allowNoSpawn,
-					Voice:         pt.Voice,
-					TurnDetection: realtimeTurnDetectionValue(pt.TurnDetection),
-					System:        pt.System,
-					Pace:          pt.Pace,
-					Events:        pt.Events,
+					ProviderName:   pt.Provider,
+					ParentID:       parentID,
+					Depth:          pt.Depth,
+					DeferRun:       true,
+					MCPNames:       pt.MCPNames,
+					CapabilityMode: capabilityMode,
+					Model:          pt.Model,
+					Reasoning:      ptReasoning,
+					Realtime:       pt.Realtime,
+					BypassNoSpawn:  allowNoSpawn,
+					Voice:          pt.Voice,
+					TurnDetection:  realtimeTurnDetectionValue(pt.TurnDetection),
+					System:         pt.System,
+					Pace:           pt.Pace,
+					Events:         pt.Events,
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -1949,6 +1959,10 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						}
 					}
 				}
+				capabilityMode := SpawnCapabilitiesAuto
+				if len(tools) > 0 || len(mcpNames) > 0 {
+					capabilityMode = SpawnCapabilitiesExplicit
+				}
 				// Provider builtin scoping
 				var builtinTools []string
 				if btStr, hasBuiltins := call.Args["builtins"]; hasBuiltins {
@@ -2004,33 +2018,34 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					logMsg("SPAWN", fmt.Sprintf("LLM-requested id=%q tools=%v mcp=%v provider=%q builtins=%v paused=%v realtime=%v voice=%q directive_len=%d",
 						id, tools, mcpNames, providerName, builtinTools, paused, realtime, voice, len(directive)))
 					err := t.threads.SpawnWithOpts(id, directive, tools, SpawnOpts{
-						MediaParts:    mediaParts,
-						ProviderName:  providerName,
-						Model:         modelName,
-						Reasoning:     reasoning,
-						ParentID:      "main",
-						Depth:         0,
-						MCPNames:      mcpNames,
-						BuiltinTools:  builtinTools,
-						Paused:        paused,
-						Realtime:      realtime,
-						Voice:         voice,
-						TurnDetection: turnDetection,
-						ExecutionIDs:  t.currentEventExecutions(),
-						ParentTrace:   call.trace,
+						MediaParts:     mediaParts,
+						ProviderName:   providerName,
+						Model:          modelName,
+						Reasoning:      reasoning,
+						ParentID:       "main",
+						Depth:          0,
+						MCPNames:       mcpNames,
+						CapabilityMode: capabilityMode,
+						BuiltinTools:   builtinTools,
+						Paused:         paused,
+						Realtime:       realtime,
+						Voice:          voice,
+						TurnDetection:  turnDetection,
+						ExecutionIDs:   t.currentEventExecutions(),
+						ParentTrace:    call.trace,
 					})
 					if err != nil {
 						logMsg("SPAWN", fmt.Sprintf("FAILED id=%q: %v", id, err))
 						addSpawnFailure(err)
 					} else {
 						logMsg("SPAWN", fmt.Sprintf("OK id=%q", id))
-						var persistedTurnDetection *RealtimeTurnDetectionConfig
-						if realtime && !turnDetection.isZero() {
-							persistedTurnDetection = cloneRealtimeTurnDetectionConfig(&turnDetection)
+						persisted, stateErr := t.threads.PersistentState(id)
+						if stateErr == nil {
+							stateErr = t.config.SaveThread(persisted)
 						}
-						if err := t.config.SaveThread(PersistentThread{ID: id, ParentID: "main", Depth: 0, Directive: directive, Tools: tools, MCPNames: mcpNames, Provider: providerName, Model: modelName, Reasoning: reasoning.String(), Realtime: realtime, Voice: voice, TurnDetection: persistedTurnDetection}); err != nil {
+						if stateErr != nil {
 							t.threads.Kill(id)
-							addSpawnFailure(fmt.Errorf("persist spawned thread: %w", err))
+							addSpawnFailure(fmt.Errorf("persist spawned thread: %w", stateErr))
 							toolNames = append(toolNames, call.Raw)
 							continue
 						}
@@ -3364,9 +3379,13 @@ func (t *Thinker) toolCallIDsProtectedFromSanitization(extra []toolCall) map[str
 }
 
 func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMProvider, messages []Message) (response ChatResponse, requestErr error) {
+	return t.thinkWithProviderMessagesAtTier(ctx, provider, messages, t.model)
+}
+
+func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider LLMProvider, messages []Message, tier ModelTier) (response ChatResponse, requestErr error) {
 	var request *requestTrace
 	if provider != nil {
-		request = t.queueRequestTrace(provider.Name(), modelIDForProvider(provider, t.model))
+		request = t.queueRequestTrace(provider.Name(), modelIDForProvider(provider, tier))
 		defer func() { request.finish(response, requestErr) }()
 	}
 	messages, _ = projectMalformedToolHistory(messages)
@@ -3423,7 +3442,7 @@ func (t *Thinker) thinkWithProviderMessages(ctx context.Context, provider LLMPro
 		}
 	}
 
-	modelID := modelIDForProvider(provider, t.model)
+	modelID := modelIDForProvider(provider, tier)
 	budget := estimatePreparedRequest(provider.Name(), modelID, messages, nativeTools)
 	t.emitRequestBudget(budget)
 	if budget.OverBudget {
@@ -3502,6 +3521,53 @@ func modelIDForProvider(provider LLMProvider, tier ModelTier) string {
 	return models[ModelLarge]
 }
 
+// overloadFallbackTiers returns distinct concrete models to try when the
+// selected model is temporarily unavailable. Prefer less expensive/capacity-
+// friendly tiers first; a small selection can only move upward. Providers
+// commonly map multiple tiers to the same model, so duplicate IDs are skipped.
+func overloadFallbackTiers(provider LLMProvider, selected ModelTier) []ModelTier {
+	if provider == nil {
+		return nil
+	}
+	orders := map[ModelTier][]ModelTier{
+		ModelLarge:  {ModelMedium, ModelSmall},
+		ModelMedium: {ModelSmall, ModelLarge},
+		ModelSmall:  {ModelMedium, ModelLarge},
+	}
+	models := provider.Models()
+	seen := map[string]bool{modelIDForProvider(provider, selected): true}
+	var tiers []ModelTier
+	for _, tier := range orders[selected] {
+		model := models[tier]
+		if model == "" || seen[model] {
+			continue
+		}
+		seen[model] = true
+		tiers = append(tiers, tier)
+	}
+	return tiers
+}
+
+func isProviderOverloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, signal := range []string{
+		" 429", "error 429", "status 429", "status=429", "status_code\":429",
+		" 503", "error 503", "status 503", "status=503", "status_code\":503",
+		" 529", "error 529", "status 529", "status=529", "status_code\":529",
+		"rate limit", "rate_limit", "too many requests", "overload", "at capacity",
+		"capacity exceeded", "resource exhausted", "resource_exhausted",
+		"service unavailable", "temporarily unavailable",
+	} {
+		if strings.Contains(msg, signal) {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 	t.sanitizeConversationMessages()
 	return t.callLLMWithRetryMessages(ctx, t.messages)
@@ -3521,7 +3587,7 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 	permanentFallbacks := map[string]error{}
 	for {
 		primary := t.provider
-		resp, nextMessages, err := t.callProviderWithContextRecovery(ctx, primary, messages)
+		resp, nextMessages, err := t.callProviderWithOverloadRecovery(ctx, primary, messages, t.model)
 		messages = nextMessages
 		primaryErr := err
 		if isInvalidToolHistory(err) {
@@ -3549,13 +3615,17 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 				fallbackErr := permanentFallbacks[fallback.Name()]
 				var fallbackResp ChatResponse
 				if fallbackErr == nil {
-					fallbackResp, messages, fallbackErr = t.callProviderWithContextRecovery(ctx, fallback, messages)
+					fallbackResp, messages, fallbackErr = t.callProviderWithOverloadRecovery(ctx, fallback, messages, t.model)
 					if fallbackErr != nil {
 						if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
 							permanentFallbacks[fallback.Name()] = fallbackErr
 						}
 						if t.telemetry != nil {
-							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": modelIDForProvider(fallback, t.model), "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
+							model := fallbackResp.Model
+							if model == "" {
+								model = modelIDForProvider(fallback, t.model)
+							}
+							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": model, "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
 						}
 					}
 				}

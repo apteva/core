@@ -196,24 +196,25 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 }
 
 type threadJSON struct {
-	Inference  InferenceHealth `json:"inference"`
-	ID         string          `json:"id"`
-	Name       string          `json:"name,omitempty"`
-	ParentID   string          `json:"parent_id,omitempty"`
-	Depth      int             `json:"depth"`
-	Directive  string          `json:"directive,omitempty"`
-	Tools      []string        `json:"tools,omitempty"`
-	MCPNames   []string        `json:"mcp_names,omitempty"`
-	Iteration  int             `json:"iteration"`
-	Rate       string          `json:"rate"`
-	NextWakeAt string          `json:"next_wake_at,omitempty"`
-	Model      string          `json:"model"`
-	Reasoning  string          `json:"reasoning,omitempty"`
-	Age        string          `json:"age"`
-	Realtime   bool            `json:"realtime,omitempty"`
-	Ephemeral  bool            `json:"ephemeral,omitempty"`
-	Voice      string          `json:"voice,omitempty"`
-	Provider   string          `json:"provider,omitempty"`
+	Inference           InferenceHealth `json:"inference"`
+	ID                  string          `json:"id"`
+	Name                string          `json:"name,omitempty"`
+	ParentID            string          `json:"parent_id,omitempty"`
+	Depth               int             `json:"depth"`
+	Directive           string          `json:"directive,omitempty"`
+	Tools               []string        `json:"tools,omitempty"`
+	MCPNames            []string        `json:"mcp_names,omitempty"`
+	InheritCapabilities bool            `json:"inherit_capabilities,omitempty"`
+	Iteration           int             `json:"iteration"`
+	Rate                string          `json:"rate"`
+	NextWakeAt          string          `json:"next_wake_at,omitempty"`
+	Model               string          `json:"model"`
+	Reasoning           string          `json:"reasoning,omitempty"`
+	Age                 string          `json:"age"`
+	Realtime            bool            `json:"realtime,omitempty"`
+	Ephemeral           bool            `json:"ephemeral,omitempty"`
+	Voice               string          `json:"voice,omitempty"`
+	Provider            string          `json:"provider,omitempty"`
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
@@ -246,24 +247,25 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	collectThreads = func(tm *ThreadManager) {
 		for _, t := range tm.List() {
 			out = append(out, threadJSON{
-				Inference:  t.Inference,
-				ID:         t.ID,
-				Name:       t.Name,
-				ParentID:   t.ParentID,
-				Depth:      t.Depth,
-				Directive:  t.Directive,
-				Tools:      t.Tools,
-				MCPNames:   t.MCPNames,
-				Iteration:  t.Iteration,
-				Rate:       t.Rate.String(),
-				NextWakeAt: formatNextWakeAt(t.NextWakeAt),
-				Model:      t.Model.String(),
-				Reasoning:  t.Reasoning.String(),
-				Age:        formatAge(time.Since(t.Started)),
-				Realtime:   t.Realtime,
-				Ephemeral:  t.Ephemeral,
-				Voice:      t.Voice,
-				Provider:   t.Provider,
+				Inference:           t.Inference,
+				ID:                  t.ID,
+				Name:                t.Name,
+				ParentID:            t.ParentID,
+				Depth:               t.Depth,
+				Directive:           t.Directive,
+				Tools:               t.Tools,
+				MCPNames:            t.MCPNames,
+				InheritCapabilities: t.InheritCapabilities,
+				Iteration:           t.Iteration,
+				Rate:                t.Rate.String(),
+				NextWakeAt:          formatNextWakeAt(t.NextWakeAt),
+				Model:               t.Model.String(),
+				Reasoning:           t.Reasoning.String(),
+				Age:                 formatAge(time.Since(t.Started)),
+				Realtime:            t.Realtime,
+				Ephemeral:           t.Ephemeral,
+				Voice:               t.Voice,
+				Provider:            t.Provider,
 			})
 			// Recurse into children
 			if t.SubThreads > 0 {
@@ -497,9 +499,10 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		tools = *body.Tools
 	}
 	result, err := a.thinker.threads.UpdateWithEvents(id, "", directive, tools, ThreadUpdateOptions{
-		RestartRealtime: body.RestartRealtime,
-		ReplaceTools:    body.Tools != nil,
-		MCPNames:        body.MCP,
+		RestartRealtime:         body.RestartRealtime,
+		ReplaceTools:            body.Tools != nil,
+		MCPNames:                body.MCP,
+		BypassCapabilityCeiling: true,
 	}, normalizedEvents)
 	if err != nil {
 		if errors.Is(err, ErrRealtimeConfigurationRestartRequired) {
@@ -703,10 +706,10 @@ func (a *APIServer) rollbackAPICreatedThread(id string) {
 // spawnThread handles POST /threads/{id}. Idempotent: if the thread
 // already exists, returns its current state with status="exists". Otherwise it
 // spawns a new one with the given directive + tools + mcp and returns
-// status="created". Missing
-// fields fall back to inherit-from-main: directive=main's directive,
-// tools=[] (spawnInternal supplies the safe baseline: send, done,
-// pace, evolve), mcp=[].
+// status="created". Missing capability fields inherit the main thread's
+// delegable ceiling. Explicit tools or mcp arrays retain the legacy strict
+// profile behavior, including explicitly empty arrays for a minimal worker.
+// Missing directive fields continue to inherit the main directive.
 func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id string) {
 	if id == "main" {
 		http.Error(w, "cannot spawn over main", http.StatusBadRequest)

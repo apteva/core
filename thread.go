@@ -58,11 +58,11 @@ IDENTITY:
 - Only call done if you are certain this thread should never run again.
 
 SPAWNING SUB-THREADS:
-- Use spawn(id="..." directive="..." tools="...") when work benefits from distinct ownership or state, parallel execution, waiting or retries, substantial context isolation, continued operation, or independent failure handling.
+- Use spawn(id="..." directive="...") when work benefits from distinct ownership or state, parallel execution, waiting or retries, substantial context isolation, continued operation, or independent failure handling. Omit tools and mcp so the child inherits your delegable capability ceiling; legacy explicit values only narrow it.
 - Keep only very small immediately completing actions local. Capability alone does not determine ownership.
 - Consolidate closely related continuing responsibilities under one focused owner instead of creating one thread per schedule.
 - Use kill(id="...") to stop a sub-thread.
-- Use update(id="..." directive="..." tools="...") to change a sub-thread's directive or tools.
+- Use update(id="..." directive="...") to change a sub-thread's directive. An explicit legacy tools profile narrows capabilities and never widens beyond yours.
 - Use list_threads(filter="...") to search your complete descendant hierarchy by id, name, directive, tool, or MCP scope. [ACTIVE THREADS] states whether the hierarchy is complete; when it says "partial view", it is NOT proof a thread is missing — search broadly before spawning.
 - Your sub-threads report to YOU, not to main. You coordinate your team.
 - ` + delegatedCompletionContract + `
@@ -176,31 +176,32 @@ const threadDirectivePersistencePrompt = `
 - For authority-based changes, copy the parent's durable intent without adding operational details they did not state. Patch only the relevant Markdown section, remove obsolete conflicts, and call evolve once for one authoritative instruction. If evolve rejects the arguments, correct them and retry once; a rejected call did not persist the instruction.`
 
 type ThreadInfo struct {
-	Inference       InferenceHealth
-	ID              string
-	Name            string // human-readable display label; empty = render id
-	System          bool   // platform-managed; hidden from and immutable by agent tools
-	ParentID        string // "main" or parent thread ID
-	Depth           int
-	Directive       string
-	Tools           []string
-	MCPNames        []string
-	Running         bool
-	Iteration       int
-	Rate            ThinkRate
-	NextWakeAt      time.Time
-	Model           ModelTier
-	Reasoning       ReasoningLevel
-	Provider        string // active provider name
-	Realtime        bool
-	Ephemeral       bool
-	BridgeConnected bool
-	Voice           string
-	TurnDetection   RealtimeTurnDetectionConfig
-	Started         time.Time
-	ContextMsgs     int
-	ContextChars    int
-	SubThreads      int // number of direct children
+	Inference           InferenceHealth
+	ID                  string
+	Name                string // human-readable display label; empty = render id
+	System              bool   // platform-managed; hidden from and immutable by agent tools
+	ParentID            string // "main" or parent thread ID
+	Depth               int
+	Directive           string
+	Tools               []string
+	MCPNames            []string
+	InheritCapabilities bool
+	Running             bool
+	Iteration           int
+	Rate                ThinkRate
+	NextWakeAt          time.Time
+	Model               ModelTier
+	Reasoning           ReasoningLevel
+	Provider            string // active provider name
+	Realtime            bool
+	Ephemeral           bool
+	BridgeConnected     bool
+	Voice               string
+	TurnDetection       RealtimeTurnDetectionConfig
+	Started             time.Time
+	ContextMsgs         int
+	ContextChars        int
+	SubThreads          int // number of direct children
 }
 
 type Thread struct {
@@ -211,21 +212,25 @@ type Thread struct {
 	System          bool   // platform-managed thread, not an agent-addressable worker
 	// Name can be edited via update without touching parent_id
 	// references or session storage. Empty means "use ID for display".
-	ParentID      string   // "main" or parent thread ID
-	Depth         int      // 0 = child of main, 1 = grandchild, etc.
-	Directive     string   // original directive before tool docs
-	MCPNames      []string // MCP server names this thread connected to
-	Thinker       *Thinker
-	Realtime      *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
-	IsRealtime    bool
-	AllowNoSpawn  bool
-	Voice         string
-	TurnDetection RealtimeTurnDetectionConfig
-	ProviderName  string
-	Ephemeral     bool
-	audioIn       chan []byte
-	audioOut      chan RealtimeAudioFrame
-	audioControl  chan string
+	ParentID  string   // "main" or parent thread ID
+	Depth     int      // 0 = child of main, 1 = grandchild, etc.
+	Directive string   // original directive before tool docs
+	MCPNames  []string // MCP server names this thread connected to
+	// InheritCapabilities records whether this thread was created from its
+	// parent's effective delegation ceiling rather than a legacy explicit
+	// tools/MCP profile. The effective snapshot is still persisted for audit.
+	InheritCapabilities bool
+	Thinker             *Thinker
+	Realtime            *RealtimeThinker // non-nil for realtime (voice/audio) threads; runs in place of Thinker.Run
+	IsRealtime          bool
+	AllowNoSpawn        bool
+	Voice               string
+	TurnDetection       RealtimeTurnDetectionConfig
+	ProviderName        string
+	Ephemeral           bool
+	audioIn             chan []byte
+	audioOut            chan RealtimeAudioFrame
+	audioControl        chan string
 	// BridgeDisconnectTTL is set only for caller-owned realtime sessions
 	// (the dashboard currently uses it). A zero value preserves the existing
 	// sidecar/telephony behaviour: losing the audio bridge does not kill the
@@ -286,13 +291,16 @@ type SpawnOpts struct {
 	ParentID        string                  // "main" or parent thread ID (empty = "main")
 	Depth           int                     // depth in the spawn tree (0 = child of main)
 	MCPNames        []string                // MCP server capability scopes; eligible tools follow loading policy
-	// Tools, when set, grants and preloads specific tool names (across any
-	// server). Complements MCPNames: MCPNames authorizes discovery across
-	// those servers, while Tools authorizes exactly those names. Both are
-	// additive. Used by the
-	// privileged HTTP spawn endpoint (POST /threads/{id}) for system
-	// callers that know which tools they need; the LLM-driven spawn
-	// tool path leaves this nil and uses mcps=[…] instead.
+	// CapabilityMode defaults to inheritance when tools and MCPNames are both
+	// omitted. Explicit legacy fields retain their strict narrowing semantics.
+	CapabilityMode SpawnCapabilityMode
+	// BypassCapabilityCeiling is reserved for host-owned system construction.
+	// Authenticated API callers use ordinary explicit profiles plus the
+	// narrower BypassNoSpawn escape hatch.
+	BypassCapabilityCeiling bool
+	// Tools is the legacy exact-profile companion to MCPNames. Normal spawns
+	// omit both and inherit the parent's ceiling; explicitly supplied values
+	// preserve the old strict, additive exact-tool/server-scope profile.
 	Tools        []string
 	BuiltinTools []string // provider builtin overrides (nil = inherit, empty = none)
 	DeferRun     bool     // if true, don't start Run() — call StartAll() later
@@ -460,6 +468,22 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		return fmt.Errorf("max spawn depth (%d) exceeded", MaxSpawnDepth)
 	}
 
+	requestedTools := append([]string(nil), tools...)
+	resolvedTools, resolvedMCPs, inheritedCapabilities, err := resolveSpawnCapabilities(tm.parent, tools, opts)
+	if err != nil {
+		return err
+	}
+	tools = resolvedTools
+	opts.MCPNames = resolvedMCPs
+	// Exact grants live in the hard allowlist. Do not also seed activeTools;
+	// that set is reserved for MCP discovery/loading state.
+	opts.Tools = nil
+	// no_spawn is an explicit authenticated attachment escape hatch, never an
+	// ambient capability inherited merely because the API created the parent.
+	if inheritedCapabilities {
+		opts.BypassNoSpawn = false
+	}
+
 	// canSpawn only if depth allows AND spawn was explicitly in the tools list
 	wantsSpawn := false
 	for _, t := range tools {
@@ -532,18 +556,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			prompt += realtimeConversationPrompt
 		}
 		if canSpawn {
-			var mcpList []string
-			for _, cfg := range tm.parent.config.GetMCPServers() {
-				if !cfg.NoSpawn {
-					mcpList = append(mcpList, cfg.Name)
-				}
-			}
-			if len(mcpList) > 0 {
-				prompt += "\n\n[AVAILABLE MCP SERVERS — use mcps=[\"name\"] when spawning]\n"
-				for _, name := range mcpList {
-					prompt += "- " + name + "\n"
-				}
-			}
+			prompt += formatInheritedMCPServers(opts.MCPNames)
 		}
 		return prompt + "\n\n[DIRECTIVE]\n" + currentDirective
 	}
@@ -557,6 +570,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		Depth:               depth,
 		Directive:           directive,
 		MCPNames:            opts.MCPNames,
+		InheritCapabilities: inheritedCapabilities,
 		IsRealtime:          opts.Realtime,
 		AllowNoSpawn:        opts.BypassNoSpawn,
 		Voice:               opts.Voice,
@@ -936,7 +950,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			ParentID:          parentID,
 			Directive:         directive,
 			Tools:             append([]string(nil), toolList...),
-			RequestedTools:    append([]string(nil), tools...),
+			RequestedTools:    requestedTools,
 			MCP:               append([]string(nil), thread.MCPNames...),
 			Realtime:          thread.IsRealtime,
 			Voice:             thread.Voice,
@@ -1289,6 +1303,10 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 						}
 					}
 				}
+				capabilityMode := SpawnCapabilitiesAuto
+				if len(spawnTools) > 0 || len(mcpNames) > 0 {
+					capabilityMode = SpawnCapabilitiesExplicit
+				}
 				// Provider builtin scoping
 				var builtinTools []string
 				if btStr, hasBuiltins := call.Args["builtins"]; hasBuiltins {
@@ -1307,25 +1325,25 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, fmt.Sprintf("error: spawn requires both id and directive (got id=%q, directive_len=%d)", sid, len(directive)))
 				} else {
 					err := thread.Children.SpawnWithOpts(sid, directive, spawnTools, SpawnOpts{
-						ProviderName: providerName,
-						Model:        modelName,
-						Reasoning:    reasoning,
-						ParentID:     thread.ID,
-						Depth:        thread.Depth + 1,
-						MCPNames:     mcpNames,
-						BuiltinTools: builtinTools,
-						Paused:       paused,
-						ParentTrace:  call.trace,
-						ExecutionIDs: t.currentEventExecutions(),
+						ProviderName:   providerName,
+						Model:          modelName,
+						Reasoning:      reasoning,
+						ParentID:       thread.ID,
+						Depth:          thread.Depth + 1,
+						MCPNames:       mcpNames,
+						CapabilityMode: capabilityMode,
+						BuiltinTools:   builtinTools,
+						Paused:         paused,
+						ParentTrace:    call.trace,
+						ExecutionIDs:   t.currentEventExecutions(),
 					})
 					if err != nil {
 						emitResult(call, fmt.Sprintf("error: %v", err))
 					} else {
-						persistErr := t.config.SaveThread(PersistentThread{
-							ID: sid, ParentID: thread.ID, Depth: thread.Depth + 1,
-							Directive: directive, Tools: spawnTools, MCPNames: mcpNames,
-							Provider: providerName, Model: modelName, Reasoning: reasoning.String(),
-						})
+						persisted, persistErr := thread.Children.PersistentState(sid)
+						if persistErr == nil {
+							persistErr = t.config.SaveThread(persisted)
+						}
 						if persistErr != nil {
 							thread.Children.Kill(sid)
 							emitResult(call, fmt.Sprintf("error: persist spawned thread: %v", persistErr))
@@ -1696,31 +1714,32 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			subCount = t.Children.Count()
 		}
 		infos = append(infos, ThreadInfo{
-			Inference:       t.Thinker.inferenceSnapshot(),
-			ID:              t.ID,
-			Name:            t.Name,
-			System:          t.System,
-			ParentID:        t.ParentID,
-			Depth:           t.Depth,
-			Directive:       t.Directive,
-			Tools:           append([]string(nil), t.cachedToolNames...),
-			Running:         true,
-			Iteration:       status.Iteration,
-			Rate:            status.Rate,
-			NextWakeAt:      status.NextWakeAt,
-			Model:           status.Model,
-			Reasoning:       status.Reasoning,
-			Provider:        providerName,
-			Realtime:        t.IsRealtime,
-			Ephemeral:       t.Ephemeral,
-			BridgeConnected: t.bridgeConnected,
-			Voice:           t.Voice,
-			TurnDetection:   t.TurnDetection,
-			Started:         t.Started,
-			ContextMsgs:     status.ContextMsgs,
-			ContextChars:    status.ContextChars,
-			MCPNames:        t.MCPNames,
-			SubThreads:      subCount,
+			Inference:           t.Thinker.inferenceSnapshot(),
+			ID:                  t.ID,
+			Name:                t.Name,
+			System:              t.System,
+			ParentID:            t.ParentID,
+			Depth:               t.Depth,
+			Directive:           t.Directive,
+			Tools:               append([]string(nil), t.cachedToolNames...),
+			Running:             true,
+			Iteration:           status.Iteration,
+			Rate:                status.Rate,
+			NextWakeAt:          status.NextWakeAt,
+			Model:               status.Model,
+			Reasoning:           status.Reasoning,
+			Provider:            providerName,
+			Realtime:            t.IsRealtime,
+			Ephemeral:           t.Ephemeral,
+			BridgeConnected:     t.bridgeConnected,
+			Voice:               t.Voice,
+			TurnDetection:       t.TurnDetection,
+			Started:             t.Started,
+			ContextMsgs:         status.ContextMsgs,
+			ContextChars:        status.ContextChars,
+			MCPNames:            t.MCPNames,
+			InheritCapabilities: t.InheritCapabilities,
+			SubThreads:          subCount,
 		})
 	}
 
@@ -1867,7 +1886,8 @@ func persistentThreadStateBase(thread *Thread) PersistentThread {
 		ID: thread.ID, Name: thread.Name, ParentID: thread.ParentID, Depth: thread.Depth,
 		System: thread.System, Directive: thread.Directive,
 		Tools: toolSetToSlice(thread.Tools), MCPNames: append([]string(nil), thread.MCPNames...),
-		Provider: thread.ProviderName, Realtime: thread.IsRealtime,
+		InheritCapabilities: thread.InheritCapabilities,
+		Provider:            thread.ProviderName, Realtime: thread.IsRealtime,
 		AllowNoSpawn: thread.AllowNoSpawn, Voice: thread.Voice,
 	}
 	if thread.IsRealtime && !thread.TurnDetection.isZero() {
@@ -1970,16 +1990,20 @@ type ThreadUpdateOptions struct {
 	ReplaceTools bool
 	// MCPNames, when non-nil, replaces the thread's discoverable MCP scopes.
 	MCPNames *[]string
+	// BypassCapabilityCeiling is reserved for authenticated API callers. Agent
+	// updates must remain a subset of the updating parent's authority.
+	BypassCapabilityCeiling bool
 }
 
 type ThreadUpdateResult struct {
-	Events            ThreadEventQueueResult
-	Changed           bool
-	NameChanged       bool
-	DirectiveChanged  bool
-	ToolsChanged      bool
-	MCPChanged        bool
-	RealtimeRestarted bool
+	Events                ThreadEventQueueResult
+	Changed               bool
+	NameChanged           bool
+	DirectiveChanged      bool
+	ToolsChanged          bool
+	MCPChanged            bool
+	CapabilityModeChanged bool
+	RealtimeRestarted     bool
 }
 
 func sameToolSet(a, b map[string]bool) bool {
@@ -2048,6 +2072,20 @@ func (tm *ThreadManager) UpdateWithEvents(id, name, directive string, tools []st
 	if owner == nil {
 		return ThreadUpdateResult{}, &threadNotFoundError{id: id}
 	}
+	if opts.ReplaceTools || len(tools) > 0 {
+		bounded, err := resolveExplicitChildTools(owner.parent, tools, opts.BypassCapabilityCeiling)
+		if err != nil {
+			return ThreadUpdateResult{}, err
+		}
+		tools = bounded
+	}
+	if opts.MCPNames != nil {
+		bounded, err := resolveExplicitChildMCPs(owner.parent, *opts.MCPNames, opts.BypassCapabilityCeiling)
+		if err != nil {
+			return ThreadUpdateResult{}, err
+		}
+		opts.MCPNames = &bounded
+	}
 	thread.profileUpdateMu.Lock()
 	defer thread.profileUpdateMu.Unlock()
 	owner.mu.RLock()
@@ -2082,10 +2120,11 @@ func (tm *ThreadManager) UpdateWithEvents(id, name, directive string, tools []st
 }
 
 type threadProfileUpdate struct {
-	result          ThreadUpdateResult
-	name, directive string
-	tools           map[string]bool
-	mcp             []string
+	result              ThreadUpdateResult
+	name, directive     string
+	tools               map[string]bool
+	mcp                 []string
+	inheritCapabilities bool
 }
 
 // planThreadProfile uses the same normalization for preflight and commit.
@@ -2124,8 +2163,13 @@ func planThreadProfile(thread *Thread, name, directive string, tools []string, o
 		nextMCPNames = compactStringList(*opts.MCPNames)
 	}
 	result.MCPChanged = !sameStringSliceSet(nextMCPNames, thread.MCPNames)
-	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged || result.MCPChanged
-	return threadProfileUpdate{result: result, name: nextName, directive: nextDirective, tools: nextTools, mcp: nextMCPNames}
+	nextInheritCapabilities := thread.InheritCapabilities
+	if opts.ReplaceTools || len(tools) > 0 || opts.MCPNames != nil {
+		nextInheritCapabilities = false
+	}
+	result.CapabilityModeChanged = nextInheritCapabilities != thread.InheritCapabilities
+	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged || result.MCPChanged || result.CapabilityModeChanged
+	return threadProfileUpdate{result: result, name: nextName, directive: nextDirective, tools: nextTools, mcp: nextMCPNames, inheritCapabilities: nextInheritCapabilities}
 }
 
 func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []string, opts ThreadUpdateOptions, incoming []PersistentThreadEvent) (ThreadUpdateResult, error) {
@@ -2176,6 +2220,7 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		persisted := persistentThreadStateBase(thread)
 		persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
 		persisted.MCPNames = append([]string(nil), nextMCPNames...)
+		persisted.InheritCapabilities = plan.inheritCapabilities
 		persisted.Events = clonePersistentThreadEvents(nextEvents)
 		if result.DirectiveChanged && persisted.Pace != nil {
 			persisted.Pace.WaitForEvents = false
@@ -2202,6 +2247,7 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 	thread.Tools = nextTools
 	thread.cachedToolNames = nil
 	thread.MCPNames = append([]string(nil), nextMCPNames...)
+	thread.InheritCapabilities = plan.inheritCapabilities
 	thread.Thinker.toolAllowlist = nextTools
 	if result.MCPChanged {
 		thread.Thinker.toolMCPScopes = nextScopes

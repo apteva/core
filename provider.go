@@ -419,6 +419,10 @@ func createProviderByName(name string) LLMProvider {
 		if token := os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"); token != "" {
 			return NewOpenAICodexProvider(token)
 		}
+	case "grok-build":
+		if token := os.Getenv("GROK_BUILD_ACCESS_TOKEN"); token != "" {
+			return NewGrokBuildProvider(token)
+		}
 	case "anthropic":
 		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
 			return NewAnthropicProvider(key)

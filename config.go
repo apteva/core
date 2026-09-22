@@ -38,23 +38,24 @@ type PersistentThreadEvent struct {
 }
 
 type PersistentThread struct {
-	ID            string                       `json:"id"`
-	Name          string                       `json:"name,omitempty"`      // human-readable label; empty = display as ID
-	ParentID      string                       `json:"parent_id,omitempty"` // empty = child of main
-	Depth         int                          `json:"depth,omitempty"`     // 0 = main's direct child
-	System        bool                         `json:"system,omitempty"`    // system thread (can't be killed by LLM)
-	Directive     string                       `json:"directive"`
-	Tools         []string                     `json:"tools"`
-	MCPNames      []string                     `json:"mcp_names,omitempty"`      // MCP servers to connect on respawn
-	Model         string                       `json:"model,omitempty"`          // starting model tier: large, medium, small
-	Reasoning     string                       `json:"reasoning,omitempty"`      // starting reasoning effort: auto, low, medium, high, ...
-	Provider      string                       `json:"provider,omitempty"`       // provider selected for this thread
-	Realtime      bool                         `json:"realtime,omitempty"`       // spawn as a realtime (voice/audio) thread
-	AllowNoSpawn  bool                         `json:"allow_no_spawn,omitempty"` // authenticated system/API grant for explicitly attached no_spawn MCPs
-	Voice         string                       `json:"voice,omitempty"`          // realtime voice id (e.g. "marin"); empty = provider default
-	TurnDetection *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"` // realtime VAD/turn-taking profile and overrides
-	Pace          *PersistentPaceState         `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
-	Events        []PersistentThreadEvent      `json:"events,omitempty"`         // pending inbox payloads + bounded consumed-ID ledger
+	ID                  string                       `json:"id"`
+	Name                string                       `json:"name,omitempty"`      // human-readable label; empty = display as ID
+	ParentID            string                       `json:"parent_id,omitempty"` // empty = child of main
+	Depth               int                          `json:"depth,omitempty"`     // 0 = main's direct child
+	System              bool                         `json:"system,omitempty"`    // system thread (can't be killed by LLM)
+	Directive           string                       `json:"directive"`
+	Tools               []string                     `json:"tools"`
+	MCPNames            []string                     `json:"mcp_names,omitempty"`            // effective MCP server scopes captured for audit/restart
+	InheritCapabilities bool                         `json:"inherit_capabilities,omitempty"` // recompute from the parent's ceiling on respawn
+	Model               string                       `json:"model,omitempty"`                // starting model tier: large, medium, small
+	Reasoning           string                       `json:"reasoning,omitempty"`            // starting reasoning effort: auto, low, medium, high, ...
+	Provider            string                       `json:"provider,omitempty"`             // provider selected for this thread
+	Realtime            bool                         `json:"realtime,omitempty"`             // spawn as a realtime (voice/audio) thread
+	AllowNoSpawn        bool                         `json:"allow_no_spawn,omitempty"`       // authenticated system/API grant for explicitly attached no_spawn MCPs
+	Voice               string                       `json:"voice,omitempty"`                // realtime voice id (e.g. "marin"); empty = provider default
+	TurnDetection       *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`       // realtime VAD/turn-taking profile and overrides
+	Pace                *PersistentPaceState         `json:"pace,omitempty"`                 // runtime cadence/deadline; never part of the directive
+	Events              []PersistentThreadEvent      `json:"events,omitempty"`               // pending inbox payloads + bounded consumed-ID ledger
 }
 
 // ProviderConfig persists a provider and its model selections.
