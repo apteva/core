@@ -46,7 +46,9 @@ func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 		Name: name,
 		url:  url,
 		client: &http.Client{
-			Timeout: 3 * time.Minute,
+			// Tool execution has its own deadline. Allow a connector's
+			// declared longer timeout without this transport cutting it short.
+			Timeout: 10 * time.Minute,
 			// Disable auto-redirects so we can re-issue POSTs with the body
 			// preserved. http.Client would otherwise follow 307/308 but drop
 			// the body for non-idempotent methods.
@@ -57,7 +59,9 @@ func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 	}
 
 	// Initialize
-	result, headers, err := srv.callWithHeaders("initialize", map[string]any{
+	initCtx, cancelInit := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancelInit()
+	result, headers, err := srv.callWithHeadersContext(initCtx, "initialize", map[string]any{
 		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]string{

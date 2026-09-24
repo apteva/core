@@ -318,8 +318,11 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 	return s.callContext(context.Background(), method, params)
 }
 func (s *MCPServer) callContext(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
-	defer cancel()
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mcpCallTimeout)
+		defer cancel()
+	}
 	id := s.nextID.Add(1)
 
 	ch := make(chan jsonRPCResponse, 1)
@@ -376,15 +379,12 @@ func (s *MCPServer) callContext(ctx context.Context, method string, params any) 
 		s.pendMu.Lock()
 		delete(s.pending, id)
 		s.pendMu.Unlock()
-		return nil, fmt.Errorf("MCP call timed out after %s", mcpCallTimeout)
+		return nil, fmt.Errorf("MCP call timed out: %w", ctx.Err())
 	}
 }
 
-// mcpCallTimeout is the deadline for a single tool invocation. Bumped
-// from 30s because legitimate long-running tools (audio transcription,
-// large-file downloads, OCR) can legitimately take a minute or two.
-// Short enough that a hung MCP still surfaces as a timeout error within
-// a reasonable window for retry.
+// mcpCallTimeout bounds calls without a caller deadline, including MCP
+// initialization. Tool calls use their caller's per-tool deadline.
 const mcpCallTimeout = 3 * time.Minute
 
 func (s *MCPServer) notify(method string, params any) {

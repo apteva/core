@@ -123,7 +123,7 @@ func executeTool(t *Thinker, call toolCall) {
 		defer call.trace.finish("cancelled")
 		defer t.releaseToolSlot()
 		defer t.asyncToolsActive.Add(-1)
-		ctx, cancel := context.WithTimeout(t.toolContext(), 3*time.Minute)
+		ctx, cancel := context.WithTimeout(t.toolContext(), toolCallTimeout(call))
 		t.toolLifecycleMu.Lock()
 		if generation != t.toolGeneration.Load() {
 			t.toolLifecycleMu.Unlock()
