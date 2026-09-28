@@ -151,9 +151,9 @@ type geminiToolDecl struct {
 }
 
 type geminiFunctionDecl struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Name                 string         `json:"name"`
+	Description          string         `json:"description"`
+	ParametersJSONSchema map[string]any `json:"parametersJsonSchema"`
 }
 
 type geminiContent struct {
@@ -187,112 +187,18 @@ type geminiInline struct {
 }
 
 func geminiToolParameters(schema map[string]any) map[string]any {
-	normalized, ok := normalizeGeminiSchema("", schema).(map[string]any)
-	if !ok || len(normalized) == 0 {
-		return map[string]any{"type": "object"}
+	// FunctionDeclaration.parameters is Google's restricted OpenAPI Schema
+	// proto, not JSON Schema. In particular, it rejects required-only anyOf
+	// branches whose properties are declared at the parent. Both GenerateContent
+	// and Live support parametersJsonSchema instead. Keep compositions, refs,
+	// nullable unions and additionalProperties intact through that field rather
+	// than weakening constraints or inventing types while lowering to the proto.
+	// https://ai.google.dev/api/caching#FunctionDeclaration
+	out := cloneJSONValue(schema).(map[string]any)
+	if _, ok := out["type"]; !ok {
+		out["type"] = "object"
 	}
-	if _, ok := normalized["type"]; !ok {
-		normalized["type"] = "object"
-	}
-	return normalized
-}
-
-func normalizeGeminiSchema(name string, v any) any {
-	switch x := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(x)+1)
-		for k, val := range x {
-			// Gemini's Schema proto rejects JSON-Schema keywords that are
-			// valid for OpenAI/MCP schemas. Drop them at every nesting
-			// level rather than sending a request that Gemini rejects with
-			// INVALID_ARGUMENT (notably additionalProperties).
-			switch k {
-			case "additionalProperties", "$schema", "$defs", "definitions", "unevaluatedProperties", "dependentSchemas":
-				continue
-			}
-			if k == "properties" {
-				props, ok := val.(map[string]any)
-				if !ok {
-					out[k] = normalizeGeminiSchema(k, val)
-					continue
-				}
-				normalizedProps := make(map[string]any, len(props))
-				for propName, propSchema := range props {
-					normalizedProps[propName] = normalizeGeminiSchema(propName, propSchema)
-				}
-				out[k] = normalizedProps
-				continue
-			}
-			out[k] = normalizeGeminiSchema(k, val)
-		}
-		// JSON Schema permits object constraints without an explicit type,
-		// including search_tools' required-only anyOf branches. Gemini's
-		// Schema validation requires the object type on each such node, not
-		// just the function parameter root. Keep unions and explicit types
-		// intact and infer only where object constraints provide evidence.
-		if _, hasType := out["type"]; !hasType {
-			_, hasProperties := out["properties"]
-			_, hasRequired := out["required"]
-			if hasProperties || hasRequired {
-				out["type"] = "object"
-			}
-		}
-		if schemaTypeIncludes(out["type"], "array") {
-			if items, ok := out["items"]; !ok || isEmptyGeminiSchema(items) {
-				out["items"] = defaultGeminiArrayItems(name)
-			}
-		}
-		return out
-	case []any:
-		out := make([]any, len(x))
-		for i, val := range x {
-			out[i] = normalizeGeminiSchema(name, val)
-		}
-		return out
-	default:
-		return v
-	}
-}
-
-func defaultGeminiArrayItems(name string) map[string]any {
-	switch name {
-	case "attributes", "channels", "definition", "filters":
-		return map[string]any{"type": "object"}
-	case "enum_values", "list_ids", "tags":
-		return map[string]any{"type": "string"}
-	default:
-		return map[string]any{"type": "object"}
-	}
-}
-
-func schemaTypeIncludes(raw any, want string) bool {
-	switch x := raw.(type) {
-	case string:
-		return strings.EqualFold(x, want)
-	case []any:
-		for _, val := range x {
-			if s, ok := val.(string); ok && strings.EqualFold(s, want) {
-				return true
-			}
-		}
-	case []string:
-		for _, s := range x {
-			if strings.EqualFold(s, want) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isEmptyGeminiSchema(v any) bool {
-	if v == nil {
-		return true
-	}
-	if m, ok := v.(map[string]any); ok {
-		return len(m) == 0
-	}
-	return false
+	return out
 }
 
 // Gemini streaming response
@@ -477,9 +383,9 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		var funcs []geminiFunctionDecl
 		for _, t := range tools {
 			funcs = append(funcs, geminiFunctionDecl{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  geminiToolParameters(t.Parameters),
+				Name:                 t.Name,
+				Description:          t.Description,
+				ParametersJSONSchema: geminiToolParameters(t.Parameters),
 			})
 		}
 		if len(funcs) > 0 {

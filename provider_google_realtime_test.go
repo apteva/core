@@ -25,7 +25,7 @@ func newGoogleRealtimeTestSession() *googleRealtimeSession {
 	}
 }
 
-func TestGoogleLiveSetupNormalizesRegisteredSearchTools(t *testing.T) {
+func TestGoogleLiveSetupPreservesRegisteredSearchToolsJSONSchema(t *testing.T) {
 	registry := NewToolRegistry("google-schema-regression")
 	tool := registry.Get("search_tools").native
 	original := string(mustJSON(t, tool.Parameters))
@@ -50,25 +50,28 @@ func TestGoogleLiveSetupNormalizesRegisteredSearchTools(t *testing.T) {
 	if declaration.Name != "search_tools" {
 		t.Fatalf("tool name = %q", declaration.Name)
 	}
-	branches := declaration.Parameters["anyOf"].([]any)
+	branches := declaration.ParametersJSONSchema["anyOf"].([]any)
 	if len(branches) != 2 {
 		t.Fatalf("query-or-queries constraint changed: %#v", branches)
 	}
 	for i, field := range []string{"query", "queries"} {
 		branch := branches[i].(map[string]any)
-		if branch["type"] != "object" {
-			t.Fatalf("search_tools.anyOf[%d]: required needs an explicit object type: %#v", i, branch)
-		}
 		required := branch["required"].([]any)
 		if len(required) != 1 || required[0] != field {
 			t.Fatalf("branch required fields changed: %#v", branch)
 		}
 	}
+	if strings.Contains(string(payload), `"parameters":`) {
+		t.Fatal("Live must use parametersJsonSchema, not the restricted Schema proto")
+	}
+	if string(mustJSON(t, declaration.ParametersJSONSchema)) != original {
+		t.Fatalf("search_tools JSON Schema constraints changed: %s", payload)
+	}
 	if string(mustJSON(t, tool.Parameters)) != original {
 		t.Fatal("realtime setup mutated the registry schema used by other providers")
 	}
 	// Ordinary Gemini uses the same conversion and must produce the same wire schema.
-	if string(mustJSON(t, declaration.Parameters)) != string(mustJSON(t, geminiToolParameters(tool.Parameters))) {
+	if string(mustJSON(t, declaration.ParametersJSONSchema)) != string(mustJSON(t, geminiToolParameters(tool.Parameters))) {
 		t.Fatal("realtime and ordinary Gemini schema conversion diverged")
 	}
 }
@@ -113,10 +116,10 @@ func TestGoogleLiveSetupUsesNativeProtocol(t *testing.T) {
 	}
 	tools := setup["tools"].([]any)
 	declarations := tools[0].(map[string]any)["functionDeclarations"].([]any)
-	parameters := declarations[0].(map[string]any)["parameters"].(map[string]any)
+	parameters := declarations[0].(map[string]any)["parametersJsonSchema"].(map[string]any)
 	slots := parameters["properties"].(map[string]any)["slots"].(map[string]any)
-	if slots["items"] == nil {
-		t.Fatalf("Gemini array schema was not normalized: %#v", slots)
+	if slots["type"] != "array" || slots["items"] != nil {
+		t.Fatalf("JSON Schema arrays must not receive invented item constraints: %#v", slots)
 	}
 }
 

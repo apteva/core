@@ -1,109 +1,150 @@
 package core
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestGeminiToolParametersInfersNestedObjectTypes(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		schema map[string]any
-		want   map[string]any
-	}{
-		{
-			name:   "required-only branch",
-			schema: map[string]any{"required": []string{"query"}},
-			want:   map[string]any{"type": "object", "required": []string{"query"}},
-		},
-		{
-			name:   "properties without type",
-			schema: map[string]any{"properties": map[string]any{"required": map[string]any{"type": "string"}}},
-			want:   map[string]any{"type": "object", "properties": map[string]any{"required": map[string]any{"type": "string"}}},
-		},
-		{
-			name:   "explicit type preserved",
-			schema: map[string]any{"type": "string", "enum": []string{"a", "b"}},
-			want:   map[string]any{"type": "string", "enum": []string{"a", "b"}},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// Exercise nested properties, array items, and union branches together.
-			schema := map[string]any{"type": "object", "properties": map[string]any{
-				"entries": map[string]any{"type": "array", "items": map[string]any{"anyOf": []any{tc.schema}}},
-			}}
+// These are JSON Schemas, not Google's restricted Schema proto. In particular
+// required-only branches are legal and retain their parent property constraints.
+func googleSchemaRegressionFixtures(t *testing.T) map[string]map[string]any {
+	t.Helper()
+	fixtures := map[string]string{
+		"nested_compositions": `{
+			"type":"object", "additionalProperties":false,
+			"properties":{"entries":{"type":"array","items":{
+				"type":"object",
+				"properties":{"query":{"type":"string","minLength":1},"queries":{"type":"array","items":{"type":"string"}}},
+				"anyOf":[{"required":["query"]},{"required":["queries"]}]
+			}}},
+			"required":["entries"]
+		}`,
+		"refs_and_exclusive_unions": `{
+			"type":"object",
+			"$defs":{"code":{"type":"string","pattern":"^[A-Z]+$"}},
+			"properties":{
+				"code":{"$ref":"#/$defs/code"},
+				"value":{"oneOf":[{"type":"number","minimum":0},{"type":"integer","maximum":10}]},
+				"bounds":{"allOf":[{"type":"number","minimum":0},{"maximum":10}]}
+			}
+		}`,
+		"nullable_and_open_arrays": `{
+			"type":"object","properties":{
+				"filters":{"type":["array","null"],"items":{}},
+				"tags":{"type":"array"},
+				"nullable":{"anyOf":[{"type":"string"},{"type":"null"}]},
+				"choice":{"enum":[1,true,null]},
+				"map":{"type":"object","additionalProperties":{"type":"integer"}}
+			}
+		}`,
+		"schema_keywords_as_data": `{
+			"type":"object","properties":{
+				"required":{"type":"string"},
+				"properties":{"type":"object","default":{"required":["literal"],"anyOf":"literal"}},
+				"anyOf":{"type":"string","const":"literal"}
+			}
+		}`,
+	}
+	out := map[string]map[string]any{}
+	for name, raw := range fixtures {
+		var schema map[string]any
+		if err := json.Unmarshal([]byte(raw), &schema); err != nil {
+			t.Fatal(err)
+		}
+		out[name] = schema
+	}
+	return out
+}
+
+func TestGeminiToolParametersPreservesJSONSchema(t *testing.T) {
+	fixtures := googleSchemaRegressionFixtures(t)
+	fixtures["registered_search_tools"] = NewToolRegistry("google-schema").Get("search_tools").native.Parameters
+	for name, schema := range fixtures {
+		t.Run(name, func(t *testing.T) {
 			before := string(mustJSON(t, schema))
 			got := geminiToolParameters(schema)
-			items := got["properties"].(map[string]any)["entries"].(map[string]any)["items"].(map[string]any)
-			if !reflect.DeepEqual(items["anyOf"].([]any)[0], tc.want) {
-				t.Fatalf("nested schema = %#v, want %#v", items["anyOf"].([]any)[0], tc.want)
+			if !reflect.DeepEqual(got, schema) {
+				t.Fatalf("schema constraints changed:\ngot %s\nwant %s", mustJSON(t, got), before)
 			}
-			if _, ok := items["type"]; ok {
-				t.Fatal("union container received an invented type")
-			}
+			// Confirm isolation, including nested maps: Google must not mutate
+			// registry schemas shared with OpenAI, Codex, xAI or Grok Build.
+			got["properties"].(map[string]any)["google_only"] = map[string]any{"type": "boolean"}
+			got["type"] = "string"
 			if string(mustJSON(t, schema)) != before {
-				t.Fatal("Google conversion mutated the provider-neutral schema")
+				t.Fatal("Google conversion aliases the provider-neutral schema")
 			}
 		})
 	}
 }
 
-func TestGeminiToolParametersAddsArrayItems(t *testing.T) {
-	schema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"tags": map[string]any{
-				"type": "array",
-			},
-			"filters": map[string]any{
-				"type":  []any{"array", "null"},
-				"items": map[string]any{},
-			},
-		},
-	}
-
-	normalized := geminiToolParameters(schema)
-	props := normalized["properties"].(map[string]any)
-
-	cases := map[string]string{
-		"tags":    "string",
-		"filters": "object",
-	}
-	for key, wantType := range cases {
-		prop := props[key].(map[string]any)
-		items, ok := prop["items"].(map[string]any)
-		if !ok {
-			t.Fatalf("%s.items missing or wrong type: %#v", key, prop["items"])
+func TestGeminiToolParametersDefaultsOnlyRootObject(t *testing.T) {
+	for _, schema := range []map[string]any{nil, {}, {"properties": map[string]any{"value": map[string]any{}}}} {
+		before := string(mustJSON(t, schema))
+		got := geminiToolParameters(schema)
+		if got["type"] != "object" {
+			t.Fatalf("function parameters need an object root: %#v", got)
 		}
-		if items["type"] != wantType {
-			t.Fatalf("%s.items.type = %#v, want %s", key, items["type"], wantType)
+		if props, ok := got["properties"].(map[string]any); ok && len(props["value"].(map[string]any)) != 0 {
+			t.Fatal("unconstrained child schema received invented constraints")
 		}
-	}
-
-	originalTags := schema["properties"].(map[string]any)["tags"].(map[string]any)
-	if _, ok := originalTags["items"]; ok {
-		t.Fatal("geminiToolParameters mutated the original schema")
+		if string(mustJSON(t, schema)) != before {
+			t.Fatal("conversion mutated input")
+		}
 	}
 }
 
-func TestGeminiToolParametersDropsUnsupportedJSONSchemaKeywords(t *testing.T) {
-	schema := map[string]any{
-		"type": "object", "additionalProperties": false,
-		"properties": map[string]any{
-			"value": map[string]any{"type": "object", "additionalProperties": false,
-				"properties": map[string]any{"nested": map[string]any{"type": "array", "items": map[string]any{"type": "object", "additionalProperties": false}}}},
-		},
-	}
-	normalized := geminiToolParameters(schema)
-	raw := mustJSON(t, normalized)
-	for _, keyword := range []string{"additionalProperties", "$schema", "$defs", "definitions"} {
-		if strings.Contains(string(raw), keyword) {
-			t.Fatalf("Gemini schema retained unsupported keyword %q: %s", keyword, raw)
+func TestGoogleChatAndLivePreserveFullToolSchemasOnWire(t *testing.T) {
+	tools := googleFullSchemaSmokeTools(t)
+	before := string(mustJSON(t, tools))
+	assertDeclarations := func(declarations []any) {
+		t.Helper()
+		if len(declarations) != len(tools) {
+			t.Fatalf("wire tool count = %d, want %d", len(declarations), len(tools))
+		}
+		for i, raw := range declarations {
+			declaration := raw.(map[string]any)
+			if _, ok := declaration["parameters"]; ok {
+				t.Fatalf("%s still uses Google's restricted Schema proto", tools[i].Name)
+			}
+			if declaration["name"] != tools[i].Name || string(mustJSON(t, declaration["parametersJsonSchema"])) != string(mustJSON(t, tools[i].Parameters)) {
+				t.Fatalf("%s schema changed on the wire: %#v", tools[i].Name, declaration)
+			}
 		}
 	}
-	if _, ok := schema["additionalProperties"]; !ok {
-		t.Fatal("normalization mutated original schema")
+
+	originalClient := llmHTTPClient
+	t.Cleanup(func() { llmHTTPClient = originalClient })
+	called := false
+	llmHTTPClient = &http.Client{Transport: auditRoundTripper(func(r *http.Request) (*http.Response, error) {
+		called = true
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		assertDeclarations(request["tools"].([]any)[0].(map[string]any)["functionDeclarations"].([]any))
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"OK\"}]},\"finishReason\":\"STOP\"}]}\n\n")), Request: r}, nil
+	})}
+	_, err := NewGoogleProvider("test-key").Chat(context.Background(), []Message{{Role: "user", Content: "Hello"}}, "gemini-2.5-flash", tools, nil, nil, nil)
+	if err != nil || !called {
+		t.Fatalf("Chat request not completed: called=%v, error=%v", called, err)
+	}
+	setup, err := buildGoogleLiveSetup(RealtimeSessionOpts{Model: "gemini-3.1-flash-live-preview", Tools: tools}, "Kore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(setup, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	assertDeclarations(envelope["setup"].(map[string]any)["tools"].([]any)[0].(map[string]any)["functionDeclarations"].([]any))
+	if string(mustJSON(t, tools)) != before {
+		t.Fatal("Google mutated the schemas used by other providers")
 	}
 }
 

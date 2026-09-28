@@ -215,6 +215,10 @@ Never invent the marker, expose tool mechanics, or call done. Keep the live conv
 	if !nativeToolSet(child.Realtime.realtimeToolSchemas())["liveprobe_lookup_code"] {
 		t.Fatal("Google session configuration is missing the always-loaded MCP tool")
 	}
+	if !nativeToolSet(child.Realtime.realtimeToolSchemas())["search_tools"] {
+		t.Fatal("Google session must include search_tools to cover composed-schema startup regression")
+	}
+	t.Logf("spawned realtime child with %d tool schemas including search_tools and the MCP probe", len(child.Realtime.realtimeToolSchemas()))
 	t.Logf("provider=google-realtime model=%s grant=mcp:liveprobe loading=always discovery=on", parent.pool.RealtimeByName("google-realtime").Models()[ModelLarge])
 	parent.threads.realtimeBridgeConnected(threadID)
 

@@ -102,8 +102,8 @@ func googleLiveTools(tools []NativeTool) []map[string]any {
 	declarations := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
 		declaration := map[string]any{
-			"name":       tool.Name,
-			"parameters": geminiToolParameters(tool.Parameters),
+			"name":                 tool.Name,
+			"parametersJsonSchema": geminiToolParameters(tool.Parameters),
 		}
 		if strings.TrimSpace(tool.Description) != "" {
 			declaration["description"] = tool.Description
