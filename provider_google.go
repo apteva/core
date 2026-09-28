@@ -225,6 +225,18 @@ func normalizeGeminiSchema(name string, v any) any {
 			}
 			out[k] = normalizeGeminiSchema(k, val)
 		}
+		// JSON Schema permits object constraints without an explicit type,
+		// including search_tools' required-only anyOf branches. Gemini's
+		// Schema validation requires the object type on each such node, not
+		// just the function parameter root. Keep unions and explicit types
+		// intact and infer only where object constraints provide evidence.
+		if _, hasType := out["type"]; !hasType {
+			_, hasProperties := out["properties"]
+			_, hasRequired := out["required"]
+			if hasProperties || hasRequired {
+				out["type"] = "object"
+			}
+		}
 		if schemaTypeIncludes(out["type"], "array") {
 			if items, ok := out["items"]; !ok || isEmptyGeminiSchema(items) {
 				out["items"] = defaultGeminiArrayItems(name)

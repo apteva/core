@@ -1,9 +1,53 @@
 package core
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestGeminiToolParametersInfersNestedObjectTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		schema map[string]any
+		want   map[string]any
+	}{
+		{
+			name:   "required-only branch",
+			schema: map[string]any{"required": []string{"query"}},
+			want:   map[string]any{"type": "object", "required": []string{"query"}},
+		},
+		{
+			name:   "properties without type",
+			schema: map[string]any{"properties": map[string]any{"required": map[string]any{"type": "string"}}},
+			want:   map[string]any{"type": "object", "properties": map[string]any{"required": map[string]any{"type": "string"}}},
+		},
+		{
+			name:   "explicit type preserved",
+			schema: map[string]any{"type": "string", "enum": []string{"a", "b"}},
+			want:   map[string]any{"type": "string", "enum": []string{"a", "b"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Exercise nested properties, array items, and union branches together.
+			schema := map[string]any{"type": "object", "properties": map[string]any{
+				"entries": map[string]any{"type": "array", "items": map[string]any{"anyOf": []any{tc.schema}}},
+			}}
+			before := string(mustJSON(t, schema))
+			got := geminiToolParameters(schema)
+			items := got["properties"].(map[string]any)["entries"].(map[string]any)["items"].(map[string]any)
+			if !reflect.DeepEqual(items["anyOf"].([]any)[0], tc.want) {
+				t.Fatalf("nested schema = %#v, want %#v", items["anyOf"].([]any)[0], tc.want)
+			}
+			if _, ok := items["type"]; ok {
+				t.Fatal("union container received an invented type")
+			}
+			if string(mustJSON(t, schema)) != before {
+				t.Fatal("Google conversion mutated the provider-neutral schema")
+			}
+		})
+	}
+}
 
 func TestGeminiToolParametersAddsArrayItems(t *testing.T) {
 	schema := map[string]any{

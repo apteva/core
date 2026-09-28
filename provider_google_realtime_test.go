@@ -25,6 +25,54 @@ func newGoogleRealtimeTestSession() *googleRealtimeSession {
 	}
 }
 
+func TestGoogleLiveSetupNormalizesRegisteredSearchTools(t *testing.T) {
+	registry := NewToolRegistry("google-schema-regression")
+	tool := registry.Get("search_tools").native
+	original := string(mustJSON(t, tool.Parameters))
+	payload, err := buildGoogleLiveSetup(RealtimeSessionOpts{
+		Model: "gemini-3.1-flash-live-preview", Tools: []NativeTool{tool},
+	}, "Kore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope struct {
+		Setup struct {
+			Tools []geminiToolDecl `json:"tools"`
+		} `json:"setup"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Setup.Tools) != 1 || len(envelope.Setup.Tools[0].FunctionDeclarations) != 1 {
+		t.Fatalf("unexpected setup tools: %s", payload)
+	}
+	declaration := envelope.Setup.Tools[0].FunctionDeclarations[0]
+	if declaration.Name != "search_tools" {
+		t.Fatalf("tool name = %q", declaration.Name)
+	}
+	branches := declaration.Parameters["anyOf"].([]any)
+	if len(branches) != 2 {
+		t.Fatalf("query-or-queries constraint changed: %#v", branches)
+	}
+	for i, field := range []string{"query", "queries"} {
+		branch := branches[i].(map[string]any)
+		if branch["type"] != "object" {
+			t.Fatalf("search_tools.anyOf[%d]: required needs an explicit object type: %#v", i, branch)
+		}
+		required := branch["required"].([]any)
+		if len(required) != 1 || required[0] != field {
+			t.Fatalf("branch required fields changed: %#v", branch)
+		}
+	}
+	if string(mustJSON(t, tool.Parameters)) != original {
+		t.Fatal("realtime setup mutated the registry schema used by other providers")
+	}
+	// Ordinary Gemini uses the same conversion and must produce the same wire schema.
+	if string(mustJSON(t, declaration.Parameters)) != string(mustJSON(t, geminiToolParameters(tool.Parameters))) {
+		t.Fatal("realtime and ordinary Gemini schema conversion diverged")
+	}
+}
+
 func TestGoogleLiveSetupUsesNativeProtocol(t *testing.T) {
 	payload, err := buildGoogleLiveSetup(RealtimeSessionOpts{
 		Model: "gemini-3.1-flash-live-preview", Voice: "Aoede", Instructions: "full core prompt",
