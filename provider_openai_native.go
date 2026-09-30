@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,24 +20,26 @@ import (
 // code_interpreter, and other OpenAI-specific features.
 // For OpenAI-compatible endpoints (Fireworks, Ollama, etc.), use OpenAICompatProvider.
 type OpenAINativeProvider struct {
-	name              string
-	apiKey            string
-	responsesURL      string
-	forceStoreFalse   bool
-	sessionProfile    *responsesSessionProviderProfile
-	sessionState      *responsesSessionState
-	runtimeTokenURL   string
-	serverAPIKey      string
-	accountID         string
-	models            map[ModelTier]string
-	modelCapabilities map[string]ModelCapabilities
-	builtinTools      []string
-	reasoning         ReasoningSettings
-	tokenMu           sync.RWMutex
-	refreshMu         sync.Mutex
-	lastTokenRefresh  time.Time
-	cacheStateMu      sync.Mutex
-	cacheState        *openAIPromptCacheState
+	name                   string
+	apiKey                 string
+	responsesURL           string
+	forceStoreFalse        bool
+	sessionProfile         *responsesSessionProviderProfile
+	sessionState           *responsesSessionState
+	runtimeTokenURL        string
+	serverAPIKey           string
+	accountID              string
+	serviceTier            string
+	serviceTierUnsupported *atomic.Bool
+	models                 map[ModelTier]string
+	modelCapabilities      map[string]ModelCapabilities
+	builtinTools           []string
+	reasoning              ReasoningSettings
+	tokenMu                sync.RWMutex
+	refreshMu              sync.Mutex
+	lastTokenRefresh       time.Time
+	cacheStateMu           sync.Mutex
+	cacheState             *openAIPromptCacheState
 }
 
 func NewOpenAINativeProvider(apiKey string) LLMProvider {
@@ -56,18 +59,19 @@ func NewOpenAICodexProvider(accessToken string) LLMProvider {
 	responsesURL := "https://chatgpt.com/backend-api/codex/responses"
 	accountID := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCOUNT_ID"))
 	return &OpenAINativeProvider{
-		name:            "openai-codex",
-		apiKey:          accessToken,
-		responsesURL:    responsesURL,
-		forceStoreFalse: true,
-		sessionProfile:  &openAICodexSessionProviderProfile,
-		runtimeTokenURL: sessionRuntimeTokenURL("OPENAI_CODEX_PROVIDER_ID"),
-		serverAPIKey:    os.Getenv("APTEVA_API_KEY"),
-		accountID:       accountID,
+		name:                   "openai-codex",
+		apiKey:                 accessToken,
+		responsesURL:           responsesURL,
+		forceStoreFalse:        true,
+		sessionProfile:         &openAICodexSessionProviderProfile,
+		runtimeTokenURL:        sessionRuntimeTokenURL("OPENAI_CODEX_PROVIDER_ID"),
+		serverAPIKey:           os.Getenv("APTEVA_API_KEY"),
+		accountID:              accountID,
+		serviceTierUnsupported: &atomic.Bool{},
 		models: map[ModelTier]string{
-			ModelLarge:  "gpt-5.5",
-			ModelMedium: "gpt-5.5",
-			ModelSmall:  "gpt-5.5",
+			ModelLarge:  "gpt-6.1-sol",
+			ModelMedium: "gpt-6.1-sol",
+			ModelSmall:  "gpt-6.1-sol",
 		},
 	}
 }
@@ -111,6 +115,30 @@ func (p *OpenAINativeProvider) WithBuiltins(builtins []string) LLMProvider {
 	return clone
 }
 
+// WithServiceTier returns a provider clone configured with a provider-specific
+// request tier. At present only the subscription-backed Codex endpoint accepts
+// the priority tier; other providers intentionally keep the field unset.
+func (p *OpenAINativeProvider) WithServiceTier(tier string) *OpenAINativeProvider {
+	clone := p.clone()
+	clone.serviceTier = strings.TrimSpace(strings.ToLower(tier))
+	if clone.serviceTierUnsupported == nil {
+		clone.serviceTierUnsupported = &atomic.Bool{}
+	}
+	return clone
+}
+
+func normalizeCodexServiceTier(raw string) (string, error) {
+	tier := strings.TrimSpace(strings.ToLower(raw))
+	switch tier {
+	case "":
+		return "", nil
+	case "priority":
+		return tier, nil
+	default:
+		return "", fmt.Errorf("unsupported service_tier %q for openai-codex (supported: priority)", raw)
+	}
+}
+
 func (p *OpenAINativeProvider) WithReasoning(settings ReasoningSettings) LLMProvider {
 	clone := p.clone()
 	clone.reasoning = settings
@@ -128,7 +156,8 @@ func (p *OpenAINativeProvider) clone() *OpenAINativeProvider {
 		name: p.name, apiKey: apiKey, responsesURL: p.responsesURL,
 		forceStoreFalse: p.forceStoreFalse, sessionProfile: p.sessionProfile,
 		sessionState: p.sessionState, runtimeTokenURL: p.runtimeTokenURL,
-		serverAPIKey: p.serverAPIKey, accountID: accountID, models: p.models,
+		serverAPIKey: p.serverAPIKey, accountID: accountID, serviceTier: p.serviceTier,
+		serviceTierUnsupported: p.serviceTierUnsupported, models: p.models,
 		modelCapabilities: cloneModelCapabilitiesMap(p.modelCapabilities),
 		builtinTools:      append([]string(nil), p.builtinTools...), reasoning: p.reasoning,
 		lastTokenRefresh: lastRefresh, cacheState: cacheState,
@@ -244,13 +273,15 @@ func openAIReasoningEffort(level ReasoningLevel, providerName, model string) str
 }
 
 func openAIModelSupportsXHigh(model string) bool {
-	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "gpt-5.5")
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(model, "gpt-5.5") || strings.Contains(model, "gpt-6.1-sol")
 }
 
 // --- Responses API types ---
 
 type oaiResponsesRequest struct {
 	Model                string         `json:"model"`
+	ServiceTier          string         `json:"service_tier,omitempty"`
 	Instructions         string         `json:"instructions,omitempty"`
 	Input                []oaiInputItem `json:"input"`
 	Tools                []any          `json:"tools,omitempty"`
@@ -372,6 +403,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		Tools:  apiTools,
 		Stream: true,
 	}
+	reqBody.ServiceTier = p.requestServiceTier()
 	reqBody.Reasoning = p.requestReasoning(model)
 	if caps, ok := p.modelCapabilities[model]; ok && caps.SupportsParallelToolCalls != nil {
 		value := *caps.SupportsParallelToolCalls
@@ -447,6 +479,35 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		if reqBody.ServiceTier != "" && unsupportedResponsesServiceTier(resp.StatusCode, string(respBody)) {
+			p.disableServiceTier()
+			reqBody.ServiceTier = ""
+			retryBody, marshalErr := json.Marshal(reqBody)
+			if marshalErr != nil {
+				return ChatResponse{}, marshalErr
+			}
+			logMsg("OPENAI-NATIVE", fmt.Sprintf("service tier %q unsupported, retrying without it: %d %s", p.serviceTier, resp.StatusCode, string(respBody)))
+			resp, err = doRequest(retryBody)
+			if err != nil {
+				return ChatResponse{}, err
+			}
+			if p.retriesAfterAuthError() && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
+				_ = resp.Body.Close()
+				resp, err = doRequest(retryBody)
+				if err != nil {
+					return ChatResponse{}, err
+				}
+			}
+			if resp.StatusCode == http.StatusOK {
+				idleBody := newIdleReader(resp.Body, streamIdleTimeout(), func() {
+					logMsg("OPENAI-NATIVE", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
+				})
+				defer idleBody.Close()
+				return p.streamResponse(idleBody, onChunk, onThinking, onToolChunk)
+			}
+			respBody, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+		}
 		if cacheHints.Key != "" && openAICacheHintsUnsupported(resp.StatusCode, string(respBody)) {
 			cacheState.disable()
 			reqBody.PromptCacheKey = ""

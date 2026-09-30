@@ -66,5 +66,9 @@ func (s *googleRealtimeSession) rejectSpeech(responseID, reason string) {
 		return
 	}
 	s.speech = googleSpeechGate{rejected: true}
-	s.emitControl(RealtimeEvent{Type: RealtimeEventOutputBlocked, ResponseID: responseID, ItemID: responseID, OutputBlockReason: reason})
+	itemID := responseID
+	if s.profile.asyncTools {
+		itemID = s.utteranceID(responseID)
+	}
+	s.emitControl(RealtimeEvent{Type: RealtimeEventOutputBlocked, ResponseID: responseID, ItemID: itemID, OutputBlockReason: reason})
 }

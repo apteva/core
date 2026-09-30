@@ -169,6 +169,7 @@ func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
 		Directive: strings.Join([]string{
 			"# Role",
 			"Answer operator questions using relevant memory.",
+			"The caller reads your text responses in this thread. Answer each request directly in this thread with the actual result before idling; no external message delivery is needed.",
 			"",
 			"# Goals",
 			"- Resolve heliotrope operation questions accurately.",
@@ -195,10 +196,11 @@ func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
 	}
 
 	go thinker.Run()
-	query := "What is the escalation channel for operation heliotrope-echo-731? Include the exact channel token in your response."
+	query := "What is the escalation channel for operation heliotrope-echo-731? Include the exact channel token and this request's ID in your direct text answer."
 	seenDone := 0
 	for turn := 1; turn <= 3; turn++ {
-		thinker.InjectConsole(query)
+		requestID := fmt.Sprintf("memory-request-%d", turn)
+		thinker.InjectConsole(requestID + ": " + query)
 		deadline := time.Now().Add(2 * time.Minute)
 		turnAnswered := false
 		for time.Now().Before(deadline) {
@@ -206,11 +208,15 @@ func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
 			count := 0
 			answered := false
 			for _, event := range events {
-				if event.Type != "llm.done" {
+				if event.Type != "llm.done" || event.ThreadID != "main" {
 					continue
 				}
 				count++
-				if count > seenDone && strings.Contains(strings.ToLower(string(event.Data)), "cobalt-desk-904") {
+				var done LLMDoneData
+				if err := json.Unmarshal(event.Data, &done); err != nil {
+					t.Fatalf("decode llm.done: %v", err)
+				}
+				if count > seenDone && strings.Contains(strings.ToLower(done.Message), "cobalt-desk-904") && strings.Contains(done.Message, requestID) {
 					answered = true
 				}
 			}
@@ -222,6 +228,12 @@ func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
 			time.Sleep(250 * time.Millisecond)
 		}
 		if !turnAnswered {
+			events, _ := thinker.telemetry.StoredEvents(0)
+			for _, event := range events {
+				if event.Type == "llm.done" || event.Type == "llm.error" || event.Type == "memory.recall" {
+					t.Logf("turn=%d thread=%s %s: %.2500s", turn, event.ThreadID, event.Type, event.Data)
+				}
+			}
 			t.Fatalf("turn %d did not use recalled memory", turn)
 		}
 	}

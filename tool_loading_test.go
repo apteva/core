@@ -185,7 +185,7 @@ func TestAlwaysLoadedToolsSurviveActivationLRU(t *testing.T) {
 	}
 }
 
-func TestSystemPromptDescribesMixedLoadingAndUsesCurrentChannelsTool(t *testing.T) {
+func TestSystemPromptDescribesMixedLoadingWithoutAssumingDeliveryTool(t *testing.T) {
 	t.Setenv("APTEVA_TOOL_SEARCH", "on")
 	catalog := []MCPServerInfo{{
 		Name: "channels", ToolCount: 4, AlwaysCount: 4,
@@ -196,10 +196,61 @@ func TestSystemPromptDescribesMixedLoadingAndUsesCurrentChannelsTool(t *testing.
 	if strings.Contains(prompt, "channels_respond") {
 		t.Fatalf("prompt still references legacy channels_respond")
 	}
-	if !strings.Contains(prompt, "channels_send") {
-		t.Fatalf("prompt does not reference channels_send")
+	if strings.Contains(prompt, "channels_send") {
+		t.Fatalf("prompt invents channels_send from the server catalog")
 	}
 	if !strings.Contains(prompt, "4 always") || !strings.Contains(prompt, "Always-loaded MCP tools are already") {
 		t.Fatalf("prompt missing mixed loading guidance:\n%s", prompt)
+	}
+}
+
+func TestSystemPromptDeliveryIsAppIndependent(t *testing.T) {
+	for _, server := range []string{"", "channels", "messenger"} {
+		for _, provider := range []string{"openai-codex", "fireworks"} {
+			t.Run(server+"/"+provider, func(t *testing.T) {
+				registry := NewToolRegistry("")
+				var catalog []MCPServerInfo
+				if server != "" {
+					registerTestMCPTools(registry, server, []mcpToolDef{{Name: "deliver", Description: "Deliver a message"}})
+					catalog = []MCPServerInfo{{Name: server, ToolCount: 1, AlwaysCount: 1}}
+				}
+				prompt := buildSystemPrompt("Answer directly in this thread.", registry, "", nil, nil, &ProviderPool{default_: provider}, catalog)
+				for _, forbidden := range []string{"channels_send", "channels_respond", "Prose between tool calls does not deliver a message to the user"} {
+					if strings.Contains(prompt, forbidden) {
+						t.Fatalf("generic prompt contains obsolete delivery instruction %q", forbidden)
+					}
+				}
+				for _, required := range []string{
+					"Follow the directive and request's delivery instructions.",
+					"A progress update is not a completed answer.",
+					"Provide the requested result before idling, or retain responsibility for genuinely pending work.",
+					"Do not claim delivery without evidence.",
+					"Answer directly in this thread.",
+				} {
+					if !strings.Contains(prompt, required) {
+						t.Fatalf("missing delivery contract %q", required)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestWorkerPromptRetainsCoreDeliveryContract(t *testing.T) {
+	for _, canSpawn := range []bool{false, true} {
+		prompt := formatThreadBasePrompt(canSpawn, false, "worker", "parent")
+		for _, required := range []string{
+			"return the complete final result exactly once with done(message)",
+			"Ordinary assistant text stays in your private thread transcript.",
+			"If this is continuing work, send requested results to your parent and remain active.",
+			normalThreadIdlePrompt,
+		} {
+			if !strings.Contains(prompt, required) {
+				t.Fatalf("worker canSpawn=%v missing Core delivery contract %q", canSpawn, required)
+			}
+		}
+		if strings.Contains(prompt, "channels_send") {
+			t.Fatalf("worker canSpawn=%v assumes an app delivery tool", canSpawn)
+		}
 	}
 }

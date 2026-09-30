@@ -264,6 +264,7 @@ func addManagedThreadBuiltins(toolSet map[string]bool, isSystem, suppressEvolve 
 		toolSet["send"] = true
 		toolSet["done"] = true
 		toolSet["search_tools"] = true
+		toolSet["history_search"] = true
 		if !suppressEvolve {
 			toolSet["evolve"] = true
 		}

@@ -103,8 +103,8 @@ func TestReviewHistory_ReturnsAllPlantedLines(t *testing.T) {
 		}
 	}
 
-	// Verify the limit knob clamps. With limit=2 we should see only
-	// the last 2 lines (most recent first by tail order).
+	// Until explicitly committed, retries must replay the full pending batch,
+	// even if a caller changes the requested limit.
 	respLim := tool.Handler(map[string]string{"limit": "2"})
 	hits := 0
 	for _, ln := range planted {
@@ -114,8 +114,8 @@ func TestReviewHistory_ReturnsAllPlantedLines(t *testing.T) {
 			hits++
 		}
 	}
-	if hits != 2 {
-		t.Errorf("limit=2 returned %d lines, want 2", hits)
+	if hits != len(planted) {
+		t.Errorf("pending replay returned %d lines, want %d", hits, len(planted))
 	}
 	t.Logf("limit=2 result: %d bytes, %d planted lines visible", len(respLim.Text), hits)
 }

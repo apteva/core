@@ -132,6 +132,10 @@ func newGeminiLiveMCPServer(t *testing.T, calls *atomic.Int64, received chan<- g
 //	RUN_GOOGLE_REALTIME_MCP_SMOKE=1 GOOGLE_API_KEY=... \
 //	  go test -v -run TestGoogleRealtimeLiveMCPThread -timeout 3m .
 func TestGoogleRealtimeLiveMCPThread(t *testing.T) {
+	runGoogleRealtimeLiveMCPThread(t, "gemini-3.1-flash-live-preview")
+}
+
+func runGoogleRealtimeLiveMCPThread(t *testing.T, model string) {
 	if os.Getenv("RUN_GOOGLE_REALTIME_MCP_SMOKE") != "1" {
 		t.Skip("set RUN_GOOGLE_REALTIME_MCP_SMOKE=1 to run the paid Gemini Live + MCP thread smoke")
 	}
@@ -156,6 +160,7 @@ func TestGoogleRealtimeLiveMCPThread(t *testing.T) {
 		RealtimeEnabled: true,
 		Providers: []ProviderConfig{{
 			Name: "google-realtime", Default: true,
+			Models: map[string]string{"large": model, "medium": model, "small": model},
 		}},
 		MCPServers: []MCPServerConfig{{
 			Name: "liveprobe", Transport: "http", URL: mcpServer.URL + "/mcp",

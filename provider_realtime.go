@@ -310,7 +310,9 @@ type RealtimeSession interface {
 
 	// SendToolResult delivers one tool result without starting the next model
 	// response. This separation lets the generic thinker submit every result
-	// from a parallel tool batch before requesting one continuation.
+	// from a parallel tool batch before requesting one continuation. Sessions
+	// opting into realtimeAsyncToolSession instead deliver each result directly
+	// to an already-running interaction, without an explicit continuation.
 	SendToolResult(callID, result string, isError bool) error
 
 	// RequestResponse asks the provider to continue after text or tool items
@@ -343,6 +345,18 @@ type RealtimeSession interface {
 	// Close terminates the session and releases resources. Safe to
 	// call multiple times.
 	Close() error
+}
+
+// Optional capability for providers that continue reasoning while tools run.
+// SendToolResult delivers immediately; no RequestResponse is needed afterwards.
+// Other providers retain the existing explicit batch/continuation contract.
+type realtimeAsyncToolSession interface {
+	SendsToolResultsImmediately() bool
+}
+
+func realtimeToolsAreAsync(session RealtimeSession) bool {
+	async, ok := session.(realtimeAsyncToolSession)
+	return ok && async.SendsToolResultsImmediately()
 }
 
 // RealtimeConfigurationDisposition describes how a live provider can apply a
@@ -389,6 +403,7 @@ const (
 	RealtimeEventToolCall         RealtimeEventType = "tool_call"
 	RealtimeEventResponseStarted  RealtimeEventType = "response_started"
 	RealtimeEventResponseDone     RealtimeEventType = "response_done"
+	RealtimeEventUtteranceDone    RealtimeEventType = "utterance_done" // speech finished, interaction still active
 	RealtimeEventSpeechStarted    RealtimeEventType = "speech_started"
 	RealtimeEventRateLimits       RealtimeEventType = "rate_limits"
 	RealtimeEventSessionEnded     RealtimeEventType = "session_ended"

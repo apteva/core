@@ -204,7 +204,7 @@ func executeTool(t *Thinker, call toolCall) {
 					t.telemetry.Emit("tool.arguments", t.threadID, call.trace.data(newToolArgumentsData(call.NativeID, call.Name, "mcp_typed", typedArgs)))
 					t.telemetry.Emit("tool.dispatch", t.threadID, call.trace.data(map[string]any{"id": call.NativeID, "manifest_hash": call.manifestHash, "resolved": toolIdentity(def), "arguments": newToolArgumentsData(call.NativeID, call.Name, "dispatched", typedArgs)}))
 				}
-				resp = t.registry.dispatchDefinition(ctx, def, dispatchArgs)
+				resp = t.registry.dispatchDefinition(withMemoryCaller(ctx, t.threadID), def, dispatchArgs)
 				if def.MCP && generation == t.toolGeneration.Load() {
 					t.recordMCPProgress(call, resp)
 					if !resp.IsError {

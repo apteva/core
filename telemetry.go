@@ -903,6 +903,9 @@ func ModelContextWindow(modelID string) int {
 		{"claude-3-sonnet", 200_000},
 		{"claude-3-haiku", 200_000},
 
+		// --- OpenAI ---
+		{"gpt-6.1-sol", 1_050_000},
+
 		// --- Fireworks + OpenCode Go (Kimi / MiniMax) ---
 		// Both providers expose the same Kimi K2.x and MiniMax M2.x
 		// base models, just under different id forms: Fireworks uses

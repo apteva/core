@@ -209,6 +209,31 @@ func responsesEndpoint(baseURL string) string {
 	return baseURL + "/responses"
 }
 
+func (p *OpenAINativeProvider) requestServiceTier() string {
+	if p.Name() != "openai-codex" || p.serviceTier != "priority" {
+		return ""
+	}
+	if p.serviceTierUnsupported != nil && p.serviceTierUnsupported.Load() {
+		return ""
+	}
+	return p.serviceTier
+}
+
+func (p *OpenAINativeProvider) disableServiceTier() {
+	if p.serviceTierUnsupported != nil {
+		p.serviceTierUnsupported.Store(true)
+	}
+}
+
+func unsupportedResponsesServiceTier(status int, body string) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "unsupported service_tier") ||
+		(strings.Contains(lower, "service_tier") && strings.Contains(lower, "unsupported"))
+}
+
 func (p *OpenAINativeProvider) currentSessionSnapshot() responsesSessionSnapshot {
 	if p.sessionState != nil {
 		return p.sessionState.snapshot()

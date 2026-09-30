@@ -296,7 +296,9 @@ func (rt *RealtimeThinker) completeToolCall(callID string) {
 			if batch.pending > 0 {
 				batch.pending--
 			}
-			if batch.responseDone && batch.pending == 0 {
+			if realtimeToolsAreAsync(batch.session) && batch.pending == 0 {
+				delete(rt.toolBatches, batchID)
+			} else if batch.responseDone && batch.pending == 0 {
 				continueSession = batch.session
 				delete(rt.toolBatches, batchID)
 			}
@@ -328,7 +330,9 @@ func (rt *RealtimeThinker) completeToolResponse(responseID string) bool {
 	if hadToolBatch {
 		batch.responseDone = true
 		if batch.pending == 0 {
-			continueSession = batch.session
+			if !realtimeToolsAreAsync(batch.session) {
+				continueSession = batch.session
+			}
 			delete(rt.toolBatches, batchID)
 		}
 	}
@@ -1255,6 +1259,16 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 		rt.setConversationState("working", event)
 		rt.dispatchToolCall(event)
+
+	case RealtimeEventUtteranceDone:
+		// Progress speech may finish while background reasoning/tools continue.
+		// Never release response ownership, settle work, or return to listening.
+		rt.finishToolMarkupResponse(event.ResponseID)
+		if rt.pendingToolWork() {
+			rt.setConversationState("working", event)
+		} else {
+			rt.setConversationState("thinking", event)
+		}
 
 	case RealtimeEventResponseDone:
 		rt.recovery.Lock()

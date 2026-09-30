@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +17,7 @@ type scriptedUnconsciousProvider struct {
 	calls int
 }
 
-func (p *scriptedUnconsciousProvider) Chat(_ context.Context, _ []Message, _ string, tools []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
+func (p *scriptedUnconsciousProvider) Chat(_ context.Context, messages []Message, _ string, tools []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
@@ -47,6 +49,21 @@ func (p *scriptedUnconsciousProvider) Chat(_ context.Context, _ []Message, _ str
 				"weight":  "0.95",
 			},
 		}}}, nil
+	case 3:
+		for _, message := range messages {
+			for _, result := range message.ToolResults {
+				if result.CallID != "review-1" {
+					continue
+				}
+				var body struct {
+					Batch *memoryReviewBatch `json:"batch"`
+				}
+				if json.Unmarshal([]byte(result.Content), &body) == nil && body.Batch != nil {
+					return ChatResponse{ToolCalls: []NativeToolCall{{ID: "commit-1", Name: "review_history", Args: map[string]string{"action": "commit", "batch_id": body.Batch.ID}}}}, nil
+				}
+			}
+		}
+		return ChatResponse{}, fmt.Errorf("missing review batch to commit")
 	default:
 		return ChatResponse{ToolCalls: []NativeToolCall{{ID: "pace", Name: "pace", Args: map[string]string{"sleep": "1h"}}}}, nil
 	}
@@ -186,6 +203,28 @@ created:
 	}
 	if _, err := os.Stat("memory.jsonl"); err != nil {
 		t.Fatalf("memory journal was not created: %v", err)
+	}
+	// Verify the actual runtime, not just a direct helper, completes the
+	// review -> write -> commit protocol and attaches trusted provenance.
+	for _, rec := range parent.memory.Active() {
+		if rec.Scope != "main" || len(rec.Sources) == 0 {
+			t.Fatalf("unscoped learned memory: %+v", rec)
+		}
+	}
+	deadline = time.After(5 * time.Second)
+	for {
+		h := parent.memory.history
+		h.mu.Lock()
+		committed := h.state.LastCommit != "" && h.state.Pending == nil
+		h.mu.Unlock()
+		if committed {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("unconscious did not acknowledge completed batch")
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 

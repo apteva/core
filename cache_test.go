@@ -157,6 +157,12 @@ func TestBuildSystemPrompt_CodexVisibleActivity(t *testing.T) {
 	if !strings.Contains(codexPrompt, "[CODEX VISIBLE ACTIVITY]") {
 		t.Fatal("Codex prompt missing visible activity guidance")
 	}
+	if !strings.Contains(codexPrompt, "Status text is only progress, not a substitute for the requested answer.") {
+		t.Fatal("Codex status guidance must distinguish progress from the answer")
+	}
+	if strings.Contains(codexPrompt, "I’ll report the result to the user.") || strings.Contains(codexPrompt, "I’ll wait quietly and check again later.") {
+		t.Fatal("Codex status examples should not encourage promises followed by idling")
+	}
 	if !strings.Contains(codexPrompt, "ALL their tools are already in your tool list") {
 		t.Fatal("Codex prompt should use eager MCP wording for small tool surfaces")
 	}

@@ -132,13 +132,16 @@ func detectEmbeddingBackend() *embeddingBackend {
 // MemoryRecord is one line in memory.jsonl. Either a memory or a
 // tombstone — never both.
 type MemoryRecord struct {
-	ID         string    `json:"id"`
-	TS         time.Time `json:"ts"`
-	Content    string    `json:"content,omitempty"`
-	Tags       []string  `json:"tags,omitempty"`
-	Weight     float64   `json:"weight,omitempty"`
-	Supersedes string    `json:"supersedes,omitempty"`
-	Embedding  []float64 `json:"embedding,omitempty"`
+	ID              string         `json:"id"`
+	TS              time.Time      `json:"ts"`
+	Content         string         `json:"content,omitempty"`
+	Tags            []string       `json:"tags,omitempty"`
+	Weight          float64        `json:"weight,omitempty"`
+	Supersedes      string         `json:"supersedes,omitempty"`
+	Embedding       []float64      `json:"embedding,omitempty"`
+	Scope           string         `json:"scope,omitempty"` // empty = agent-wide (legacy); otherwise exact source thread
+	Sources         []MemorySource `json:"sources,omitempty"`
+	ForgottenThread string         `json:"forgotten_thread,omitempty"` // durable ingestion deny marker, not a memory
 
 	// Tombstone bits.
 	Tombstone bool   `json:"tombstone,omitempty"`
@@ -152,6 +155,7 @@ func (r MemoryRecord) IsTombstone() bool { return r.Tombstone }
 // MemoryStore is the in-process journal owner. Append-only on disk,
 // rebuilds the active-set on load.
 type MemoryStore struct {
+	history          *memoryHistory
 	normalized       map[string]string
 	embeddingMu      sync.Mutex
 	embeddingCache   map[[32]byte]embeddingCacheEntry
@@ -356,6 +360,16 @@ func (ms *MemoryStore) rebuildActiveLocked() {
 }
 
 func (ms *MemoryStore) applyActiveRecordLocked(rec MemoryRecord) {
+	if rec.ForgottenThread != "" {
+		// The marker is sufficient on replay even if a crash truncated the
+		// following audit tombstones.
+		for id, active := range ms.active {
+			if memoryFromSource(active, rec.ForgottenThread) {
+				ms.removeActiveLocked(id)
+			}
+		}
+		return
+	}
 	if rec.Tombstone {
 		ms.removeActiveLocked(rec.IDTarget)
 		return
@@ -423,6 +437,7 @@ func (ms *MemoryStore) Active() []MemoryRecord {
 	out := make([]MemoryRecord, 0, len(ms.active))
 	for _, id := range ms.activeOrder {
 		if rec, ok := ms.active[id]; ok {
+			rec.Sources = append([]MemorySource(nil), rec.Sources...)
 			out = append(out, rec)
 		}
 	}
@@ -465,6 +480,9 @@ func (ms *MemoryStore) All() []MemoryRecord {
 	defer ms.mu.RUnlock()
 	out := make([]MemoryRecord, len(ms.records))
 	copy(out, ms.records)
+	for i := range out {
+		out[i].Sources = append([]MemorySource(nil), out[i].Sources...)
+	}
 	return out
 }
 
@@ -477,6 +495,22 @@ func (ms *MemoryStore) append(rec MemoryRecord) error {
 func (ms *MemoryStore) appendRecords(records ...MemoryRecord) error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
+	return ms.appendRecordsLocked(records...)
+}
+
+func (ms *MemoryStore) appendRecordsLocked(records ...MemoryRecord) error {
+	for _, rec := range records {
+		if !rec.Tombstone && rec.ForgottenThread == "" {
+			if ms.forgottenLocked(rec.Scope) {
+				return fmt.Errorf("memory source has been forgotten")
+			}
+			for _, source := range rec.Sources {
+				if ms.forgottenLocked(source.ThreadID) {
+					return fmt.Errorf("memory source has been forgotten")
+				}
+			}
+		}
+	}
 	var payload bytes.Buffer
 	enc := json.NewEncoder(&payload)
 	for i := range records {
@@ -512,7 +546,7 @@ func (ms *MemoryStore) appendRecords(records ...MemoryRecord) error {
 // 0.7 if zero. tags may be nil. Embedding is computed when a backend is
 // configured; on failure the record is still written without an
 // embedding (lexical recall continues to work).
-func (ms *MemoryStore) Remember(content string, tags []string, weight float64) (string, error) {
+func (ms *MemoryStore) Remember(content string, tags []string, weight float64, metadata ...MemoryMetadata) (string, error) {
 	if strings.TrimSpace(content) == "" {
 		return "", errors.New("memory_remember: content required")
 	}
@@ -528,6 +562,9 @@ func (ms *MemoryStore) Remember(content string, tags []string, weight float64) (
 		Content: content,
 		Tags:    tags,
 		Weight:  weight,
+	}
+	if len(metadata) > 0 {
+		rec.Scope, rec.Sources = metadata[0].Scope, append([]MemorySource(nil), metadata[0].Sources...)
 	}
 	if ms.backend != nil {
 		if emb, err := ms.embed(content); err == nil {
@@ -549,7 +586,7 @@ func (ms *MemoryStore) Remember(content string, tags []string, weight float64) (
 // Errors if id is empty (use Remember) or if the id already exists
 // (caller should call HasID first and route to Supersede). Refusing
 // silent overwrite keeps the journal append-only semantics intact.
-func (ms *MemoryStore) RememberWithID(id, content string, tags []string, weight float64) (string, error) {
+func (ms *MemoryStore) RememberWithID(id, content string, tags []string, weight float64, metadata ...MemoryMetadata) (string, error) {
 	if strings.TrimSpace(id) == "" {
 		return "", errors.New("memory_remember: id required (use Remember for autogen)")
 	}
@@ -574,6 +611,9 @@ func (ms *MemoryStore) RememberWithID(id, content string, tags []string, weight 
 		Content: content,
 		Tags:    tags,
 		Weight:  weight,
+	}
+	if len(metadata) > 0 {
+		rec.Scope, rec.Sources = metadata[0].Scope, append([]MemorySource(nil), metadata[0].Sources...)
 	}
 	if ms.backend != nil {
 		if emb, err := ms.embed(content); err == nil {
@@ -643,7 +683,7 @@ func (ms *MemoryStore) supersedesLocked(candidateID, targetID string) bool {
 // them via the new record's Supersedes field. Both records are
 // appended atomically (one after the other, no other writer in
 // between because we hold the lock for both). Returns the new id.
-func (ms *MemoryStore) Supersede(oldID, content string, tags []string, weight float64, reason string) (string, error) {
+func (ms *MemoryStore) Supersede(oldID, content string, tags []string, weight float64, reason string, metadata ...MemoryMetadata) (string, error) {
 	if oldID == "" {
 		return "", errors.New("memory_supersede: old_id required")
 	}
@@ -659,6 +699,7 @@ func (ms *MemoryStore) Supersede(oldID, content string, tags []string, weight fl
 		ms.mu.RUnlock()
 		return "", fmt.Errorf("memory_supersede: id %q not found", oldID)
 	}
+	old := ms.records[ms.byID[oldID]]
 	ms.mu.RUnlock()
 
 	if weight <= 0 {
@@ -674,6 +715,17 @@ func (ms *MemoryStore) Supersede(oldID, content string, tags []string, weight fl
 		Tags:       tags,
 		Weight:     weight,
 		Supersedes: oldID,
+		Scope:      old.Scope,
+		Sources:    append([]MemorySource(nil), old.Sources...),
+	}
+	if len(metadata) > 0 {
+		newRec.Scope = metadata[0].Scope
+		newRec.Sources = mergeMemorySources(newRec.Sources, metadata[0].Sources)
+	}
+	// API-created scoped memories may have no transcript provenance. Publishing
+	// one must still retain its original scope as lineage for source forgetting.
+	if old.Scope != "" && !memoryFromSource(newRec, old.Scope) {
+		newRec.Sources = append(newRec.Sources, MemorySource{ThreadID: old.Scope, EntryID: "memory:" + old.ID, Role: "memory"})
 	}
 	if ms.backend != nil {
 		if emb, err := ms.embed(content); err == nil {
@@ -790,6 +842,7 @@ func (ms *MemoryStore) RecallMatchesForContexts(queries []string, n int) []Memor
 }
 
 type scoreOpts struct {
+	thread       *string
 	unsorted     bool
 	useEmbedding bool
 	applyDecay   bool
@@ -857,6 +910,9 @@ func (ms *MemoryStore) scoreActive(query string, opts scoreOpts) []scoredRec {
 	out := make([]scoredRec, 0, len(candidates))
 	for id := range candidates {
 		r := ms.active[id]
+		if opts.thread != nil && !memoryVisible(r, *opts.thread) {
+			continue
+		}
 		// Signal: prefer embedding cosine when both sides have one
 		// of matching dim; fall back to lexical otherwise.
 		var signal float64
@@ -1272,11 +1328,25 @@ func formatAge(d time.Duration) string {
 func (ms *MemoryStore) Reset() error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if err := atomicWriteFile(ms.path, nil, 0600); err != nil {
+	// Clearing learned facts must not revoke source-forgetting privacy policy.
+	var retained []MemoryRecord
+	var payload bytes.Buffer
+	for _, rec := range ms.records {
+		if rec.ForgottenThread != "" {
+			retained = append(retained, rec)
+			if err := json.NewEncoder(&payload).Encode(rec); err != nil {
+				return err
+			}
+		}
+	}
+	if err := atomicWriteFile(ms.path, payload.Bytes(), 0600); err != nil {
 		return err
 	}
-	ms.records = nil
+	ms.records = retained
 	ms.byID = map[string]int{}
+	for i, rec := range retained {
+		ms.byID[rec.ID] = i
+	}
 	ms.active = map[string]MemoryRecord{}
 	ms.activeOrder = nil
 	ms.lexical = nil

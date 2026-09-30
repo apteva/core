@@ -150,6 +150,7 @@ func newCoreHTTPServer(thinker *Thinker) (*http.Server, error) {
 	//   DELETE /memory/by-id/{id}  — drop by ULID (preferred for
 	//                                 platform-driven cleanup)
 	mux.HandleFunc("/memory", api.apiAuth(api.memoryRoot))
+	mux.HandleFunc("/memory/forget-source", api.apiAuth(api.memoryForgetSource))
 	mux.HandleFunc("/memory/", api.apiAuth(api.memoryItem))
 	mux.HandleFunc("/", api.apiAuth(http.FileServer(http.Dir("web")).ServeHTTP))
 	return &http.Server{
@@ -1255,6 +1256,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, map[string]any{
 			"automatic_tool_loading": a.thinker.config.GetAutomaticToolLoading(),
+			"memory_policy":          a.thinker.config.GetMemoryPolicy(),
 			"directive":              a.thinker.config.GetDirective(),
 			"provider":               providerInfo,
 			"providers":              a.thinker.config.GetProviders(),
@@ -1268,6 +1270,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		var body struct {
 			AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
+			MemoryPolicy         *MemoryPolicy               `json:"memory_policy,omitempty"`
 			Directive            string                      `json:"directive,omitempty"`
 			Provider             *ProviderConfig             `json:"provider,omitempty"`
 			Providers            []ProviderConfig            `json:"providers,omitempty"`
@@ -1288,6 +1291,10 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := validateAutomaticToolLoading(body.AutomaticToolLoading); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := validateMemoryPolicy(body.MemoryPolicy); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -1350,6 +1357,9 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 		commit := func(mcp []MCPServerConfig) error {
 			return cfg.update(func() {
+				if body.MemoryPolicy != nil {
+					cfg.MemoryPolicy = MemoryPolicy{ExcludeThreads: append([]string(nil), body.MemoryPolicy.ExcludeThreads...)}
+				}
 				if body.AutomaticToolLoading != nil {
 					cfg.AutomaticToolLoading = body.AutomaticToolLoading
 				}
@@ -1481,12 +1491,14 @@ func writeJSON(w http.ResponseWriter, v any) {
 // continues to work; ID is also exposed for callers that want to
 // address by id directly.
 type memoryListItem struct {
-	Index  int       `json:"index"`
-	ID     string    `json:"id"`
-	Text   string    `json:"text"` // = MemoryRecord.Content (kept as `text` for backward UI compat)
-	Tags   []string  `json:"tags,omitempty"`
-	Weight float64   `json:"weight,omitempty"`
-	Time   time.Time `json:"time"` // = MemoryRecord.TS
+	Scope   string         `json:"scope,omitempty"`
+	Sources []MemorySource `json:"sources,omitempty"`
+	Index   int            `json:"index"`
+	ID      string         `json:"id"`
+	Text    string         `json:"text"` // = MemoryRecord.Content (kept as `text` for backward UI compat)
+	Tags    []string       `json:"tags,omitempty"`
+	Weight  float64        `json:"weight,omitempty"`
+	Time    time.Time      `json:"time"` // = MemoryRecord.TS
 }
 
 // memoryRoot dispatches /memory by method:
@@ -1518,12 +1530,14 @@ func (a *APIServer) memoryList(w http.ResponseWriter, r *http.Request) {
 	out := make([]memoryListItem, len(active))
 	for i, r := range active {
 		out[i] = memoryListItem{
-			Index:  i,
-			ID:     r.ID,
-			Text:   r.Content,
-			Tags:   r.Tags,
-			Weight: r.Weight,
-			Time:   r.TS,
+			Scope:   r.Scope,
+			Sources: r.Sources,
+			Index:   i,
+			ID:      r.ID,
+			Text:    r.Content,
+			Tags:    r.Tags,
+			Weight:  r.Weight,
+			Time:    r.TS,
 		}
 	}
 	writeJSON(w, out)
@@ -1551,6 +1565,7 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		Tags    []string `json:"tags"`
 		Weight  float64  `json:"weight"`
 		Reason  string   `json:"reason"` // optional supersede reason
+		Scope   *string  `json:"scope"`  // omitted preserves existing scope; empty explicitly shares
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -1561,8 +1576,16 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimSpace(body.ID)
+	var metadata []MemoryMetadata
+	if body.Scope != nil {
+		if *body.Scope != "" && !validMemoryThreadID(*body.Scope) {
+			http.Error(w, "invalid memory scope", http.StatusBadRequest)
+			return
+		}
+		metadata = []MemoryMetadata{{Scope: *body.Scope}}
+	}
 	if id == "" {
-		newID, err := a.thinker.memory.Remember(body.Content, body.Tags, body.Weight)
+		newID, err := a.thinker.memory.Remember(body.Content, body.Tags, body.Weight, metadata...)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -1575,7 +1598,7 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		if reason == "" {
 			reason = "upsert via POST /memory"
 		}
-		newID, err := a.thinker.memory.Supersede(targetID, body.Content, body.Tags, body.Weight, reason)
+		newID, err := a.thinker.memory.Supersede(targetID, body.Content, body.Tags, body.Weight, reason, metadata...)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -1583,7 +1606,7 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"id": newID, "supersedes": targetID, "source_id": id, "action": "upserted"})
 		return
 	}
-	newID, err := a.thinker.memory.RememberWithID(id, body.Content, body.Tags, body.Weight)
+	newID, err := a.thinker.memory.RememberWithID(id, body.Content, body.Tags, body.Weight, metadata...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

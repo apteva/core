@@ -728,6 +728,17 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		if p == nil {
 			continue
 		}
+		if pc.ServiceTier != "" {
+			native, ok := p.(*OpenAINativeProvider)
+			if !ok || native.Name() != "openai-codex" {
+				return nil, fmt.Errorf("provider %q does not support service_tier", pc.Name)
+			}
+			tier, err := normalizeCodexServiceTier(pc.ServiceTier)
+			if err != nil {
+				return nil, err
+			}
+			p = native.WithServiceTier(tier)
+		}
 		applyModelOverrides(p, pc.Models)
 		registerModelCapabilities(pc.ModelCapabilities)
 		if native, ok := p.(*OpenAINativeProvider); ok {

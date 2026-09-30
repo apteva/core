@@ -83,10 +83,12 @@ type ProviderConfig struct {
 	Models            map[string]string            `json:"models,omitempty"`             // "large" → model ID, "medium" → ..., "small" → ...
 	ModelCapabilities map[string]ModelCapabilities `json:"model_capabilities,omitempty"` // selected model metadata keyed by model ID
 	BuiltinTools      []string                     `json:"builtin_tools,omitempty"`      // e.g. ["code_execution"]
+	ServiceTier       string                       `json:"service_tier,omitempty"`       // provider request tier, e.g. "priority"
 	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "marin")
 }
 
 type Config struct {
+	MemoryPolicy         MemoryPolicy                `json:"memory_policy,omitempty"`
 	AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
 	RuntimeSequence      uint64                      `json:"runtime_sequence,omitempty"`
 	mu                   sync.RWMutex
@@ -147,6 +149,9 @@ func (c *Config) load() error {
 		}
 	}
 	if err := validateAutomaticToolLoading(c.AutomaticToolLoading); err != nil {
+		return err
+	}
+	if err := validateMemoryPolicy(&c.MemoryPolicy); err != nil {
 		return err
 	}
 	return c.loadRuntimeJournalLocked()
@@ -221,6 +226,7 @@ func (c *Config) restore(data []byte) {
 	c.RuntimeSequence = restored.RuntimeSequence
 	c.Directive = restored.Directive
 	c.Unconscious = restored.Unconscious
+	c.MemoryPolicy = restored.MemoryPolicy
 	c.RealtimeEnabled = restored.RealtimeEnabled
 	c.RealtimeVoice = restored.RealtimeVoice
 	c.RealtimeVoiceMCP = restored.RealtimeVoiceMCP
@@ -446,7 +452,7 @@ func (c *Config) GetProviders() []ProviderConfig {
 	defer c.mu.RUnlock()
 	out := make([]ProviderConfig, len(c.Providers))
 	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: p.BuiltinTools, RealtimeVoice: p.RealtimeVoice}
+		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: p.BuiltinTools, ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice}
 		if p.Models != nil {
 			cp.Models = make(map[string]string)
 			for k, v := range p.Models {
@@ -657,6 +663,9 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 	}
 	if update.BuiltinTools != nil {
 		providers[index].BuiltinTools = append([]string(nil), update.BuiltinTools...)
+	}
+	if update.ServiceTier != "" {
+		providers[index].ServiceTier = update.ServiceTier
 	}
 	if update.RealtimeVoice != "" {
 		providers[index].RealtimeVoice = update.RealtimeVoice
