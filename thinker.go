@@ -3435,6 +3435,7 @@ func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider 
 	}
 
 	modelID := modelIDForProvider(provider, tier)
+	messages = fileRefMessagesForModel(messages)
 	budget := estimatePreparedRequest(provider.Name(), modelID, messages, nativeTools)
 	t.emitRequestBudget(budget)
 	if budget.OverBudget {

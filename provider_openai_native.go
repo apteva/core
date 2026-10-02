@@ -658,6 +658,7 @@ func (p *OpenAINativeProvider) instructionsFromMessages(messages []Message) stri
 
 // buildInput converts our Message slice to Responses API input items.
 func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
+	messages = fileRefMessagesForModel(messages)
 	var items []oaiInputItem
 
 	for _, m := range messages {

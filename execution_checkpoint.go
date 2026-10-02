@@ -247,6 +247,12 @@ func cloneContentParts(in []ContentPart) []ContentPart {
 	}
 	out := make([]ContentPart, len(in))
 	copy(out, in)
+	for i := range out {
+		if in[i].FileRef != nil {
+			ref := *in[i].FileRef
+			out[i].FileRef = &ref
+		}
+	}
 	return out
 }
 

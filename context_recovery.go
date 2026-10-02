@@ -197,7 +197,9 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 		for _, m := range old {
 			ids = append(ids, m.EventIDs...)
 		}
-		prefix = append(prefix, Message{Role: "user", Content: "[COMPACTED CONTEXT]\n" + summary + "\nFull pre-recovery context: " + ref, EventIDs: ids})
+		compacted := summaryWithFileRefs("[COMPACTED CONTEXT]\n"+summary+"\nFull pre-recovery context: "+ref, old)
+		compacted.EventIDs = ids
+		prefix = append(prefix, compacted)
 		next = append(prefix, next[start:]...)
 	}
 	if !materiallySmaller(next) {

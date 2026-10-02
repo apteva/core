@@ -201,6 +201,7 @@ type openaiToolResultMsg struct {
 }
 
 func toOpenAIMessages(messages []Message) []any {
+	messages = fileRefMessagesForModel(messages)
 	var out []any
 	for _, m := range messages {
 		// Tool result messages

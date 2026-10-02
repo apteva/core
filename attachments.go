@@ -69,7 +69,7 @@ func transientAttachmentCount(messages []Message) int {
 	count := 0
 	for _, msg := range messages {
 		for _, part := range msg.Parts {
-			if part.Type != "text" {
+			if part.Type != "text" && part.Type != "file_ref" {
 				count++
 			}
 		}
@@ -80,7 +80,12 @@ func transientAttachmentCount(messages []Message) int {
 func projectTransientAttachmentsFromMessage(msg Message) (Message, int) {
 	count := 0
 	var textParts []string
+	var refs []ContentPart
 	for _, part := range msg.Parts {
+		if part.Type == "file_ref" {
+			refs = append(refs, part)
+			continue
+		}
 		if part.Type == "text" {
 			if strings.TrimSpace(part.Text) != "" {
 				textParts = append(textParts, part.Text)
@@ -103,6 +108,9 @@ func projectTransientAttachmentsFromMessage(msg Message) (Message, int) {
 			projected.Content = strings.TrimRight(projected.Content, "\n") + "\n\n"
 		}
 		projected.Content += transientAttachmentHistoryNotice
+	}
+	if len(refs) > 0 {
+		projected.Parts = append([]ContentPart{{Type: "text", Text: projected.Content}}, refs...)
 	}
 	return projected, count
 }
@@ -140,7 +148,7 @@ func projectTransientAttachmentsFromEntry(entry SessionEntry) (SessionEntry, int
 		return entry, 0
 	}
 	entry.Content = projected.Content
-	entry.Parts = nil
+	entry.Parts = projected.Parts
 	return entry, count
 }
 

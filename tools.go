@@ -124,6 +124,7 @@ func executeTool(t *Thinker, call toolCall) {
 		defer t.releaseToolSlot()
 		defer t.asyncToolsActive.Add(-1)
 		ctx, cancel := context.WithTimeout(t.toolContext(), toolCallTimeout(call))
+		ctx = withBlobCallerThread(ctx, t.threadID)
 		t.toolLifecycleMu.Lock()
 		if generation != t.toolGeneration.Load() {
 			t.toolLifecycleMu.Unlock()

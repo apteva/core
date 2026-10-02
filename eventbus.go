@@ -31,7 +31,7 @@ type Event struct {
 
 	Text       string        // message payload
 	ToolName   string        // tool name (for EventToolChunk)
-	Parts      []ContentPart // optional media (images, audio) attached to this event
+	Parts      []ContentPart // optional media or durable server file references attached to this event
 	ToolResult *ToolResult   // optional: structured tool result
 	// ExecutionIDs correlate opt-in durable inbox work across continuations,
 	// tools, sends, and spawned workers. They are runtime metadata only and are

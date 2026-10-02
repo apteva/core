@@ -382,8 +382,9 @@ func (rt *RealtimeThinker) boundedTranscript() []Message {
 		for _, result := range msg.ToolResults {
 			eligible = append(eligible, Message{Role: "user", Content: fmt.Sprintf("[Internal completed tool result. This operation already ran; do not repeat it.] %s (call %s): %s", result.ToolName, result.CallID, result.Content)})
 		}
-		if (msg.Role == "user" || msg.Role == "assistant") && strings.TrimSpace(msg.Content) != "" {
-			eligible = append(eligible, Message{Role: msg.Role, Content: msg.Content})
+		text := appendFileRefText(msg.Content, msg.Parts)
+		if (msg.Role == "user" || msg.Role == "assistant") && strings.TrimSpace(text) != "" {
+			eligible = append(eligible, Message{Role: msg.Role, Content: text})
 		}
 	}
 	if len(eligible) > realtimeRestoreMessages {
@@ -1459,6 +1460,8 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	if event.From != "" {
 		note = fmt.Sprintf("[from:%s] %s", event.From, event.Text)
 	}
+	messageText := note
+	note = appendFileRefText(note, event.Parts)
 	if strings.TrimSpace(note) == "" {
 		return
 	}
@@ -1486,7 +1489,15 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 	rt.setConversationState("thinking", RealtimeEvent{})
 	responseErr := rt.requestProviderResponse(session)
 	{
-		message := Message{Role: "user", Content: note, EventIDs: []string{event.ID}}
+		message := Message{Role: "user", Content: messageText, EventIDs: []string{event.ID}}
+		for _, part := range event.Parts {
+			if part.Type == "file_ref" {
+				if len(message.Parts) == 0 {
+					message.Parts = []ContentPart{{Type: "text", Text: messageText}}
+				}
+				message.Parts = append(message.Parts, cloneContentParts([]ContentPart{part})...)
+			}
+		}
 		if event.ID == "" {
 			message.EventIDs = nil
 		}

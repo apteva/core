@@ -349,7 +349,7 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 	// Collect compacted summaries
 	for _, e := range entries {
 		if e.Role == "_compacted" && e.Summary != "" {
-			compactedSummaries = append(compactedSummaries, e.Summary)
+			compactedSummaries = append(compactedSummaries, appendFileRefText(e.Summary, e.Parts))
 		}
 	}
 
@@ -633,6 +633,17 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		Summary:   summaryText,
 		OrigCount: realCount,
 	}
+	// Keep reference metadata independently of the model-written summary, so
+	// summarization cannot drop or rewrite opaque handles. No bytes are retained.
+	seenRefs := map[FileRef]bool{}
+	for _, entry := range entries[:compactPrefix] {
+		for _, part := range entry.Parts {
+			if part.Type == "file_ref" && part.FileRef != nil && !seenRefs[*part.FileRef] {
+				seenRefs[*part.FileRef] = true
+				compactedEntry.Parts = append(compactedEntry.Parts, cloneContentParts([]ContentPart{part})...)
+			}
+		}
+	}
 
 	// Rewrite file
 	newEntries := append([]SessionEntry{compactedEntry}, recent...)
@@ -689,10 +700,10 @@ func buildCompactionParts(entries []SessionEntry, keepRecent int) (combined stri
 
 	for _, e := range old {
 		if e.Role == "_compacted" {
-			combined += "[previous summary]\n" + excerptForCompaction(e.Summary, compactionInputMessagePreviewChars) + "\n"
+			combined += "[previous summary]\n" + excerptForCompaction(appendFileRefText(e.Summary, e.Parts), compactionInputMessagePreviewChars) + "\n"
 		} else if e.Role != "system" {
 			realCount++
-			combined += fmt.Sprintf("[%s]\n%s\n", e.Role, excerptForCompaction(e.Content, compactionInputMessagePreviewChars))
+			combined += fmt.Sprintf("[%s]\n%s\n", e.Role, excerptForCompaction(appendFileRefText(e.Content, e.Parts), compactionInputMessagePreviewChars))
 			if len(e.ToolCalls) > 0 {
 				combined += "Tool calls:\n"
 				for _, call := range e.ToolCalls {

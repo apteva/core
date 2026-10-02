@@ -27,6 +27,7 @@ const (
 )
 
 func contextChars(messages []Message) int {
+	messages = fileRefMessagesForModel(messages)
 	n := 0
 	for _, msg := range messages {
 		n += len(msg.Role) + len(msg.Content) + len(msg.Reasoning)
@@ -65,6 +66,7 @@ func contextChars(messages []Message) int {
 // dimensions, not JPEG/PNG byte size; using len(image)/4 caused screenshots to
 // look hundreds of thousands of tokens larger than the provider reported.
 func estimatedContextTokens(messages []Message) int {
+	messages = fileRefMessagesForModel(messages)
 	textChars := 0
 	imageTokens := 0
 	for _, msg := range messages {
@@ -474,10 +476,7 @@ func (t *Thinker) semanticCompactContext(reason string) (semanticCompactionResul
 		return result, fmt.Errorf("compaction summary was empty")
 	}
 
-	summaryMessage := Message{
-		Role:    "user",
-		Content: "[COMPACTED CONTEXT]\n" + summary,
-	}
+	summaryMessage := summaryWithFileRefs("[COMPACTED CONTEXT]\n"+summary, old)
 	next := make([]Message, 0, len(retained)+2)
 	next = append(next, t.messages[0], summaryMessage)
 	next = append(next, retained...)
@@ -517,8 +516,9 @@ func renderMessagesForSemanticCompaction(messages []Message) string {
 	var b strings.Builder
 	for i, msg := range messages {
 		fmt.Fprintf(&b, "## Message %d (%s)\n", i+1, msg.Role)
-		if strings.TrimSpace(msg.Content) != "" {
-			b.WriteString(excerptForCompaction(msg.Content, compactionInputMessagePreviewChars))
+		text := appendFileRefText(msg.Content, msg.Parts)
+		if strings.TrimSpace(text) != "" {
+			b.WriteString(excerptForCompaction(text, compactionInputMessagePreviewChars))
 			b.WriteString("\n")
 		}
 		if len(msg.ToolCalls) > 0 {

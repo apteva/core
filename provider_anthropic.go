@@ -617,6 +617,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 
 // toAnthropicBlocks converts our ContentParts to Anthropic content blocks.
 func toAnthropicBlocks(parts []ContentPart) []anthropicContentBlock {
+	parts = fileRefsForModel(parts)
 	var blocks []anthropicContentBlock
 	for _, p := range parts {
 		switch p.Type {

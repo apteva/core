@@ -40,13 +40,15 @@ func SetVersion(version, buildTime string) {
 	BuildTime = buildTime
 }
 
-// ContentPart represents a multimodal content block (OpenAI Chat Completions format).
+// ContentPart represents an event content block. Media uses the OpenAI Chat
+// Completions format; server file references are projected to metadata text.
 type ContentPart struct {
-	Type       string      `json:"type"`                  // "text", "image_url", "input_audio", "audio_url"
+	Type       string      `json:"type"`                  // "text", "image_url", "input_audio", "audio_url", "file_ref"
 	Text       string      `json:"text,omitempty"`        // type=text
 	ImageURL   *ImageURL   `json:"image_url,omitempty"`   // type=image_url
 	InputAudio *InputAudio `json:"input_audio,omitempty"` // type=input_audio
 	AudioURL   *AudioURL   `json:"audio_url,omitempty"`   // type=audio_url
+	FileRef    *FileRef    `json:"file_ref,omitempty"`    // type=file_ref; opaque server-owned reference, never bytes
 }
 
 type ImageURL struct {
@@ -92,12 +94,14 @@ func (m Message) TextContent() string {
 	if len(m.Parts) == 0 {
 		return m.Content
 	}
+	text := m.Content
 	for _, p := range m.Parts {
 		if p.Type == "text" {
-			return p.Text
+			text = p.Text
+			break
 		}
 	}
-	return m.Content
+	return appendFileRefText(text, m.Parts)
 }
 
 // HasParts returns true if this message has multimodal content.

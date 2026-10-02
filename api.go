@@ -591,6 +591,13 @@ func parseAPIEventMessage(raw json.RawMessage) (string, []ContentPart, error) {
 			if part.AudioURL == nil || strings.TrimSpace(part.AudioURL.URL) == "" {
 				return "", nil, fmt.Errorf("message part %d: audio_url.url required", i)
 			}
+		case "file_ref":
+			if part.Text != "" || part.ImageURL != nil || part.InputAudio != nil || part.AudioURL != nil {
+				return "", nil, fmt.Errorf("message part %d: file_ref may contain only reference metadata", i)
+			}
+			if err := validateFileRef(part.FileRef); err != nil {
+				return "", nil, fmt.Errorf("message part %d: %w", i, err)
+			}
 		default:
 			return "", nil, fmt.Errorf("message part %d: unsupported type %q", i, part.Type)
 		}

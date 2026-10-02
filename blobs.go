@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -43,10 +44,11 @@ type BlobStore struct {
 }
 
 type blobEntry struct {
-	mime    string
-	data    []byte
-	size    int
-	created time.Time
+	mime     string
+	filename string
+	data     []byte
+	size     int
+	created  time.Time
 }
 
 const blobRefPrefix = "blobref://"
@@ -105,6 +107,10 @@ func (bs *BlobStore) evictExpired() {
 // Put stores bytes and returns a ref of the form "blobref://<id>".
 // Evicts the oldest blob(s) if the aggregate cap would be exceeded.
 func (bs *BlobStore) Put(mime string, data []byte) string {
+	return bs.putNamed(mime, "", data)
+}
+
+func (bs *BlobStore) putNamed(mime, filename string, data []byte) string {
 	if int64(len(data)) > bs.maxTotal {
 		return ""
 	}
@@ -130,10 +136,11 @@ func (bs *BlobStore) Put(mime string, data []byte) string {
 
 	id := randomBlobID()
 	bs.blobs[id] = &blobEntry{
-		mime:    mime,
-		data:    data,
-		size:    len(data),
-		created: time.Now(),
+		mime:     mime,
+		filename: filename,
+		data:     data,
+		size:     len(data),
+		created:  time.Now(),
 	}
 	bs.total += int64(len(data))
 	return blobRefPrefix + id
@@ -172,6 +179,7 @@ type binaryEnvelope struct {
 	Base64   string `json:"base64"`
 	MimeType string `json:"mimeType"`
 	Size     int    `json:"size"`
+	Filename string `json:"filename,omitempty"`
 }
 
 // RewriteBinaryToHandle inspects a tool-result string. If it parses as
@@ -195,12 +203,20 @@ func (bs *BlobStore) RewriteBinaryToHandle(text string) string {
 	if err != nil {
 		return text
 	}
-	ref := bs.Put(env.MimeType, data)
+	ref := bs.putNamed(env.MimeType, env.Filename, data)
+	if ref == "" {
+		// Never replace bytes with an unusable handle when the local
+		// compatibility store is over its configured cap.
+		return text
+	}
 	handle := map[string]any{
 		"_file":    true,
 		"ref":      ref,
 		"mimeType": env.MimeType,
-		"size":     env.Size,
+		"size":     len(data),
+	}
+	if env.Filename != "" {
+		handle["filename"] = env.Filename
 	}
 	out, _ := json.Marshal(handle)
 	return string(out)
@@ -241,22 +257,63 @@ func (bs *BlobStore) rehydrateValue(v string) string {
 		return v
 	}
 	trimmed := strings.TrimSpace(v)
-	if !strings.HasPrefix(trimmed, "{") || !strings.Contains(trimmed, `"_file_ref"`) {
+	if (!strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[")) ||
+		(!strings.Contains(trimmed, blobRefPrefix) && !strings.Contains(trimmed, `"_file_ref"`)) {
 		return v
 	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+	var obj any
+	decoder := json.NewDecoder(bytes.NewReader([]byte(trimmed)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&obj); err != nil || !json.Valid([]byte(trimmed)) {
 		return v
 	}
-	ref, ok := obj["_file_ref"].(string)
-	if !ok || ref == "" {
-		return v
+	changed := false
+	var visit func(any, int) any
+	visit = func(value any, depth int) any {
+		if depth > 24 {
+			return value
+		}
+		ref := ""
+		switch item := value.(type) {
+		case string:
+			if strings.HasPrefix(item, blobRefPrefix) {
+				ref = item
+			}
+		case map[string]any:
+			if explicit, ok := item["_file_ref"].(string); ok {
+				ref = explicit
+				if ref != "" && !strings.Contains(ref, "://") {
+					ref = blobRefPrefix + ref // legacy bare-id wrapper
+				}
+			} else if item["_file"] == true {
+				ref, _ = item["ref"].(string)
+			}
+		}
+		if ref != "" {
+			if env := bs.makeEnvelope(ref); env != "" {
+				var binary any
+				_ = json.Unmarshal([]byte(env), &binary)
+				changed = true
+				return binary
+			}
+			return value // leave unknown/shared handles exactly as supplied
+		}
+		switch item := value.(type) {
+		case map[string]any:
+			for key, child := range item {
+				item[key] = visit(child, depth+1)
+			}
+		case []any:
+			for i, child := range item {
+				item[i] = visit(child, depth+1)
+			}
+		}
+		return value
 	}
-	if !strings.HasPrefix(ref, blobRefPrefix) {
-		ref = blobRefPrefix + ref
-	}
-	if env := bs.makeEnvelope(ref); env != "" {
-		return env
+	obj = visit(obj, 0)
+	if changed {
+		out, _ := json.Marshal(obj)
+		return string(out)
 	}
 	return v
 }
@@ -272,6 +329,11 @@ func (bs *BlobStore) makeEnvelope(ref string) string {
 		"mimeType": mime,
 		"size":     len(data),
 	}
+	bs.mu.Lock()
+	if entry := bs.blobs[strings.TrimPrefix(ref, blobRefPrefix)]; entry != nil && entry.filename != "" {
+		env["filename"] = entry.filename
+	}
+	bs.mu.Unlock()
 	out, _ := json.Marshal(env)
 	return string(out)
 }
@@ -282,5 +344,5 @@ func (bs *BlobStore) makeEnvelope(ref string) string {
 const blobPromptHint = `
 
 [FILE HANDLES]
-When a tool result is an object {"_file": true, "ref": "blobref://...", "mimeType": ..., "size": ...}, the raw bytes have been stashed server-side and this handle is a reference to them.
-To pass the file to another tool, set that tool's argument to either the scalar "blobref://..." string or the object {"_file_ref": "blobref://..."}. The bytes are injected on your behalf — do NOT decode, base64, or inline the payload yourself. Handles stay valid within the same session.`
+Incoming files and tool-produced files use the same handle: {"_file": true, "ref": "blobref://...", "filename": ..., "mimeType": ..., "size": ...}. This is metadata, not file contents.
+To pass the file to a compatible tool, use the unchanged "blobref://..." string or the complete _file handle as its file argument. The legacy {"_file_ref": "blobref://..."} wrapper also works. The runtime supplies the bytes — do NOT decode, base64, or inline them yourself. Availability is determined by the owning store; a reference is not an access grant.`

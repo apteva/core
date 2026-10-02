@@ -611,6 +611,7 @@ func parseDataURI(uri string) (string, string) {
 
 // toGeminiParts converts our ContentParts to Gemini parts.
 func toGeminiParts(parts []ContentPart) []geminiPart {
+	parts = fileRefsForModel(parts)
 	var out []geminiPart
 	for _, p := range parts {
 		switch p.Type {

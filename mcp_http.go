@@ -145,6 +145,11 @@ func (s *MCPHTTPServer) doPOSTContext(ctx context.Context, body []byte, includeA
 		if agentID := os.Getenv("AGENT_ID"); agentID != "" && isAptevaAppMCPURL(currentURL) {
 			httpReq.Header.Set("X-Apteva-Caller-Agent", agentID)
 		}
+		if isAptevaBlobMCPURL(currentURL) {
+			if thread, _ := ctx.Value(blobCallerThreadKey{}).(string); thread != "" {
+				httpReq.Header.Set("X-Apteva-File-Thread", thread)
+			}
+		}
 		if sessionID != "" {
 			httpReq.Header.Set("Mcp-Session-Id", sessionID)
 		}
@@ -205,6 +210,17 @@ func isAptevaAppMCPURL(raw string) bool {
 	}
 	return (strings.HasPrefix(u.Path, "/api/apps/") || strings.HasPrefix(u.Path, "/api/environment-app-gateway/")) &&
 		strings.HasSuffix(u.Path, "/mcp")
+}
+
+// Identity is supplied only to server-authorized local gateway endpoints,
+// never to external MCP services or from model-generated tool arguments.
+func isAptevaBlobMCPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" && u.Hostname() != "::1") {
+		return false
+	}
+	return u.Query().Get("file_agent") != "" && u.Query().Get("file_auth") != "" &&
+		(isAptevaAppMCPURL(raw) || strings.HasPrefix(u.Path, "/mcp/"))
 }
 
 func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMessage, http.Header, error) {
