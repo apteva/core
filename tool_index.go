@@ -462,15 +462,18 @@ type indexSearchOptions struct {
 	Access  DiscoveryAccess
 }
 
-func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized func(string) bool) []IndexEntry {
+func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized func(IndexEntry) bool) []IndexEntry {
 	return ix.searchDetailed(query, k, allowNoSpawn, authorized).Hits
 }
 
-func (ix *ToolIndex) searchDetailed(query string, k int, allowNoSpawn bool, authorized func(string) bool) indexSearchResult {
+func (ix *ToolIndex) searchDetailed(query string, k int, allowNoSpawn bool, authorized func(IndexEntry) bool) indexSearchResult {
 	return ix.searchDetailedWithOptions(query, k, allowNoSpawn, authorized, indexSearchOptions{})
 }
 
-func (ix *ToolIndex) searchDetailedWithOptions(query string, k int, allowNoSpawn bool, authorized func(string) bool, options indexSearchOptions) indexSearchResult {
+// Authorization receives the entry from the same locked catalog snapshot used
+// for matching and ranking. It must not call index methods: a nested RLock can
+// deadlock as soon as a catalog writer is pending.
+func (ix *ToolIndex) searchDetailedWithOptions(query string, k int, allowNoSpawn bool, authorized func(IndexEntry) bool, options indexSearchOptions) indexSearchResult {
 	result := indexSearchResult{}
 	if ix == nil || k <= 0 {
 		return result
@@ -478,7 +481,7 @@ func (ix *ToolIndex) searchDetailedWithOptions(query string, k int, allowNoSpawn
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	allowed := func(e IndexEntry) bool {
-		if !allowNoSpawn && e.NoSpawn || authorized != nil && !authorized(e.Name) {
+		if !allowNoSpawn && e.NoSpawn || authorized != nil && !authorized(e) {
 			return false
 		}
 		if len(options.Servers) > 0 && !options.Servers[strings.ToLower(e.Server)] {

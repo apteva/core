@@ -67,6 +67,27 @@ Realtime sessions retain their existing `realtime.*` session/usage events;
 the request events cover request/response inference, while shared worker and
 tool instrumentation also applies to realtime workers.
 
+## Tool activity labels
+
+Registered tools expose a required nonempty `_reason` string to the model.
+Core strips that operator-only field before dispatch and emits it as
+`tool.call.data.reason`. Omitting it, or sending only whitespace, does not
+block execution: Core uses the first sentence/line of the captured tool
+description, capped at 160 characters. Without a usable description, Core
+uses the tool name as a readable operation label. Fallbacks never include
+argument values or claim that an operation succeeded.
+
+`reason_source` identifies `model`, `tool_description`, or `tool_name`, so a
+nonempty activity label does not conceal an upstream omission. The same
+preparation applies to asynchronous tools, main-thread inline tools, and
+worker inline or unavailable-tool calls. Consumers such as Conversations
+can keep reading `reason` without changes. Existing persisted empty labels
+are not backfilled.
+
+`tool.arguments` at the `provider_raw` stage retains the original model JSON;
+fallback labels are never injected into replay arguments. Use that event to
+distinguish a model omission from an argument-conversion or telemetry bug.
+
 ## Compatibility and aggregation
 
 Continue calculating existing usage/cost/call totals from `llm.done` and

@@ -724,6 +724,7 @@ type ToolCallData struct {
 	Name         string            `json:"name"`
 	Args         map[string]string `json:"args,omitempty"`
 	Reason       string            `json:"reason,omitempty"`
+	ReasonSource string            `json:"reason_source,omitempty"` // model, tool_description, or tool_name
 	ExecutionIDs []string          `json:"execution_ids,omitempty"`
 }
 

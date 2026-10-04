@@ -7,10 +7,20 @@ func (t *Thinker) toolAuthorizedFor(name string, grants, scopes map[string]bool)
 		return true
 	}
 	entry, indexed := t.toolIndex.Get(name)
-	if indexed && entry.NoSpawn && !t.allowNoSpawn {
-		return false
+	if indexed {
+		return indexedToolAuthorized(entry, grants, scopes, t.allowNoSpawn)
 	}
-	return grants[name] || (indexed && scopes[entry.Server])
+	return grants[name]
+}
+
+// indexedToolAuthorized evaluates catalog metadata supplied by the caller. In
+// discovery this is the entry already protected by the search's read lock; do
+// not look it up again or acquire any index lock here.
+func indexedToolAuthorized(entry IndexEntry, grants, scopes map[string]bool, allowNoSpawn bool) bool {
+	if grants == nil {
+		return true
+	}
+	return (!entry.NoSpawn || allowNoSpawn) && (grants[entry.Name] || scopes[entry.Server])
 }
 
 // visibleNativeToolSnapshot is shared by text requests and realtime session

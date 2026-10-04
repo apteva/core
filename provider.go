@@ -297,6 +297,7 @@ type ChatResponse struct {
 	ProviderTiming           ProviderTiming         // transport phase timings, when reported by the provider
 	ToolCalls                []NativeToolCall       // structured tool calls WE need to execute
 	ServerResults            []ServerToolResult     // tools the PROVIDER already executed
+	GeneratedFiles           []FileRef              // hosted artifacts; metadata only, bytes remain in the gateway
 	ProviderState            *ProviderResponseState // opaque provider output items needed for stateless continuation
 	Usage                    TokenUsage
 }
@@ -707,6 +708,9 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		// silently skipped so HasRealtimeProvider() returns false and
 		// the feature is completely invisible to main.
 		if isRealtimeProviderName(pc.Name) {
+			if len(pc.Builtins) > 0 {
+				return nil, fmt.Errorf("provider %q does not support configurable hosted builtins", pc.Name)
+			}
 			if !cfg.RealtimeEnabledFlag() {
 				continue
 			}
@@ -744,8 +748,8 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		if native, ok := p.(*OpenAINativeProvider); ok {
 			native.modelCapabilities = cloneModelCapabilitiesMap(pc.ModelCapabilities)
 		}
-		if len(pc.BuiltinTools) > 0 {
-			p.SetBuiltinTools(pc.BuiltinTools)
+		if err := configureProviderBuiltins(p, pc); err != nil {
+			return nil, err
 		}
 		pool.providers[pc.Name] = p
 		pool.order = append(pool.order, pc.Name)

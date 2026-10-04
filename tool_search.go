@@ -226,26 +226,7 @@ func (t *Thinker) searchAuthorizedToolsDetailed(query string, k int, allowNoSpaw
 	if t == nil || t.toolIndex == nil || k <= 0 {
 		return indexSearchResult{}
 	}
-	if t.toolAllowlist == nil {
-		return t.toolIndex.searchDetailed(query, k, allowNoSpawn, nil)
-	}
-	// Snapshot grants outside the index lock: toolAuthorized also reads it.
-	allowed := make(map[string]bool, len(t.toolAllowlist))
-	for name, enabled := range t.toolAllowlist {
-		if enabled && t.toolAuthorized(name) {
-			allowed[name] = true
-		}
-	}
-	for server, enabled := range t.toolMCPScopes {
-		if enabled {
-			for _, name := range t.toolIndex.ToolsForServer(server) {
-				if t.toolAuthorized(name) {
-					allowed[name] = true
-				}
-			}
-		}
-	}
-	return t.toolIndex.searchDetailed(query, k, allowNoSpawn, func(name string) bool { return allowed[name] })
+	return t.toolIndex.searchDetailed(query, k, allowNoSpawn, t.discoveryAuthorizedPredicate())
 }
 
 func (t *Thinker) authorizedActiveTools(active map[string]bool) map[string]bool {

@@ -1267,6 +1267,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			"directive":              a.thinker.config.GetDirective(),
 			"provider":               providerInfo,
 			"providers":              a.thinker.config.GetProviders(),
+			"builtin_capabilities":   status.BuiltinCapabilities,
 			"mcp_servers":            mcpInfo,
 			"execution_control":      a.thinker.executionStatus(),
 			"execution_checkpoints":  a.thinker.executionCheckpointMeta(),

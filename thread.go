@@ -1183,12 +1183,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				t.queueToolTrace(&call)
 				inlineSpans = append(inlineSpans, call.trace)
 				call.trace.start()
-				reason := call.Args["_reason"]
-				delete(call.Args, "_reason")
+				callData := t.prepareToolCallData(&call, t.currentEventExecutions())
 				if t.telemetry != nil {
-					t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
-						ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
-					}))
+					t.telemetry.Emit("tool.call", t.threadID, call.trace.data(callData))
 				}
 				emitResult(call, fmt.Sprintf(
 					"error: tool %q is not available to this thread in the current model turn; use an exposed tool or search_tools, then retry on the next turn",
@@ -1211,15 +1208,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				inlineSpans = append(inlineSpans, call.trace)
 				call.trace.start()
 			}
-			reason := ""
+			var callData ToolCallData
 			if isInline {
-				reason = call.Args["_reason"]
-				delete(call.Args, "_reason")
+				callData = t.prepareToolCallData(&call, t.currentEventExecutions())
 			}
 			if isInline && t.telemetry != nil {
-				t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
-					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
-				}))
+				t.telemetry.Emit("tool.call", t.threadID, call.trace.data(callData))
 			}
 			switch call.Name {
 			case "send":

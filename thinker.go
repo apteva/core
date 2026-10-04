@@ -203,7 +203,7 @@ You never communicate with other threads. You never interact with users. Treat t
 // toolArgumentPresenceContract is shared by every text-model role. MCP schemas
 // describe the values a caller may provide; they must never be mistaken for a
 // request to manufacture every optional property.
-const toolArgumentPresenceContract = `Include only tool arguments needed for the operation. Omit optional properties unless you intentionally need to override their server-side behavior. JSON Schema constraints, examples, and enum ordering are not defaults: never fill optional properties with empty strings, false, zero or minimum values, the first enum value, or placeholder objects merely to complete a schema. If false, zero, or an empty string is deliberately required, preserve and send that value.`
+const toolArgumentPresenceContract = `Include only tool arguments needed for the operation. Always include the required nonempty _reason activity phrase for the operator, even when the operation needs no other arguments. Omit optional properties unless you intentionally need to override their server-side behavior. JSON Schema constraints, examples, and enum ordering are not defaults: never fill optional properties with empty strings, false, zero or minimum values, the first enum value, or placeholder objects merely to complete a schema. If false, zero, or an empty string is deliberately required, preserve and send that value.`
 
 const reasoningBaselineContract = `Keep reasoning at auto for ordinary work. Sleeping and waiting use no model inference, so never lower reasoning merely because activity is sparse or you are about to wait. Use small models or low/minimal reasoning only for genuinely trivial, low-risk work that needs no analysis, synthesis, ambiguity resolution, multi-tool coordination, or consequential decision. Use at least a medium model with auto/medium reasoning for substantial active work, and medium/high reasoning when complexity warrants it.`
 
@@ -1156,24 +1156,25 @@ func (t *Thinker) releaseToolSlot() {
 }
 
 type thinkerRuntimeStatus struct {
-	Iteration         int
-	Rate              ThinkRate
-	Model             ModelTier
-	Reasoning         ReasoningLevel
-	BaselineModel     ModelTier
-	BaselineReasoning ReasoningLevel
-	Provider          string
-	ContextMsgs       int
-	ContextChars      int
-	ModelID           string
-	Paused            bool
-	LLMActive         bool
-	Sleep             time.Duration
-	NextWakeAt        time.Time
-	PaceDurable       bool
-	WaitForEvents     bool
-	ProviderModels    map[ModelTier]string
-	MCPNames          []string
+	Iteration           int
+	Rate                ThinkRate
+	Model               ModelTier
+	Reasoning           ReasoningLevel
+	BaselineModel       ModelTier
+	BaselineReasoning   ReasoningLevel
+	Provider            string
+	ContextMsgs         int
+	ContextChars        int
+	ModelID             string
+	Paused              bool
+	LLMActive           bool
+	Sleep               time.Duration
+	NextWakeAt          time.Time
+	PaceDurable         bool
+	WaitForEvents       bool
+	ProviderModels      map[ModelTier]string
+	BuiltinCapabilities map[string][]BuiltinCapability
+	MCPNames            []string
 }
 
 type thinkerContextStatus struct {
@@ -1182,6 +1183,14 @@ type thinkerContextStatus struct {
 }
 
 func (t *Thinker) publishRuntimeStatus() {
+	builtinCapabilities := map[string][]BuiltinCapability{}
+	if t.pool != nil {
+		for _, name := range t.pool.Names() {
+			builtinCapabilities[name] = builtinCapabilityInfo(t.pool.Get(name))
+		}
+	} else if t.provider != nil {
+		builtinCapabilities[t.provider.Name()] = builtinCapabilityInfo(t.provider)
+	}
 	providerName := ""
 	var providerModels map[ModelTier]string
 	if t.provider != nil {
@@ -1196,24 +1205,25 @@ func (t *Thinker) publishRuntimeStatus() {
 		mcpNames = append(mcpNames, server.GetName())
 	}
 	t.runtimeStatus.Store(thinkerRuntimeStatus{
-		Iteration:         t.iteration,
-		Rate:              t.rate,
-		Model:             t.model,
-		Reasoning:         t.effectiveReasoningLevel(),
-		BaselineModel:     t.baselineModel,
-		BaselineReasoning: normalizeReasoningLevel(t.baselineReasoning),
-		Provider:          providerName,
-		ContextMsgs:       len(t.messages),
-		ContextChars:      contextChars(t.messages),
-		ModelID:           t.modelID(),
-		Paused:            t.paused,
-		LLMActive:         t.llmActive.Load(),
-		Sleep:             t.agentSleep,
-		NextWakeAt:        t.nextWakeAt,
-		PaceDurable:       t.paceDurable,
-		WaitForEvents:     t.waitForEvents,
-		ProviderModels:    providerModels,
-		MCPNames:          mcpNames,
+		Iteration:           t.iteration,
+		Rate:                t.rate,
+		Model:               t.model,
+		Reasoning:           t.effectiveReasoningLevel(),
+		BaselineModel:       t.baselineModel,
+		BaselineReasoning:   normalizeReasoningLevel(t.baselineReasoning),
+		Provider:            providerName,
+		ContextMsgs:         len(t.messages),
+		ContextChars:        contextChars(t.messages),
+		ModelID:             t.modelID(),
+		Paused:              t.paused,
+		LLMActive:           t.llmActive.Load(),
+		Sleep:               t.agentSleep,
+		NextWakeAt:          t.nextWakeAt,
+		PaceDurable:         t.paceDurable,
+		WaitForEvents:       t.waitForEvents,
+		ProviderModels:      providerModels,
+		BuiltinCapabilities: builtinCapabilities,
+		MCPNames:            mcpNames,
 	})
 }
 
@@ -1859,10 +1869,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			}
 
 			// Only strip _reason for inline tools — executeTool needs it
-			reason := ""
+			var callData ToolCallData
 			if isInline {
-				reason = call.Args["_reason"]
-				delete(call.Args, "_reason")
+				callData = t.prepareToolCallData(&call, t.currentEventExecutions())
 			}
 
 			if isInline {
@@ -1872,9 +1881,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 			}
 			// Emit tool.call telemetry only for inline tools
 			if isInline && t.telemetry != nil {
-				t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
-					ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: t.currentEventExecutions(),
-				}))
+				t.telemetry.Emit("tool.call", t.threadID, call.trace.data(callData))
 			}
 			// Helper to add inline tool result + emit telemetry
 			addResult := func(content string) {
@@ -2929,7 +2936,7 @@ func (t *Thinker) Run() {
 		// alone doesn't justify keeping the turn — without text or
 		// tool calls there's nothing for the agent to act on or the
 		// provider to replay.
-		if reply == "" && len(chatResp.ToolCalls) == 0 {
+		if reply == "" && len(chatResp.ToolCalls) == 0 && len(chatResp.GeneratedFiles) == 0 {
 			emptyLLMResponses++
 			if shouldRecoverFromEmptyResponse(usage, t.modelID(), requestMessages, emptyLLMResponses) {
 				reduced := t.compactForContextPressure("empty_response", usage, emptyLLMResponses)
@@ -2959,6 +2966,7 @@ func (t *Thinker) Run() {
 			ToolCalls:     chatResp.ToolCalls,
 			Reasoning:     chatResp.Reasoning,
 			ProviderState: chatResp.ProviderState,
+			Parts:         generatedFileParts(chatResp.GeneratedFiles),
 		}
 		t.messages = append(t.messages, assistantMsg)
 
@@ -3159,6 +3167,9 @@ func (t *Thinker) Run() {
 
 		// Telemetry: llm.done with full data
 		if t.telemetry != nil {
+			if len(chatResp.GeneratedFiles) > 0 {
+				t.telemetry.Emit("image.generated", t.threadID, map[string]any{"files": chatResp.GeneratedFiles})
+			}
 			model := chatResp.Model
 			if model == "" {
 				model = t.modelID()
@@ -3489,6 +3500,7 @@ func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider 
 	defer releaseBudget()
 	request.start()
 	ctx = context.WithValue(ctx, requestTraceKey{}, request)
+	ctx = withBlobCallerThread(ctx, t.threadID)
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
 	if err == nil {
 		resp, err = validateProviderToolOutput(resp)

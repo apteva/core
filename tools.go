@@ -74,9 +74,6 @@ func executeTool(t *Thinker, call toolCall) {
 			call.trace.finish("cancelled")
 		}
 	}()
-	// Extract _reason before dispatch (observability field, not passed to handler)
-	reason := call.Args["_reason"]
-	delete(call.Args, "_reason")
 	executionIDs := call.executionIDs
 	if executionIDs == nil {
 		executionIDs = t.currentEventExecutions()
@@ -85,6 +82,7 @@ func executeTool(t *Thinker, call toolCall) {
 	if call.definition == nil && call.resolutionError == "" {
 		t.resolveToolCall(&call)
 	}
+	callData := t.prepareToolCallData(&call, executionIDs)
 	generation := call.generation
 	if !call.admitted {
 		generation = t.toolGeneration.Load()
@@ -105,9 +103,7 @@ func executeTool(t *Thinker, call toolCall) {
 
 	// Telemetry: tool.call
 	if t.telemetry != nil {
-		t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
-			ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: executionIDs,
-		}))
+		t.telemetry.Emit("tool.call", t.threadID, call.trace.data(callData))
 	}
 
 	// Track pending async tool call. Value carries the tool name so the

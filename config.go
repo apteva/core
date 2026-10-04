@@ -83,6 +83,8 @@ type ProviderConfig struct {
 	Models            map[string]string            `json:"models,omitempty"`             // "large" → model ID, "medium" → ..., "small" → ...
 	ModelCapabilities map[string]ModelCapabilities `json:"model_capabilities,omitempty"` // selected model metadata keyed by model ID
 	BuiltinTools      []string                     `json:"builtin_tools,omitempty"`      // e.g. ["code_execution"]
+	Builtins          map[string]BuiltinToolConfig `json:"builtins,omitempty"`           // provider-hosted capability flags and options
+	ImageGeneration   *ImageGenerationConfig       `json:"image_generation,omitempty"`   // experimental hosted image generation; disabled by default
 	ServiceTier       string                       `json:"service_tier,omitempty"`       // provider request tier, e.g. "priority"
 	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "marin")
 }
@@ -452,7 +454,7 @@ func (c *Config) GetProviders() []ProviderConfig {
 	defer c.mu.RUnlock()
 	out := make([]ProviderConfig, len(c.Providers))
 	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: p.BuiltinTools, ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice}
+		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice}
 		if p.Models != nil {
 			cp.Models = make(map[string]string)
 			for k, v := range p.Models {
@@ -472,11 +474,15 @@ func (c *Config) GetDefaultProvider() *ProviderConfig {
 	for _, p := range c.Providers {
 		if p.Default {
 			cp := p
+			cp.ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
+			cp.Builtins = cloneBuiltinConfigs(p.Builtins)
 			return &cp
 		}
 	}
 	if len(c.Providers) > 0 {
 		cp := c.Providers[0]
+		cp.ImageGeneration = cloneImageGenerationConfig(cp.ImageGeneration)
+		cp.Builtins = cloneBuiltinConfigs(cp.Builtins)
 		return &cp
 	}
 	return nil
@@ -495,6 +501,8 @@ func (c *Config) GetProviderByName(name string) *ProviderConfig {
 	for _, p := range c.Providers {
 		if p.Name == name {
 			cp := p
+			cp.ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
+			cp.Builtins = cloneBuiltinConfigs(p.Builtins)
 			return &cp
 		}
 	}
@@ -503,17 +511,20 @@ func (c *Config) GetProviderByName(name string) *ProviderConfig {
 
 // SetProvider adds or updates a provider in the list. If it's the only one, marks it default.
 func (c *Config) SetProvider(pc *ProviderConfig) error {
+	copy := *pc
+	copy.ImageGeneration = cloneImageGenerationConfig(pc.ImageGeneration)
+	copy.Builtins = cloneBuiltinConfigs(pc.Builtins)
 	return c.update(func() {
 		found := false
 		for i, p := range c.Providers {
 			if p.Name == pc.Name {
-				c.Providers[i] = *pc
+				c.Providers[i] = copy
 				found = true
 				break
 			}
 		}
 		if !found {
-			c.Providers = append(c.Providers, *pc)
+			c.Providers = append(c.Providers, copy)
 		}
 		if len(c.Providers) == 1 {
 			c.Providers[0].Default = true
@@ -596,6 +607,8 @@ func cloneProviderConfigs(in []ProviderConfig) []ProviderConfig {
 	for i, p := range in {
 		out[i] = p
 		out[i].BuiltinTools = append([]string(nil), p.BuiltinTools...)
+		out[i].ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
+		out[i].Builtins = cloneBuiltinConfigs(p.Builtins)
 		if p.Models != nil {
 			out[i].Models = make(map[string]string, len(p.Models))
 			for tier, model := range p.Models {
@@ -663,6 +676,24 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 	}
 	if update.BuiltinTools != nil {
 		providers[index].BuiltinTools = append([]string(nil), update.BuiltinTools...)
+	}
+	if update.ImageGeneration != nil {
+		providers[index].ImageGeneration = cloneImageGenerationConfig(update.ImageGeneration)
+	}
+	if update.Builtins != nil {
+		if providers[index].Builtins == nil {
+			providers[index].Builtins = map[string]BuiltinToolConfig{}
+		}
+		for name := range update.Builtins {
+			for existing := range providers[index].Builtins {
+				if canonicalBuiltinName(existing) == canonicalBuiltinName(name) {
+					delete(providers[index].Builtins, existing)
+				}
+			}
+		}
+		for name, cfg := range cloneBuiltinConfigs(update.Builtins) {
+			providers[index].Builtins[name] = cfg
+		}
 	}
 	if update.ServiceTier != "" {
 		providers[index].ServiceTier = update.ServiceTier

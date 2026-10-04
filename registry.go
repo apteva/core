@@ -654,6 +654,7 @@ func copyAndInjectReason(schema map[string]any) map[string]any {
 	// every Chat call.
 	props["_reason"] = map[string]any{
 		"type":        "string",
+		"minLength":   1,
 		"description": "Capitalized activity phrase, max 6 words, usually ending in -ing.",
 	}
 	out["properties"] = props

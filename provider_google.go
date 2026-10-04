@@ -64,10 +64,12 @@ var GeminiModelOrder = []string{
 }
 
 type GoogleProvider struct {
-	mu          sync.RWMutex
-	apiKey      string
-	models      map[ModelTier]string
-	activeModel string // current model ID for cost tracking
+	mu             sync.RWMutex
+	apiKey         string
+	models         map[ModelTier]string
+	activeModel    string // current model ID for cost tracking
+	builtinTools   []string
+	builtinConfigs map[string]BuiltinToolConfig
 }
 
 func NewGoogleProvider(apiKey string) LLMProvider {
@@ -97,15 +99,29 @@ func (p *GoogleProvider) SupportsNativeTools() bool { return true }
 func (p *GoogleProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
 		{Type: "code_execution", Name: "code_execution"},
+		{Type: "googleSearch", Name: "web_search"},
 	}
 }
 
 func (p *GoogleProvider) SetBuiltinTools(tools []string) {
-	// Google built-in tools handled via API config
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.builtinTools = append([]string(nil), tools...)
 }
 
 func (p *GoogleProvider) WithBuiltins(builtins []string) LLMProvider {
-	return &GoogleProvider{apiKey: p.apiKey, models: p.Models(), activeModel: p.ActiveModel()}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	models := map[ModelTier]string{}
+	for tier, model := range p.models {
+		models[tier] = model
+	}
+	clone := &GoogleProvider{apiKey: p.apiKey, models: models, activeModel: p.activeModel, builtinTools: append([]string(nil), p.builtinTools...), builtinConfigs: cloneBuiltinConfigs(p.builtinConfigs)}
+	if builtins != nil {
+		clone.builtinTools = append([]string(nil), builtins...)
+		clone.builtinConfigs = narrowBuiltinConfigs(clone.builtinConfigs, builtins)
+	}
+	return clone
 }
 
 func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
@@ -148,6 +164,24 @@ type geminiRequest struct {
 
 type geminiToolDecl struct {
 	FunctionDeclarations []geminiFunctionDecl `json:"functionDeclarations,omitempty"`
+	GoogleSearch         map[string]any       `json:"googleSearch,omitempty"`
+	CodeExecution        map[string]any       `json:"codeExecution,omitempty"`
+}
+
+// Empty option objects are meaningful for Gemini builtins; omitempty on a map
+// would otherwise erase the enabled tool from the request.
+func (t geminiToolDecl) MarshalJSON() ([]byte, error) {
+	out := map[string]any{}
+	if len(t.FunctionDeclarations) > 0 {
+		out["functionDeclarations"] = t.FunctionDeclarations
+	}
+	if t.GoogleSearch != nil {
+		out["googleSearch"] = t.GoogleSearch
+	}
+	if t.CodeExecution != nil {
+		out["codeExecution"] = t.CodeExecution
+	}
+	return json.Marshal(out)
 }
 
 type geminiFunctionDecl struct {
@@ -167,6 +201,14 @@ type geminiPart struct {
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
 	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
+	ExecutableCode   *struct {
+		Language string `json:"language"`
+		Code     string `json:"code"`
+	} `json:"executableCode,omitempty"`
+	CodeExecutionResult *struct {
+		Outcome string `json:"outcome"`
+		Output  string `json:"output"`
+	} `json:"codeExecutionResult,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -393,6 +435,7 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		}
 	}
 
+	geminiTools = append(geminiTools, p.configuredGoogleBuiltins()...)
 	reqBody := geminiRequest{
 		Contents:          contents,
 		SystemInstruction: systemContent,
@@ -441,6 +484,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
+	var serverResults []ServerToolResult
 	callPrefix := "gemini_" + newULID()
 	toolCallSeq := 0
 	completedStream := false
@@ -468,6 +512,19 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 				completedStream = true
 			}
 			for _, part := range candidate.Content.Parts {
+				if part.ExecutableCode != nil {
+					serverResults = append(serverResults, ServerToolResult{ToolName: "code_execution", Code: part.ExecutableCode.Code})
+				}
+				if part.CodeExecutionResult != nil {
+					if len(serverResults) == 0 || serverResults[len(serverResults)-1].Output != "" {
+						serverResults = append(serverResults, ServerToolResult{ToolName: "code_execution"})
+					}
+					result := &serverResults[len(serverResults)-1]
+					result.Output = part.CodeExecutionResult.Output
+					if part.CodeExecutionResult.Outcome != "OUTCOME_OK" {
+						result.Error = part.CodeExecutionResult.Outcome
+					}
+				}
 				if part.Text != "" {
 					full.WriteString(part.Text)
 					if onChunk != nil {
@@ -529,7 +586,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 		preview = preview[:200] + "..."
 	}
 	logMsg("GEMINI", fmt.Sprintf("done tokens_in=%d tokens_out=%d len=%d tools=%d response=%q", usage.PromptTokens, usage.CompletionTokens, len(response), len(toolCalls), preview))
-	return validateProviderToolOutput(ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage})
+	return validateProviderToolOutput(ChatResponse{Text: response, ToolCalls: toolCalls, ServerResults: serverResults, Usage: usage})
 }
 
 // audioMimeTypes maps file extensions to MIME types for audio.

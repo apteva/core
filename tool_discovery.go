@@ -238,11 +238,17 @@ func compileDiscoveryIntent(query string, servers []string, access DiscoveryAcce
 	return out
 }
 
-func (t *Thinker) discoveryAuthorizedPredicate() func(string) bool {
+func (t *Thinker) discoveryAuthorizedPredicate() func(IndexEntry) bool {
 	if t == nil || t.toolAllowlist == nil {
 		return nil
 	}
-	return func(name string) bool { return t.toolAuthorized(name) }
+	// Freeze grants for this pass. Search supplies its own consistent catalog
+	// entry, so this callback never re-enters ToolIndex while it is read-locked.
+	grants, scopes := copyBoolMap(t.toolAllowlist), copyBoolMap(t.toolMCPScopes)
+	allowNoSpawn := t.allowNoSpawn
+	return func(entry IndexEntry) bool {
+		return indexedToolAuthorized(entry, grants, scopes, allowNoSpawn)
+	}
 }
 
 func (t *Thinker) discoverTools(request DiscoveryRequest) DiscoveryResult {

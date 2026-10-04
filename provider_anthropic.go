@@ -77,10 +77,11 @@ func sanitizeToolID(id string) string {
 }
 
 type AnthropicProvider struct {
-	apiKey       string
-	url          string
-	models       map[ModelTier]string
-	builtinTools []string // enabled built-in tools: "code_execution", "web_search"
+	apiKey         string
+	url            string
+	models         map[ModelTier]string
+	builtinTools   []string // enabled built-in tools: "code_execution", "web_search"
+	builtinConfigs map[string]BuiltinToolConfig
 }
 
 func NewAnthropicProvider(apiKey string) LLMProvider {
@@ -129,7 +130,8 @@ func (p *AnthropicProvider) WithBuiltins(builtins []string) LLMProvider {
 		return p // nil = inherit all
 	}
 	clone := *p // shallow copy — shares apiKey, models, httpClient
-	clone.builtinTools = builtins
+	clone.builtinTools = append([]string(nil), builtins...)
+	clone.builtinConfigs = narrowBuiltinConfigs(p.builtinConfigs, builtins)
 	return &clone
 }
 
@@ -330,18 +332,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		})
 	}
 
-	// Add enabled built-in tools
-	for _, btName := range p.builtinTools {
-		for _, available := range p.AvailableBuiltinTools() {
-			if available.Name == btName {
-				anthropicTools = append(anthropicTools, map[string]string{
-					"type": available.Type,
-					"name": available.Name,
-				})
-				break
-			}
-		}
-	}
+	anthropicTools = append(anthropicTools, p.configuredAnthropicBuiltins()...)
 
 	// System prompt as cacheable block
 	var systemContent any

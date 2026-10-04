@@ -34,6 +34,8 @@ type OpenAINativeProvider struct {
 	models                 map[ModelTier]string
 	modelCapabilities      map[string]ModelCapabilities
 	builtinTools           []string
+	builtinConfigs         map[string]BuiltinToolConfig
+	imageGeneration        *ImageGenerationConfig
 	reasoning              ReasoningSettings
 	tokenMu                sync.RWMutex
 	refreshMu              sync.Mutex
@@ -93,13 +95,17 @@ func (p *OpenAINativeProvider) CostPer1M() (float64, float64, float64) {
 }
 
 func (p *OpenAINativeProvider) AvailableBuiltinTools() []BuiltinTool {
-	if p.sessionProfile != nil && !p.sessionProfile.advertiseBuiltinTools || p.Name() == "openai-codex" {
-		return nil
+	var imageTools []BuiltinTool
+	if p.imageGenerationEnabled() {
+		imageTools = []BuiltinTool{{Type: "image_generation", Name: "image_generation"}}
 	}
-	return []BuiltinTool{
+	if p.sessionProfile != nil && !p.sessionProfile.advertiseBuiltinTools || p.Name() == "openai-codex" {
+		return imageTools
+	}
+	return append([]BuiltinTool{
 		{Type: "code_interpreter", Name: "code_interpreter"},
 		{Type: "web_search_preview", Name: "web_search"},
-	}
+	}, imageTools...)
 }
 
 func (p *OpenAINativeProvider) SetBuiltinTools(tools []string) {
@@ -110,8 +116,21 @@ func (p *OpenAINativeProvider) SetBuiltinTools(tools []string) {
 }
 
 func (p *OpenAINativeProvider) WithBuiltins(builtins []string) LLMProvider {
+	if builtins == nil {
+		return p
+	}
 	clone := p.clone()
 	clone.SetBuiltinTools(builtins)
+	clone.builtinConfigs = narrowBuiltinConfigs(clone.builtinConfigs, builtins)
+	includeImages := false
+	for _, name := range builtins {
+		if name == "image_generation" {
+			includeImages = true
+		}
+	}
+	if !includeImages && clone.imageGeneration != nil {
+		clone.imageGeneration.Enabled = false
+	}
 	return clone
 }
 
@@ -160,6 +179,8 @@ func (p *OpenAINativeProvider) clone() *OpenAINativeProvider {
 		serviceTierUnsupported: p.serviceTierUnsupported, models: p.models,
 		modelCapabilities: cloneModelCapabilitiesMap(p.modelCapabilities),
 		builtinTools:      append([]string(nil), p.builtinTools...), reasoning: p.reasoning,
+		imageGeneration:  cloneImageGenerationConfig(p.imageGeneration),
+		builtinConfigs:   cloneBuiltinConfigs(p.builtinConfigs),
 		lastTokenRefresh: lastRefresh, cacheState: cacheState,
 	}
 }
@@ -352,10 +373,11 @@ type oaiStreamEvent struct {
 }
 
 type oaiOutputItem struct {
-	Type    string `json:"type"` // "message", "function_call"
-	ID      string `json:"id,omitempty"`
-	Status  string `json:"status,omitempty"`
-	Role    string `json:"role,omitempty"`
+	Type    string   `json:"type"` // "message", "function_call"
+	ID      string   `json:"id,omitempty"`
+	Status  string   `json:"status,omitempty"`
+	FileRef *FileRef `json:"file_ref,omitempty"` // gateway replaces hosted image bytes with this handle
+	Role    string   `json:"role,omitempty"`
 	Content []struct {
 		Type string `json:"type"`
 		Text string `json:"text,omitempty"`
@@ -386,16 +408,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	// Convert tools
 	apiTools := p.buildAPITools(model, tools)
 
-	// Add builtin tools (only those supported by Responses API)
-	supportedBuiltins := map[string]bool{
-		"code_interpreter": true, "web_search_preview": true,
-		"file_search": true, "image_generation": true,
-	}
-	for _, bt := range p.builtinTools {
-		if supportedBuiltins[bt] {
-			apiTools = append(apiTools, map[string]string{"type": bt})
-		}
-	}
+	apiTools = append(apiTools, p.configuredOpenAIBuiltins()...)
 
 	reqBody := oaiResponsesRequest{
 		Model:  model,
@@ -450,12 +463,23 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		if err := observeProviderRequest(ctx, p.Name(), model, payload); err != nil {
 			return nil, err
 		}
-		req, err := http.NewRequestWithContext(ctx, "POST", p.responsesEndpoint(), bytes.NewReader(payload))
+		endpoint, err := p.imageResponsesEndpoint(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.token())
+		if p.imageGenerationEnabled() {
+			req.Header.Set("X-Agent-Secret", imageGatewayAgentSecret())
+			req.Header.Set("X-Apteva-Caller-Agent", os.Getenv("AGENT_ID"))
+			thread, _ := ctx.Value(blobCallerThreadKey{}).(string)
+			req.Header.Set("X-Apteva-File-Thread", thread)
+			req.Header.Set("X-Apteva-Image-Provider", p.Name())
+		}
 		if p.sessionProfile != nil && p.sessionProfile.applyRequestHeaders != nil {
 			p.sessionProfile.applyRequestHeaders(req.Header, p.currentSessionSnapshot(), model)
 		} else if accountID := p.account(); p.Name() == "openai-codex" && accountID != "" {
@@ -695,6 +719,13 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 				for _, raw := range m.ProviderState.Items {
 					items = append(items, oaiInputItem{Raw: append(json.RawMessage(nil), raw...)})
 				}
+				// Hosted images have no byte-bearing replay item. Keep their
+				// shared handles visible even when other provider state exists.
+				for _, part := range m.Parts {
+					if part.Type == "text" && strings.HasPrefix(part.Text, "[FILE HANDLE]") {
+						items = append(items, oaiInputItem{Type: "message", Role: "assistant", Content: part.Text})
+					}
+				}
 				continue
 			}
 		}
@@ -756,6 +787,9 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 		if m.HasParts() {
 			logMsg("OPENAI-NATIVE", fmt.Sprintf("message with %d parts (role=%s)", len(m.Parts), m.Role))
 			var blocks []oaiContentBlock
+			if m.Content != "" {
+				blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: m.Content})
+			}
 			for _, part := range m.Parts {
 				logMsg("OPENAI-NATIVE", fmt.Sprintf("  part type=%s", part.Type))
 				switch part.Type {
@@ -784,6 +818,33 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 	var fullReasoning strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
+	var generatedFiles []FileRef
+	seenImages := map[string]bool{}
+	collectImage := func(item oaiOutputItem) error {
+		if item.Type != "image_generation_call" {
+			return nil
+		}
+		if !p.imageGenerationEnabled() {
+			return fmt.Errorf("unexpected image generation while feature is disabled")
+		}
+		if item.FileRef == nil {
+			return fmt.Errorf("image generation did not return a gateway file handle")
+		}
+		if item.Status != "" && item.Status != "completed" {
+			return fmt.Errorf("image generation ended with status %q", item.Status)
+		}
+		if err := validateFileRef(item.FileRef); err != nil {
+			return err
+		}
+		if !strings.HasPrefix(item.FileRef.MimeType, "image/") {
+			return fmt.Errorf("image generation returned a non-image file")
+		}
+		if !seenImages[item.FileRef.Ref] {
+			generatedFiles = append(generatedFiles, *item.FileRef)
+			seenImages[item.FileRef.Ref] = true
+		}
+		return nil
+	}
 	var providerItems []json.RawMessage
 	completedStream := false
 
@@ -911,7 +972,10 @@ streamLoop:
 		case "response.output_item.done":
 			var item oaiOutputItem
 			json.Unmarshal(event.Item, &item)
-			if len(event.Item) > 0 && json.Valid(event.Item) {
+			if err := collectImage(item); err != nil {
+				return ChatResponse{}, err
+			}
+			if item.Type != "image_generation_call" && len(event.Item) > 0 && json.Valid(event.Item) {
 				providerItems = append(providerItems, append(json.RawMessage(nil), event.Item...))
 			}
 
@@ -996,7 +1060,8 @@ streamLoop:
 
 			var completed struct {
 				Response struct {
-					Usage struct {
+					Output []oaiOutputItem `json:"output"`
+					Usage  struct {
 						InputTokens  int `json:"input_tokens"`
 						OutputTokens int `json:"output_tokens"`
 						InputDetails struct {
@@ -1007,6 +1072,11 @@ streamLoop:
 				} `json:"response"`
 			}
 			json.Unmarshal([]byte(data), &completed)
+			for _, item := range completed.Response.Output {
+				if err := collectImage(item); err != nil {
+					return ChatResponse{}, err
+				}
+			}
 			usage.PromptTokens = completed.Response.Usage.InputTokens
 			usage.CompletionTokens = completed.Response.Usage.OutputTokens
 			usage.CachedTokens = completed.Response.Usage.InputDetails.CachedTokens
@@ -1054,11 +1124,12 @@ streamLoop:
 		}
 	}
 	return validateProviderToolOutput(ChatResponse{
-		Text:          response,
-		ToolCalls:     toolCalls,
-		Reasoning:     fullReasoning.String(),
-		ProviderState: providerState,
-		Usage:         usage,
+		Text:           response,
+		ToolCalls:      toolCalls,
+		GeneratedFiles: generatedFiles,
+		Reasoning:      fullReasoning.String(),
+		ProviderState:  providerState,
+		Usage:          usage,
 	})
 }
 
