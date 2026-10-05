@@ -13,21 +13,22 @@ import (
 // Estimates are deliberately labelled: serialized bytes are exact, tokens are
 // conservative approximations (including opaque state), not tokenizer counts.
 type requestBudget struct {
-	Provider           string `json:"provider"`
-	Model              string `json:"model"`
-	Stage              string `json:"stage"`
-	Fingerprint        string `json:"request_fingerprint"`
-	SerializedBytes    int    `json:"serialized_bytes"`
-	SystemTokens       int    `json:"system_tokens_est"`
-	ConversationTokens int    `json:"conversation_tokens_est"`
-	ToolTokens         int    `json:"tool_tokens_est"`
-	ImageTokens        int    `json:"image_tokens_est"`
-	OpaqueTokens       int    `json:"opaque_tokens_est"`
-	InputTokens        int    `json:"input_tokens_est"`
-	ReservedOutput     int    `json:"reserved_output_tokens"`
-	ContextWindow      int    `json:"context_window"`
-	InputBudget        int    `json:"input_budget"`
-	OverBudget         bool   `json:"over_budget"`
+	Provider            string `json:"provider"`
+	Model               string `json:"model"`
+	Stage               string `json:"stage"`
+	Fingerprint         string `json:"request_fingerprint"`
+	SerializedBytes     int    `json:"serialized_bytes"`
+	SystemTokens        int    `json:"system_tokens_est"`
+	ConversationTokens  int    `json:"conversation_tokens_est"`
+	ToolTokens          int    `json:"tool_tokens_est"`
+	ImageTokens         int    `json:"image_tokens_est"`
+	OpaqueTokens        int    `json:"opaque_tokens_est"`
+	InputTokens         int    `json:"input_tokens_est"`
+	ReservedOutput      int    `json:"reserved_output_tokens"`
+	ContextWindow       int    `json:"context_window"`
+	ContextWindowSource string `json:"context_window_source"`
+	InputBudget         int    `json:"input_budget"`
+	OverBudget          bool   `json:"over_budget"`
 }
 
 type contextBudgetError struct{ Budget requestBudget }
@@ -72,8 +73,13 @@ func providerExecutionFailureReason(err error) string {
 
 func (b *requestBudget) finish(output int) {
 	b.ContextWindow = ModelEffectiveContextWindow(b.Model)
+	b.ContextWindowSource = "model_capabilities"
+	if caps, ok := capabilitiesForModel(b.Model); !ok || caps.ContextWindow <= 0 {
+		b.ContextWindowSource = "static_model_table"
+	}
 	if b.ContextWindow <= 0 {
 		b.ContextWindow = contextPressureCharFallback / 4
+		b.ContextWindowSource = "unknown_model_default"
 	}
 	if output <= 0 {
 		output = 16384
@@ -91,6 +97,15 @@ func requestFingerprint(body []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 func estimatePreparedRequest(provider, model string, messages []Message, tools []NativeTool) requestBudget {
+	if provider == "anthropic" {
+		// Responses state and reasoning replay are not part of Anthropic's
+		// wire representation. Do not reject fallback for bytes it never sends.
+		messages = cloneMessages(messages)
+		for i := range messages {
+			messages[i].ProviderState = nil
+			messages[i].Reasoning = ""
+		}
+	}
 	b := requestBudget{Provider: provider, Model: model, Stage: "prepared"}
 	for _, msg := range messages {
 		n := estimatedContextTokens([]Message{msg}) + 8
@@ -110,7 +125,7 @@ func estimatePreparedRequest(provider, model string, messages []Message, tools [
 	b.Fingerprint = requestFingerprint(raw)
 	reserve := 16384
 	if provider == "anthropic" {
-		reserve = anthropicMaxTokens(model)
+		reserve = (&AnthropicProvider{}).outputTokenLimit(model)
 	}
 	b.finish(reserve)
 	return b

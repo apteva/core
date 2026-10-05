@@ -694,15 +694,23 @@ func (pp *ProviderPool) ProviderSummary(name string) string {
 // buildProviderPool creates a ProviderPool from config + env vars.
 // Priority: CORE_PROVIDER env → config.json providers → auto-detect from API keys.
 func buildProviderPool(cfg *Config) (*ProviderPool, error) {
+	return buildProviderPoolWithCapabilities(cfg, true)
+}
+
+// Configuration validation must not replace the live capability table.
+func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPool, error) {
 	pool := &ProviderPool{
 		providers:         map[string]LLMProvider{},
 		realtimeProviders: map[string]RealtimeProvider{},
 	}
-	resetRuntimeModelCapabilities()
+	capabilities := map[string]ModelCapabilities{}
 
 	// 1. Config providers array
 	configs := cfg.GetProviders()
 	for _, pc := range configs {
+		if pc.MaxOutputTokens < 0 || pc.MaxOutputTokens > 64000 || (pc.MaxOutputTokens > 0 && pc.Name != "anthropic") {
+			return nil, fmt.Errorf("max_output_tokens is supported for anthropic only and must be between 0 and 64000")
+		}
 		// Route realtime providers to their own map. Gated on
 		// Config.RealtimeEnabled: when off, realtime entries are
 		// silently skipped so HasRealtimeProvider() returns false and
@@ -744,7 +752,12 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 			p = native.WithServiceTier(tier)
 		}
 		applyModelOverrides(p, pc.Models)
-		registerModelCapabilities(pc.ModelCapabilities)
+		for id, caps := range pc.ModelCapabilities {
+			capabilities[id] = caps
+		}
+		if anthropic, ok := p.(*AnthropicProvider); ok {
+			anthropic.maxOutputTokens = pc.MaxOutputTokens
+		}
 		if native, ok := p.(*OpenAINativeProvider); ok {
 			native.modelCapabilities = cloneModelCapabilitiesMap(pc.ModelCapabilities)
 		}
@@ -815,6 +828,10 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		}
 	}
 
+	if activate {
+		resetRuntimeModelCapabilities()
+		registerModelCapabilities(capabilities)
+	}
 	return pool, nil
 }
 

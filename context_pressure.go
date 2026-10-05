@@ -171,6 +171,21 @@ func isComputerToolName(name string) bool {
 	return strings.HasPrefix(name, "computer_")
 }
 
+// The current frame and its navigation metadata remain current evidence even
+// after several model calls. Historical-result aging must not remove them.
+func latestComputerScreenshotCallID(messages []Message) string {
+	names := toolNamesByCallID(messages)
+	for i := len(messages) - 1; i >= 0; i-- {
+		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
+			result := messages[i].ToolResults[j]
+			if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
+				return result.CallID
+			}
+		}
+	}
+	return ""
+}
+
 // evictStaleComputerScreenshots keeps only the newest computer frame. Unlike
 // generated/user images, browser screenshots are transient observations: once
 // a subsequent action returns a newer frame, replaying older frames adds cost

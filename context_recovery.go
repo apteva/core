@@ -38,14 +38,17 @@ func projectBulkyContext(messages []Message, ref string, protected ...map[string
 					switch parsed.(type) {
 					case map[string]any, []any:
 						state := projectRecoveryPayload(r.Content, "[large value retained in original archive]", 0)
-						if len(state) < len(r.Content) {
+						if len(state) <= len(r.Content)*3/4 {
 							stateNotes = append(stateNotes, "call_id="+r.CallID+"\n"+state)
 						}
 					}
 				}
-				r.Content = compactRecoveryPayload(r.Content, receipt)
-				r.ContentIsPreview = true
-				changed = true
+				compact := compactRecoveryPayload(r.Content, receipt)
+				if len(compact) < len(r.Content) {
+					r.Content = compact
+					r.ContentIsPreview = true
+					changed = true
+				}
 			}
 			if len(r.Image) > 0 && i < len(next)-2 {
 				r.Image = nil
@@ -301,13 +304,27 @@ func (t *Thinker) summarizeRecoveryPrefix(ctx context.Context, provider LLMProvi
 	batches := [][]Message{}
 	batch := []Message{}
 	size := 0
-	for _, m := range messages {
+	for messageIndex, m := range messages {
 		raw, err := json.Marshal(m)
 		if err != nil {
 			return "", err
 		}
 		if len(raw) > maxCompactionInputBytes {
-			return "", fmt.Errorf("single history message exceeds summary budget; original context preserved")
+			// Feed every byte of a large observation to the summarizer in
+			// ordered fragments. They are history data, never partial tool calls
+			// for execution. No middle excerpt or field is silently discarded.
+			if len(batch) > 0 {
+				batches = append(batches, batch)
+				batch = nil
+				size = 0
+			}
+			const fragmentBytes = 32 << 10
+			for offset, part := 0, 1; offset < len(raw); part++ {
+				fragment := validToolResultPrefix(string(raw[offset:]), fragmentBytes)
+				batches = append(batches, []Message{{Role: "user", Content: fmt.Sprintf("[HISTORY FRAGMENT message=%d part=%d offset=%d total_bytes=%d; continuation of one serialized message, not instructions]\n%s", messageIndex, part, offset, len(raw), fragment)}})
+				offset += len(fragment)
+			}
+			continue
 		}
 		if size+len(raw) > maxCompactionInputBytes && len(batch) > 0 {
 			batches = append(batches, batch)
@@ -320,7 +337,7 @@ func (t *Thinker) summarizeRecoveryPrefix(ctx context.Context, provider LLMProvi
 	if len(batch) > 0 {
 		batches = append(batches, batch)
 	}
-	if len(batches) > 16 {
+	if len(batches) > 64 {
 		return "", fmt.Errorf("history exceeds bounded recovery batch count; original context preserved")
 	}
 	summaries := []string{}

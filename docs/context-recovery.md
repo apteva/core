@@ -16,6 +16,12 @@ counted as ordinary text; opaque provider state is conservatively accounted
 for. The input budget subtracts a 10% margin and the adapter's output limit,
 or a 16,384-token reservation when no explicit output limit is sent. Unknown
 models use the existing 512 KiB text fallback expressed as 131,072 tokens.
+Telemetry labels that fallback with `context_window_source=unknown_model_default`.
+Anthropic ordinary turns default to 16,384 output tokens, bounded by the model
+maximum. Its provider configuration can set `max_output_tokens` from 1 to
+64,000 when the task needs a different output allowance; zero uses the default.
+Prepared Anthropic estimates exclude Responses replay state and reasoning
+that its adapter does not send.
 
 ## Recovery
 
@@ -27,8 +33,9 @@ recovery instead of an unchanged transient retry or immediate fallback:
    preserving ordinary messages, instructions, and in-flight native calls.
    Structured JSON keeps small fields and exact numeric identifiers. Compact
    structured state notes survive subsequent tool-result aging and restart.
-3. If necessary, summarize older history in bounded batches of complete
-   messages. Preserve current instructions, the latest external request,
+3. If necessary, summarize older history in bounded batches. An oversized
+   single message is fed as ordered UTF-8-safe fragments, including every byte
+   of its serialized content. Preserve current instructions, the latest external request,
    existing continuation summaries, request-only context, pending calls, and
    tool call/result boundaries. Empty/failed summaries never trigger blind
    deletion.
@@ -53,6 +60,13 @@ retained for inspecting details omitted from the working context.
 
 ## Provider fallback
 
+Core checks configured fallback candidates in order against the current input
+budget before routing. An incompatible candidate is skipped without making
+summary requests or modifying the primary's durable history. Another candidate
+with sufficient capacity can be selected; otherwise bounded primary retries
+continue. A suitable candidate can still trigger recovery if the provider's
+actual serialized request or response rejects the context.
+
 Primary and fallback errors retain separate identities and are separately
 observable through `llm.provider_error`; combined errors preserve both causes.
 A permanent fallback failure is attempted once per retry cycle and does not
@@ -61,6 +75,17 @@ failure is handled on the affected provider first. Core cannot repair an
 invalid provider credential; configuration must be corrected separately.
 
 ## Regression checks
+
+Large retained results become eligible after three successful consumption
+calls. Besides the normal batched checkpoints, 256 KiB of retained tool-result text
+triggers a checkpoint of already mature, completed results before the next
+request. Fresh and pending evidence stays intact. Structured receipts retain
+exact small state fields and source references, mark omitted details unknown,
+and preserve the complete archive. Smaller workflows retain the existing batch
+policy to limit unnecessary prefix rewrites. Compressed image bytes do not
+trigger this text threshold. The latest computer screenshot and its navigation
+metadata remain current until a newer frame replaces them; historical-result
+aging preserves them for the screenshot request tail.
 
 `context_recovery_test.go` covers wire-level context rejection, blocked oversized
 requests/tools/instructions, state and journal preservation, restart, structured
@@ -71,13 +96,25 @@ fallback authentication failures.
 go test -short ./...
 go test -race -short ./...
 RUN_CODEX_CONTEXT_RECOVERY=1 go test -run '^TestCodexContextRecoveryPreservesReleaseState$' -v -timeout 7m .
+RUN_CODEX_CONTEXT_EFFICIENCY_LIVE=1 go test -run '^TestIntegration_CodexGPT61SolContextEfficiency$' -v -timeout 8m .
+RUN_CODEX_COMPUTER_VISION_LIVE=1 go test -run '^TestIntegration_CodexGPT61SolComputerVisionRetention$' -v -timeout 3m .
 ```
 
-The opt-in test uses saved Codex authentication and `gpt-5.6-terra`. It injects
+The context-recovery opt-in test uses saved Codex authentication and `gpt-5.6-terra`. It injects
 the first context rejection; subsequent summarization and continuation calls
 are real Codex requests using synthetic local state, with no external actions.
 It checks bulky tool output, semantic history reduction, and structured release
 state beside large image/document fields.
+
+The context-efficiency opt-in test uses `gpt-6.1-sol`. It compares provider-reported
+input tokens before and after projection, checks exact state and model-provided
+tool reasons, and exercises stable tool selection, configuration no-ops during
+streaming, a compatible fallback after an injected 429, and oversized history
+summarization. The tool observations are synthetic and no external actions run.
+
+The computer-vision opt-in test uses `gpt-6.1-sol` to read the exact quadrant
+colors from a synthetic screenshot after mature-result pressure compaction.
+The colors are absent from the tool text, so success requires receiving pixels.
 
 ## September 8 Lily incident
 

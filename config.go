@@ -86,6 +86,7 @@ type ProviderConfig struct {
 	Builtins          map[string]BuiltinToolConfig `json:"builtins,omitempty"`           // provider-hosted capability flags and options
 	ImageGeneration   *ImageGenerationConfig       `json:"image_generation,omitempty"`   // experimental hosted image generation; disabled by default
 	ServiceTier       string                       `json:"service_tier,omitempty"`       // provider request tier, e.g. "priority"
+	MaxOutputTokens   int                          `json:"max_output_tokens,omitempty"`  // Anthropic turn output limit; 0 uses 16K, bounded by model maximum
 	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "marin")
 }
 

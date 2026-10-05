@@ -2869,9 +2869,7 @@ func (t *Thinker) Run() {
 		if !t.executionGate(ExecutionPhaseLLMStart, ExecutionGate{Summary: fmt.Sprintf("Calling %s", t.modelID())}) {
 			return
 		}
-		requestCtx, finishRequest := t.runtimeRequest(runCtx)
-		chatResp, err := t.callLLMWithRetryMessages(requestCtx, requestMessages)
-		finishRequest()
+		chatResp, err := t.callLLMWithRuntimeMutations(runCtx, requestMessages)
 		if t.applyRuntimeMutations() && runCtx.Err() == nil {
 			continue
 		}
@@ -3448,6 +3446,9 @@ func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider 
 	modelID := modelIDForProvider(provider, tier)
 	messages = fileRefMessagesForModel(messages)
 	budget := estimatePreparedRequest(provider.Name(), modelID, messages, nativeTools)
+	if p, ok := provider.(*AnthropicProvider); ok {
+		budget.finish(p.outputTokenLimit(modelID))
+	}
 	t.emitRequestBudget(budget)
 	if budget.OverBudget {
 		return ChatResponse{Provider: provider.Name(), Model: modelID}, &contextBudgetError{Budget: budget}
@@ -3615,7 +3616,7 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 			continue
 		}
 		if err != nil && !isContextLengthError(err) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
-			if fallback := t.pool.Fallback(primary.Name()); fallback != nil {
+			if fallback := t.compatibleFallback(primary.Name(), messages); fallback != nil {
 				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), err, fallback.Name()))
 				fallbackErr := permanentFallbacks[fallback.Name()]
 				var fallbackResp ChatResponse
@@ -3644,7 +3645,6 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 					return fallbackResp, nil
 				}
 				err = &providerChainError{PrimaryName: primary.Name(), FallbackName: fallback.Name(), Primary: primaryErr, Fallback: fallbackErr}
-
 			}
 		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {

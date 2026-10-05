@@ -11,6 +11,9 @@ const (
 	toolResultProjectionBatchSize  = 12
 	toolResultProjectionBatchChars = 512 << 10
 	toolResultProjectionMaxAge     = 16
+	// Do not wait for twelve results when a few procedure snapshots already
+	// occupy most of an ordinary tool workflow's input.
+	toolResultProjectionPressureBytes = 256 << 10
 )
 
 func toolResultKey(result ToolResult) string {
@@ -142,12 +145,13 @@ type toolResultProjectionStats struct {
 func (t *Thinker) matureToolResultStats(messages []Message) toolResultProjectionStats {
 	var stats toolResultProjectionStats
 	seen := make(map[string]bool)
+	currentScreen := latestComputerScreenshotCallID(messages)
 	t.toolResultMu.Lock()
 	defer t.toolResultMu.Unlock()
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
 			key := toolResultKey(result)
-			if key == "" || seen[key] || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
+			if key == "" || seen[key] || (currentScreen != "" && result.CallID == currentScreen) || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
 				continue
 			}
 			seen[key] = true
@@ -175,6 +179,10 @@ func toolResultProjectionBatchReady(stats toolResultProjectionStats) bool {
 // provider-only bounded projection in one operation. The durable archive and
 // in-memory full payload remain untouched.
 func (t *Thinker) commitMatureToolResults(messages []Message) int {
+	protected := t.toolCallIDsProtectedFromSanitization(nil)
+	if currentScreen := latestComputerScreenshotCallID(messages); currentScreen != "" {
+		protected[currentScreen] = true
+	}
 	committed := 0
 	seen := make(map[string]bool)
 	t.toolResultMu.Lock()
@@ -185,7 +193,7 @@ func (t *Thinker) commitMatureToolResults(messages []Message) int {
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
 			key := toolResultKey(result)
-			if key == "" || seen[key] || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
+			if key == "" || seen[key] || protected[result.CallID] || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
 				continue
 			}
 			seen[key] = true
@@ -203,10 +211,14 @@ func (t *Thinker) commitMatureToolResults(messages []Message) int {
 // Once old, large results become deterministic bounded previews; aged small
 // results remain full until the aggregate historical budget would be exceeded.
 func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
+	currentScreen := latestComputerScreenshotCallID(messages)
+	protectCurrentScreen := func(result ToolResult) bool {
+		return currentScreen != "" && result.CallID == currentScreen
+	}
 	historicalCount := 0
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
-			if t.toolResultIsHistorical(result) {
+			if !protectCurrentScreen(result) && t.toolResultIsHistorical(result) {
 				historicalCount++
 			}
 		}
@@ -218,7 +230,7 @@ func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
 		message := messages[messageIndex]
 		for resultIndex := len(message.ToolResults) - 1; resultIndex >= 0; resultIndex-- {
 			result := message.ToolResults[resultIndex]
-			if !t.toolResultIsHistorical(result) {
+			if protectCurrentScreen(result) || !t.toolResultIsHistorical(result) {
 				continue
 			}
 			maxForResult := remaining
@@ -257,5 +269,40 @@ func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
 }
 
 func (t *Thinker) prepareToolResultRequest(messages []Message) []Message {
-	return prepareComputerScreenshotTail(t.prepareHistoricalToolResults(messages))
+	retainedBytes := 0
+	for _, message := range messages {
+		for _, result := range message.ToolResults {
+			if !t.toolResultIsHistorical(result) {
+				// Compressed pixels are budgeted as images, not text tokens.
+				// The current computer frame is already handled by its tail.
+				retainedBytes += len(result.Content)
+			}
+		}
+	}
+	if retainedBytes >= toolResultProjectionPressureBytes {
+		if projected := t.commitMatureToolResults(messages); projected > 0 {
+			t.advancePromptCacheEpoch("tool_result_context_pressure", false, map[string]any{
+				"results_projected": projected, "retained_bytes_before": retainedBytes,
+			})
+		}
+	}
+	projected := prepareComputerScreenshotTail(t.prepareHistoricalToolResults(messages))
+	if t.telemetry != nil {
+		original, sent, shortened := 0, 0, 0
+		for i, message := range messages {
+			for j, result := range message.ToolResults {
+				original += len(result.Content) + len(result.Image)
+				next := projected[i].ToolResults[j]
+				sent += len(next.Content) + len(next.Image)
+				if next.Content != result.Content || len(next.Image) != len(result.Image) {
+					shortened++
+				}
+			}
+		}
+		t.telemetry.Emit("tool.result.context", t.threadID, map[string]any{
+			"iteration": t.iteration, "original_bytes": original,
+			"projected_bytes": sent, "results_shortened": shortened,
+		})
+	}
+	return projected
 }

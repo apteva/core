@@ -1,5 +1,12 @@
 # Automatic tool loading
 
+Automatic selections remain stable within a phase defined by the full current
+instruction, standing directive, active execution IDs and loading policy.
+Memory refreshes and required-action bookkeeping do not reselect the schemas
+on ordinary tool continuations. Each request still checks the live catalog,
+authorization and schema budget; revocations take effect immediately and
+explicit discovery can add a newly required tool. Tool ordering is sorted.
+
 Automatic tool loading is **enabled by default**, with `search_tools` retained
 as a backup. When `automatic_tool_loading` is absent, the defaults are eight
 automatically selected tools, approximately 2,000 schema tokens, and relevance

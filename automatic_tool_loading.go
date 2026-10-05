@@ -180,7 +180,21 @@ func (t *Thinker) prepareAutomaticTools(c AutomaticToolLoadingConfig) map[string
 	}
 	queries := t.automaticToolQueries(c)
 	rawPolicy, _ := json.Marshal(c)
-	rawContext, _ := json.Marshal(queries)
+	// Retrieval and required-action bookkeeping can change on every tool
+	// continuation. They are selection inputs, not phase boundaries.
+	// Hash the full instruction, even though search uses a bounded excerpt.
+	// Different long tasks with the same opening are different phases.
+	instruction, _ := recallQueryForTurn(nil, t.messages, "")
+	if instruction == "" {
+		instruction = t.lastInboundForPreload
+	}
+	phaseQueries := []automaticToolQuery{{Source: "instruction", Text: instruction}, {Source: "directive", Text: t.directive}}
+	executions := append([]string(nil), t.currentEventExecutions()...)
+	sort.Strings(executions)
+	rawContext, _ := json.Marshal(struct {
+		Queries    []automaticToolQuery
+		Executions []string
+	}{phaseQueries, executions})
 	policy, contextKey := string(rawPolicy), promptCacheShortHash(rawContext)
 	previous := t.automaticTools
 	if previous.policy != policy {
@@ -196,21 +210,19 @@ func (t *Thinker) prepareAutomaticTools(c AutomaticToolLoadingConfig) map[string
 		}
 		intents = append(intents, compileDiscoveryIntent(name, nil, DiscoveryAccessAny, 1, "workflow", 100, available)...)
 	}
-	for _, q := range queries {
-		priority := 70
-		if q.Source == "memory" {
-			priority = 20
-		}
-		intents = append(intents, compileDiscoveryIntent(normalize(q.Text), nil, DiscoveryAccessPreferRead, c.MaxTools, q.Source, priority, available)...)
-	}
-	if previous.context == contextKey {
+	// Revalidate frozen names against the live catalog, grants and schema
+	// budget each time. Explicit search can still introduce newly needed tools.
+	if previous.context == contextKey && len(previous.names) > 0 {
 		for _, name := range previous.names {
-			reason := previous.reasons[name]
-			priority := 60
-			if reason == "workflow" {
-				priority = 100
+			intents = append(intents, compileDiscoveryIntent(name, nil, DiscoveryAccessAny, 1, previous.reasons[name], 90, available)...)
+		}
+	} else {
+		for _, q := range queries {
+			priority := 70
+			if q.Source == "memory" {
+				priority = 20
 			}
-			intents = append(intents, compileDiscoveryIntent(name, nil, DiscoveryAccessAny, 1, reason, priority, available)...)
+			intents = append(intents, compileDiscoveryIntent(normalize(q.Text), nil, DiscoveryAccessPreferRead, c.MaxTools, q.Source, priority, available)...)
 		}
 	}
 	memoryMax := c.MaxTools / 4

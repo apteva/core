@@ -77,11 +77,12 @@ func sanitizeToolID(id string) string {
 }
 
 type AnthropicProvider struct {
-	apiKey         string
-	url            string
-	models         map[ModelTier]string
-	builtinTools   []string // enabled built-in tools: "code_execution", "web_search"
-	builtinConfigs map[string]BuiltinToolConfig
+	apiKey          string
+	url             string
+	models          map[ModelTier]string
+	builtinTools    []string // enabled built-in tools: "code_execution", "web_search"
+	builtinConfigs  map[string]BuiltinToolConfig
+	maxOutputTokens int
 }
 
 func NewAnthropicProvider(apiKey string) LLMProvider {
@@ -112,6 +113,14 @@ func anthropicMaxTokens(model string) int {
 		}
 	}
 	return 4096
+}
+
+func (p *AnthropicProvider) outputTokenLimit(model string) int {
+	limit := p.maxOutputTokens
+	if limit == 0 {
+		limit = 16384
+	}
+	return min(limit, anthropicMaxTokens(model))
 }
 
 func (p *AnthropicProvider) AvailableBuiltinTools() []BuiltinTool {
@@ -371,7 +380,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 
 	reqBody := anthropicRequest{
 		Model:     model,
-		MaxTokens: anthropicMaxTokens(model),
+		MaxTokens: p.outputTokenLimit(model),
 		Stream:    true,
 		System:    systemContent,
 		Messages:  anthropicMsgs,

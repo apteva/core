@@ -32,6 +32,13 @@ a fabricated workflow execution ID.
 
 ## Events and timing
 
+Creating a child through `POST /threads/{id}` or lazy `POST /event` delivery
+does not cancel main's inference or discard its response. Construction is
+serialized by the owning loop while inference runs; the existing parent inbox
+notification is consumed on the next turn. Concurrent duplicate creation
+remains idempotent. Edits to the active thread's configuration, permissions,
+or history still invalidate its request before the changed state is applied.
+
 | Event | Meaning |
 | --- | --- |
 | `llm.request.queued` | Provider attempt entered preparation. |
@@ -89,6 +96,19 @@ fallback labels are never injected into replay arguments. Use that event to
 distinguish a model omission from an argument-conversion or telemetry bug.
 
 ## Compatibility and aggregation
+
+Tool result preview truncation and model-context projection are separate.
+`tool.result.result_preview_truncated` is the explicit preview flag;
+`result_truncated` remains its compatibility alias. Neither means the model
+received a shortened result. `tool.result.context` reports original and
+projected tool-result bytes and `results_shortened` for the prepared request.
+Provider request budgets still report the final serialized request estimate.
+
+`llm.fallback.skipped` identifies candidates whose input cannot fit, including
+the candidate's complete budget. `context_window_source` distinguishes live
+model capabilities, the static table, and `unknown_model_default`; an unknown
+default is not an advertised provider limit. Input-size rejection does not
+trigger fallback compaction or rewrite the primary's durable history.
 
 Continue calculating existing usage/cost/call totals from `llm.done` and
 existing realtime usage events. Do not count detailed request or HTTP records

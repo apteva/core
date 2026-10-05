@@ -814,17 +814,18 @@ func topLevelArgumentTypes(value any) map[string]string {
 }
 
 type ToolResultData struct {
-	ID                  string   `json:"id,omitempty"`
-	Name                string   `json:"name"`
-	DurationMs          int64    `json:"duration_ms"`
-	Success             bool     `json:"success"`
-	Result              string   `json:"result,omitempty"`
-	ResultOriginalBytes int      `json:"result_original_bytes"`
-	ResultContextBytes  int      `json:"result_context_bytes"`
-	ResultPreviewBytes  int      `json:"result_preview_bytes"`
-	ResultImageBytes    int      `json:"result_image_bytes,omitempty"`
-	ResultTruncated     bool     `json:"result_truncated"`
-	ExecutionIDs        []string `json:"execution_ids,omitempty"`
+	ID                     string   `json:"id,omitempty"`
+	Name                   string   `json:"name"`
+	DurationMs             int64    `json:"duration_ms"`
+	Success                bool     `json:"success"`
+	Result                 string   `json:"result,omitempty"`
+	ResultOriginalBytes    int      `json:"result_original_bytes"`
+	ResultContextBytes     int      `json:"result_context_bytes"`
+	ResultPreviewBytes     int      `json:"result_preview_bytes"`
+	ResultImageBytes       int      `json:"result_image_bytes,omitempty"`
+	ResultTruncated        bool     `json:"result_truncated"`
+	ResultPreviewTruncated bool     `json:"result_preview_truncated"`
+	ExecutionIDs           []string `json:"execution_ids,omitempty"`
 }
 
 const toolResultTelemetryPreviewBytes = 1000
@@ -844,16 +845,17 @@ func newToolResultData(id, name string, durationMs int64, success bool, original
 		preview = preview[:end] + "..."
 	}
 	return ToolResultData{
-		ID:                  id,
-		Name:                name,
-		DurationMs:          durationMs,
-		Success:             success,
-		Result:              preview,
-		ResultOriginalBytes: len(originalText) + imageBytes,
-		ResultContextBytes:  len(contextText) + imageBytes,
-		ResultPreviewBytes:  len(preview),
-		ResultImageBytes:    imageBytes,
-		ResultTruncated:     truncated,
+		ID:                     id,
+		Name:                   name,
+		DurationMs:             durationMs,
+		Success:                success,
+		Result:                 preview,
+		ResultOriginalBytes:    len(originalText) + imageBytes,
+		ResultContextBytes:     len(contextText) + imageBytes,
+		ResultPreviewBytes:     len(preview),
+		ResultImageBytes:       imageBytes,
+		ResultTruncated:        truncated,
+		ResultPreviewTruncated: truncated,
 	}
 }
 

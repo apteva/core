@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -869,7 +870,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		opts.AudioControl = audioControl
 	}
 
-	if err := a.thinker.mutateRuntime(func() error { return a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts) }); err != nil {
+	if err := a.thinker.createRuntimeChild(func() error { return a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts) }); err != nil {
 		// Race: another caller spawned the same id between our
 		// findThinkerByID check and the lock inside Spawn. Treat as
 		// success — the caller's intent (a live thread by this name)
@@ -1125,7 +1126,7 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	if threadID != "main" && findThinkerByID(a.thinker, threadID) == nil && !a.thinker.bus.HasSubscriber(threadID) {
 		directive := a.thinker.config.GetDirective()
 		created := false
-		if err := a.thinker.mutateRuntime(func() error { return a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}) }); err != nil {
+		if err := a.thinker.createRuntimeChild(func() error { return a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}) }); err != nil {
 			if !strings.Contains(err.Error(), "already exists") {
 				logMsg("API", fmt.Sprintf("lazy spawn %q failed: %v", threadID, err))
 				http.Error(w, "failed to spawn thread: "+err.Error(), http.StatusInternalServerError)
@@ -1206,6 +1207,15 @@ func (a *APIServer) eventLifecycle(w http.ResponseWriter, r *http.Request) {
 
 func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPut {
+		body, valid := a.decodeConfigUpdate(w, r)
+		if !valid {
+			return
+		}
+		if !configUpdateChanges(a.thinker.config, body) {
+			writeJSON(w, map[string]any{"status": "updated"})
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), configUpdateKey{}, body))
 		if err := a.thinker.mutateRuntime(func() error { a.configNow(w, r); return nil }); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 		}
@@ -1276,67 +1286,11 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			"realtime_voice_mcp":     a.thinker.config.GetRealtimeVoiceMCP(),
 		})
 	case http.MethodPut:
-		var body struct {
-			AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
-			MemoryPolicy         *MemoryPolicy               `json:"memory_policy,omitempty"`
-			Directive            string                      `json:"directive,omitempty"`
-			Provider             *ProviderConfig             `json:"provider,omitempty"`
-			Providers            []ProviderConfig            `json:"providers,omitempty"`
-			Computer             json.RawMessage             `json:"computer,omitempty"`
-			MCPServers           []MCPServerConfig           `json:"mcp_servers,omitempty"`
-			Execution            *ExecutionControlConfig     `json:"execution_control,omitempty"`
-			RealtimeEnabled      *bool                       `json:"realtime_enabled,omitempty"`
-			RealtimeVoice        *string                     `json:"realtime_voice,omitempty"`
-			RealtimeVoiceMCP     *[]string                   `json:"realtime_voice_mcp,omitempty"`
-			Reset                *struct {
-				History bool `json:"history,omitempty"`
-				Memory  bool `json:"memory,omitempty"`
-				Threads bool `json:"threads,omitempty"`
-			} `json:"reset,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := validateAutomaticToolLoading(body.AutomaticToolLoading); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := validateMemoryPolicy(body.MemoryPolicy); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if len(body.Computer) > 0 {
-			http.Error(w, "core computer config has been removed; use the Computer app MCP tools instead", http.StatusGone)
-			return
-		}
-		for _, server := range body.MCPServers {
-			if err := validateMCPToolLoading(server); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if body.RealtimeVoice != nil {
-			candidate := &Config{}
-			if err := candidate.SetRealtimeVoice(*body.RealtimeVoice); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil {
-			providers := a.thinker.config.GetProviders()
-			if len(body.Providers) > 0 {
-				providers = cloneProviderConfigs(body.Providers)
-			}
-			if body.Provider != nil {
-				providers = mergeProviderConfig(providers, *body.Provider)
-			}
-			enabled := a.thinker.config.RealtimeEnabledFlag()
-			if body.RealtimeEnabled != nil {
-				enabled = *body.RealtimeEnabled
-			}
-			if _, err := buildProviderPool(&Config{Providers: providers, RealtimeEnabled: enabled}); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+		body, prevalidated := r.Context().Value(configUpdateKey{}).(configUpdate)
+		if !prevalidated {
+			var valid bool
+			body, valid = a.decodeConfigUpdate(w, r)
+			if !valid {
 				return
 			}
 		}

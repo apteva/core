@@ -393,6 +393,7 @@ func projectArchivedToolResult(result ToolResult, maxChars int) ToolResult {
 		"call_id=" + result.CallID,
 		"original_chars=" + strconv.Itoa(result.OriginalChars),
 		"original_bytes=" + strconv.Itoa(result.OriginalBytes),
+		"Omitted fields are unknown; re-read the source before relying on them.",
 		"preview:",
 	}, "\n")
 	if len(header) >= maxChars {
@@ -400,7 +401,11 @@ func projectArchivedToolResult(result ToolResult, maxChars int) ToolResult {
 		return projected
 	}
 	bodyBudget := maxChars - len(header) - 1
-	projected.Content = header + "\n" + deterministicToolResultExcerpt(result.Content, bodyBudget)
+	body := toolResultStateReceipt(result.Content, bodyBudget)
+	if body == "" {
+		body = deterministicToolResultExcerpt(result.Content, bodyBudget)
+	}
+	projected.Content = header + "\n" + body
 	return projected
 }
 

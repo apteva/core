@@ -164,6 +164,7 @@ func TestAPICreatedThreadPersistsEffectiveStateAndRestores(t *testing.T) {
 	}
 }
 
+
 func TestAPIRealtimeTurnDetectionPersistsAndRestoresIntoSession(t *testing.T) {
 	api, thinker, textProvider := newPersistentThreadTestAPI(t)
 	realtimeProvider := &fakeRealtimeProvider{}
