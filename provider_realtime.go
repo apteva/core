@@ -239,6 +239,8 @@ type RealtimeSessionOpts struct {
 	TranscribeInput    bool
 	TranscriptionModel string // empty = provider default
 	TurnDetection      RealtimeTurnDetectionConfig
+	OutputConfig       RealtimeOutputConfig
+	timing             *realtimeTiming // internal, session-scoped observer
 	// RestoreHistory asks immutable providers to accept an initial history seed.
 	// Fresh sessions must not synthesize an empty completed conversation turn.
 	RestoreHistory bool
@@ -291,6 +293,7 @@ type RealtimeAudioFrame struct {
 	ResponseID string
 	ItemID     string
 	AudioEndMS int
+	timing     *realtimeTiming
 }
 
 // RealtimeSession is the live, bidirectional handle to a single
@@ -396,26 +399,36 @@ var ErrRealtimeResumeUnavailable = errors.New("realtime resumption unavailable")
 // emit. Receivers should switch on Type before reading fields.
 type RealtimeEventType string
 
+// A provider may cancel a call before Core consumes its cancellation event.
+// Adapters return this sentinel instead of treating the late result as a broken
+// connection. Core normalizes the race through the same cancellation lifecycle.
+var ErrRealtimeToolCallCancelled = errors.New("realtime tool call was cancelled")
+
 const (
-	RealtimeEventAudioOut         RealtimeEventType = "audio_out"         // PCM chunk
-	RealtimeEventTranscriptInput  RealtimeEventType = "transcript_input"  // user said
-	RealtimeEventTranscriptOutput RealtimeEventType = "transcript_output" // model said
-	RealtimeEventToolCall         RealtimeEventType = "tool_call"
-	RealtimeEventResponseStarted  RealtimeEventType = "response_started"
-	RealtimeEventResponseDone     RealtimeEventType = "response_done"
-	RealtimeEventUtteranceDone    RealtimeEventType = "utterance_done" // speech finished, interaction still active
-	RealtimeEventSpeechStarted    RealtimeEventType = "speech_started"
-	RealtimeEventRateLimits       RealtimeEventType = "rate_limits"
-	RealtimeEventSessionEnded     RealtimeEventType = "session_ended"
-	RealtimeEventOutputBlocked    RealtimeEventType = "output_blocked"
-	RealtimeEventError            RealtimeEventType = "error"
-	RealtimeEventSessionExpiring  RealtimeEventType = "session_expiring"
+	RealtimeEventAudioOut          RealtimeEventType = "audio_out"         // PCM chunk
+	RealtimeEventTranscriptInput   RealtimeEventType = "transcript_input"  // user said
+	RealtimeEventTranscriptOutput  RealtimeEventType = "transcript_output" // model said
+	RealtimeEventToolCall          RealtimeEventType = "tool_call"
+	RealtimeEventToolCallCancelled RealtimeEventType = "tool_call_cancelled"
+	RealtimeEventResponseStarted   RealtimeEventType = "response_started"
+	RealtimeEventResponseDone      RealtimeEventType = "response_done"
+	RealtimeEventUtteranceDone     RealtimeEventType = "utterance_done" // speech finished, interaction still active
+	RealtimeEventSpeechStarted     RealtimeEventType = "speech_started"
+	RealtimeEventSessionReady      RealtimeEventType = "session_ready"
+	RealtimeEventSpeechStopped     RealtimeEventType = "speech_stopped"
+	RealtimeEventRateLimits        RealtimeEventType = "rate_limits"
+	RealtimeEventSessionEnded      RealtimeEventType = "session_ended"
+	RealtimeEventOutputBlocked     RealtimeEventType = "output_blocked"
+	RealtimeEventError             RealtimeEventType = "error"
+	RealtimeEventSessionExpiring   RealtimeEventType = "session_expiring"
 )
 
 // RealtimeEvent is a single event from a session. Only the fields
 // relevant to the Type are populated.
 type RealtimeEvent struct {
-	Type RealtimeEventType
+	ObservedAt time.Time      // local receipt time; never a provider wall clock
+	Settings   map[string]any // sanitized session acknowledgement
+	Type       RealtimeEventType
 
 	// Audio (RealtimeEventAudioOut)
 	Audio []byte

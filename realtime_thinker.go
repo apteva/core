@@ -68,6 +68,7 @@ type RealtimeThinker struct {
 	statePhase      string
 
 	lifecycleMu                 sync.Mutex
+	timing                      *realtimeTiming // protected by lifecycleMu
 	sessionGeneration           int
 	bridgeConnected             bool
 	bridgeConnectedAt           time.Time
@@ -79,9 +80,11 @@ type RealtimeThinker struct {
 	pendingReconnectReason      string
 	pendingReconnectPlanned     bool
 
-	toolBatchMu     sync.Mutex
-	toolBatches     map[string]*realtimeToolBatch
-	toolCallBatches map[string]string
+	toolBatchMu       sync.Mutex
+	toolBatches       map[string]*realtimeToolBatch
+	toolCallBatches   map[string]string
+	toolCallRecords   map[realtimeToolCallKey]*realtimeToolCallRecord
+	terminalToolCalls []realtimeToolCallKey
 
 	toolMarkupMu           sync.Mutex
 	toolMarkupTails        map[string]string
@@ -273,6 +276,7 @@ func (rt *RealtimeThinker) beginToolCall(event RealtimeEvent, session RealtimeSe
 	rt.recovery.Unlock()
 	batchID := event.ResponseID
 	rt.toolBatchMu.Lock()
+	rt.rememberActiveToolCallLocked(session, event.ToolCallID)
 	batch := rt.toolBatches[batchID]
 	if batch == nil {
 		batch = &realtimeToolBatch{session: session, names: map[string]bool{}}
@@ -287,19 +291,26 @@ func (rt *RealtimeThinker) beginToolCall(event RealtimeEvent, session RealtimeSe
 }
 
 func (rt *RealtimeThinker) completeToolCall(callID string) {
+	rt.finishToolCall(callID, false)
+}
+
+func (rt *RealtimeThinker) finishToolCall(callID string, cancelled bool) {
 	var continueSession RealtimeSession
 	rt.toolBatchMu.Lock()
 	batchID, exists := rt.toolCallBatches[callID]
 	if exists {
 		delete(rt.toolCallBatches, callID)
 		if batch := rt.toolBatches[batchID]; batch != nil {
+			rt.rememberTerminalToolCallLocked(batch.session, callID, cancelled)
 			if batch.pending > 0 {
 				batch.pending--
 			}
 			if realtimeToolsAreAsync(batch.session) && batch.pending == 0 {
 				delete(rt.toolBatches, batchID)
-			} else if batch.responseDone && batch.pending == 0 {
-				continueSession = batch.session
+			} else if (batch.responseDone || cancelled) && batch.pending == 0 {
+				if !cancelled {
+					continueSession = batch.session
+				}
 				delete(rt.toolBatches, batchID)
 			}
 			if batch.pending == 0 && batch.session != rt.currentSession() {
@@ -345,6 +356,9 @@ func (rt *RealtimeThinker) completeToolResponse(responseID string) bool {
 }
 
 func (rt *RealtimeThinker) submitToolResult(session RealtimeSession, callID, result string, isError bool) {
+	if rt.cancelledToolCall(session, callID) {
+		return
+	}
 	rt.toolBatchMu.Lock()
 	if batchID, ok := rt.toolCallBatches[callID]; ok {
 		if batch := rt.toolBatches[batchID]; batch != nil {
@@ -362,6 +376,12 @@ func (rt *RealtimeThinker) submitToolResult(session RealtimeSession, callID, res
 		return
 	}
 	if err := session.SendToolResult(callID, result, isError); err != nil {
+		if errors.Is(err, ErrRealtimeToolCallCancelled) {
+			rt.cancelRealtimeToolCall(session, callID)
+			// The result was already archived by the caller of this method.
+			rt.recordCancelledToolOutcome(session, callID)
+			return
+		}
 		logMsg("REALTIME", fmt.Sprintf("[%s] send tool result %s: %v", rt.threadID, callID, err))
 		rt.completeToolCall(callID)
 		rt.closeForRecovery(session, false, "tool_result_delivery_failed")
@@ -393,7 +413,29 @@ func (rt *RealtimeThinker) boundedTranscript() []Message {
 	return eligible
 }
 
+func (rt *RealtimeThinker) currentTiming() *realtimeTiming {
+	rt.lifecycleMu.Lock()
+	defer rt.lifecycleMu.Unlock()
+	return rt.timing
+}
+
+func startRealtimeThinkerWithOutput(ctx context.Context, thinker *Thinker, provider RealtimeProvider, voice string, audioIn <-chan []byte, audioOut chan RealtimeAudioFrame, audioControl chan<- string, turn RealtimeTurnDetectionConfig, output RealtimeOutputConfig) (*RealtimeThinker, error) {
+	rt := newRealtimeThinker(ctx, thinker, provider, voice, audioIn, audioOut, audioControl, turn)
+	rt.opts.OutputConfig = output
+	if err := rt.openSession(false); err != nil {
+		rt.cancel()
+		return nil, fmt.Errorf("realtime open: %w", err)
+	}
+	return rt, nil
+}
+
 func (rt *RealtimeThinker) openSession(restore bool) error {
+	connectedAt := time.Now()
+	rt.lifecycleMu.Lock()
+	nextGeneration := rt.sessionGeneration + 1
+	rt.lifecycleMu.Unlock()
+	timing := newRealtimeTiming(uint64(nextGeneration), rt.emit)
+	timing.connectedAt = connectedAt
 	instructions, tools := rt.configurationSnapshot()
 	rt.transcriptMu.Lock()
 	rt.opts.Instructions, rt.opts.Tools = instructions, tools
@@ -404,6 +446,7 @@ func (rt *RealtimeThinker) openSession(restore bool) error {
 		history = rt.boundedTranscript()
 	}
 	opts.RestoreHistory = len(history) > 0
+	opts.timing = timing
 	rt.recovery.Lock()
 	previous := rt.recovery.resume
 	rt.recovery.resume = nil
@@ -442,12 +485,26 @@ func (rt *RealtimeThinker) openSession(restore bool) error {
 	rt.recovery.deadline = time.Time{}
 	rt.recovery.Unlock()
 	rt.lifecycleMu.Lock()
+	previousTiming := rt.timing
+	rt.timing = timing
 	rt.sessionGeneration++
 	generation := rt.sessionGeneration
 	rt.lifecycleMu.Unlock()
-	rt.emit("realtime.session_opened", map[string]any{
-		"generation": generation, "restored": restore && !resumed, "resumed": resumed,
-	})
+	previousTiming.finish("", "", "session_replaced")
+	data := map[string]any{"generation": generation, "restored": restore && !resumed, "resumed": resumed,
+		"connection_to_open_ms": float64(time.Since(connectedAt)) / float64(time.Millisecond), "provider": rt.provider.Name(),
+		"requested": realtimeRequestedSettings(opts), "applied": nil}
+	if reporter, ok := session.(realtimeSettingsSession); ok {
+		data["applied"] = reporter.RealtimeSettings()
+		if reporter.RealtimeSettings()["source"] == "accepted_setup" {
+			readyAt := time.Now()
+			if ready, ok := session.(realtimeReadySession); ok {
+				readyAt = ready.RealtimeReadyAt()
+			}
+			timing.ready(readyAt, reporter.RealtimeSettings())
+		}
+	}
+	rt.emit("realtime.session_opened", data)
 	if !resumed {
 		rt.requestInitialMessageIfNeeded()
 	}
@@ -610,7 +667,7 @@ func (rt *RealtimeThinker) markAssistantAudioEmitted() {
 	connectedAt := rt.bridgeConnectedAt
 	replayed := generation > 1 && rt.greetingRequestedGeneration == generation
 	rt.lifecycleMu.Unlock()
-	data := map[string]any{"generation": generation, "replayed_greeting": replayed}
+	data := map[string]any{"generation": generation, "replayed_greeting": replayed, "measurement_stage": "output_enqueue"}
 	if !connectedAt.IsZero() {
 		data["bridge_to_first_audio_ms"] = time.Since(connectedAt).Milliseconds()
 	}
@@ -850,6 +907,8 @@ func (rt *RealtimeThinker) rejectRealtimeOutput(event RealtimeEvent, toolName, p
 	}
 	rt.toolMarkupMu.Unlock()
 
+	rt.currentTiming().observed(event.ResponseID, event.ItemID)
+	rt.currentTiming().finish(event.ResponseID, event.ItemID, "blocked")
 	interrupted := rt.interruptPlayback("provider_tool_markup_leaked", "", true, true)
 	recoveryRequested := false
 	if retry {
@@ -880,8 +939,8 @@ func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int) {
 		return
 	}
 	rt.outputMu.Lock()
-	defer rt.outputMu.Unlock()
 	if itemID != rt.outputItemID {
+		rt.outputMu.Unlock()
 		return
 	}
 	generatedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
@@ -895,6 +954,8 @@ func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int) {
 		rt.playedMS = audioEndMS
 	}
 	rt.playbackTracked = true
+	rt.outputMu.Unlock()
+	rt.currentTiming().playback(itemID, audioEndMS, time.Now())
 	rt.wakeRecovery()
 }
 
@@ -908,6 +969,7 @@ func (rt *RealtimeThinker) discardQueuedOutput() (frames, bytes int) {
 			if !ok {
 				return frames, bytes
 			}
+			frame.timing.written(frame.ResponseID, frame.ItemID, time.Time{}, len(frame.Audio), false)
 			frames++
 			bytes += len(frame.Audio)
 		default:
@@ -937,6 +999,11 @@ func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, canc
 	rt.suppressOutput = itemID != ""
 	rt.outputMu.Unlock()
 
+	// Mark cancellation before draining so a completed generation with queued
+	// frames is summarized as interrupted rather than as a failed bridge write.
+	if itemID != "" {
+		rt.currentTiming().finish("", itemID, "interrupted")
+	}
 	drainedFrames, drainedBytes := rt.discardQueuedOutput()
 	session := rt.currentSession()
 	if cancelProvider && session != nil {
@@ -995,6 +1062,7 @@ func (rt *RealtimeThinker) Run() {
 		rt.emit("realtime.thread_ended", map[string]any{
 			"reason": terminalReason, "generation": generation,
 		})
+		rt.currentTiming().finish("", "", "thread_ended")
 		rt.cancel()
 		rt.replaceSession(nil)
 		if rt.onStop != nil {
@@ -1158,6 +1226,8 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.recovery.Unlock()
 	}
 	switch event.Type {
+	case RealtimeEventSessionReady:
+		rt.currentTiming().ready(event.ObservedAt, event.Settings)
 	case RealtimeEventSessionExpiring:
 		deadline := time.Now().Add(event.TimeLeft)
 		rt.recovery.Lock()
@@ -1168,9 +1238,11 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.emit("realtime.reconnect_planned", map[string]any{"reason": "provider_goaway", "planned": true, "time_left_ms": event.TimeLeft.Milliseconds()})
 	case RealtimeEventAudioOut:
 		if rt.paused {
+			rt.currentTiming().dropped(event.ResponseID, event.ItemID, len(event.Audio))
 			return
 		}
 		if rt.toolMarkupResponseSuppressed(event) {
+			rt.currentTiming().dropped(event.ResponseID, event.ItemID, len(event.Audio))
 			rt.emit("realtime.audio_drop", map[string]any{
 				"direction": "output", "bytes": len(event.Audio), "reason": "provider_tool_markup_leaked",
 				"response_id": event.ResponseID, "item_id": event.ItemID,
@@ -1181,6 +1253,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 			rt.outputMu.Lock()
 			if rt.suppressOutput && (event.ItemID == "" || event.ItemID == rt.interruptedItem) {
 				rt.outputMu.Unlock()
+				rt.currentTiming().dropped(event.ResponseID, event.ItemID, len(event.Audio))
 				rt.emit("realtime.audio_drop", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "interrupted_item"})
 				return
 			}
@@ -1194,13 +1267,15 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 				rt.playbackTracked = false
 			}
 			endMS := (rt.outputBytes + len(event.Audio)) * 1000 / realtimePCMBytesPerSecond
-			frame := RealtimeAudioFrame{Audio: event.Audio, ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS}
+			frame := RealtimeAudioFrame{timing: rt.currentTiming(), Audio: event.Audio, ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS}
 			rt.outputBytes += len(event.Audio)
 			rt.outputMu.Unlock()
+			frame.timing.enqueued(event.ResponseID, event.ItemID, time.Now(), min(cap(rt.audioOut), len(rt.audioOut)+1), len(event.Audio))
 			select {
 			case rt.audioOut <- frame:
 				rt.markAssistantAudioEmitted()
 			default:
+				frame.timing.written(event.ResponseID, event.ItemID, time.Time{}, len(event.Audio), false)
 				rt.emit("realtime.audio_overflow", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "consumer_backpressure"})
 				rt.interruptPlayback("core_output_overflow", event.ItemID, true, true)
 				return
@@ -1209,13 +1284,21 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.setConversationState("speaking", event)
 
 	case RealtimeEventSpeechStarted:
+		if event.ResponseID != "" || event.ItemID != "" {
+			rt.currentTiming().finish(event.ResponseID, event.ItemID, "interrupted")
+		}
 		rt.setConversationState("listening", event)
 		rt.interruptPlayback("provider_speech_started", "", false, false)
 
+	case RealtimeEventSpeechStopped:
+		// The adapter timestamps its received VAD event; no inferred Gemini speech end.
 	case RealtimeEventOutputBlocked:
 		rt.rejectRealtimeOutput(event, "", event.OutputBlockReason, "")
 
 	case RealtimeEventTranscriptOutput:
+		if strings.TrimSpace(event.Transcript) != "" {
+			rt.currentTiming().observed(event.ResponseID, event.ItemID)
+		}
 		if rt.suppressLeakedToolMarkup(event) {
 			return
 		}
@@ -1250,6 +1333,9 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.setConversationState("thinking", event)
 
 	case RealtimeEventToolCall:
+		if rt.seenToolCall(rt.currentSession(), event.ToolCallID) {
+			return
+		}
 		rt.responseStarted()
 		if rt.paused {
 			if session := rt.currentSession(); session != nil {
@@ -1261,7 +1347,16 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.setConversationState("working", event)
 		rt.dispatchToolCall(event)
 
+	case RealtimeEventToolCallCancelled:
+		rt.cancelRealtimeToolCall(rt.currentSession(), event.ToolCallID)
+		if rt.pendingToolWork() {
+			rt.setConversationState("working", event)
+		} else if !rt.responseInProgress() {
+			rt.setConversationState("listening", event)
+		}
+
 	case RealtimeEventUtteranceDone:
+		rt.currentTiming().finish(event.ResponseID, event.ItemID, "completed")
 		// Progress speech may finish while background reasoning/tools continue.
 		// Never release response ownership, settle work, or return to listening.
 		rt.finishToolMarkupResponse(event.ResponseID)
@@ -1272,6 +1367,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 
 	case RealtimeEventResponseDone:
+		rt.currentTiming().finish(event.ResponseID, "", "completed")
 		rt.recovery.Lock()
 		if rt.recovery.hadInput {
 			rt.recovery.retry = realtimeRecoveryRetry{}
@@ -1281,10 +1377,15 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		hadToolBatch := rt.completeToolResponse(event.ResponseID)
 		rt.responseFinished(rt.currentSession())
 		rt.finishToolMarkupResponse(event.ResponseID)
-		if !hadToolBatch {
+		pendingTools := rt.pendingToolWork()
+		if pendingTools {
+			// Standard async models can finish a spoken turn while a tool from
+			// an earlier response still runs. That does not finish Core's work.
+			rt.setConversationState("working", event)
+		} else if !hadToolBatch {
 			rt.setConversationState("listening", event)
 		}
-		if !hadToolBatch && !rt.responseInProgress() {
+		if !hadToolBatch && !pendingTools && !rt.responseInProgress() {
 			rt.Thinker.settleEventExecutions("realtime_response_done")
 		}
 		cost := calculateCostForRealtimeProvider(rt.provider, rt.opts.Model, event.Usage)
@@ -1307,6 +1408,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.emit("realtime.error", map[string]any{"error": fmt.Sprint(event.Err)})
 
 	case RealtimeEventSessionEnded:
+		rt.currentTiming().finish("", "", "session_ended")
 		rt.setConversationState("disconnected", event)
 		rt.lifecycleMu.Lock()
 		generation := rt.sessionGeneration
@@ -1328,10 +1430,7 @@ func (rt *RealtimeThinker) dispatchToolCall(event RealtimeEvent) {
 	if session == nil {
 		return
 	}
-	rt.toolBatchMu.Lock()
-	_, duplicate := rt.toolCallBatches[event.ToolCallID]
-	rt.toolBatchMu.Unlock()
-	if duplicate {
+	if rt.seenToolCall(session, event.ToolCallID) {
 		return
 	}
 	rt.recovery.Lock()
@@ -1354,6 +1453,7 @@ func (rt *RealtimeThinker) dispatchToolCall(event RealtimeEvent) {
 	call := toolCall{
 		Name: event.ToolName, Args: flattenJSONArgs(event.ToolArgs),
 		Raw: event.ToolName, NativeID: event.ToolCallID,
+		context: rt.realtimeToolContext(session, event.ToolCallID),
 	}
 	if !rt.modelToolCallable(call.Name, rt.toolAllowlist) {
 		rt.submitToolResult(session, call.NativeID, "tool is not available to this thread", true)
@@ -1443,6 +1543,18 @@ func (rt *RealtimeThinker) handleBusEvent(event Event) {
 		_, known := rt.toolCallBatches[event.ToolResult.CallID]
 		rt.toolBatchMu.Unlock()
 		if !known {
+			if rt.recordCancelledToolOutcome(session, event.ToolResult.CallID) {
+				// Cancellation cannot undo completed side effects. Preserve the
+				// actual late outcome for audit/recovery, without waking the model
+				// or sending a response for a cancelled provider call.
+				message := rt.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{*event.ToolResult}})
+				rt.transcriptMu.Lock()
+				rt.messages = append(rt.messages, message)
+				rt.transcriptMu.Unlock()
+				if rt.Thinker.session != nil {
+					_ = rt.Thinker.session.AppendMessage(message, rt.iteration, TokenUsage{})
+				}
+			}
 			return
 		} // Duplicate/stale completions never target a new socket.
 		message := rt.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{*event.ToolResult}})

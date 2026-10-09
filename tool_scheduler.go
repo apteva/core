@@ -56,6 +56,23 @@ func (t *Thinker) toolContext() context.Context {
 	return t.toolCtx
 }
 
+// Ordinary calls retain their existing admission behavior. Realtime calls can
+// also leave a saturated execution queue when their individual call is cancelled.
+func (t *Thinker) acquireToolSlotForContext(ctx context.Context) bool {
+	if ctx == nil {
+		return t.acquireToolSlot()
+	}
+	t.initializeToolSlots()
+	select {
+	case t.toolSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-t.quit:
+		return false
+	}
+}
+
 func toolResponseParts(resp ToolResponse) []ContentPart {
 	parts := append([]ContentPart(nil), resp.Parts...)
 	if resp.Image != nil {

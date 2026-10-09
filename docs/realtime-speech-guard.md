@@ -5,8 +5,10 @@ argument rules and structured tool access, but do not inherit worker thought,
 timer, model-selection, or one-shot completion instructions. Ordinary text
 workers keep those instructions.
 
-Google Live explicitly requests `includeThoughts=false`. Parts marked `thought`
-are discarded. This alone cannot prevent a model from generating instruction
+Google Live uses model-specific thinking settings: legacy models request
+`includeThoughts=false`, standard Gemini 3.8 omits `thinkingConfig`, and Extended
+Thinking uses its supported reasoning levels. Parts marked `thought` are
+discarded. This alone cannot prevent a model from generating instruction
 narration as ordinary speech, which is how the recorded incident reached Core.
 
 The Google adapter buffers opening PCM until it has a short output transcript
@@ -15,6 +17,14 @@ short response. Guard-bearing transcript events precede released audio and
 cannot be dropped by the audio backpressure path. The buffer is capped at five
 seconds of PCM (240,000 bytes); missing transcription drops the audio and emits
 an output-blocked event instead of releasing unchecked speech.
+
+These are the default settings. `realtime_output.speech_guard` can explicitly
+select `transcript_prefix`, change `prefix_bytes`, or change
+`max_buffered_audio_ms`. The five-second capacity measures generated audio,
+which may arrive faster than playback. It is neither a five-second wait nor a
+wall-clock deadline. Missing transcript/audio ordering can therefore delay a
+short reply until its completed transcript. The measured waiting time is
+reported separately; see [realtime latency](realtime-latency.md).
 
 The deterministic guard recognizes specific self-directed instruction-narration
 patterns, including the recorded "Private reasoning processed..." case. It

@@ -3,10 +3,67 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestGoogleAsyncResultMatchesSDKFunctionResponseWireShape(t *testing.T) {
+	for _, tc := range []struct{ model, mode, scheduling string }{
+		{"gemini-3.8-live", "async", "WHEN_IDLE"},
+		{"gemini-3.8-live-extended-thinking", "", ""},
+		{"gemini-3.8-live", "blocking", ""},
+	} {
+		for _, isError := range []bool{false, true} {
+			t.Run(tc.model+"/"+tc.mode+"/"+fmt.Sprint(isError), func(t *testing.T) {
+				s := newGoogleRealtimeTestSession()
+				var err error
+				s.profile, err = googleLiveProfileWithOptions(RealtimeSessionOpts{Model: tc.model, OutputConfig: RealtimeOutputConfig{ToolMode: tc.mode}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				s.callNames["call-a"] = "probe"
+				if err := s.SendToolResult("call-a", `{"marker":"BRAVO","scheduling":"application_owned"}`, isError); err != nil {
+					t.Fatal(err)
+				}
+				if !s.profile.asyncTools {
+					if err := s.RequestResponse(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				frame := <-s.outbox
+				var wire struct {
+					ToolResponse struct {
+						Responses []map[string]any `json:"functionResponses"`
+					} `json:"toolResponse"`
+				}
+				if err := json.Unmarshal(frame.data, &wire); err != nil {
+					t.Fatal(err)
+				}
+				if len(wire.ToolResponse.Responses) != 1 {
+					t.Fatalf("bad response: %s", frame.data)
+				}
+				response := wire.ToolResponse.Responses[0]
+				scheduling, _ := response["scheduling"].(string)
+				if scheduling != tc.scheduling || response["id"] != "call-a" || response["name"] != "probe" {
+					t.Fatalf("SDK control fields differ: %s", frame.data)
+				}
+				data := response["response"].(map[string]any)
+				if _, nested := data["scheduling"]; nested {
+					t.Fatalf("protocol scheduling leaked into tool data: %s", frame.data)
+				}
+				if isError {
+					if _, ok := data["error"]; !ok {
+						t.Fatalf("missing error: %s", frame.data)
+					}
+				} else if data["result"].(map[string]any)["scheduling"] != "application_owned" {
+					t.Fatal("application result was changed")
+				}
+			})
+		}
+	}
+}
 
 func TestGoogleLiveModelSpecificSetup(t *testing.T) {
 	for _, tc := range []struct{ model, reasoning, wantLevel, behavior, version string }{

@@ -135,7 +135,11 @@ func TestGoogleRealtimeLiveMCPThread(t *testing.T) {
 	runGoogleRealtimeLiveMCPThread(t, "gemini-3.1-flash-live-preview")
 }
 
-func runGoogleRealtimeLiveMCPThread(t *testing.T, model string) {
+func runGoogleRealtimeLiveMCPThread(t *testing.T, model string, output ...RealtimeOutputConfig) {
+	var outputConfig RealtimeOutputConfig
+	if len(output) > 0 {
+		outputConfig = output[0]
+	}
 	if os.Getenv("RUN_GOOGLE_REALTIME_MCP_SMOKE") != "1" {
 		t.Skip("set RUN_GOOGLE_REALTIME_MCP_SMOKE=1 to run the paid Gemini Live + MCP thread smoke")
 	}
@@ -199,6 +203,7 @@ Never invent the marker, expose tool mechanics, or call done. Keep the live conv
 		nil, // Whole-MCP grant only: an exact grant would mask baseline-loading bugs.
 		SpawnOpts{
 			Realtime:       true,
+			RealtimeOutput: outputConfig,
 			Ephemeral:      true,
 			ProviderName:   "google-realtime",
 			MCPNames:       []string{"liveprobe"},

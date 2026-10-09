@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Match self-directed instruction narration, not ordinary conversational phrases
 // such as "I think", "let me check", or a caller discussing their instructions.
@@ -35,18 +38,22 @@ const googleSpeechPrefixMaxBytes = realtimePCMBytesPerSecond * 5
 
 func (s *googleRealtimeSession) queueSpeechAudio(event RealtimeEvent) {
 	if s.speech.rejected {
+		s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
 		return
 	}
 	if s.speech.approved {
+		s.timing.released(event.ResponseID, event.ItemID, time.Now(), 0, "transcript_prefix")
 		s.emitAudio(event)
 		return
 	}
-	if s.speech.bytes+len(event.Audio) > googleSpeechPrefixMaxBytes {
+	if s.speech.bytes+len(event.Audio) > s.guardConfig.resolved().MaxBufferedAudioMS*realtimePCMBytesPerSecond/1000 {
+		s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
 		s.rejectSpeech(event.ResponseID, "missing_output_transcript")
 		return
 	}
 	s.speech.pending = append(s.speech.pending, event)
 	s.speech.bytes += len(event.Audio)
+	s.timing.buffered(event.ResponseID, event.ItemID, s.speech.bytes)
 }
 
 func (s *googleRealtimeSession) releaseSpeechAudio() {
@@ -55,6 +62,7 @@ func (s *googleRealtimeSession) releaseSpeechAudio() {
 	}
 	s.speech.approved = true
 	for _, event := range s.speech.pending {
+		s.timing.released(event.ResponseID, event.ItemID, time.Now(), s.speech.bytes, "transcript_prefix")
 		s.emitAudio(event)
 	}
 	s.speech.pending = nil
@@ -65,9 +73,12 @@ func (s *googleRealtimeSession) rejectSpeech(responseID, reason string) {
 	if s.speech.rejected {
 		return
 	}
+	for _, event := range s.speech.pending {
+		s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+	}
 	s.speech = googleSpeechGate{rejected: true}
 	itemID := responseID
-	if s.profile.asyncTools {
+	if s.profile.interactionStatus {
 		itemID = s.utteranceID(responseID)
 	}
 	s.emitControl(RealtimeEvent{Type: RealtimeEventOutputBlocked, ResponseID: responseID, ItemID: itemID, OutputBlockReason: reason})

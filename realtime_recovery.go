@@ -122,6 +122,7 @@ func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned boo
 		data["since_output_ms"] = now.Sub(r.lastOutput).Milliseconds()
 	}
 	rt.recovery.Unlock()
+	rt.currentTiming().finish("", "", "session_closed")
 	rt.emit("realtime.session_closed", data)
 	rt.replaceSession(nil)
 }

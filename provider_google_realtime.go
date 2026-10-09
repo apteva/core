@@ -37,9 +37,9 @@ func NewGoogleRealtimeProvider(apiKey string) *GoogleRealtimeProvider {
 		endpoint:     googleRealtimeEndpoint,
 		defaultVoice: "Kore",
 		models: map[ModelTier]string{
-			ModelLarge:  "gemini-3.1-flash-live-preview",
-			ModelMedium: "gemini-3.1-flash-live-preview",
-			ModelSmall:  "gemini-3.1-flash-live-preview",
+			ModelLarge:  "gemini-3.8-live",
+			ModelMedium: "gemini-3.8-live",
+			ModelSmall:  "gemini-3.8-live",
 		},
 	}
 }
@@ -140,7 +140,10 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 			},
 		},
 	}
-	profile := googleLiveProfileFor(model)
+	profile, err := googleLiveProfileWithOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	thinking, err := profile.thinkingConfig(opts.Reasoning)
 	if err != nil {
 		return nil, err
@@ -179,7 +182,7 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 	setup := map[string]any{
 		"model":             "models/" + strings.TrimPrefix(model, "models/"),
 		"generationConfig":  generation,
-		"systemInstruction": map[string]any{"parts": []map[string]any{{"text": opts.Instructions}}},
+		"systemInstruction": map[string]any{"parts": []map[string]any{{"text": realtimeToolInstructions(opts.Instructions, profile.asyncTools)}}},
 		"realtimeInputConfig": map[string]any{
 			"automaticActivityDetection": automaticActivityDetection,
 			"activityHandling":           activityHandling,
@@ -280,9 +283,10 @@ type googleLiveServerMessage struct {
 }
 
 type googleLiveFunctionResponse struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Response map[string]any `json:"response"`
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Response   map[string]any `json:"response"`
+	Scheduling string         `json:"scheduling,omitempty"`
 }
 
 type googleRealtimeSession struct {
@@ -298,9 +302,14 @@ type googleRealtimeSession struct {
 	seq       atomic.Uint64
 	dropped   atomic.Uint64
 
-	inputRate int
-	profile   googleLiveProfile
-	speech    googleSpeechGate // owned by translate/readLoop
+	inputRate   int
+	profile     googleLiveProfile
+	timing      *realtimeTiming
+	guardConfig RealtimeSpeechGuardConfig
+	settings    map[string]any
+	receivedAt  time.Time        // readLoop owned
+	readyAt     time.Time        // published before the setup acknowledgement channel
+	speech      googleSpeechGate // owned by translate/readLoop
 
 	mu                  sync.Mutex
 	currentResponseID   string
@@ -310,6 +319,8 @@ type googleRealtimeSession struct {
 	lastUsage           RealtimeUsage
 	interactionUsage    RealtimeUsage
 	callNames           map[string]string
+	cancelledCalls      map[string]bool
+	cancelledCallOrder  []string
 	pendingResponses    []googleLiveFunctionResponse
 	configFingerprint   string
 	restartAfterTurn    bool
@@ -343,11 +354,13 @@ func openGoogleRealtimeSession(ctx context.Context, provider *GoogleRealtimeProv
 	if inputRate == 0 {
 		inputRate = 16000
 	}
+	profile, _ := googleLiveProfileWithOptions(opts)
 	s := &googleRealtimeSession{
 		conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer),
 		outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), done: make(chan struct{}), ready: make(chan error, 1),
 		inputRate: inputRate, callNames: map[string]string{},
-		profile:           googleLiveProfileFor(opts.Model),
+		profile: profile, timing: opts.timing, guardConfig: opts.OutputConfig.SpeechGuard.resolved(),
+		settings:          googleRealtimeSettings(opts, setup),
 		configFingerprint: googleRealtimeConfigFingerprint(opts.Instructions, opts.Tools),
 		historySeeding:    opts.RestoreHistory,
 		sessionID:         googleRealtimeSessionSequence.Add(1),
@@ -403,7 +416,7 @@ func (s *googleRealtimeSession) currentOrNextResponseID() string {
 	}
 	id := s.currentResponseID
 	s.mu.Unlock()
-	if started && s.profile.asyncTools {
+	if started && s.profile.interactionStatus {
 		s.emitControl(RealtimeEvent{Type: RealtimeEventResponseStarted, ResponseID: id})
 	}
 	return id
@@ -416,7 +429,7 @@ func (s *googleRealtimeSession) activeResponse() bool {
 }
 
 func (s *googleRealtimeSession) utteranceID(responseID string) string {
-	if !s.profile.asyncTools {
+	if !s.profile.interactionStatus {
 		return responseID
 	}
 	s.mu.Lock()
@@ -523,6 +536,7 @@ func (s *googleRealtimeSession) readLoop() {
 			continue
 		}
 		var message googleLiveServerMessage
+		s.receivedAt = time.Now()
 		if err := json.Unmarshal(data, &message); err != nil {
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime decode: %w", err)})
 			continue
@@ -532,11 +546,16 @@ func (s *googleRealtimeSession) readLoop() {
 }
 
 func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
+	if s.receivedAt.IsZero() {
+		s.receivedAt = time.Now()
+	}
+	receivedAt := s.receivedAt
+	s.receivedAt = time.Time{}
 	status := message.InteractionStatus
 	if status == "" && message.ServerContent != nil {
 		status = message.ServerContent.InteractionStatus
 	}
-	if s.profile.asyncTools && status == "IN_PROGRESS" {
+	if s.profile.interactionStatus && status == "IN_PROGRESS" {
 		s.currentOrNextResponseID()
 	}
 	if message.GoAway != nil {
@@ -554,6 +573,11 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 		return
 	}
 	if message.SetupComplete != nil {
+		s.mu.Lock()
+		if s.readyAt.IsZero() {
+			s.readyAt = receivedAt
+		}
+		s.mu.Unlock()
 		s.signalReady(nil)
 	}
 	if message.UsageMetadata != nil {
@@ -563,26 +587,62 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 	}
 	if message.ToolCallCancellation != nil {
 		s.mu.Lock()
+		responseID := s.currentResponseID
 		for _, id := range message.ToolCallCancellation.IDs {
 			delete(s.callNames, id)
+			if s.cancelledCalls == nil {
+				s.cancelledCalls = make(map[string]bool)
+			}
+			if !s.cancelledCalls[id] {
+				s.cancelledCalls[id] = true
+				s.cancelledCallOrder = append(s.cancelledCallOrder, id)
+				if len(s.cancelledCallOrder) > realtimeTerminalToolLimit {
+					delete(s.cancelledCalls, s.cancelledCallOrder[0])
+					copy(s.cancelledCallOrder, s.cancelledCallOrder[1:])
+					s.cancelledCallOrder = s.cancelledCallOrder[:realtimeTerminalToolLimit]
+				}
+			}
 		}
+		kept := s.pendingResponses[:0]
+		for _, response := range s.pendingResponses {
+			cancelled := false
+			for _, id := range message.ToolCallCancellation.IDs {
+				cancelled = cancelled || response.ID == id
+			}
+			if !cancelled {
+				kept = append(kept, response)
+			}
+		}
+		s.pendingResponses = kept
 		s.mu.Unlock()
+		for _, id := range message.ToolCallCancellation.IDs {
+			s.emitControl(RealtimeEvent{Type: RealtimeEventToolCallCancelled, ToolCallID: id, ResponseID: responseID})
+		}
 	}
 	// A status-only IDLE update must not create a phantom interaction, but
 	// other fields in the same envelope (e.g. tool calls) still need handling.
-	if content := message.ServerContent; content != nil && (!s.profile.asyncTools || s.activeResponse() || content.ModelTurn != nil || content.InputTranscription != nil || content.OutputTranscription != nil) {
+	if content := message.ServerContent; content != nil && (!s.profile.interactionStatus || s.activeResponse() || content.ModelTurn != nil || content.InputTranscription != nil || content.OutputTranscription != nil) {
 		if content.Interrupted {
+			s.mu.Lock()
+			interruptedResponse, interruptedItem := s.currentResponseID, s.currentItemID
+			s.mu.Unlock()
+			if !s.profile.interactionStatus {
+				interruptedItem = interruptedResponse
+			}
+			for _, event := range s.speech.pending {
+				s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+			}
 			s.speech = googleSpeechGate{}
-			if s.profile.asyncTools {
+			if s.profile.interactionStatus {
 				s.mu.Lock()
 				s.outputTranscript, s.currentItemID = "", ""
 				s.mu.Unlock()
 			}
-			s.emitControl(RealtimeEvent{Type: RealtimeEventSpeechStarted})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventSpeechStarted, ResponseID: interruptedResponse, ItemID: interruptedItem})
 		}
 		responseID := s.currentOrNextResponseID()
 		itemID := responseID
-		if s.profile.asyncTools {
+		if s.profile.interactionStatus {
 			s.mu.Lock()
 			itemID = s.currentItemID
 			s.mu.Unlock()
@@ -592,6 +652,29 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 			}
 		}
 
+		var audioEvents []RealtimeEvent
+		if content.ModelTurn != nil {
+			for _, part := range content.ModelTurn.Parts {
+				if part.Thought {
+					continue
+				}
+				if part.InlineData != nil && strings.HasPrefix(strings.ToLower(part.InlineData.MimeType), "audio/") {
+					pcm, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
+					if err != nil {
+						s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime audio: %w", err)})
+						continue
+					}
+					s.mu.Lock()
+					s.turnOutputSinceTool = true
+					s.mu.Unlock()
+					s.timing.audio(responseID, itemID, receivedAt)
+					audioEvents = append(audioEvents, RealtimeEvent{
+						Type: RealtimeEventAudioOut, Audio: pcm,
+						ResponseID: responseID, ItemID: itemID,
+					})
+				}
+			}
+		}
 		if content.InputTranscription != nil && content.InputTranscription.Text != "" {
 			s.mu.Lock()
 			s.inputTranscript = appendGoogleTranscript(s.inputTranscript, content.InputTranscription.Text)
@@ -609,38 +692,24 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 			s.turnOutputSinceTool = true
 			s.mu.Unlock()
 			if pattern := detectRealtimeInternalNarration(partial); pattern != "" {
+				for _, event := range audioEvents {
+					s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+				}
+				audioEvents = nil
 				s.rejectSpeech(responseID, pattern)
 			} else if !s.speech.rejected {
 				// Guard-bearing transcripts cannot be dropped under audio backpressure.
 				s.emitControl(RealtimeEvent{Type: RealtimeEventTranscriptOutput, Transcript: partial, ResponseID: responseID, ItemID: itemID})
-				if len(strings.TrimSpace(partial)) >= 32 || strings.ContainsAny(partial, ".?!") {
+				if len(strings.TrimSpace(partial)) >= s.guardConfig.resolved().PrefixBytes || strings.ContainsAny(partial, ".?!") {
 					s.releaseSpeechAudio()
 				}
 			}
 		}
-		if content.ModelTurn != nil {
-			for _, part := range content.ModelTurn.Parts {
-				if part.Thought {
-					continue
-				}
-				if part.InlineData != nil && strings.HasPrefix(strings.ToLower(part.InlineData.MimeType), "audio/") {
-					pcm, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
-					if err != nil {
-						s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime audio: %w", err)})
-						continue
-					}
-					s.mu.Lock()
-					s.turnOutputSinceTool = true
-					s.mu.Unlock()
-					s.queueSpeechAudio(RealtimeEvent{
-						Type: RealtimeEventAudioOut, Audio: pcm,
-						ResponseID: responseID, ItemID: itemID,
-					})
-				}
-			}
+		for _, event := range audioEvents {
+			s.queueSpeechAudio(event)
 		}
 		if content.TurnComplete {
-			if s.profile.asyncTools {
+			if s.profile.interactionStatus {
 				s.finishUtterance(responseID)
 			} else {
 				s.finishTurn()
@@ -664,19 +733,19 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 		// Gemini's dedicated toolCall message ends the function-selection
 		// response. The queued tool responses themselves trigger continuation;
 		// RequestResponse only flushes them as one atomic batch.
-		if !s.profile.asyncTools {
+		if !s.profile.interactionStatus {
 			s.finishTurn()
 		} else {
 			s.commitInteractionUsage()
 		}
 	}
-	if s.profile.asyncTools && status == "IDLE" && s.activeResponse() {
+	if s.profile.interactionStatus && status == "IDLE" && s.activeResponse() {
 		s.finishTurn()
 	}
 }
 
 func (s *googleRealtimeSession) finishUtterance(responseID string) {
-	if s.profile.asyncTools {
+	if s.profile.interactionStatus {
 		s.commitInteractionUsage()
 	}
 	s.mu.Lock()
@@ -685,10 +754,10 @@ func (s *googleRealtimeSession) finishUtterance(responseID string) {
 	s.turnOutputSinceTool = false
 	itemID := s.currentItemID
 	s.mu.Unlock()
-	if !s.profile.asyncTools {
+	if !s.profile.interactionStatus {
 		itemID = responseID
 	}
-	if s.profile.asyncTools && itemID == "" && input == "" && output == "" && s.speech.bytes == 0 {
+	if s.profile.interactionStatus && itemID == "" && input == "" && output == "" && s.speech.bytes == 0 {
 		return
 	}
 	if input != "" {
@@ -714,7 +783,7 @@ func (s *googleRealtimeSession) finishUtterance(responseID string) {
 	s.mu.Lock()
 	s.currentItemID = ""
 	s.mu.Unlock()
-	if s.profile.asyncTools {
+	if s.profile.interactionStatus {
 		s.emitControl(RealtimeEvent{Type: RealtimeEventUtteranceDone, ResponseID: responseID, ItemID: itemID})
 	}
 }
@@ -726,7 +795,7 @@ func (s *googleRealtimeSession) finishTurn() {
 	s.mu.Lock()
 	usage := s.lastUsage
 	s.lastUsage = RealtimeUsage{}
-	if s.profile.asyncTools {
+	if s.profile.interactionStatus {
 		usage = s.interactionUsage
 		s.interactionUsage = RealtimeUsage{}
 	}
@@ -815,6 +884,9 @@ func (s *googleRealtimeSession) emitAudio(event RealtimeEvent) {
 	select {
 	case s.events <- event:
 	default:
+		if event.Type == RealtimeEventAudioOut {
+			s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+		}
 		s.dropped.Add(1)
 	}
 }
@@ -861,6 +933,9 @@ func googleLiveResultValue(result string) any {
 func (s *googleRealtimeSession) SendToolResult(callID, result string, isError bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.cancelledCalls[callID] {
+		return ErrRealtimeToolCallCancelled
+	}
 	name := s.callNames[callID]
 	if name == "" {
 		return fmt.Errorf("google-realtime: unknown tool call %q", callID)
@@ -870,10 +945,17 @@ func (s *googleRealtimeSession) SendToolResult(callID, result string, isError bo
 		response = map[string]any{"error": result}
 	}
 	if s.profile.asyncTools {
-		// Extended Thinking is already running and awaits this result. Do
+		// An async session accepts each result as it becomes ready. Do
 		// not queue it behind RequestResponse/IDLE or other parallel calls.
+		functionResponse := googleLiveFunctionResponse{ID: callID, Name: name, Response: response}
+		if !s.profile.interactionStatus {
+			// Match the Google SDK's FunctionResponse wire shape. Scheduling is
+			// a protocol field, separate from the tool's response data. Extended
+			// Thinking retains its existing model-managed result delivery.
+			functionResponse.Scheduling = "WHEN_IDLE"
+		}
 		err := s.enqueue(map[string]any{"toolResponse": map[string]any{
-			"functionResponses": []googleLiveFunctionResponse{{ID: callID, Name: name, Response: response}},
+			"functionResponses": []googleLiveFunctionResponse{functionResponse},
 		}})
 		if err == nil {
 			delete(s.callNames, callID)
@@ -989,3 +1071,11 @@ func (s *googleRealtimeSession) Close() error {
 var _ RealtimeProvider = (*GoogleRealtimeProvider)(nil)
 var _ configurableRealtimeProvider = (*GoogleRealtimeProvider)(nil)
 var _ RealtimeSession = (*googleRealtimeSession)(nil)
+
+func (s *googleRealtimeSession) RealtimeSettings() map[string]any { return s.settings }
+
+func (s *googleRealtimeSession) RealtimeReadyAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyAt
+}

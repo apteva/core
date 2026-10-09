@@ -9,6 +9,7 @@ import (
 )
 
 type toolCall struct {
+	context           context.Context // optional call-owned cancellation, used by realtime
 	trace             *toolTrace
 	prerequisites     map[string]RequiredFirstAction
 	prerequisiteNames map[string]string
@@ -74,6 +75,10 @@ func executeTool(t *Thinker, call toolCall) {
 			call.trace.finish("cancelled")
 		}
 	}()
+	if call.context != nil && call.context.Err() != nil {
+		t.pendingTools.Delete(call.NativeID)
+		return
+	}
 	executionIDs := call.executionIDs
 	if executionIDs == nil {
 		executionIDs = t.currentEventExecutions()
@@ -91,12 +96,15 @@ func executeTool(t *Thinker, call toolCall) {
 	if generation != t.toolGeneration.Load() {
 		return
 	}
-	if !t.acquireToolSlot() {
+	if !t.acquireToolSlotForContext(call.context) {
 		t.pendingTools.Delete(call.NativeID)
 		return
 	}
-	if generation != t.toolGeneration.Load() {
+	if generation != t.toolGeneration.Load() || call.context != nil && call.context.Err() != nil {
 		t.releaseToolSlot()
+		if call.context != nil && call.context.Err() != nil {
+			t.pendingTools.Delete(call.NativeID)
+		}
 		return
 	}
 	t.asyncToolsActive.Add(1)
@@ -120,11 +128,23 @@ func executeTool(t *Thinker, call toolCall) {
 		defer t.releaseToolSlot()
 		defer t.asyncToolsActive.Add(-1)
 		ctx, cancel := context.WithTimeout(t.toolContext(), toolCallTimeout(call))
+		if call.context != nil {
+			// Retain owner shutdown/reset semantics while adding cancellation
+			// of this individual provider call, including queued-call races.
+			stopCallCancellation := context.AfterFunc(call.context, cancel)
+			defer stopCallCancellation()
+			if call.context.Err() != nil {
+				cancel()
+			}
+		}
 		ctx = withBlobCallerThread(ctx, t.threadID)
 		t.toolLifecycleMu.Lock()
-		if generation != t.toolGeneration.Load() {
+		if generation != t.toolGeneration.Load() || ctx.Err() != nil {
 			t.toolLifecycleMu.Unlock()
 			cancel()
+			if call.context != nil && call.context.Err() != nil {
+				t.pendingTools.Delete(call.NativeID)
+			}
 			return
 		}
 		t.toolCancels.Store(call.NativeID, context.CancelFunc(cancel))

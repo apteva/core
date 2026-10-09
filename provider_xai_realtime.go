@@ -81,6 +81,9 @@ func (p *XAIRealtimeProvider) Open(ctx context.Context, opts RealtimeSessionOpts
 }
 
 func buildXAISessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, error) {
+	if err := validateCompatibleRealtimeOutput(opts); err != nil {
+		return nil, err
+	}
 	normalizedTurnDetection, err := opts.TurnDetection.normalized()
 	if err != nil {
 		return nil, fmt.Errorf("xai-realtime turn detection: %w", err)

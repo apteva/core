@@ -198,6 +198,7 @@ type ThreadInfo struct {
 	BridgeConnected     bool
 	Voice               string
 	TurnDetection       RealtimeTurnDetectionConfig
+	RealtimeOutput      RealtimeOutputConfig
 	Started             time.Time
 	ContextMsgs         int
 	ContextChars        int
@@ -226,6 +227,7 @@ type Thread struct {
 	AllowNoSpawn        bool
 	Voice               string
 	TurnDetection       RealtimeTurnDetectionConfig
+	RealtimeOutput      RealtimeOutputConfig
 	ProviderName        string
 	Ephemeral           bool
 	audioIn             chan []byte
@@ -337,7 +339,8 @@ type SpawnOpts struct {
 	// TurnDetection selects a provider-neutral realtime VAD/turn-taking
 	// profile plus optional per-thread overrides. The zero value preserves
 	// provider defaults.
-	TurnDetection RealtimeTurnDetectionConfig
+	TurnDetection  RealtimeTurnDetectionConfig
+	RealtimeOutput RealtimeOutputConfig
 	// AudioIn: PCM audio chunks pushed by the caller (telephony
 	// bridge, browser WebRTC, mic source). The realtime thread reads
 	// these and forwards to session.SendAudio. nil = no inbound audio
@@ -442,6 +445,14 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				return fmt.Errorf("realtime spawn refused: no default realtime provider")
 			}
 		}
+	}
+	if !opts.Realtime && !opts.RealtimeOutput.isZero() {
+		return fmt.Errorf("realtime_output requires realtime=true")
+	}
+	if output, err := opts.RealtimeOutput.normalized(); err != nil {
+		return err
+	} else {
+		opts.RealtimeOutput = output
 	}
 	if !opts.Realtime && !opts.TurnDetection.isZero() {
 		return fmt.Errorf("realtime turn detection requires realtime=true")
@@ -576,6 +587,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		AllowNoSpawn:        opts.BypassNoSpawn,
 		Voice:               opts.Voice,
 		TurnDetection:       opts.TurnDetection,
+		RealtimeOutput:      opts.RealtimeOutput,
 		ProviderName:        opts.ProviderName,
 		Ephemeral:           opts.Ephemeral,
 		audioIn:             opts.AudioIn,
@@ -836,6 +848,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			opts.AudioIn, opts.AudioOut, opts.AudioControl,
 			opts.TurnDetection,
 		)
+		thread.Realtime.opts.OutputConfig = opts.RealtimeOutput
 		thread.Realtime.setInitialMessage(thread.initialMessage)
 	}
 
@@ -885,7 +898,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		// registry, bus, telemetry) so all the late-result and
 		// tool-dispatch machinery works identically.
 		if opts.Realtime && realtimeProvider != nil {
-			rt, err := startRealtimeThinker(
+			rt, err := startRealtimeThinkerWithOutput(
 				context.Background(),
 				thinker,
 				realtimeProvider,
@@ -893,7 +906,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 				opts.AudioIn,
 				opts.AudioOut,
 				opts.AudioControl,
-				opts.TurnDetection,
+				opts.TurnDetection, opts.RealtimeOutput,
 			)
 			if err != nil {
 				logMsg("REALTIME", fmt.Sprintf("[%s] open failed: %v", id, err))
@@ -1037,6 +1050,14 @@ func (tm *ThreadManager) realtimePlaybackOverflow(id, itemID string) {
 		return
 	}
 	thread.Realtime.rendererPlaybackOverflow(itemID)
+}
+
+func (tm *ThreadManager) realtimeInputSpeechStopped(id string) {
+	_, thread := tm.findManagedThread(id)
+	if thread == nil || thread.Realtime == nil {
+		return
+	}
+	thread.Realtime.currentTiming().speechStopped(time.Now(), "client_reported_signal_received")
 }
 
 func (tm *ThreadManager) realtimeInputSpeechStarted(id string) {
@@ -1729,6 +1750,7 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			BridgeConnected:     t.bridgeConnected,
 			Voice:               t.Voice,
 			TurnDetection:       t.TurnDetection,
+			RealtimeOutput:      t.RealtimeOutput,
 			Started:             t.Started,
 			ContextMsgs:         status.ContextMsgs,
 			ContextChars:        status.ContextChars,
@@ -1884,6 +1906,9 @@ func persistentThreadStateBase(thread *Thread) PersistentThread {
 		InheritCapabilities: thread.InheritCapabilities,
 		Provider:            thread.ProviderName, Realtime: thread.IsRealtime,
 		AllowNoSpawn: thread.AllowNoSpawn, Voice: thread.Voice,
+	}
+	if thread.IsRealtime && !thread.RealtimeOutput.isZero() {
+		state.RealtimeOutput = cloneRealtimeOutputConfig(&thread.RealtimeOutput)
 	}
 	if thread.IsRealtime && !thread.TurnDetection.isZero() {
 		state.TurnDetection = cloneRealtimeTurnDetectionConfig(&thread.TurnDetection)

@@ -50,6 +50,9 @@ type openaiRealtimeSession struct {
 	lifecycle                realtimeSessionLifecycle
 	droppedAudio             atomic.Uint64
 	itemPhases               map[string]string
+	timing                   *realtimeTiming
+	settings                 map[string]any
+	receivedAt               time.Time
 }
 
 type openAICompatibleRealtimeConfig struct {
@@ -88,6 +91,7 @@ type openaiRealtimeOutputItem struct {
 }
 
 type openaiRealtimeEvent struct {
+	Session      map[string]any           `json:"session,omitempty"`
 	Type         string                   `json:"type"`
 	EventID      string                   `json:"event_id,omitempty"`
 	ResponseID   string                   `json:"response_id,omitempty"`
@@ -99,6 +103,7 @@ type openaiRealtimeEvent struct {
 	Name         string                   `json:"name,omitempty"`
 	Arguments    string                   `json:"arguments,omitempty"`
 	Phase        string                   `json:"phase,omitempty"`
+	AudioEndMS   int                      `json:"audio_end_ms,omitempty"`
 	AudioStartMS int                      `json:"audio_start_ms,omitempty"`
 	Item         openaiRealtimeOutputItem `json:"item,omitempty"`
 
@@ -161,6 +166,7 @@ func openAICompatibleRealtimeSession(ctx context.Context, opts RealtimeSessionOp
 	s := &openaiRealtimeSession{
 		conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer),
 		outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), done: make(chan struct{}),
+		timing:       opts.timing,
 		providerName: config.providerName, buildConfigurationUpdate: config.buildConfigurationUpdate,
 		itemPhases:             make(map[string]string),
 		audioInBytesPerSecond:  audioBytesPerSecond(opts.AudioInFmt, opts.AudioInRate),
@@ -176,6 +182,7 @@ func openAICompatibleRealtimeSession(ctx context.Context, opts RealtimeSessionOp
 		_ = conn.Close()
 		return nil, err
 	}
+	s.settings = compatibleRealtimeSettings(opts, config.providerName, sessUpdate)
 	s.outbox <- realtimeOutboundFrame{op: ws.OpText, data: sessUpdate}
 
 	s.lifecycle.start(s.events, s.readLoop, s.writeLoop, s.pingLoop)
@@ -232,6 +239,9 @@ func audioBytesPerSecond(format AudioFormat, rate int) float64 {
 }
 
 func buildSessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, error) {
+	if err := validateCompatibleRealtimeOutput(opts); err != nil {
+		return nil, err
+	}
 	voice := opts.Voice
 	if voice == "" {
 		voice = defaultVoice
@@ -314,6 +324,7 @@ func (s *openaiRealtimeSession) readLoop() {
 			continue
 		}
 		var event openaiRealtimeEvent
+		s.receivedAt = time.Now()
 		if err := json.Unmarshal(data, &event); err != nil {
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("decode event: %w", err)})
 			continue
@@ -323,11 +334,21 @@ func (s *openaiRealtimeSession) readLoop() {
 }
 
 func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
+	at := s.receivedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	s.receivedAt = time.Time{}
 	base := RealtimeEvent{ResponseID: event.ResponseID, ItemID: event.ItemID, Phase: event.Phase}
 	if base.ItemID != "" && base.Phase == "" {
 		base.Phase = s.itemPhases[base.ItemID]
 	}
 	switch event.Type {
+	case "session.updated":
+		settings := compatibleRealtimeSettings(RealtimeSessionOpts{}, s.providerName, mustRealtimeSettingsJSON(event.Session))
+		settings["source"] = "provider_session_updated"
+		settings["model"] = event.Session["model"]
+		s.emitControl(RealtimeEvent{Type: RealtimeEventSessionReady, ObservedAt: at, Settings: settings})
 	case "response.created":
 		base.Type = RealtimeEventResponseStarted
 		if event.Response.ID != "" {
@@ -364,6 +385,8 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 			return
 		}
 		s.audioOutBytes.Add(uint64(len(pcm)))
+		s.timing.audio(base.ResponseID, base.ItemID, at)
+		s.timing.released(base.ResponseID, base.ItemID, at, 0, "provider_stream")
 		base.Type, base.Audio = RealtimeEventAudioOut, pcm
 		s.emitAudio(base)
 	case "response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta":
@@ -390,6 +413,10 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 		s.emitControl(base)
 	case "input_audio_buffer.speech_started":
 		base.Type, base.AudioStartMS = RealtimeEventSpeechStarted, event.AudioStartMS
+		s.emitControl(base)
+	case "input_audio_buffer.speech_stopped":
+		base.Type, base.AudioEndMS = RealtimeEventSpeechStopped, event.AudioEndMS
+		s.timing.speechStopped(at, "provider_vad_event_received")
 		s.emitControl(base)
 	case "response.function_call_arguments.done":
 		base.Type = RealtimeEventToolCall
@@ -440,6 +467,9 @@ func (s *openaiRealtimeSession) emitAudio(event RealtimeEvent) {
 	select {
 	case s.events <- event:
 	default:
+		if event.Type == RealtimeEventAudioOut {
+			s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+		}
 		s.droppedAudio.Add(1)
 	}
 }
@@ -604,3 +634,5 @@ func (s *openaiRealtimeSession) Close() error {
 	})
 	return err
 }
+
+func (s *openaiRealtimeSession) RealtimeSettings() map[string]any { return s.settings }

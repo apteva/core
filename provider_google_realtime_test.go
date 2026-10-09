@@ -328,7 +328,7 @@ func TestGoogleRealtimeProviderRegistrationOverridesAndPricing(t *testing.T) {
 	if !ok {
 		t.Fatalf("provider = %T", pool.RealtimeDefault())
 	}
-	if provider.Models()[ModelLarge] != "gemini-live-pinned" || provider.Models()[ModelSmall] != "gemini-live-small" || provider.DefaultVoice() != "Aoede" {
+	if provider.Models()[ModelLarge] != "gemini-live-pinned" || provider.Models()[ModelMedium] != "gemini-3.8-live" || provider.Models()[ModelSmall] != "gemini-live-small" || provider.DefaultVoice() != "Aoede" {
 		t.Fatalf("models=%#v voice=%q", provider.Models(), provider.DefaultVoice())
 	}
 	cost := calculateCostForRealtimeProvider(provider, "gemini-live-pinned", RealtimeUsage{

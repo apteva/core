@@ -53,9 +53,10 @@ type PersistentThread struct {
 	Realtime            bool                         `json:"realtime,omitempty"`             // spawn as a realtime (voice/audio) thread
 	AllowNoSpawn        bool                         `json:"allow_no_spawn,omitempty"`       // authenticated system/API grant for explicitly attached no_spawn MCPs
 	Voice               string                       `json:"voice,omitempty"`                // realtime voice id (e.g. "marin"); empty = provider default
-	TurnDetection       *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`       // realtime VAD/turn-taking profile and overrides
-	Pace                *PersistentPaceState         `json:"pace,omitempty"`                 // runtime cadence/deadline; never part of the directive
-	Events              []PersistentThreadEvent      `json:"events,omitempty"`               // pending inbox payloads + bounded consumed-ID ledger
+	RealtimeOutput      *RealtimeOutputConfig        `json:"realtime_output,omitempty"`
+	TurnDetection       *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"` // realtime VAD/turn-taking profile and overrides
+	Pace                *PersistentPaceState         `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
+	Events              []PersistentThreadEvent      `json:"events,omitempty"`         // pending inbox payloads + bounded consumed-ID ledger
 }
 
 // ProviderConfig persists a provider and its model selections.
@@ -418,6 +419,7 @@ func (c *Config) GetThreads() []PersistentThread {
 	copy(out, c.Threads)
 	for i := range out {
 		out[i].Pace = clonePersistentPaceState(out[i].Pace)
+		out[i].RealtimeOutput = cloneRealtimeOutputConfig(out[i].RealtimeOutput)
 		out[i].TurnDetection = cloneRealtimeTurnDetectionConfig(out[i].TurnDetection)
 		out[i].Events = clonePersistentThreadEvents(out[i].Events)
 	}

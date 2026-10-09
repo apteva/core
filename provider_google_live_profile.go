@@ -9,30 +9,55 @@ import (
 // their endpoint, thinking settings, synchronous tools and turn lifecycle.
 // https://ai.google.dev/gemini-api/docs/live-api/thinking
 type googleLiveProfile struct {
-	alpha        bool
-	omitThinking bool
-	asyncTools   bool
-	toolBehavior string
+	alpha             bool
+	omitThinking      bool
+	asyncTools        bool
+	interactionStatus bool // Extended Thinking lifecycle; independent of tool behavior
+	toolBehavior      string
 }
 
 func googleLiveProfileFor(model string) googleLiveProfile {
 	switch strings.TrimPrefix(strings.TrimSpace(model), "models/") {
 	case "gemini-3.8-live":
-		// 3.8 defaults to asynchronous tools. Explicit blocking preserves
+		// Standard 3.8 supports both tool modes. Explicit blocking preserves
 		// Core's existing batch/continuation contract for the standard model.
 		return googleLiveProfile{alpha: true, omitThinking: true, toolBehavior: "BLOCKING"}
 	case "gemini-3.8-live-extended-thinking":
-		return googleLiveProfile{alpha: true, asyncTools: true, toolBehavior: "NON_BLOCKING"}
+		return googleLiveProfile{alpha: true, asyncTools: true, interactionStatus: true, toolBehavior: "NON_BLOCKING"}
 	default:
 		return googleLiveProfile{}
 	}
+}
+
+func googleLiveProfileWithOptions(opts RealtimeSessionOpts) (googleLiveProfile, error) {
+	p := googleLiveProfileFor(opts.Model)
+	config, err := opts.OutputConfig.normalized()
+	if err != nil {
+		return p, err
+	}
+	switch config.ToolMode {
+	case "async":
+		if !p.alpha {
+			return p, fmt.Errorf("google-realtime: async tools are unsupported for %s", opts.Model)
+		}
+		p.asyncTools, p.toolBehavior = true, "NON_BLOCKING"
+	case "blocking":
+		if strings.Contains(opts.Model, "extended-thinking") {
+			return p, fmt.Errorf("google-realtime: Extended Thinking requires async tools")
+		}
+		if p.alpha {
+			p.toolBehavior = "BLOCKING"
+		}
+		p.asyncTools = false
+	}
+	return p, nil
 }
 
 func (p googleLiveProfile) thinkingConfig(reasoning string) (map[string]any, error) {
 	if p.omitThinking {
 		return nil, nil
 	}
-	if !p.asyncTools {
+	if !p.interactionStatus {
 		config := map[string]any{"includeThoughts": false}
 		if level := googleLiveThinkingLevel(reasoning); level != "" {
 			config["thinkingLevel"] = level

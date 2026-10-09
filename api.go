@@ -742,6 +742,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		InitialMessage             string                      `json:"initial_message,omitempty"`
 		Events                     []apiThreadEventRequest     `json:"events,omitempty"`
 		BridgeDisconnectTTLSeconds int                         `json:"bridge_disconnect_ttl_seconds,omitempty"`
+		RealtimeOutput             RealtimeOutputConfig        `json:"realtime_output,omitempty"`
 		TurnDetection              RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`
 	}
 	if r.ContentLength > 0 {
@@ -801,19 +802,30 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	// grabbing them. The LLM's spawn-tool path doesn't set
 	// this, so in-agent workers still can't escalate.
 	opts := SpawnOpts{
-		MCPNames:      body.MCP,
-		BypassNoSpawn: true,
-		Realtime:      body.Realtime,
-		Ephemeral:     body.Ephemeral,
-		Voice:         body.Voice,
-		TurnDetection: body.TurnDetection,
-		ProviderName:  body.ProviderName,
-		Model:         strings.ToLower(strings.TrimSpace(body.Model)),
-		DeferRun:      true,
+		MCPNames:       body.MCP,
+		BypassNoSpawn:  true,
+		Realtime:       body.Realtime,
+		Ephemeral:      body.Ephemeral,
+		Voice:          body.Voice,
+		TurnDetection:  body.TurnDetection,
+		RealtimeOutput: body.RealtimeOutput,
+		ProviderName:   body.ProviderName,
+		Model:          strings.ToLower(strings.TrimSpace(body.Model)),
+		DeferRun:       true,
 	}
 	if body.BridgeDisconnectTTLSeconds < 0 || body.BridgeDisconnectTTLSeconds > 3600 {
 		http.Error(w, "bridge_disconnect_ttl_seconds must be between 0 and 3600", http.StatusBadRequest)
 		return
+	}
+	if !body.Realtime && !body.RealtimeOutput.isZero() {
+		http.Error(w, "realtime_output requires realtime=true", http.StatusBadRequest)
+		return
+	}
+	if output, err := body.RealtimeOutput.normalized(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	} else {
+		opts.RealtimeOutput = output
 	}
 	if !body.Realtime && !body.TurnDetection.isZero() {
 		http.Error(w, "turn_detection requires realtime=true", http.StatusBadRequest)

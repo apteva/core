@@ -511,11 +511,13 @@ bridgeLoop:
 				"item_id": frame.ItemID, "audio_end_ms": frame.AudioEndMS,
 			})
 			if err := socket.writeAudio(metadata, frame.Audio); err != nil {
+				frame.timing.written(frame.ResponseID, frame.ItemID, time.Time{}, len(frame.Audio), false)
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
 				break bridgeLoop
 			}
+			frame.timing.written(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), true)
 		case control, ok := <-reg.control:
 			if !ok {
 				reg.control = nil
@@ -640,6 +642,8 @@ func runRealtimeAudioBridgeReader(
 					if control.ItemID != "" {
 						a.thinker.threads.realtimePlaybackOverflow(thread, control.ItemID)
 					}
+				case "input.speech_stopped":
+					a.thinker.threads.realtimeInputSpeechStopped(thread)
 				case "input.speech_started":
 					a.thinker.threads.realtimeInputSpeechStarted(thread)
 				}
