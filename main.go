@@ -67,12 +67,13 @@ type AudioURL struct {
 }
 
 type Message struct {
-	Role          string                 `json:"role"`
-	Content       string                 `json:"content"`
-	Parts         []ContentPart          `json:"parts,omitempty"`          // multimodal content
-	ToolCalls     []NativeToolCall       `json:"tool_calls,omitempty"`     // assistant messages: structured tool calls
-	ToolResults   []ToolResult           `json:"tool_results,omitempty"`   // user messages: results for prior tool calls
-	ProviderState *ProviderResponseState `json:"provider_state,omitempty"` // opaque state for exact provider replay
+	RealtimeTranscript *RealtimeTranscriptMetadata `json:"-"` // history evidence, never provider request fields
+	Role               string                      `json:"role"`
+	Content            string                      `json:"content"`
+	Parts              []ContentPart               `json:"parts,omitempty"`          // multimodal content
+	ToolCalls          []NativeToolCall            `json:"tool_calls,omitempty"`     // assistant messages: structured tool calls
+	ToolResults        []ToolResult                `json:"tool_results,omitempty"`   // user messages: results for prior tool calls
+	ProviderState      *ProviderResponseState      `json:"provider_state,omitempty"` // opaque state for exact provider replay
 	// EventIDs records durable API inbox events represented by this user
 	// message. Providers never receive these identifiers; the session journal
 	// uses them to reconcile an accepted event across process restarts.

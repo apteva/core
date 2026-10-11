@@ -51,21 +51,29 @@ type RealtimeThinker struct {
 	audioOut     chan RealtimeAudioFrame
 	audioControl chan<- string
 
-	transcriptMu    sync.Mutex
-	outputMu        sync.Mutex
-	outputItemID    string
-	outputBytes     int
-	playedItemID    string
-	playedMS        int
-	playbackTracked bool
-	interruptedItem string
-	suppressOutput  bool
-	responseMu      sync.Mutex
-	responseActive  bool
-	responsePending bool
-	stateMu         sync.Mutex
-	state           string
-	statePhase      string
+	transcriptNamespace  string
+	transcriptTurns      map[string]*realtimeTranscriptTurn
+	transcriptAnonymous  map[string]int
+	transcriptFinalOrder []string
+	transcriptOrdinal    int
+	completion           realtimeCompletion
+	delivery             realtimeDelivery
+	shutdownOnce         sync.Once
+	transcriptMu         sync.Mutex
+	outputMu             sync.Mutex
+	outputItemID         string
+	outputBytes          int
+	playedItemID         string
+	playedMS             int
+	playbackTracked      bool
+	interruptedItem      string
+	suppressOutput       bool
+	responseMu           sync.Mutex
+	responseActive       bool
+	responsePending      bool
+	stateMu              sync.Mutex
+	state                string
+	statePhase           string
 
 	lifecycleMu                 sync.Mutex
 	timing                      *realtimeTiming // protected by lifecycleMu
@@ -165,7 +173,10 @@ func newRealtimeThinker(
 		audioIn: audioIn, audioOut: audioOut, audioControl: audioControl,
 		toolBatches: map[string]*realtimeToolBatch{}, toolCallBatches: map[string]string{},
 		toolMarkupTails: map[string]string{}, toolMarkupSuppressed: map[string]bool{},
-		terminalReason: "server_shutdown",
+		terminalReason:      "server_shutdown",
+		transcriptNamespace: generateAudioToken(),
+		transcriptTurns:     map[string]*realtimeTranscriptTurn{},
+		transcriptAnonymous: map[string]int{},
 	}
 	rt.recovery.wake = make(chan struct{}, 1)
 	rt.recovery.toolNames = map[string]bool{}
@@ -518,6 +529,9 @@ func (rt *RealtimeThinker) openSession(restore bool) error {
 }
 
 func (rt *RealtimeThinker) refreshConfiguration() {
+	if rt.completionRequested() {
+		return
+	}
 	session := rt.currentSession()
 	if session == nil {
 		return
@@ -588,6 +602,8 @@ func (rt *RealtimeThinker) applyExternalConfigurationChange(allowRestart bool, r
 		rt.pendingReconnectReason = reason
 		rt.pendingReconnectPlanned = true
 		rt.lifecycleMu.Unlock()
+		rt.flushPendingTranscripts(reason)
+		rt.recordSessionClosure(reason, true, nil)
 		rt.replaceSession(nil)
 		return true, nil
 	default:
@@ -620,6 +636,7 @@ func (rt *RealtimeThinker) audioBridgeDisconnected() {
 	rt.lifecycleMu.Lock()
 	rt.bridgeConnected = false
 	rt.lifecycleMu.Unlock()
+	rt.flushPendingTranscripts("bridge_disconnected")
 	if ender, ok := rt.currentSession().(RealtimeInputEnder); ok {
 		_ = ender.EndAudioInput()
 	}
@@ -720,6 +737,9 @@ func (rt *RealtimeThinker) setConversationState(state string, event RealtimeEven
 }
 
 func (rt *RealtimeThinker) requestProviderResponse(session RealtimeSession) error {
+	if rt.completionRequested() {
+		return nil
+	}
 	if session == nil || session != rt.currentSession() {
 		return errors.New("realtime session unavailable")
 	}
@@ -846,6 +866,9 @@ func (rt *RealtimeThinker) toolMarkupResponseSuppressed(event RealtimeEvent) boo
 }
 
 func (rt *RealtimeThinker) queueToolMarkupRecovery(session RealtimeSession) error {
+	if rt.completionRequested() {
+		return errors.New("realtime completion requested")
+	}
 	if session == nil {
 		return errors.New("realtime session unavailable")
 	}
@@ -893,6 +916,7 @@ func (rt *RealtimeThinker) suppressLeakedToolMarkup(event RealtimeEvent) bool {
 }
 
 func (rt *RealtimeThinker) rejectRealtimeOutput(event RealtimeEvent, toolName, pattern, combined string) bool {
+	rt.blockTranscript(event)
 	key := realtimeToolMarkupResponseKey(event)
 	rt.toolMarkupMu.Lock()
 	if rt.toolMarkupSuppressed[key] {
@@ -935,6 +959,12 @@ func (rt *RealtimeThinker) rejectRealtimeOutput(event RealtimeEvent, toolName, p
 }
 
 func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int) {
+	rt.lifecycleMu.Lock()
+	generation := rt.sessionGeneration
+	rt.lifecycleMu.Unlock()
+	if itemID != "" && audioEndMS >= 0 {
+		rt.delivery.acknowledge(fmt.Sprintf("%d/%s", generation, itemID), audioEndMS)
+	}
 	if itemID == "" || audioEndMS < 0 {
 		return
 	}
@@ -970,6 +1000,7 @@ func (rt *RealtimeThinker) discardQueuedOutput() (frames, bytes int) {
 				return frames, bytes
 			}
 			frame.timing.written(frame.ResponseID, frame.ItemID, time.Time{}, len(frame.Audio), false)
+			frame.written(false)
 			frames++
 			bytes += len(frame.Audio)
 		default:
@@ -998,6 +1029,7 @@ func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, canc
 	rt.interruptedItem = itemID
 	rt.suppressOutput = itemID != ""
 	rt.outputMu.Unlock()
+	rt.delivery.abandonPlayback(itemID)
 
 	// Mark cancellation before draining so a completed generation with queued
 	// frames is summarized as interrupted rather than as a failed bridge write.
@@ -1055,13 +1087,9 @@ func (rt *RealtimeThinker) Run() {
 		}
 	}()
 	defer func() {
-		rt.lifecycleMu.Lock()
-		terminalReason := rt.terminalReason
-		generation := rt.sessionGeneration
-		rt.lifecycleMu.Unlock()
-		rt.emit("realtime.thread_ended", map[string]any{
-			"reason": terminalReason, "generation": generation,
-		})
+		rt.drainTerminalTranscripts()
+		rt.finishShutdown()
+		rt.Thinker.Stop()
 		rt.currentTiming().finish("", "", "thread_ended")
 		rt.cancel()
 		rt.replaceSession(nil)
@@ -1078,6 +1106,10 @@ func (rt *RealtimeThinker) Run() {
 	rt.setConversationState("listening", RealtimeEvent{})
 	catalogDirty := false
 	for {
+		if rt.completionRequested() {
+			rt.finishRealtimeCompletion(rt.currentSession())
+			return
+		}
 		if catalogDirty && !rt.responseInProgress() && !rt.pendingToolWork() {
 			catalogDirty = false
 			if _, err := rt.applyExternalConfigurationChange(true, "mcp_catalog_changed"); err != nil {
@@ -1216,6 +1248,7 @@ func (rt *RealtimeThinker) appendTranscript(role, transcript string) {
 }
 
 func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
+	rt.noteCompletionEvent(event)
 	if event.Type == RealtimeEventAudioOut || event.Type == RealtimeEventTranscriptOutput {
 		if !event.Final {
 			rt.responseStarted()
@@ -1268,6 +1301,11 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 			}
 			endMS := (rt.outputBytes + len(event.Audio)) * 1000 / realtimePCMBytesPerSecond
 			frame := RealtimeAudioFrame{timing: rt.currentTiming(), Audio: event.Audio, ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS}
+			rt.lifecycleMu.Lock()
+			generation := rt.sessionGeneration
+			rt.lifecycleMu.Unlock()
+			itemKey := realtimeTimingKey(event.ResponseID, event.ItemID)
+			frame.delivery = rt.delivery.enqueue(fmt.Sprintf("%d/%s", generation, itemKey), event.ItemID, len(event.Audio))
 			rt.outputBytes += len(event.Audio)
 			rt.outputMu.Unlock()
 			frame.timing.enqueued(event.ResponseID, event.ItemID, time.Now(), min(cap(rt.audioOut), len(rt.audioOut)+1), len(event.Audio))
@@ -1276,6 +1314,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 				rt.markAssistantAudioEmitted()
 			default:
 				frame.timing.written(event.ResponseID, event.ItemID, time.Time{}, len(event.Audio), false)
+				frame.written(false)
 				rt.emit("realtime.audio_overflow", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "consumer_backpressure"})
 				rt.interruptPlayback("core_output_overflow", event.ItemID, true, true)
 				return
@@ -1302,9 +1341,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		if rt.suppressLeakedToolMarkup(event) {
 			return
 		}
-		if event.Final && strings.TrimSpace(event.Transcript) != "" {
-			rt.appendTranscript("assistant", event.Transcript)
-		}
+		rt.trackTranscript("assistant", event)
 
 	case RealtimeEventTranscriptInput:
 		if strings.TrimSpace(event.Transcript) != "" {
@@ -1318,9 +1355,9 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 				rt.newRealtimeCallerTurn()
 			}
 		}
+		rt.trackTranscript("user", event)
 		if event.Final && strings.TrimSpace(event.Transcript) != "" {
 			rt.resetToolMarkupTurn()
-			rt.appendTranscript("user", event.Transcript)
 			rt.setConversationState("thinking", event)
 		}
 
@@ -1333,6 +1370,9 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.setConversationState("thinking", event)
 
 	case RealtimeEventToolCall:
+		if rt.completionRequested() {
+			return
+		}
 		if rt.seenToolCall(rt.currentSession(), event.ToolCallID) {
 			return
 		}
@@ -1356,6 +1396,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 
 	case RealtimeEventUtteranceDone:
+		rt.advanceAnonymousTranscriptTurns()
 		rt.currentTiming().finish(event.ResponseID, event.ItemID, "completed")
 		// Progress speech may finish while background reasoning/tools continue.
 		// Never release response ownership, settle work, or return to listening.
@@ -1367,6 +1408,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 
 	case RealtimeEventResponseDone:
+		rt.advanceAnonymousTranscriptTurns()
 		rt.currentTiming().finish(event.ResponseID, "", "completed")
 		rt.recovery.Lock()
 		if rt.recovery.hadInput {

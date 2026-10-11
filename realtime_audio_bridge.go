@@ -512,12 +512,14 @@ bridgeLoop:
 			})
 			if err := socket.writeAudio(metadata, frame.Audio); err != nil {
 				frame.timing.written(frame.ResponseID, frame.ItemID, time.Time{}, len(frame.Audio), false)
+				frame.written(false)
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
 				break bridgeLoop
 			}
 			frame.timing.written(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), true)
+			frame.written(true)
 		case control, ok := <-reg.control:
 			if !ok {
 				reg.control = nil
@@ -634,6 +636,8 @@ func runRealtimeAudioBridgeReader(
 			}
 			if json.Unmarshal(data, &control) == nil && a.thinker != nil && a.thinker.threads != nil {
 				switch control.Type {
+				case "playback.ready":
+					a.thinker.threads.realtimePlaybackReady(thread)
 				case "playback.progress":
 					if control.ItemID != "" && control.AudioEndMS >= 0 {
 						a.thinker.threads.realtimePlaybackProgress(thread, control.ItemID, control.AudioEndMS)

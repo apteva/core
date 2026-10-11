@@ -391,6 +391,7 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 		s.emitAudio(base)
 	case "response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta":
 		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptOutput, event.Delta, false
+		base.TranscriptDelta = true
 		s.emitAudio(base)
 	case "response.output_audio_transcript.done":
 		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptOutput, event.Transcript, true
@@ -400,6 +401,7 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 		s.emitControl(base)
 	case "conversation.item.input_audio_transcription.delta":
 		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptInput, event.Delta, false
+		base.TranscriptDelta = true
 		s.emitAudio(base)
 	case "conversation.item.input_audio_transcription.updated":
 		transcript := event.Transcript

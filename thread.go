@@ -308,7 +308,7 @@ type SpawnOpts struct {
 	BuiltinTools []string // provider builtin overrides (nil = inherit, empty = none)
 	DeferRun     bool     // if true, don't start Run() — call StartAll() later
 	System       bool     // true for platform-owned system threads such as unconscious
-	Ephemeral    bool     // temporary caller-owned thread; cleanup also removes session history
+	Ephemeral    bool     // temporary caller-owned thread; realtime transcript history survives cleanup
 	// Paused: if true, the thread spawns in paused state. Run() loop
 	// blocks at the top of its first iteration until either an inbox
 	// event arrives (an explicit `send` from the leader) OR the
@@ -1015,6 +1015,11 @@ func (tm *ThreadManager) RenewRealtimeAudioToken(id string) (string, error) {
 		thread.bridgeCleanupTimer = nil
 	}
 	owner.mu.Unlock()
+	if thread.Realtime != nil {
+		data := thread.Realtime.shutdownData()
+		data["trigger"], data["reason"] = "audio_bridge_renewed", "audio_bridge_renewed"
+		thread.Realtime.emitDurableLifecycle("realtime.bridge_renewed", data)
+	}
 	return renewAudioBridge(id, thread.audioIn, thread.audioOut, thread.audioControl), nil
 }
 
@@ -1042,6 +1047,14 @@ func (tm *ThreadManager) realtimePlaybackProgress(id, itemID string, audioEndMS 
 		return
 	}
 	thread.Realtime.acknowledgePlayback(itemID, audioEndMS)
+}
+
+func (tm *ThreadManager) realtimePlaybackReady(id string) {
+	_, thread := tm.findManagedThread(id)
+	if thread != nil && thread.Realtime != nil {
+		thread.Realtime.delivery.playbackReady()
+		thread.Realtime.wakeRecovery()
+	}
 }
 
 func (tm *ThreadManager) realtimePlaybackOverflow(id, itemID string) {
@@ -1537,9 +1550,10 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 			t.workerMilestone("finished", "completed")
 			t.settleEventExecutions("thread_done")
 			if thread.Realtime != nil {
-				thread.Realtime.setTerminalReason("caller_done")
+				thread.Realtime.requestCompletion(calls[0].NativeID)
+			} else {
+				t.Stop()
 			}
-			t.Stop()
 		}
 
 		return replies, toolNames, results
@@ -2477,6 +2491,9 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 	}
 	delete(tm.threads, id)
 	tm.mu.Unlock()
+	if thread != nil && thread.Realtime != nil {
+		thread.Realtime.finishShutdown()
+	}
 	unregisterAudioBridge(id)
 
 	// Cascade: kill all children first
@@ -2494,9 +2511,10 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 		thread.Thinker.mcpServers = nil
 	}
 
-	// Only delete session history if thread called done (permanent termination).
-	// For kills/restarts, keep the session so the thread can restore context on respawn.
-	if thread != nil && (thread.doneForever || thread.Ephemeral) && thread.Thinker.session != nil {
+	// Normal completed/ephemeral workers discard their history. Realtime
+	// histories retain the caller evidence even after permanent completion.
+	// Kills/restarts keep history for restoration as before.
+	if thread != nil && (thread.doneForever || thread.Ephemeral) && !thread.IsRealtime && thread.Thinker.session != nil {
 		thread.Thinker.session.Delete()
 	}
 

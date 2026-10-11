@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ const (
 
 // SessionEntry is one line in the JSONL history file.
 type SessionEntry struct {
+	RealtimeTranscript *RealtimeTranscriptMetadata `json:"realtime_transcript,omitempty"`
 	// Sequence is a per-session, monotonically increasing cursor. It makes the
 	// durable history safe for consumers that need to observe a running thread:
 	// unlike the in-memory context window, this cursor does not move when old
@@ -260,18 +262,19 @@ func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) er
 		return err
 	}
 	entry := SessionEntry{
-		Timestamp:     time.Now(),
-		Role:          msg.Role,
-		Content:       msg.Content,
-		Parts:         msg.Parts,
-		ToolCalls:     msg.ToolCalls,
-		ToolResults:   msg.ToolResults,
-		Reasoning:     msg.Reasoning,
-		ProviderState: msg.ProviderState,
-		EventIDs:      append([]string(nil), msg.EventIDs...),
-		TokensIn:      usage.PromptTokens,
-		TokensOut:     usage.CompletionTokens,
-		Iteration:     iteration,
+		RealtimeTranscript: msg.RealtimeTranscript,
+		Timestamp:          time.Now(),
+		Role:               msg.Role,
+		Content:            msg.Content,
+		Parts:              msg.Parts,
+		ToolCalls:          msg.ToolCalls,
+		ToolResults:        msg.ToolResults,
+		Reasoning:          msg.Reasoning,
+		ProviderState:      msg.ProviderState,
+		EventIDs:           append([]string(nil), msg.EventIDs...),
+		TokensIn:           usage.PromptTokens,
+		TokensOut:          usage.CompletionTokens,
+		Iteration:          iteration,
 	}
 	return s.Append(entry)
 }
@@ -370,14 +373,15 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 	// Convert to Messages
 	for _, e := range real {
 		msg := Message{
-			Role:          e.Role,
-			Content:       e.Content,
-			Parts:         e.Parts,
-			ToolCalls:     e.ToolCalls,
-			ToolResults:   e.ToolResults,
-			Reasoning:     e.Reasoning,
-			ProviderState: e.ProviderState,
-			EventIDs:      append([]string(nil), e.EventIDs...),
+			RealtimeTranscript: e.RealtimeTranscript,
+			Role:               e.Role,
+			Content:            e.Content,
+			Parts:              e.Parts,
+			ToolCalls:          e.ToolCalls,
+			ToolResults:        e.ToolResults,
+			Reasoning:          e.Reasoning,
+			ProviderState:      e.ProviderState,
+			EventIDs:           append([]string(nil), e.EventIDs...),
 		}
 		// Normalize role: "tool_result" → "user" with ToolResults
 		if e.Role == "tool_result" {
@@ -415,6 +419,9 @@ func (s *Session) LoadAfter(after int64, limit int) (entries []SessionEntry, nex
 	if limit <= 0 {
 		limit = 500
 	}
+	// Transcript revisions retain their chronological position but have a new
+	// cursor so live consumers can update the same turn without missing edits.
+	sort.SliceStable(all, func(i, j int) bool { return all[i].Sequence < all[j].Sequence })
 	capacity := limit
 	if len(all) < capacity {
 		capacity = len(all)

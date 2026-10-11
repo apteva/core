@@ -67,6 +67,7 @@ func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned boo
 	if session == nil || session != rt.currentSession() {
 		return
 	}
+	rt.flushPendingTranscripts(reason)
 	busy, tools := rt.responseInProgress(), rt.pendingToolWork()
 	rt.toolBatchMu.Lock()
 	var pendingNames []string
@@ -123,7 +124,7 @@ func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned boo
 	}
 	rt.recovery.Unlock()
 	rt.currentTiming().finish("", "", "session_closed")
-	rt.emit("realtime.session_closed", data)
+	rt.recordSessionClosure(reason, planned, data)
 	rt.replaceSession(nil)
 }
 

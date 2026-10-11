@@ -294,6 +294,13 @@ type RealtimeAudioFrame struct {
 	ItemID     string
 	AudioEndMS int
 	timing     *realtimeTiming
+	delivery   func(bool) // bridge write receipt; never a playback acknowledgement
+}
+
+func (f RealtimeAudioFrame) written(success bool) {
+	if f.delivery != nil {
+		f.delivery(success)
+	}
 }
 
 // RealtimeSession is the live, bidirectional handle to a single
@@ -434,8 +441,9 @@ type RealtimeEvent struct {
 	Audio []byte
 
 	// Transcript (RealtimeEventTranscript*)
-	Transcript string
-	Final      bool // true = end-of-utterance, false = partial
+	Transcript      string
+	Final           bool // true = end-of-utterance, false = partial
+	TranscriptDelta bool // partial is an increment rather than a complete snapshot
 
 	// Tool call (RealtimeEventToolCall)
 	ToolCallID string
