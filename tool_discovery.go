@@ -68,6 +68,11 @@ func classifyToolAccess(tool mcpToolDef) ToolAccessClass {
 	words := strings.FieldsFunc(strings.ToLower(tool.Name), func(r rune) bool {
 		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
 	})
+	readVerbs := wordSet("get", "list", "read", "search", "find", "query", "count", "sum", "top", "topics", "inspect", "lookup", "fetch", "view", "status", "download", "history")
+	postIsResource := false
+	for _, word := range words {
+		postIsResource = postIsResource || readVerbs[word]
+	}
 	classes := []struct {
 		class ToolAccessClass
 		verbs map[string]bool
@@ -75,11 +80,16 @@ func classifyToolAccess(tool mcpToolDef) ToolAccessClass {
 		{ToolAccessDelete, wordSet("delete", "remove", "archive")},
 		{ToolAccessCreate, wordSet("create", "add", "post", "send", "upload", "publish")},
 		{ToolAccessUpdate, wordSet("update", "set", "edit", "assign", "patch", "move")},
-		{ToolAccessRead, wordSet("get", "list", "read", "search", "find", "query", "count", "sum", "top", "topics", "inspect", "lookup", "fetch", "view", "status", "download", "history")},
-		{ToolAccessExecute, wordSet("run", "exec", "execute", "deploy", "trigger", "call")},
+		{ToolAccessExecute, wordSet("run", "exec", "execute", "deploy", "trigger", "call", "retry", "schedule", "reschedule", "submit")},
+		{ToolAccessRead, readVerbs},
 	}
 	for _, candidate := range classes {
 		for _, word := range words {
+			// In post_list/get_post, post names the resource. Explicit
+			// mutating verbs still take precedence over any read verb.
+			if word == "post" && postIsResource && candidate.class == ToolAccessCreate {
+				continue
+			}
 			if candidate.verbs[word] {
 				if hasReadOnly && !readOnly && candidate.class == ToolAccessRead {
 					return ToolAccessUnknown
