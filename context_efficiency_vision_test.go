@@ -37,6 +37,7 @@ func TestContextEfficiencyComputerScreenshotSurvivesProjection(t *testing.T) {
 				observation := th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "large-text", Content: strings.Repeat("historical document ", 20_000)}}})
 				th.messages = append(th.messages, observation)
 			}
+			th.messages = append(th.messages, Message{Role: "assistant", Content: "First follow-up."}, Message{Role: "assistant", Content: "Second follow-up."}, Message{Role: "assistant", Content: "Third follow-up."})
 			for i := 0; i < toolResultFullRetentionCalls; i++ {
 				th.markToolResultsConsumed(th.messages)
 			}
@@ -63,7 +64,7 @@ func TestContextEfficiencyComputerScreenshotSurvivesProjection(t *testing.T) {
 			if !textPressure && th.promptCacheEpoch != 0 {
 				t.Fatal("compressed image bytes triggered text-retention checkpoint")
 			}
-			if textPressure && !projected[len(before)-1].ToolResults[0].ContentIsPreview {
+			if textPressure && !projected[len(before)-4].ToolResults[0].ContentIsPreview {
 				t.Fatal("mature oversized text was not shortened")
 			}
 			// The previously current frame may age only when a newer frame
@@ -71,7 +72,8 @@ func TestContextEfficiencyComputerScreenshotSurvivesProjection(t *testing.T) {
 			th.messages = append(th.messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "next-screen", Name: "computer_computer_use"}}})
 			th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "next-screen", Content: "Next navigation state", Image: latest}}}))
 			th.commitMatureToolResults(th.messages)
-			if !th.toolResultIsHistorical(th.messages[5].ToolResults[0]) || th.toolResultIsHistorical(th.messages[len(th.messages)-1].ToolResults[0]) {
+			nextRequest := th.prepareToolResultRequest(th.messages)
+			if len(nextRequest[5].ToolResults[0].Image) != 0 || th.toolResultIsHistorical(th.messages[len(th.messages)-1].ToolResults[0]) || !strings.Contains(nextRequest[len(nextRequest)-1].Parts[0].Text, "next-screen") {
 				t.Fatal("screenshot replacement failed to move current-frame protection")
 			}
 		})
@@ -104,6 +106,7 @@ func TestIntegration_CodexGPT61SolComputerVisionRetention(t *testing.T) {
 	th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "screen", Content: "Capture successful", Image: pixels}}}))
 	th.messages = append(th.messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "document", Name: "read_document"}}})
 	th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "document", Content: strings.Repeat("Historical document unrelated to the current screen. ", 7000)}}}))
+	th.messages = append(th.messages, Message{Role: "assistant", Content: "First follow-up."}, Message{Role: "assistant", Content: "Second follow-up."}, Message{Role: "assistant", Content: "Third follow-up."})
 	for i := 0; i < toolResultFullRetentionCalls; i++ {
 		th.markToolResultsConsumed(th.messages)
 	}

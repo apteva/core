@@ -28,6 +28,9 @@ func efficiencyHistory(t *testing.T, thinker *Thinker) []Message {
 	t.Helper()
 	messages := []Message{{Role: "system", Content: "Use observations exactly; approval pending is not completion."}, {Role: "user", Content: "Inspect the frozen run and report its state."}}
 	for i, id := range []string{"old-one", "old-two", "current"} {
+		if id == "current" {
+			messages = append(messages, Message{Role: "assistant", Content: "First follow-up."}, Message{Role: "assistant", Content: "Second follow-up."}, Message{Role: "assistant", Content: "Third follow-up."})
+		}
 		callID := "inspect-" + id
 		messages = append(messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: callID, Name: "inspect", Args: map[string]string{"id": id}}}})
 		result := Message{Role: "user", ToolResults: []ToolResult{{CallID: callID, ToolName: "inspect", Content: efficiencyPayload(t, id)}}}
@@ -64,7 +67,7 @@ func TestContextEfficiencyRetentionProtectsFreshStateAndArchive(t *testing.T) {
 			t.Fatal("archive lost original", err)
 		}
 	}
-	if !reflect.DeepEqual(projected[7], original[7]) {
+	if !reflect.DeepEqual(projected[len(projected)-1], original[len(original)-1]) {
 		t.Fatal("fresh result changed before consumption")
 	}
 	if th.promptCacheEpoch != 1 {

@@ -144,6 +144,10 @@ type toolResultProjectionStats struct {
 
 func (t *Thinker) matureToolResultStats(messages []Message) toolResultProjectionStats {
 	var stats toolResultProjectionStats
+	if !t.toolResultContextUnderPressure(messages) {
+		return stats
+	}
+	protected := t.protectedHistoricalToolResults(messages)
 	seen := make(map[string]bool)
 	currentScreen := latestComputerScreenshotCallID(messages)
 	t.toolResultMu.Lock()
@@ -151,7 +155,7 @@ func (t *Thinker) matureToolResultStats(messages []Message) toolResultProjection
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
 			key := toolResultKey(result)
-			if key == "" || seen[key] || (currentScreen != "" && result.CallID == currentScreen) || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
+			if key == "" || seen[key] || protected[result.CallID] || (currentScreen != "" && result.CallID == currentScreen) || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
 				continue
 			}
 			seen[key] = true
@@ -179,10 +183,10 @@ func toolResultProjectionBatchReady(stats toolResultProjectionStats) bool {
 // provider-only bounded projection in one operation. The durable archive and
 // in-memory full payload remain untouched.
 func (t *Thinker) commitMatureToolResults(messages []Message) int {
-	protected := t.toolCallIDsProtectedFromSanitization(nil)
-	if currentScreen := latestComputerScreenshotCallID(messages); currentScreen != "" {
-		protected[currentScreen] = true
+	if !t.toolResultContextUnderPressure(messages) {
+		return 0
 	}
+	protected := t.protectedHistoricalToolResults(messages)
 	committed := 0
 	seen := make(map[string]bool)
 	t.toolResultMu.Lock()
@@ -211,10 +215,9 @@ func (t *Thinker) commitMatureToolResults(messages []Message) int {
 // Once old, large results become deterministic bounded previews; aged small
 // results remain full until the aggregate historical budget would be exceeded.
 func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
-	currentScreen := latestComputerScreenshotCallID(messages)
-	protectCurrentScreen := func(result ToolResult) bool {
-		return currentScreen != "" && result.CallID == currentScreen
-	}
+	protected := t.protectedHistoricalToolResults(messages)
+	protectCurrentScreen := func(result ToolResult) bool { return protected[result.CallID] }
+	perResult, totalBudget := t.historicalToolResultBudgets()
 	historicalCount := 0
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
@@ -223,7 +226,7 @@ func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
 			}
 		}
 	}
-	remaining := historicalToolResultTotalChars
+	remaining := totalBudget
 	remainingResults := historicalCount
 	var projected []Message
 	for messageIndex := len(messages) - 1; messageIndex >= 0; messageIndex-- {
@@ -242,7 +245,7 @@ func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
 				maxForResult = 0
 			}
 			remainingResults--
-			mustProject := shouldArchiveToolResult(result) || len(result.Content) > maxForResult
+			mustProject := len(result.Image) > 0 || len(result.Content) > min(perResult, maxForResult)
 			if !mustProject {
 				remaining -= len(result.Content)
 				continue
@@ -250,7 +253,7 @@ func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
 			if projected == nil {
 				projected = cloneMessages(messages)
 			}
-			limit := historicalToolResultPerResultChars
+			limit := perResult
 			if maxForResult < limit {
 				limit = maxForResult
 			}
@@ -279,7 +282,7 @@ func (t *Thinker) prepareToolResultRequest(messages []Message) []Message {
 			}
 		}
 	}
-	if retainedBytes >= toolResultProjectionPressureBytes {
+	if t.toolResultContextUnderPressure(messages) {
 		if projected := t.commitMatureToolResults(messages); projected > 0 {
 			t.advancePromptCacheEpoch("tool_result_context_pressure", false, map[string]any{
 				"results_projected": projected, "retained_bytes_before": retainedBytes,
@@ -305,4 +308,92 @@ func (t *Thinker) prepareToolResultRequest(messages []Message) []Message {
 		})
 	}
 	return projected
+}
+
+// OpenClaw-style whole-result caps. Go's limits use UTF-8 bytes, rather than
+// UTF-16 characters; these are approximate text/token budgets, not tokenizer counts.
+func (t *Thinker) historicalToolResultBudgets() (perResult, total int) {
+	perResult, total = historicalToolResultPerResultChars, historicalToolResultTotalChars
+	window := ModelEffectiveContextWindow(t.modelID())
+	if window >= 200_000 {
+		perResult = 64_000
+	} else if window >= 100_000 {
+		perResult = 32_000
+	}
+	if window > 0 {
+		budget := estimatePreparedRequest("", t.modelID(), nil, nil)
+		if t.provider != nil {
+			budget = estimatePreparedRequest(t.provider.Name(), t.modelID(), nil, nil)
+		}
+		share := max(0, budget.InputBudget) * 4 * 3 / 10
+		perResult, total = min(perResult, share), min(total, share)
+	}
+	return
+}
+
+func (t *Thinker) protectedHistoricalToolResults(messages []Message) map[string]bool {
+	protected := t.toolCallIDsProtectedFromSanitization(nil)
+	if screen := latestComputerScreenshotCallID(messages); screen != "" {
+		protected[screen] = true
+	}
+	boundary, turns := len(messages), 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			turns++
+			boundary = i
+			if turns == 3 {
+				break
+			}
+		}
+	}
+	// With fewer than three turns, protect the entire recent exchange.
+	if turns < 3 {
+		boundary = 0
+	}
+	firstUser := -1
+	for i, msg := range messages {
+		if msg.Role == "user" && len(msg.ToolResults) == 0 {
+			firstUser = i
+			break
+		}
+	}
+	for i, msg := range messages {
+		if i < boundary && (firstUser < 0 || i >= firstUser) {
+			continue
+		}
+		for _, call := range msg.ToolCalls {
+			if call.ID != "" {
+				protected[call.ID] = true
+			}
+		}
+		for _, result := range msg.ToolResults {
+			if result.CallID != "" {
+				protected[result.CallID] = true
+			}
+		}
+	}
+	return protected
+}
+
+func (t *Thinker) toolResultContextUnderPressure(messages []Message) bool {
+	messages = t.prepareHistoricalToolResults(messages)
+	textBytes := 0
+	for _, message := range messages {
+		for _, result := range message.ToolResults {
+			textBytes += len(result.Content)
+		}
+	}
+	if textBytes >= toolResultProjectionPressureBytes {
+		return true
+	}
+	window := ModelEffectiveContextWindow(t.modelID())
+	if window <= 0 {
+		return false
+	}
+	provider := ""
+	if t.provider != nil {
+		provider = t.provider.Name()
+	}
+	budget := estimatePreparedRequest(provider, t.modelID(), nil, nil)
+	return estimatedContextTokens(messages) >= budget.InputBudget*3/10
 }

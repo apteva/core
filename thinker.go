@@ -1401,7 +1401,8 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	}
 
 	// Load conversation history from persistent session
-	if saved, summaries := t.session.LoadTail(defaultLoadTail); len(saved) > 0 {
+	restoredToolResultBudget, _ := t.historicalToolResultBudgets()
+	if saved, summaries := t.session.LoadTail(defaultLoadTail, restoredToolResultBudget); len(saved) > 0 {
 		// Prepend compacted summaries as context in system prompt
 		if len(summaries) > 0 {
 			contextBlock := "\n\n[PREVIOUS CONTEXT]\n"

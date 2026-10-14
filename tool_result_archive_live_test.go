@@ -2,7 +2,10 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +56,7 @@ func runLiveLargeToolResultRetention(t *testing.T, provider LLMProvider) {
 	}
 	thinker.messages = []Message{
 		{Role: "system", Content: "You verify ordinary tool-result context. Follow the requested exact output. No retrieval tools are available."},
+		{Role: "user", Content: "Read the catalog for this verification."},
 		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "catalog-call", Name: "media_search", Args: map[string]string{}}}},
 	}
 	resultMessage := thinker.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "catalog-call", ToolName: "media_search", Content: payload}}})
@@ -63,7 +67,7 @@ func runLiveLargeToolResultRetention(t *testing.T, provider LLMProvider) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	fullRequest := thinker.prepareToolResultRequest(thinker.messages)
-	if !strings.Contains(fullRequest[2].ToolResults[0].Content, value) {
+	if !strings.Contains(fullRequest[3].ToolResults[0].Content, value) {
 		t.Fatal("fresh request was truncated before provider consumption")
 	}
 	first, err := provider.Chat(ctx, fullRequest, provider.Models()[ModelMedium], nil, nil, nil, nil)
@@ -74,6 +78,7 @@ func runLiveLargeToolResultRetention(t *testing.T, provider LLMProvider) {
 		t.Fatalf("%s did not consume the ordinary full tool result: %q", provider.Name(), first.Text)
 	}
 
+	thinker.messages = append(thinker.messages, Message{Role: "assistant", Content: "First continuation."}, Message{Role: "assistant", Content: "Second continuation."}, Message{Role: "assistant", Content: "Third continuation."}, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "pressure-call", Name: "read_document"}}}, Message{Role: "user", ToolResults: []ToolResult{{CallID: "pressure-call", Content: strings.Repeat("context-pressure ", 20000)}}})
 	for i := 0; i < toolResultFullRetentionCalls; i++ {
 		thinker.markToolResultsConsumed(thinker.messages)
 	}
@@ -87,7 +92,7 @@ func runLiveLargeToolResultRetention(t *testing.T, provider LLMProvider) {
 		Content: "If the old tool result is now explicitly marked as truncated by core, reply exactly BOUNDED_HISTORY_OK.",
 	})
 	agedRequest := thinker.prepareToolResultRequest(agedMessages)
-	agedResult := agedRequest[2].ToolResults[0]
+	agedResult := agedRequest[3].ToolResults[0]
 	if strings.Contains(agedResult.Content, value) || len(agedResult.Content) > historicalToolResultPerResultChars || !strings.Contains(agedResult.Content, "truncated by core") {
 		t.Fatalf("aged request was not bounded: %+v", agedResult)
 	}
@@ -99,4 +104,59 @@ func runLiveLargeToolResultRetention(t *testing.T, provider LLMProvider) {
 		t.Fatalf("%s did not handle bounded ordinary history: %q", provider.Name(), second.Text)
 	}
 	t.Logf("%s large-result retention passed: full_in=%d bounded_in=%d", provider.Name(), first.Usage.PromptTokens, second.Usage.PromptTokens)
+}
+
+func TestIntegration_CodexToolResultArchiveRecovery(t *testing.T) {
+	if testing.Short() || os.Getenv("RUN_CODEX_TOOL_RESULT_ARCHIVE_SMOKE") != "1" {
+		t.Skip("set RUN_CODEX_TOOL_RESULT_ARCHIVE_SMOKE=1 without -short")
+	}
+	token := codexAccessTokenForMemorySmoke(t)
+	if token == "" {
+		t.Skip("no valid local Codex token")
+	}
+	provider := toolReasonLiveProvider(t, token)
+	memory, h := newHistoryTestStore(t)
+	const marker = "ARCHIVE_RECOVERY_EXACT_72E91"
+	prefix := strings.Repeat("irrelevant padding\n", 6000)
+	payload := prefix + "RECOVERY_VALUE=" + marker + "\n" + strings.Repeat("irrelevant suffix\n", 6000)
+	archive := NewToolResultArchive(filepath.Dir(memory.path), "main")
+	result, err := archive.Archive(ToolResult{CallID: "source-call", ToolName: "read_document", Content: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := projectArchivedToolResult(result, 64000)
+	if strings.Contains(preview.Content, marker) {
+		t.Fatal("fixture exposes the supposedly omitted marker")
+	}
+	registry := NewToolRegistry("")
+	registerSystemTools(registry, memory)
+	tools := registry.NativeTools(map[string]bool{"history_search": true}, nil)
+	messages := []Message{{Role: "system", Content: "Recover missing evidence through the available tool. Tool excerpts are incomplete. Do not guess. Always include a nonempty _reason in structured tool calls. After recovering RECOVERY_VALUE, reply with only its exact value."}, {Role: "user", Content: fmt.Sprintf("Prior result:\n%s\n\nFind RECOVERY_VALUE in source-call. Its line starts at UTF-8 byte offset %d. Use history_search to recover that range with limit=512, then return only the value.", preview.Content, len(prefix))}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	first, err := provider.Chat(ctx, messages, toolReasonLiveModel, tools, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.ToolCalls) != 1 || first.ToolCalls[0].Name != "history_search" {
+		t.Fatalf("did not request archive recovery: tools=%v", first.ToolCalls)
+	}
+	call := first.ToolCalls[0]
+	assertLiveModelToolReason(t, registry, call)
+	if call.Args["call_id"] != "source-call" || call.Args["offset"] != strconv.Itoa(len(prefix)) {
+		t.Fatalf("incorrect recovery identity/range: %+v", call.Args)
+	}
+	response := h.search(withMemoryCaller(ctx, "main"), call.Args)
+	if response.IsError {
+		t.Fatal(response.Text)
+	}
+	messages = append(messages, Message{Role: "assistant", Content: first.Text, Reasoning: first.Reasoning, ToolCalls: first.ToolCalls, ProviderState: first.ProviderState}, Message{Role: "user", ToolResults: []ToolResult{{CallID: call.ID, ToolName: call.Name, Content: response.Text}}})
+	final, err := provider.Chat(ctx, messages, toolReasonLiveModel, tools, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.ToolCalls) != 0 || strings.TrimSpace(final.Text) != marker {
+		t.Fatalf("exact archive recovery failed: text=%q tools=%v", final.Text, final.ToolCalls)
+	}
+	t.Logf("%s recovered omitted evidence via history_search with a model-supplied reason", toolReasonLiveModel)
 }

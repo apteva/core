@@ -813,7 +813,8 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	thinker.handleTools = threadToolHandler(thread, tm)
 
 	// Load conversation history from persistent session (for respawned threads)
-	if saved, summaries := thinker.session.LoadTail(defaultLoadTail); len(saved) > 0 {
+	restoredToolResultBudget, _ := thinker.historicalToolResultBudgets()
+	if saved, summaries := thinker.session.LoadTail(defaultLoadTail, restoredToolResultBudget); len(saved) > 0 {
 		if len(summaries) > 0 {
 			contextBlock := "\n\n[PREVIOUS CONTEXT]\n"
 			for _, s := range summaries {

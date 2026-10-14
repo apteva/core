@@ -536,8 +536,8 @@ func TestSessionLoadTailDoesNotReloadComputerScreenshots(t *testing.T) {
 	if messages[1].ToolResults[0].Image != nil {
 		t.Fatal("stale computer screenshot was reloaded")
 	}
-	if !strings.Contains(messages[1].ToolResults[0].Content, "OLDER TOOL RESULT") {
-		t.Fatalf("loaded result = %q, want bounded archive preview", messages[1].ToolResults[0].Content)
+	if messages[1].ToolResults[0].Content != "screen metadata" {
+		t.Fatalf("loaded result = %q, want original short screen metadata", messages[1].ToolResults[0].Content)
 	}
 }
 

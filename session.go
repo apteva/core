@@ -184,7 +184,11 @@ func (s *Session) prepareEntryForDurability(entry SessionEntry) (SessionEntry, e
 // projectEntriesForModelLoad migrates legacy full-payload entries into the
 // archive and always returns bounded projections. If an archive write fails,
 // the in-memory fallback is still bounded and contains no image bytes.
-func (s *Session) projectEntriesForModelLoad(entries []SessionEntry) []SessionEntry {
+func (s *Session) projectEntriesForModelLoad(entries []SessionEntry, toolResultBudget ...int) []SessionEntry {
+	limit := historicalToolResultPerResultChars
+	if len(toolResultBudget) > 0 {
+		limit = max(0, min(toolResultBudget[0], 64_000))
+	}
 	projected := make([]SessionEntry, len(entries))
 	for i, entry := range entries {
 		projected[i] = entry
@@ -220,10 +224,10 @@ func (s *Session) projectEntriesForModelLoad(entries []SessionEntry) []SessionEn
 			if err != nil {
 				archived = original
 				archived.Image = nil
-				archived.Content = deterministicToolResultExcerpt(original.Content, historicalToolResultPerResultChars)
+				archived.Content = deterministicToolResultExcerpt(original.Content, limit)
 				archived.ContentIsPreview = true
 			}
-			projected[i].ToolResults[j] = projectArchivedToolResult(archived, historicalToolResultPerResultChars)
+			projected[i].ToolResults[j] = projectArchivedToolResult(archived, limit)
 		}
 	}
 	return projected
@@ -310,7 +314,7 @@ func (s *Session) EventIDs() map[string]bool {
 
 // LoadTail reads the last n messages from the history file and converts them to Messages.
 // Skips system messages and _compacted entries (compacted summaries are prepended as context).
-func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []string) {
+func (s *Session) LoadTail(n int, toolResultBudget ...int) (messages []Message, compactedSummaries []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -347,7 +351,7 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 			}
 		}
 	}
-	entries = s.projectEntriesForModelLoad(entries)
+	entries = s.projectEntriesForModelLoad(entries, toolResultBudget...)
 
 	// Collect compacted summaries
 	for _, e := range entries {

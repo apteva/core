@@ -76,16 +76,37 @@ invalid provider credential; configuration must be corrected separately.
 
 ## Regression checks
 
-Large retained results become eligible after three successful consumption
-calls. Besides the normal batched checkpoints, 256 KiB of retained tool-result text
-triggers a checkpoint of already mature, completed results before the next
-request. Fresh and pending evidence stays intact. Structured receipts retain
-exact small state fields and source references, mark omitted details unknown,
-and preserve the complete archive. Smaller workflows retain the existing batch
-policy to limit unnecessary prefix rewrites. Compressed image bytes do not
-trigger this text threshold. The latest computer screenshot and its navigation
-metadata remain current until a newer frame replaces them; historical-result
-aging preserves them for the screenshot request tail.
+Tool-result history uses OpenClaw-style whole-result excerpts. Default per-result
+text caps are 16,000 UTF-8 bytes for unknown/smaller windows, 32,000 for windows
+of at least 100,000 tokens, and 64,000 for windows of at least 200,000 tokens.
+The shared historical budget is at most 256 KiB; both limits are additionally
+bounded by 30% of the model's safe input budget after output reservation. These
+are byte budgets, not exact tokenizer counts. There is no 512-byte field limit
+and no transformation of long JSON strings into `omitted_bytes` objects.
+Main startup and worker respawn resolve the same model-aware cap before loading
+archived history; restarting does not silently revert larger models to a 16 KiB
+preview. Standalone history reads without a model budget use the 16,000-byte
+fallback, and historical image bytes remain excluded from model reloads.
+
+New pruning requires actual pressure: at least 256 KiB of tool-result text in
+the current projected request or estimated request context reaching 30% of the
+safe input budget. Three successful consumption calls only establish eligibility;
+age and checkpoints alone do not initiate pruning. The most recent three
+assistant turns, bootstrap reads before the first external user message, pending
+calls, and the current computer screenshot/navigation metadata stay intact.
+Compressed image bytes do not count as retained text. Existing projections replay
+stably to avoid cache churn; full source bytes remain unchanged in the archive.
+
+An oversized older result keeps an equal-share head/tail excerpt, with an explicit
+incomplete-text marker and `history_search(call_id="...", offset=0)` recovery hint.
+Results fitting their whole-result budget remain verbatim. The existing
+`history_search` tool accepts a call ID and UTF-8 byte offset/limit (default 16,000,
+maximum 64,000) to retrieve exact text from that caller's archive, or retained
+journal for a small result. Follow `next_offset` until `complete=true`.
+Archive retrieval survives compaction and restart, checks content hashes, respects
+source withdrawal/exclusion, and never reintroduces historical image bytes or
+allows another thread's call ledger to be read. Historical text retains its
+original authority; recovery does not create new instructions or authorization.
 
 `context_recovery_test.go` covers wire-level context rejection, blocked oversized
 requests/tools/instructions, state and journal preservation, restart, structured

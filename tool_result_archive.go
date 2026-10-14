@@ -23,8 +23,8 @@ const (
 	toolResultArchiveDir               = "tool-results"
 	toolResultArchiveObjectDir         = "objects"
 	toolResultArchiveCallsDir          = "calls"
-	historicalToolResultPerResultChars = 2_000
-	historicalToolResultTotalChars     = 64 * 1024
+	historicalToolResultPerResultChars = 16_000
+	historicalToolResultTotalChars     = 256 * 1024
 	maxArchivedToolResultObjectBytes   = 256 << 20
 )
 
@@ -342,7 +342,7 @@ func deterministicToolResultExcerpt(content string, maxChars int) string {
 		return validToolResultPrefix(content, maxChars)
 	}
 	available := maxChars - len(marker)
-	head := available * 3 / 4
+	head := available / 2
 	tail := available - head
 	return validToolResultPrefix(content, head) + marker + validToolResultSuffix(content, tail)
 }
@@ -379,6 +379,10 @@ func projectArchivedToolResult(result ToolResult, maxChars int) ToolResult {
 	projected := result
 	projected.Image = nil
 	projected.ContentIsPreview = true
+	if len(result.Content) <= maxChars && !result.ContentIsPreview {
+		projected.ContentIsPreview = false
+		return projected
+	}
 	if maxChars <= 0 {
 		projected.Content = ""
 		return projected
@@ -393,7 +397,8 @@ func projectArchivedToolResult(result ToolResult, maxChars int) ToolResult {
 		"call_id=" + result.CallID,
 		"original_chars=" + strconv.Itoa(result.OriginalChars),
 		"original_bytes=" + strconv.Itoa(result.OriginalBytes),
-		"Omitted fields are unknown; re-read the source before relying on them.",
+		"Incomplete excerpt, not a complete JSON response. Omitted text remains unknown.",
+		"Recover exact text with history_search(call_id=\"" + result.CallID + "\", offset=0).",
 		"preview:",
 	}, "\n")
 	if len(header) >= maxChars {
@@ -401,10 +406,7 @@ func projectArchivedToolResult(result ToolResult, maxChars int) ToolResult {
 		return projected
 	}
 	bodyBudget := maxChars - len(header) - 1
-	body := toolResultStateReceipt(result.Content, bodyBudget)
-	if body == "" {
-		body = deterministicToolResultExcerpt(result.Content, bodyBudget)
-	}
+	body := deterministicToolResultExcerpt(result.Content, bodyBudget)
 	projected.Content = header + "\n" + body
 	return projected
 }

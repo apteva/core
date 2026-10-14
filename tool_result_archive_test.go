@@ -176,14 +176,19 @@ func TestLargeToolResultStaysFullUntilBatchedRetentionCheckpoint(t *testing.T) {
 	if thinker.promptCacheEpoch != initialEpoch {
 		t.Fatalf("maturity alone reset prompt cache: epoch=%d reason=%q", thinker.promptCacheEpoch, thinker.promptCacheResetReason)
 	}
-	for thinker.matureToolResultStats(thinker.messages).maxAge < toolResultProjectionMaxAge {
+	// Age alone cannot shorten a result, even at a former checkpoint age.
+	for i := 0; i < toolResultProjectionMaxAge; i++ {
 		thinker.markToolResultsConsumed(thinker.messages)
 	}
-	stats := thinker.matureToolResultStats(thinker.messages)
-	if !toolResultProjectionBatchReady(stats) {
-		t.Fatalf("aged result did not make a block checkpoint ready: %+v", stats)
+	if committed := thinker.commitMatureToolResults(thinker.messages); committed != 0 {
+		t.Fatal("age alone projected a result")
 	}
+	// Move it beyond the protected three turns and create real text pressure.
+	thinker.messages = append(thinker.messages, Message{Role: "assistant", Content: "First continuation."}, Message{Role: "assistant", Content: "Second continuation."}, Message{Role: "assistant", Content: "Third continuation."}, Message{Role: "user", ToolResults: []ToolResult{{CallID: "fresh-pressure", Content: strings.Repeat("x", toolResultProjectionPressureBytes)}}})
 	projected := thinker.commitMatureToolResults(thinker.messages)
+	if projected != 1 {
+		t.Fatalf("committed %d older results", projected)
+	}
 	thinker.advancePromptCacheEpoch("tool_result_retention_checkpoint", false, map[string]any{"results_projected": projected})
 	aged := thinker.prepareToolResultRequest(thinker.messages)
 	if strings.Contains(aged[2].ToolResults[0].Content, "MIDDLE_ONLY_ARCHIVE_SENTINEL") || len(aged[2].ToolResults[0].Content) > historicalToolResultPerResultChars || !aged[2].ToolResults[0].ContentIsPreview {
@@ -209,13 +214,17 @@ func TestHistoricalToolResultTotalLimit(t *testing.T) {
 	for i := 0; i < toolResultFullRetentionCalls; i++ {
 		thinker.markToolResultsConsumed(thinker.messages)
 	}
-	if committed := thinker.commitMatureToolResults(thinker.messages); committed != 50 {
-		t.Fatalf("committed historical results = %d, want 50", committed)
+	if committed := thinker.commitMatureToolResults(thinker.messages); committed != 47 {
+		t.Fatalf("committed historical results = %d, want 47", committed)
 	}
 	request := thinker.prepareToolResultRequest(thinker.messages)
 	total := 0
+	protected := thinker.protectedHistoricalToolResults(thinker.messages)
 	for _, message := range request {
 		for _, result := range message.ToolResults {
+			if protected[result.CallID] {
+				continue
+			}
 			total += len(result.Content)
 			if len(result.Content) > historicalToolResultPerResultChars {
 				t.Fatalf("per-result limit exceeded: %d", len(result.Content))
