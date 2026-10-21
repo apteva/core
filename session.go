@@ -25,7 +25,9 @@ const (
 
 // SessionEntry is one line in the JSONL history file.
 type SessionEntry struct {
+	Work               *ThreadWork                 `json:"work,omitempty"`
 	RealtimeTranscript *RealtimeTranscriptMetadata `json:"realtime_transcript,omitempty"`
+	RealtimeBackend    bool                        `json:"realtime_backend,omitempty"`
 	// Sequence is a per-session, monotonically increasing cursor. It makes the
 	// durable history safe for consumers that need to observe a running thread:
 	// unlike the in-memory context window, this cursor does not move when old
@@ -267,6 +269,8 @@ func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) er
 	}
 	entry := SessionEntry{
 		RealtimeTranscript: msg.RealtimeTranscript,
+		RealtimeBackend:    msg.RealtimeBackend,
+		Work:               cloneThreadWork(msg.Work),
 		Timestamp:          time.Now(),
 		Role:               msg.Role,
 		Content:            msg.Content,
@@ -378,6 +382,8 @@ func (s *Session) LoadTail(n int, toolResultBudget ...int) (messages []Message, 
 	for _, e := range real {
 		msg := Message{
 			RealtimeTranscript: e.RealtimeTranscript,
+			RealtimeBackend:    e.RealtimeBackend,
+			Work:               cloneThreadWork(e.Work),
 			Role:               e.Role,
 			Content:            e.Content,
 			Parts:              e.Parts,

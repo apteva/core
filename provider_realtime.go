@@ -243,7 +243,14 @@ type RealtimeSessionOpts struct {
 	timing             *realtimeTiming // internal, session-scoped observer
 	// RestoreHistory asks immutable providers to accept an initial history seed.
 	// Fresh sessions must not synthesize an empty completed conversation turn.
-	RestoreHistory bool
+	RestoreHistory           bool
+	History                  []Message // startup seed for providers whose history is immutable
+	ConversationInstructions string    // voice role; backend keeps the full Core prompt
+	ExecutionMode            string
+	ExecutionModel           string
+	ExecutionInstructions    string
+	ExecutionTools           []NativeTool
+	InitialMessage           string // trusted greeting instructions, seeded at startup
 }
 
 // RealtimePricing supports dollars per one million tokens plus optional
@@ -263,6 +270,7 @@ type RealtimePricing struct {
 	AudioInputPerMinute  float64
 	AudioOutputPerMinute float64
 	TextInputPerMessage  float64
+	SessionPerMinute     float64
 }
 
 // RealtimeUsage is the detailed token accounting carried by a completed
@@ -282,6 +290,7 @@ type RealtimeUsage struct {
 	AudioInputSeconds  float64
 	AudioOutputSeconds float64
 	TextInputMessages  int
+	SessionSeconds     float64 // a delta, even when the provider reports cumulative usage
 }
 
 // RealtimeAudioFrame is the provider-neutral unit sent to an external audio
@@ -412,22 +421,26 @@ type RealtimeEventType string
 var ErrRealtimeToolCallCancelled = errors.New("realtime tool call was cancelled")
 
 const (
-	RealtimeEventAudioOut          RealtimeEventType = "audio_out"         // PCM chunk
-	RealtimeEventTranscriptInput   RealtimeEventType = "transcript_input"  // user said
-	RealtimeEventTranscriptOutput  RealtimeEventType = "transcript_output" // model said
-	RealtimeEventToolCall          RealtimeEventType = "tool_call"
-	RealtimeEventToolCallCancelled RealtimeEventType = "tool_call_cancelled"
-	RealtimeEventResponseStarted   RealtimeEventType = "response_started"
-	RealtimeEventResponseDone      RealtimeEventType = "response_done"
-	RealtimeEventUtteranceDone     RealtimeEventType = "utterance_done" // speech finished, interaction still active
-	RealtimeEventSpeechStarted     RealtimeEventType = "speech_started"
-	RealtimeEventSessionReady      RealtimeEventType = "session_ready"
-	RealtimeEventSpeechStopped     RealtimeEventType = "speech_stopped"
-	RealtimeEventRateLimits        RealtimeEventType = "rate_limits"
-	RealtimeEventSessionEnded      RealtimeEventType = "session_ended"
-	RealtimeEventOutputBlocked     RealtimeEventType = "output_blocked"
-	RealtimeEventError             RealtimeEventType = "error"
-	RealtimeEventSessionExpiring   RealtimeEventType = "session_expiring"
+	RealtimeEventAudioOut            RealtimeEventType = "audio_out"         // PCM chunk
+	RealtimeEventTranscriptInput     RealtimeEventType = "transcript_input"  // user said
+	RealtimeEventTranscriptOutput    RealtimeEventType = "transcript_output" // model said
+	RealtimeEventToolCall            RealtimeEventType = "tool_call"
+	RealtimeEventToolCallCancelled   RealtimeEventType = "tool_call_cancelled"
+	RealtimeEventResponseStarted     RealtimeEventType = "response_started"
+	RealtimeEventResponseDone        RealtimeEventType = "response_done"
+	RealtimeEventUtteranceDone       RealtimeEventType = "utterance_done" // speech finished, interaction still active
+	RealtimeEventSpeechStarted       RealtimeEventType = "speech_started"
+	RealtimeEventSessionReady        RealtimeEventType = "session_ready"
+	RealtimeEventSpeechStopped       RealtimeEventType = "speech_stopped"
+	RealtimeEventRateLimits          RealtimeEventType = "rate_limits"
+	RealtimeEventSessionEnded        RealtimeEventType = "session_ended"
+	RealtimeEventOutputBlocked       RealtimeEventType = "output_blocked"
+	RealtimeEventError               RealtimeEventType = "error"
+	RealtimeEventSessionExpiring     RealtimeEventType = "session_expiring"
+	RealtimeEventBackendProgress     RealtimeEventType = "backend_progress"
+	RealtimeEventDelegation          RealtimeEventType = "delegation"
+	RealtimeEventSessionUsage        RealtimeEventType = "session_usage"
+	RealtimeEventContextAcknowledged RealtimeEventType = "context_acknowledged"
 )
 
 // RealtimeEvent is a single event from a session. Only the fields
@@ -441,9 +454,17 @@ type RealtimeEvent struct {
 	Audio []byte
 
 	// Transcript (RealtimeEventTranscript*)
-	Transcript      string
-	Final           bool // true = end-of-utterance, false = partial
-	TranscriptDelta bool // partial is an increment rather than a complete snapshot
+	Transcript         string
+	Final              bool // true = end-of-utterance, false = partial
+	TranscriptDelta    bool // partial is an increment rather than a complete snapshot
+	TranscriptStartMS  int
+	TranscriptEndMS    int
+	TranscriptGrouped  bool // application grouping; never provider-final evidence
+	DelegationID       string
+	ApplicationOwned   bool // work originated in Core; no provider delegation ID
+	DelegationOffsetMS int
+	ClientEventID      string
+	Terminal           bool // provider says this session must not be automatically restarted
 
 	// Tool call (RealtimeEventToolCall)
 	ToolCallID string

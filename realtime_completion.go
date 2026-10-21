@@ -15,6 +15,7 @@ type realtimeCompletion struct {
 	initiator, callID  string
 	responseID, itemID string
 	utteranceDone      bool
+	awaitOutput        bool
 	outcome            string
 }
 
@@ -145,8 +146,12 @@ func (rt *RealtimeThinker) requestCompletion(callID string) {
 	rt.completion.requested = true
 	rt.completion.requestedAt = time.Now()
 	rt.completion.initiator, rt.completion.callID = "model", callID
+	rt.completion.awaitOutput = rt.capabilities.ContinuousConversation
 	rt.terminalReason = "done_tool"
 	rt.lifecycleMu.Unlock()
+	if rt.capabilities.ContinuousConversation {
+		_ = rt.appendRealtimeContext(RealtimeContextUpdate{Kind: "instructions", Content: "The conversation is ending. Give a brief closing in the caller's language, using only verified facts, then stop speaking and listen. Do not start new backend work."})
+	}
 	rt.emit("realtime.completion_requested", rt.shutdownData())
 	rt.setConversationState("finishing", RealtimeEvent{})
 	rt.wakeRecovery()
@@ -156,6 +161,9 @@ func (rt *RealtimeThinker) noteCompletionEvent(event RealtimeEvent) {
 	rt.lifecycleMu.Lock()
 	defer rt.lifecycleMu.Unlock()
 	if event.Type == RealtimeEventAudioOut || event.Type == RealtimeEventTranscriptOutput || event.Type == RealtimeEventResponseStarted {
+		if rt.completion.requested && (event.Type == RealtimeEventAudioOut || rt.audioOut == nil) {
+			rt.completion.awaitOutput = false
+		}
 		rt.completion.responseID, rt.completion.itemID = event.ResponseID, event.ItemID
 		if !event.Final {
 			rt.completion.utteranceDone = false
@@ -179,6 +187,7 @@ func (rt *RealtimeThinker) finishRealtimeCompletion(session RealtimeSession) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	var settledAt time.Time
+	closing, finalized := false, false
 	var events <-chan RealtimeEvent
 	if session != nil {
 		events = session.Events()
@@ -194,7 +203,7 @@ func (rt *RealtimeThinker) finishRealtimeCompletion(session RealtimeSession) {
 		default:
 		}
 		rt.lifecycleMu.Lock()
-		connected, done := rt.bridgeConnected, rt.completion.utteranceDone
+		connected, done, awaitOutput := rt.bridgeConnected, rt.completion.utteranceDone, rt.completion.awaitOutput
 		rt.lifecycleMu.Unlock()
 		// A missing bridge is also valid for text-only workers. Never drain audio
 		// to a peer that has disconnected; retain the evidence before closing.
@@ -203,14 +212,27 @@ func (rt *RealtimeThinker) finishRealtimeCompletion(session RealtimeSession) {
 			return
 		}
 		pending, awaiting, _ := rt.delivery.snapshot()
-		ready := (done || !rt.responseInProgress() || session == nil) && pending == 0 && awaiting == 0
+		if rt.capabilities.ContinuousConversation {
+			done = rt.continuous.lastAudio.IsZero() || time.Since(rt.continuous.lastAudio) >= realtimeObservedQuiet
+		}
+		ready := !awaitOutput && (done || !rt.responseInProgress() || session == nil) && pending == 0 && awaiting == 0 && !rt.backend.active
 		if ready {
 			if settledAt.IsZero() {
 				settledAt = time.Now()
 			}
 			if time.Since(settledAt) >= realtimeCompletionQuietPeriod {
-				rt.setCompletionOutcome("completed")
-				return
+				if graceful, ok := session.(RealtimeGracefulSession); ok && !finalized {
+					if !closing {
+						if err := graceful.BeginClose(); err != nil {
+							rt.setCompletionOutcome("timed_out")
+							return
+						}
+						closing = true
+					}
+				} else {
+					rt.setCompletionOutcome("completed")
+					return
+				}
 			}
 		} else {
 			settledAt = time.Time{}
@@ -231,8 +253,19 @@ func (rt *RealtimeThinker) finishRealtimeCompletion(session RealtimeSession) {
 		case event, ok := <-events:
 			if !ok {
 				events = nil
+				if rt.capabilities.ContinuousConversation && !finalized {
+					rt.setCompletionOutcome("disconnected")
+					return
+				}
+				if closing && !finalized {
+					rt.setCompletionOutcome("timed_out")
+					return
+				}
 				session = nil
 				continue
+			}
+			if event.Type == RealtimeEventSessionEnded {
+				finalized = true
 			}
 			rt.handleSessionEvent(event)
 			settledAt = time.Time{}

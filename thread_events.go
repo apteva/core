@@ -49,6 +49,7 @@ func clonePersistentThreadEvents(in []PersistentThreadEvent) []PersistentThreadE
 	out := make([]PersistentThreadEvent, len(in))
 	for i := range in {
 		out[i] = in[i]
+		out[i].Work = cloneThreadWork(in[i].Work)
 		out[i].Parts = cloneContentParts(in[i].Parts)
 		out[i].ExecutionIDs = append([]string(nil), in[i].ExecutionIDs...)
 	}
@@ -173,7 +174,7 @@ func (thread *Thread) reconcileInboxEventIDs(seen map[string]bool) bool {
 func publishThreadInboxEvents(bus *EventBus, threadID string, events []PersistentThreadEvent) {
 	for _, event := range events {
 		bus.Publish(Event{
-			ID: event.ID, Type: EventInbox, To: threadID,
+			ID: event.ID, Type: EventInbox, To: threadID, Work: cloneThreadWork(event.Work),
 			Text: event.Text, Parts: cloneContentParts(event.Parts),
 			ExecutionIDs: executionIDsForEvent(event),
 		})

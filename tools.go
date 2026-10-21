@@ -9,6 +9,7 @@ import (
 )
 
 type toolCall struct {
+	work              *ThreadWork     // immutable assignment revision at inference/queue admission
 	context           context.Context // optional call-owned cancellation, used by realtime
 	trace             *toolTrace
 	prerequisites     map[string]RequiredFirstAction
@@ -197,7 +198,9 @@ func executeTool(t *Thinker, call toolCall) {
 		}
 		var resp ToolResponse
 		def := call.definition
-		if call.resolutionError != "" {
+		if call.work != nil && !t.work.current(*call.work) {
+			resp = ToolResponse{Text: "Skipped: assignment changed before this operation started. Reassess the latest input.", IsError: true}
+		} else if call.resolutionError != "" {
 			resp = ToolResponse{Text: call.resolutionError, IsError: true}
 		} else if def == nil || (def.Handler == nil && def.HandlerContext == nil) {
 			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 )
 
 // OpenAIRealtimeProvider implements OpenAI's GA Realtime WebSocket API.
@@ -39,6 +40,9 @@ func (p *OpenAIRealtimeProvider) Models() map[ModelTier]string {
 }
 
 func (p *OpenAIRealtimeProvider) Pricing(model string) RealtimePricing {
+	if isOpenAILiveModel(model) {
+		return RealtimePricing{SessionPerMinute: 0.05}
+	}
 	if model == "gpt-realtime-2.1-mini" {
 		return RealtimePricing{
 			TextInput: 0.60, TextCachedInput: 0.06, TextOutput: 2.40,
@@ -77,7 +81,21 @@ func (p *OpenAIRealtimeProvider) applyRealtimeConfig(config ProviderConfig) {
 // reads/writes and will surface a RealtimeEventSessionEnded event
 // when the connection drops.
 func (p *OpenAIRealtimeProvider) Open(ctx context.Context, opts RealtimeSessionOpts) (RealtimeSession, error) {
+	if isOpenAILiveModel(opts.Model) {
+		return p.openLiveSession(ctx, opts)
+	}
 	return p.openSession(ctx, opts)
+}
+
+func isOpenAILiveModel(model string) bool {
+	return strings.HasPrefix(model, "gpt-live-") && !strings.Contains(model, "transcribe")
+}
+
+func (p *OpenAIRealtimeProvider) RealtimeCapabilities(model string) RealtimeCapabilities {
+	if isOpenAILiveModel(model) {
+		return RealtimeCapabilities{ContinuousConversation: true, CoreExecution: true, ProviderExecution: true, TranscriptFragments: true, ProviderInterruption: true}
+	}
+	return RealtimeCapabilities{AudioTruncation: true}
 }
 
 var _ RealtimeProvider = (*OpenAIRealtimeProvider)(nil)

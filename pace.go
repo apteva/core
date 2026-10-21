@@ -238,6 +238,9 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 		nextReasoning = r
 		parts = append(parts, "reasoning="+r.String())
 	}
+	if name := args["provider"]; name != "" && managesInferenceLifecycle(t.provider) && name != t.provider.Name() {
+		return "", fmt.Errorf("provider-managed inference cannot switch executor through pace; configure the realtime execution mode instead")
+	}
 	if name := args["provider"]; name != "" && t.pool != nil {
 		if p := t.pool.Get(name); p != nil {
 			nextProvider = p

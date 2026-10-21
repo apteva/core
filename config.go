@@ -27,6 +27,7 @@ type PersistentPaceState struct {
 // entries retain their payload so they can be replayed after a crash;
 // consumed entries retain only ID+hash as the bounded deduplication ledger.
 type PersistentThreadEvent struct {
+	Work           *ThreadWork   `json:"work,omitempty"`
 	ExecutionIDs   []string      `json:"execution_ids,omitempty"`
 	ID             string        `json:"id"`
 	Hash           string        `json:"hash"`
@@ -38,6 +39,8 @@ type PersistentThreadEvent struct {
 }
 
 type PersistentThread struct {
+	RealtimeExecution   *RealtimeExecutionConfig     `json:"realtime_execution,omitempty"`
+	WorkMode            bool                         `json:"work_mode,omitempty"`
 	ID                  string                       `json:"id"`
 	Name                string                       `json:"name,omitempty"`      // human-readable label; empty = display as ID
 	ParentID            string                       `json:"parent_id,omitempty"` // empty = child of main
@@ -89,6 +92,8 @@ type ProviderConfig struct {
 	ServiceTier       string                       `json:"service_tier,omitempty"`       // provider request tier, e.g. "priority"
 	MaxOutputTokens   int                          `json:"max_output_tokens,omitempty"`  // Anthropic turn output limit; 0 uses 16K, bounded by model maximum
 	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "marin")
+	RealtimeModels    map[string]string            `json:"realtime_models,omitempty"`    // voice models on this same API integration
+	RealtimeExecution RealtimeExecutionConfig      `json:"realtime_execution,omitempty,omitzero"`
 }
 
 type Config struct {
@@ -418,6 +423,7 @@ func (c *Config) GetThreads() []PersistentThread {
 	out := make([]PersistentThread, len(c.Threads))
 	copy(out, c.Threads)
 	for i := range out {
+		out[i].RealtimeExecution = cloneRealtimeExecutionConfig(out[i].RealtimeExecution)
 		out[i].Pace = clonePersistentPaceState(out[i].Pace)
 		out[i].RealtimeOutput = cloneRealtimeOutputConfig(out[i].RealtimeOutput)
 		out[i].TurnDetection = cloneRealtimeTurnDetectionConfig(out[i].TurnDetection)
@@ -457,7 +463,7 @@ func (c *Config) GetProviders() []ProviderConfig {
 	defer c.mu.RUnlock()
 	out := make([]ProviderConfig, len(c.Providers))
 	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice}
+		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice, RealtimeModels: cloneRealtimeModels(p.RealtimeModels), RealtimeExecution: p.RealtimeExecution}
 		if p.Models != nil {
 			cp.Models = make(map[string]string)
 			for k, v := range p.Models {
@@ -477,6 +483,7 @@ func (c *Config) GetDefaultProvider() *ProviderConfig {
 	for _, p := range c.Providers {
 		if p.Default {
 			cp := p
+			cp.RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
 			cp.ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
 			cp.Builtins = cloneBuiltinConfigs(p.Builtins)
 			return &cp
@@ -484,6 +491,7 @@ func (c *Config) GetDefaultProvider() *ProviderConfig {
 	}
 	if len(c.Providers) > 0 {
 		cp := c.Providers[0]
+		cp.RealtimeModels = cloneRealtimeModels(cp.RealtimeModels)
 		cp.ImageGeneration = cloneImageGenerationConfig(cp.ImageGeneration)
 		cp.Builtins = cloneBuiltinConfigs(cp.Builtins)
 		return &cp
@@ -504,6 +512,7 @@ func (c *Config) GetProviderByName(name string) *ProviderConfig {
 	for _, p := range c.Providers {
 		if p.Name == name {
 			cp := p
+			cp.RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
 			cp.ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
 			cp.Builtins = cloneBuiltinConfigs(p.Builtins)
 			return &cp
@@ -619,6 +628,7 @@ func cloneProviderConfigs(in []ProviderConfig) []ProviderConfig {
 			}
 		}
 		out[i].ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
+		out[i].RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
 	}
 	return out
 }
@@ -701,6 +711,12 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 	if update.ServiceTier != "" {
 		providers[index].ServiceTier = update.ServiceTier
 	}
+	if update.RealtimeModels != nil {
+		providers[index].RealtimeModels = cloneRealtimeModels(update.RealtimeModels)
+	}
+	if update.RealtimeExecution != (RealtimeExecutionConfig{}) {
+		providers[index].RealtimeExecution = update.RealtimeExecution
+	}
 	if update.RealtimeVoice != "" {
 		providers[index].RealtimeVoice = update.RealtimeVoice
 	}
@@ -710,4 +726,15 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 		}
 	}
 	return providers
+}
+
+func cloneRealtimeModels(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

@@ -381,11 +381,28 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 		}
 	}
 	tools, definitions, active := t.visibleNativeToolSnapshot(t.toolAllowlist, t.toolMCPScopes, overlay)
+	if t.work != nil {
+		for i := range tools {
+			switch tools[i].Name {
+			case "done":
+				tools[i].Description = "Permanently terminate this execution worker. Ordinary assistant text already returns an assignment result without stopping the worker. This does not end the parent conversation."
+			case "pace":
+				tools[i].Description = "Schedule a future wake for genuinely ongoing work. Do not use this to return a completed assignment or wait for the next assignment: return factual text and Core waits automatically."
+			}
+		}
+	}
 	t.recordPresentedTools(tools, definitions)
 	t.lastNativeToolCount = len(tools)
 	t.lastActiveMCPCount = countActiveMCPTools(active)
 	t.lastAlwaysMCPCount = t.toolIndex.AlwaysCount(allowNoSpawn)
 	t.lastDeferredMCPCount = t.toolIndex.DeferredCount(eager, allowNoSpawn)
+	if t.work != nil {
+		instructions := ""
+		if len(t.messages) > 0 {
+			instructions = t.messages[0].Content
+		}
+		t.work.setSetup(instructions, tools)
+	}
 	return tools
 }
 

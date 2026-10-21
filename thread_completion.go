@@ -3,6 +3,9 @@ package core
 import "fmt"
 
 func (thread *Thread) queueCompletion(callID, message string) error {
+	if thread.WorkMode && thread.Thinker.work != nil {
+		return thread.Thinker.publishThreadWork(thread.Thinker.work.snapshot(), message, "completed", nil)
+	}
 	parent := thread.Parent
 	if parent == nil {
 		return fmt.Errorf("missing completion recipient")

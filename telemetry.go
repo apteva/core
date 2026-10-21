@@ -624,6 +624,7 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 // --- Convenience emitters with typed data ---
 
 type LLMDoneData struct {
+	Purpose            string `json:"purpose,omitempty"`
 	Provider           string `json:"provider,omitempty"`
 	Model              string `json:"model"`
 	Reasoning          string `json:"reasoning,omitempty"` // legacy alias for requested effort

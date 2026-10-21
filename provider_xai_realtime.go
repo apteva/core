@@ -32,6 +32,10 @@ func NewXAIRealtimeProvider(apiKey string) *XAIRealtimeProvider {
 
 func (p *XAIRealtimeProvider) Name() string { return "xai-realtime" }
 
+func (p *XAIRealtimeProvider) RealtimeCapabilities(string) RealtimeCapabilities {
+	return RealtimeCapabilities{AudioTruncation: true}
+}
+
 func (p *XAIRealtimeProvider) Models() map[ModelTier]string {
 	out := make(map[ModelTier]string, len(p.models))
 	for tier, model := range p.models {

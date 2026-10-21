@@ -46,6 +46,10 @@ func NewGoogleRealtimeProvider(apiKey string) *GoogleRealtimeProvider {
 
 func (p *GoogleRealtimeProvider) Name() string { return "google-realtime" }
 
+func (p *GoogleRealtimeProvider) RealtimeCapabilities(string) RealtimeCapabilities {
+	return RealtimeCapabilities{AudioTruncation: true}
+}
+
 func (p *GoogleRealtimeProvider) Models() map[ModelTier]string {
 	out := make(map[ModelTier]string, len(p.models))
 	for tier, model := range p.models {

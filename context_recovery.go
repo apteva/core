@@ -267,6 +267,10 @@ func (t *Thinker) callProviderWithContextRecoveryAtTier(ctx context.Context, pro
 // the selected model is overloaded. Cross-provider fallback remains the
 // caller's responsibility.
 func (t *Thinker) callProviderWithOverloadRecovery(ctx context.Context, provider LLMProvider, messages []Message, selected ModelTier) (ChatResponse, []Message, error) {
+	if managesInferenceLifecycle(provider) {
+		r, err := t.thinkWithProviderMessagesAtTier(ctx, provider, messages, selected)
+		return r, messages, err
+	}
 	resp, messages, err := t.callProviderWithContextRecoveryAtTier(ctx, provider, messages, selected)
 	if !isProviderOverloadError(err) || ctx.Err() != nil {
 		return resp, messages, err

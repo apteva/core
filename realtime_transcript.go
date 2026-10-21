@@ -17,12 +17,16 @@ type RealtimeTranscriptMetadata struct {
 	ItemID             string `json:"item_id,omitempty"`
 	Status             string `json:"status"` // provider_final, interrupted, or blocked
 	FinalizationReason string `json:"finalization_reason"`
+	StartMS            int    `json:"start_ms,omitempty"`
+	EndMS              int    `json:"end_ms,omitempty"`
 }
 
 type realtimeTranscriptTurn struct {
-	message   Message
-	persisted bool
-	order     int
+	message      Message
+	persisted    bool
+	order        int
+	checkpointAt time.Time
+	dirty        bool
 }
 
 // UpsertRealtimeTranscript preserves one history turn and advances its cursor
@@ -92,6 +96,7 @@ func (rt *RealtimeThinker) trackTranscript(role string, event RealtimeEvent) {
 		rt.transcriptOrdinal++
 		turn = &realtimeTranscriptTurn{message: Message{Role: role, RealtimeTranscript: &RealtimeTranscriptMetadata{
 			ID: rt.transcriptNamespace + "/" + key, Generation: generation, ResponseID: event.ResponseID, ItemID: event.ItemID,
+			StartMS: event.TranscriptStartMS,
 		}}}
 		turn.order = rt.transcriptOrdinal
 		rt.transcriptTurns[key] = turn
@@ -103,6 +108,16 @@ func (rt *RealtimeThinker) trackTranscript(role string, event RealtimeEvent) {
 		turn.message.Content += event.Transcript
 	} else {
 		turn.message.Content = event.Transcript
+	}
+	turn.message.RealtimeTranscript.EndMS = max(turn.message.RealtimeTranscript.EndMS, event.TranscriptEndMS)
+	if event.TranscriptGrouped {
+		meta := *turn.message.RealtimeTranscript
+		meta.Status, meta.FinalizationReason = "application_grouped", "fragment_checkpoint"
+		turn.message.RealtimeTranscript = &meta
+		turn.dirty = true
+		if !turn.persisted || time.Since(turn.checkpointAt) >= 300*time.Millisecond || strings.ContainsAny(event.Transcript, ".!?。！？") {
+			rt.persistTranscriptLocked(turn)
+		}
 	}
 	if event.Final {
 		meta := *turn.message.RealtimeTranscript
@@ -144,8 +159,33 @@ func (rt *RealtimeThinker) persistTranscriptLocked(turn *realtimeTranscriptTurn)
 		rt.messages = append(rt.messages, msg)
 	}
 	turn.persisted = true
+	turn.dirty = false
+	turn.checkpointAt = time.Now()
 	rt.publishContextStatus()
 	rt.emit("realtime."+msg.Role, map[string]any{"text": msg.Content, "transcript": msg.RealtimeTranscript})
+}
+
+func (rt *RealtimeThinker) checkpointContinuousTranscripts() {
+	if !rt.capabilities.TranscriptFragments {
+		return
+	}
+	rt.transcriptMu.Lock()
+	defer rt.transcriptMu.Unlock()
+	for _, turn := range rt.transcriptTurns {
+		if turn.dirty && time.Since(turn.checkpointAt) >= 300*time.Millisecond {
+			rt.persistTranscriptLocked(turn)
+		}
+	}
+	// Keep only a bounded recent fragment ledger. The session journal owns
+	// durable history; pending/dirty and guard-sensitive current turns stay.
+	if len(rt.transcriptTurns) > 256 {
+		cutoff := rt.transcriptOrdinal - 128
+		for key, turn := range rt.transcriptTurns {
+			if turn.order < cutoff && turn.persisted && !turn.dirty {
+				delete(rt.transcriptTurns, key)
+			}
+		}
+	}
 }
 
 func (rt *RealtimeThinker) flushPendingTranscripts(reason string) {

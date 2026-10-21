@@ -742,6 +742,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		InitialMessage             string                      `json:"initial_message,omitempty"`
 		Events                     []apiThreadEventRequest     `json:"events,omitempty"`
 		BridgeDisconnectTTLSeconds int                         `json:"bridge_disconnect_ttl_seconds,omitempty"`
+		RealtimeExecution          *RealtimeExecutionConfig    `json:"realtime_execution,omitempty"`
 		RealtimeOutput             RealtimeOutputConfig        `json:"realtime_output,omitempty"`
 		TurnDetection              RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`
 	}
@@ -802,16 +803,17 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	// grabbing them. The LLM's spawn-tool path doesn't set
 	// this, so in-agent workers still can't escalate.
 	opts := SpawnOpts{
-		MCPNames:       body.MCP,
-		BypassNoSpawn:  true,
-		Realtime:       body.Realtime,
-		Ephemeral:      body.Ephemeral,
-		Voice:          body.Voice,
-		TurnDetection:  body.TurnDetection,
-		RealtimeOutput: body.RealtimeOutput,
-		ProviderName:   body.ProviderName,
-		Model:          strings.ToLower(strings.TrimSpace(body.Model)),
-		DeferRun:       true,
+		MCPNames:          body.MCP,
+		BypassNoSpawn:     true,
+		Realtime:          body.Realtime,
+		Ephemeral:         body.Ephemeral,
+		Voice:             body.Voice,
+		TurnDetection:     body.TurnDetection,
+		RealtimeOutput:    body.RealtimeOutput,
+		RealtimeExecution: cloneRealtimeExecutionConfig(body.RealtimeExecution),
+		ProviderName:      body.ProviderName,
+		Model:             strings.ToLower(strings.TrimSpace(body.Model)),
+		DeferRun:          true,
 	}
 	if body.BridgeDisconnectTTLSeconds < 0 || body.BridgeDisconnectTTLSeconds > 3600 {
 		http.Error(w, "bridge_disconnect_ttl_seconds must be between 0 and 3600", http.StatusBadRequest)
@@ -1294,6 +1296,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			"execution_control":      a.thinker.executionStatus(),
 			"execution_checkpoints":  a.thinker.executionCheckpointMeta(),
 			"realtime_enabled":       a.thinker.config.RealtimeEnabledFlag(),
+			"realtime_providers":     status.RealtimeProviders,
 			"realtime_voice":         a.thinker.config.GetRealtimeVoice(),
 			"realtime_voice_mcp":     a.thinker.config.GetRealtimeVoiceMCP(),
 		})

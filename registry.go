@@ -159,6 +159,7 @@ func (tr *ToolRegistry) registerDefaults() {
 			"properties": map[string]any{
 				"id":      map[string]any{"type": "string", "description": "Target thread ID. Child only: \"parent\" means its spawner and \"main\" means the root coordinator. Root main uses only a known other thread ID."},
 				"message": map[string]any{"type": "string", "description": "Message body."},
+				"status":  map[string]any{"type": "string", "enum": []string{"progress", "completed", "completion_requested"}, "description": "Optional assigned-worker update to parent. completion_requested asks the parent to finish its conversation; it does not stop the worker or parent directly."},
 				"media":   map[string]any{"type": "string", "description": "Optional space-separated media URLs (audio/image/video)."},
 			},
 			"required": []string{"id", "message"},

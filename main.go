@@ -67,6 +67,8 @@ type AudioURL struct {
 }
 
 type Message struct {
+	Work               *ThreadWork                 `json:"-"` // runtime correlation; never model input
+	RealtimeBackend    bool                        `json:"-"` // execution evidence, never an assertion of spoken words
 	RealtimeTranscript *RealtimeTranscriptMetadata `json:"-"` // history evidence, never provider request fields
 	Role               string                      `json:"role"`
 	Content            string                      `json:"content"`

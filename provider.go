@@ -650,7 +650,11 @@ func (pp *ProviderPool) RealtimeByName(name string) RealtimeProvider {
 	if pp == nil {
 		return nil
 	}
-	return pp.realtimeProviders[name]
+	if p := pp.realtimeProviders[name]; p != nil {
+		return p
+	}
+	// API integrations expose one vendor; transport companions are internal.
+	return pp.realtimeProviders[name+"-realtime"]
 }
 
 // RealtimeNames returns all registered realtime provider names.
@@ -805,6 +809,33 @@ func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPoo
 	if len(pool.providers) == 0 {
 		return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, or OLLAMA_HOST")
 	}
+	// One configured API integration supplies text and voice credentials.
+	// Explicit legacy companion entries retain priority and defaults.
+	if cfg.RealtimeEnabledFlag() {
+		for _, pc := range configs {
+			name := pc.Name + "-realtime"
+			if pool.Get(pc.Name) == nil || !isRealtimeProviderName(name) {
+				continue
+			}
+			if existing := pool.realtimeProviders[name]; existing != nil {
+				// New voice fields on the primary integration are explicit user
+				// overrides, including when an older server injects a companion.
+				if c, ok := existing.(configurableRealtimeProvider); ok {
+					c.applyRealtimeConfig(ProviderConfig{Models: pc.RealtimeModels, RealtimeVoice: pc.RealtimeVoice})
+				}
+				continue
+			}
+			rp := createRealtimeProviderByName(name)
+			if rp == nil {
+				continue
+			}
+			if c, ok := rp.(configurableRealtimeProvider); ok {
+				c.applyRealtimeConfig(ProviderConfig{Models: pc.RealtimeModels, RealtimeVoice: pc.RealtimeVoice})
+			}
+			pool.realtimeProviders[name] = rp
+			pool.realtimeOrder = append(pool.realtimeOrder, name)
+		}
+	}
 
 	// Default = first with Default flag, or first in order
 	if pool.default_ == "" && len(pool.order) > 0 {
@@ -898,5 +929,6 @@ func calculateCostForRealtimeProvider(provider RealtimeProvider, model string, u
 		float64(usage.AudioOutputTokens)*pricing.AudioOutput)/1_000_000 +
 		usage.AudioInputSeconds/60*pricing.AudioInputPerMinute +
 		usage.AudioOutputSeconds/60*pricing.AudioOutputPerMinute +
-		float64(usage.TextInputMessages)*pricing.TextInputPerMessage
+		float64(usage.TextInputMessages)*pricing.TextInputPerMessage +
+		usage.SessionSeconds/60*pricing.SessionPerMinute
 }

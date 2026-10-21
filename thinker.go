@@ -866,9 +866,11 @@ type Thinker struct {
 	directive string
 
 	// Hooks — set these to customize behavior. nil = defaults.
-	handleTools   ToolHandler
-	rebuildPrompt func(toolDocs string) string // rebuild system prompt with current tool docs
-	onStop        func()
+	work              *threadWorkState // optional correlated assignments; owned by this managed thread
+	realtimeExecution *RealtimeExecutionConfig
+	handleTools       ToolHandler
+	rebuildPrompt     func(toolDocs string) string // rebuild system prompt with current tool docs
+	onStop            func()
 	// toolAllowlist is the exact portion of a worker's capability ceiling. It
 	// contains inherited or strictly narrowed tools plus Core's managed
 	// scaffolding. Discovery may load schemas only from this set or the MCP
@@ -1156,6 +1158,7 @@ func (t *Thinker) releaseToolSlot() {
 }
 
 type thinkerRuntimeStatus struct {
+	RealtimeProviders   []RealtimeProviderInfo
 	Iteration           int
 	Rate                ThinkRate
 	Model               ModelTier
@@ -1183,6 +1186,21 @@ type thinkerContextStatus struct {
 }
 
 func (t *Thinker) publishRuntimeStatus() {
+	var realtimeProviders []RealtimeProviderInfo
+	if t.pool != nil {
+		for _, name := range t.pool.RealtimeNames() {
+			p := t.pool.RealtimeByName(name)
+			if p == nil {
+				continue
+			}
+			info := RealtimeProviderInfo{Integration: strings.TrimSuffix(name, "-realtime"), Provider: name, Models: map[string]string{}, Capabilities: map[string]RealtimeCapabilities{}}
+			for tier, model := range p.Models() {
+				info.Models[tier.String()] = model
+				info.Capabilities[model] = capabilitiesForRealtime(p, model)
+			}
+			realtimeProviders = append(realtimeProviders, info)
+		}
+	}
 	builtinCapabilities := map[string][]BuiltinCapability{}
 	if t.pool != nil {
 		for _, name := range t.pool.Names() {
@@ -1205,6 +1223,7 @@ func (t *Thinker) publishRuntimeStatus() {
 		mcpNames = append(mcpNames, server.GetName())
 	}
 	t.runtimeStatus.Store(thinkerRuntimeStatus{
+		RealtimeProviders:   realtimeProviders,
 		Iteration:           t.iteration,
 		Rate:                t.rate,
 		Model:               t.model,
@@ -1463,22 +1482,24 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				capabilityMode = SpawnCapabilitiesInherit
 			}
 			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-				ProviderName:   pt.Provider,
-				ParentID:       "main",
-				Depth:          pt.Depth,
-				DeferRun:       true,
-				MCPNames:       pt.MCPNames,
-				CapabilityMode: capabilityMode,
-				Model:          pt.Model,
-				Reasoning:      ptReasoning,
-				Realtime:       pt.Realtime,
-				BypassNoSpawn:  allowNoSpawn,
-				Voice:          pt.Voice,
-				TurnDetection:  realtimeTurnDetectionValue(pt.TurnDetection),
-				RealtimeOutput: realtimeOutputConfigValue(pt.RealtimeOutput),
-				System:         pt.System,
-				Pace:           pt.Pace,
-				Events:         pt.Events,
+				ProviderName:      pt.Provider,
+				ParentID:          "main",
+				Depth:             pt.Depth,
+				DeferRun:          true,
+				MCPNames:          pt.MCPNames,
+				CapabilityMode:    capabilityMode,
+				Model:             pt.Model,
+				Reasoning:         ptReasoning,
+				Realtime:          pt.Realtime,
+				BypassNoSpawn:     allowNoSpawn,
+				Voice:             pt.Voice,
+				TurnDetection:     realtimeTurnDetectionValue(pt.TurnDetection),
+				RealtimeOutput:    realtimeOutputConfigValue(pt.RealtimeOutput),
+				System:            pt.System,
+				Pace:              pt.Pace,
+				Events:            pt.Events,
+				WorkMode:          pt.WorkMode,
+				RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
 			})
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
@@ -1488,22 +1509,24 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					capabilityMode = SpawnCapabilitiesInherit
 				}
 				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-					ProviderName:   pt.Provider,
-					ParentID:       parentID,
-					Depth:          pt.Depth,
-					DeferRun:       true,
-					MCPNames:       pt.MCPNames,
-					CapabilityMode: capabilityMode,
-					Model:          pt.Model,
-					Reasoning:      ptReasoning,
-					Realtime:       pt.Realtime,
-					BypassNoSpawn:  allowNoSpawn,
-					Voice:          pt.Voice,
-					TurnDetection:  realtimeTurnDetectionValue(pt.TurnDetection),
-					RealtimeOutput: realtimeOutputConfigValue(pt.RealtimeOutput),
-					System:         pt.System,
-					Pace:           pt.Pace,
-					Events:         pt.Events,
+					ProviderName:      pt.Provider,
+					ParentID:          parentID,
+					Depth:             pt.Depth,
+					DeferRun:          true,
+					MCPNames:          pt.MCPNames,
+					CapabilityMode:    capabilityMode,
+					Model:             pt.Model,
+					Reasoning:         ptReasoning,
+					Realtime:          pt.Realtime,
+					BypassNoSpawn:     allowNoSpawn,
+					Voice:             pt.Voice,
+					TurnDetection:     realtimeTurnDetectionValue(pt.TurnDetection),
+					RealtimeOutput:    realtimeOutputConfigValue(pt.RealtimeOutput),
+					System:            pt.System,
+					Pace:              pt.Pace,
+					Events:            pt.Events,
+					WorkMode:          pt.WorkMode,
+					RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
 				})
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
@@ -2741,6 +2764,10 @@ func (t *Thinker) Run() {
 			}
 			if sb.Len() > 0 || len(mediaParts) > 0 {
 				msg := Message{Role: "user", Content: sb.String(), EventIDs: append([]string(nil), eventIDs...)}
+				if t.work != nil {
+					w := t.work.snapshot()
+					msg.Work = &w
+				}
 				if len(mediaParts) > 0 {
 					msg.Parts = append([]ContentPart{{Type: "text", Text: sb.String()}}, mediaParts...)
 				}
@@ -2838,7 +2865,11 @@ func (t *Thinker) Run() {
 		// the same anchor so selected memory remains visible without duplication.
 		dynCtx := buildDynamicTurnContextView(activeThreads, recallContext, rosterForTurn)
 		dynCtx = appendWakeStateContext(dynCtx, turnWakeReason, t.nextWakeAt, t.wakeDeadlineFired)
-		dynCtx += "\n" + idlePacingContract
+		if t.work == nil {
+			dynCtx += "\n" + idlePacingContract
+		} else {
+			dynCtx += "\n[ASSIGNMENT RETURN] Return concise factual text when ready. Core forwards it to your parent and waits automatically; do not call pace or send just to finish this assignment."
+		}
 		refreshRequestContext := recallRefreshed || hasExternalEvent || (!hadEvents && len(toolResults) == 0)
 		requestMessages := t.requestContext.prepare(
 			t.messages,
@@ -2872,7 +2903,21 @@ func (t *Thinker) Run() {
 		if !t.executionGate(ExecutionPhaseLLMStart, ExecutionGate{Summary: fmt.Sprintf("Calling %s", t.modelID())}) {
 			return
 		}
+		workAtRequest := t.work.snapshot()
+		if t.work != nil && !t.work.ready(workAtRequest) {
+			select {
+			case <-t.quit:
+				return
+			case <-t.sub.Wake:
+			case <-t.mutationWake:
+			}
+			continue
+		}
 		chatResp, err := t.callLLMWithRuntimeMutations(runCtx, requestMessages)
+		if t.work != nil && !t.work.current(workAtRequest) {
+			t.preserveSupersededWork(chatResp)
+			continue
+		}
 		if t.applyRuntimeMutations() && runCtx.Err() == nil {
 			continue
 		}
@@ -2887,6 +2932,9 @@ func (t *Thinker) Run() {
 				return
 			}
 			t.failEventExecutions(providerExecutionFailureReason(err))
+			if t.work != nil {
+				_ = t.publishThreadWork(workAtRequest, "The backend request failed: "+err.Error(), "failed", nil)
+			}
 			// Stay available for updated configuration or a new instruction.
 			select {
 			case <-t.quit:
@@ -2969,6 +3017,14 @@ func (t *Thinker) Run() {
 			ProviderState: chatResp.ProviderState,
 			Parts:         generatedFileParts(chatResp.GeneratedFiles),
 		}
+		if t.work != nil {
+			w := workAtRequest
+			if len(chatResp.ToolCalls) == 0 && t.pendingToolCount() == 0 {
+				w.Kind = "result"
+				w.Status = "completed"
+			}
+			assistantMsg.Work = &w
+		}
 		t.messages = append(t.messages, assistantMsg)
 
 		// Persist to session history
@@ -3021,7 +3077,12 @@ func (t *Thinker) Run() {
 		var calls []toolCall
 		if len(chatResp.ToolCalls) > 0 {
 			for _, ntc := range chatResp.ToolCalls {
-				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: ntc.Name, NativeID: ntc.ID})
+				calls = append(calls, toolCall{Name: ntc.Name, Args: ntc.Args, Raw: ntc.Name, NativeID: ntc.ID, work: cloneThreadWork(&workAtRequest)})
+			}
+		}
+		if t.work == nil {
+			for i := range calls {
+				calls[i].work = nil
 			}
 		}
 		// NOTE: text-based [[...]] parsing removed — all providers use native tool calling now
@@ -3120,6 +3181,13 @@ func (t *Thinker) Run() {
 		t.model = t.agentModel
 		t.applyActiveModelFloor()
 		t.publishRuntimeStatus()
+
+		if t.work != nil && len(calls) == 0 && t.pendingToolCount() == 0 {
+			if err := t.publishThreadWork(workAtRequest, reply, "completed", generatedFileParts(chatResp.GeneratedFiles)); err != nil {
+				t.recordPersistenceFailure(err)
+				return
+			}
+		}
 
 		// A fired one-shot wake is part of this turn's input. Consume it after
 		// all model-selected tools (including a replacement pace call) have
@@ -3599,6 +3667,9 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 		resp, nextMessages, err := t.callProviderWithOverloadRecovery(ctx, primary, messages, t.model)
 		messages = nextMessages
 		primaryErr := err
+		if managesInferenceLifecycle(primary) {
+			return resp, err
+		}
 		if isInvalidToolHistory(err) {
 			return resp, err
 		}
@@ -3772,6 +3843,7 @@ func providerRetryDelay(err error, attempt int) time.Duration {
 
 // drainEvents reads all pending events and wake signals from this thinker's bus subscription.
 type drainedEvent struct {
+	Work         *ThreadWork
 	ID           string
 	Text         string
 	Parts        []ContentPart
@@ -3796,7 +3868,8 @@ func (t *Thinker) drainEvents() []drainedEvent {
 			continue
 		}
 		if ev.Type == EventInbox {
-			items = append(items, drainedEvent{ID: ev.ID, Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult, ExecutionIDs: append([]string(nil), ev.ExecutionIDs...)})
+			t.work.observe(ev.Work)
+			items = append(items, drainedEvent{Work: cloneThreadWork(ev.Work), ID: ev.ID, Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult, ExecutionIDs: append([]string(nil), ev.ExecutionIDs...)})
 		}
 	}
 	return items
@@ -3878,6 +3951,7 @@ func (t *Thinker) waitForPendingTools(
 				continue
 			}
 			if ev.Type == EventInbox {
+				t.work.observe(ev.Work)
 				if ev.ID != "" && len(eventIDs) > 0 && eventIDs[0] != nil {
 					*eventIDs[0] = append(*eventIDs[0], ev.ID)
 				}
