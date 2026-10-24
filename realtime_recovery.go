@@ -172,7 +172,9 @@ func (rt *RealtimeThinker) flushRecoveryInput() {
 	for _, event := range input {
 		rt.handleBusEvent(event)
 	}
-	if session := rt.currentSession(); session != nil {
-		rt.drainRealtimeInput(session)
+	if !rt.audioLane.active.Load() {
+		if session := rt.currentSession(); session != nil {
+			rt.drainRealtimeInput(session)
+		}
 	}
 }

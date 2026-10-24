@@ -24,9 +24,10 @@ func TestRendererInputBoundIsAudioDuration(t *testing.T) {
 	if len(input) != 6 {
 		t.Fatal("not normalized", len(input))
 	}
-	if err := enqueueLiveRendererInput(context.Background(), input, make([]byte, 960)); err == nil {
-		t.Fatal("over 120ms buffered")
+	if err := enqueueLiveRendererInput(context.Background(), input, make([]byte, 960)); err != nil {
+		t.Fatal("fresh input rejected after only 120ms", err)
 	}
+	pcm = append(pcm, make([]byte, 960)...)
 	var got []byte
 	for len(input) > 0 {
 		got = append(got, (<-input)...)

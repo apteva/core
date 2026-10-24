@@ -424,3 +424,10 @@ func (s *openaiLiveSession) DiscardPlayback(item string) {
 	s.guardMu.Unlock()
 }
 func (s *openaiLiveSession) RealtimeInterruptCommand() string { return "session.instructions.append" }
+
+func (s *openaiLiveSession) SendAudioFrame(f RealtimeInputAudio) error {
+	if len(f.Audio)%2 != 0 {
+		return realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("PCM16 requires complete samples"))
+	}
+	return s.sendAudioFrame(f, map[string]any{"type": "session.input_audio.append", "audio": base64.StdEncoding.EncodeToString(f.Audio)})
+}

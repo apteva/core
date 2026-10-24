@@ -99,7 +99,8 @@ func (e *realtimeBridgeControlError) Unwrap() error { return e.err }
 // separate header and payload. Without this lock a reader-generated pong can
 // land between an outbound audio frame's header and payload.
 type realtimeBridgeSocket struct {
-	conn net.Conn
+	window realtimePlaybackWindow
+	conn   net.Conn
 
 	writeMu      sync.Mutex
 	closeSent    bool
@@ -608,21 +609,37 @@ bridgeLoop:
 					break flushControls
 				}
 			}
-			metadata, _ := json.Marshal(map[string]any{
-				"type": "audio.frame", "response_id": frame.ResponseID,
-				"item_id": frame.ItemID, "audio_end_ms": frame.AudioEndMS, "silence": frame.Silent, "session_generation": frame.SessionGeneration,
+			frame.timing.outputWait(frame.ResponseID, frame.ItemID, frame.queuedAt)
+			written, err := socket.writeFlowControlledAudio(ctx, frame, func() error {
+				for {
+					select {
+					case control, ok := <-reg.control:
+						if !ok {
+							reg.control = nil
+							return nil
+						}
+						if err := writeControl(control); err != nil {
+							return err
+						}
+					case <-providerStates:
+						if err := writeControl(providerStateSource.providerStateControl()); err != nil {
+							return err
+						}
+					default:
+						return nil
+					}
+				}
 			})
-			written, err := socket.writePlaybackAudio(metadata, frame.Audio, frame.cancelled)
 			if err != nil {
-				frame.timing.written(frame.ResponseID, frame.ItemID, time.Time{}, len(frame.Audio), false)
-				frame.written(false)
+				frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
+				frame.writtenBytes(written)
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
 				break bridgeLoop
 			}
-			frame.timing.written(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
-			frame.written(written)
+			frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
+			frame.writtenBytes(written)
 		case control, ok := <-reg.control:
 			if !ok {
 				reg.control = nil
@@ -738,10 +755,14 @@ func runRealtimeAudioBridgeReader(
 				Evidence   string `json:"evidence"`
 				Scope      string `json:"scope"`
 				Generation int64  `json:"session_generation"`
+				CapacityMS int    `json:"capacity_ms"`
 			}
 			if json.Unmarshal(data, &control) == nil && a.thinker != nil && a.thinker.threads != nil {
 				switch control.Type {
 				case "playback.ready":
+					if socket.writeTimeout > 0 && control.CapacityMS > 0 {
+						socket.window.configure(control.CapacityMS)
+					}
 					if control.Evidence == "" || validPlaybackEvidence(control.Evidence) {
 						_, t := a.thinker.threads.findManagedThread(thread)
 						if t != nil && t.Realtime != nil {
@@ -754,6 +775,7 @@ func runRealtimeAudioBridgeReader(
 					if control.Scope != "" && control.Scope != "local" && control.Scope != "stream" {
 						continue
 					}
+					socket.window.clear(control.Generation, control.ItemID)
 					_, t := a.thinker.threads.findManagedThread(thread)
 					if t != nil && t.Realtime != nil {
 						t.Realtime.emit("realtime.renderer_clear", map[string]any{"item_id": control.ItemID, "session_generation": control.Generation, "scope": control.Scope, "remote_playback_confirmed": false})
@@ -766,6 +788,7 @@ func runRealtimeAudioBridgeReader(
 						if control.Evidence == "" || validPlaybackEvidence(control.Evidence) {
 							_, t := a.thinker.threads.findManagedThread(thread)
 							if t != nil && t.Realtime != nil {
+								socket.window.progress(control.Generation, control.ItemID, control.AudioEndMS)
 								t.Realtime.acknowledgePlayback(control.ItemID, control.AudioEndMS, control.Generation)
 							}
 						}
@@ -790,6 +813,15 @@ func runRealtimeAudioBridgeReader(
 		}
 		if len(data)%2 != 0 {
 			return newRealtimeBridgeEnd("client", "read", ws.StatusInvalidFramePayloadData, "unaligned PCM16 audio", "protocol", false)
+		}
+		// Managed input goes straight to the duration-budgeted queue; never wait
+		// behind provider recovery or stop reading interruption/lifecycle controls.
+		if a.thinker != nil && a.thinker.threads != nil {
+			_, t := a.thinker.threads.findManagedThread(thread)
+			if t != nil && t.Realtime != nil {
+				t.Realtime.admitRealtimeAudio(data, time.Now())
+				continue
+			}
 		}
 		if socket.writeTimeout > 0 {
 			if err := enqueueLiveRendererInput(ctx, reg.audioIn, data); err != nil {

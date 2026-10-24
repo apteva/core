@@ -294,11 +294,12 @@ type googleLiveFunctionResponse struct {
 }
 
 type googleRealtimeSession struct {
-	conn   net.Conn
-	events chan RealtimeEvent
-	outbox chan realtimeOutboundFrame
-	done   chan struct{}
-	ready  chan error
+	inputReservations realtimeInputReservations
+	conn              net.Conn
+	events            chan RealtimeEvent
+	outbox            chan realtimeOutboundFrame
+	done              chan struct{}
+	ready             chan error
 
 	closeOnce sync.Once
 	readyOnce sync.Once
@@ -838,12 +839,28 @@ func (s *googleRealtimeSession) writeLoop() {
 		case <-s.done:
 			return
 		case frame := <-s.outbox:
-			_ = s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			started := time.Now()
+			if frame.input.stale() {
+				frame.input.settle(false, 0)
+				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("input audio expired before transport write"))})
+				_ = s.Close()
+				return
+			}
+			budget := 5 * time.Second
+			if frame.input != nil && frame.input.frame.MaxAge > 0 {
+				remaining := frame.input.frame.MaxAge - time.Since(frame.input.frame.ReceivedAt)
+				if remaining < budget {
+					budget = remaining
+				}
+			}
+			_ = s.conn.SetWriteDeadline(time.Now().Add(budget))
 			if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
+				frame.input.settle(false, time.Since(started))
 				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("google-realtime write: %w", err))})
 				_ = s.Close()
 				return
 			}
+			frame.input.settle(true, time.Since(started))
 		}
 	}
 }
@@ -1066,6 +1083,7 @@ func (s *googleRealtimeSession) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.done)
+		s.inputReservations.close()
 		if s.conn != nil {
 			err = s.conn.Close()
 		}
@@ -1083,4 +1101,14 @@ func (s *googleRealtimeSession) RealtimeReadyAt() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.readyAt
+}
+
+func (s *googleRealtimeSession) SendAudioFrame(f RealtimeInputAudio) error {
+	data, err := json.Marshal(map[string]any{"realtimeInput": map[string]any{"audio": map[string]any{"mimeType": fmt.Sprintf("audio/pcm;rate=%d", s.inputRate), "data": base64.StdEncoding.EncodeToString(f.Audio)}}})
+	if err != nil {
+		return err
+	}
+	return s.inputReservations.admit(f, func(p *realtimeInputReservation) error {
+		return s.enqueueFrame(realtimeOutboundFrame{op: ws.OpText, data: data, input: p})
+	})
 }

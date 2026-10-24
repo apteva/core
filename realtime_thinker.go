@@ -48,17 +48,22 @@ type RealtimeThinker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	sessionMu         sync.RWMutex
-	rtSession         RealtimeSession
-	recovery          realtimeRecovery
-	input             realtimeInputQueue
-	inputPaused       atomic.Bool
-	opening           *realtimeOpenAttempt
-	openResults       chan realtimeOpenResult
-	sessionCancel     context.CancelFunc
-	providerStateMu   sync.Mutex
-	providerStatus    string
-	providerStateWake chan struct{}
+	sessionMu          sync.RWMutex
+	rtSession          RealtimeSession
+	recovery           realtimeRecovery
+	input              realtimeInputQueue
+	audioLane          realtimeAudioLane
+	outputPending      []RealtimeAudioFrame
+	outputPendingBytes int
+	inputPaused        atomic.Bool
+	outputPaused       atomic.Bool
+	rendererScoped     atomic.Bool
+	opening            *realtimeOpenAttempt
+	openResults        chan realtimeOpenResult
+	sessionCancel      context.CancelFunc
+	providerStateMu    sync.Mutex
+	providerStatus     string
+	providerStateWake  chan struct{}
 
 	audioIn      <-chan []byte
 	audioOut     chan RealtimeAudioFrame
@@ -195,6 +200,7 @@ func newRealtimeThinker(
 		transcriptTurns:     map[string]*realtimeTranscriptTurn{},
 		transcriptAnonymous: map[string]int{},
 	}
+	rt.initAudioLane()
 	rt.openResults = make(chan realtimeOpenResult)
 	rt.providerStateWake = make(chan struct{}, 1)
 	rt.recovery.wake = make(chan struct{}, 1)
@@ -587,8 +593,6 @@ func (rt *RealtimeThinker) installSession(result realtimeOpenResult) error {
 	}
 	rt.rememberConfiguration(opts.Instructions, opts.Tools)
 	rt.sessionDirective = rt.directive
-	rt.replaceSession(session)
-	rt.sessionCancel = a.cancel
 	rt.recovery.Lock()
 	rt.recovery.opened = time.Now()
 	continueTurn := rt.recovery.continueTurn && len(rt.recovery.input) == 0 && !rt.input.pending()
@@ -603,6 +607,20 @@ func (rt *RealtimeThinker) installSession(result realtimeOpenResult) error {
 	rt.sessionGeneration++
 	generation := rt.sessionGeneration
 	rt.lifecycleMu.Unlock()
+	rt.outputMu.Lock()
+	rt.delivery.abandonPlayback("")
+	rt.cancelledPlaybacks = map[string]bool{}
+	rt.cancelledPlaybackOrder = nil
+	rt.suppressOutput = false
+	rt.interruptedItem = ""
+	rt.outputItemID = ""
+	rt.outputBytes = 0
+	rt.playedItemID = ""
+	rt.playedMS = 0
+	rt.playbackTracked = false
+	rt.outputMu.Unlock()
+	rt.replaceSession(session)
+	rt.sessionCancel = a.cancel
 	previousTiming.finish("", "", "session_replaced")
 	data := map[string]any{"generation": generation, "restored": restore && !resumed, "resumed": resumed,
 		"connection_to_open_ms": float64(time.Since(connectedAt)) / float64(time.Millisecond), "provider": rt.provider.Name(),
@@ -682,6 +700,7 @@ func (rt *RealtimeThinker) rememberConfiguration(instructions string, tools []Na
 	rt.transcriptMu.Lock()
 	rt.opts.Instructions, rt.opts.Tools = instructions, tools
 	rt.transcriptMu.Unlock()
+	rt.audioLane.tools.Store(append([]NativeTool(nil), tools...))
 }
 
 func (rt *RealtimeThinker) previewConfigurationUpdate(session RealtimeSession, instructions string, tools []NativeTool) RealtimeConfigurationDisposition {
@@ -822,6 +841,14 @@ func (rt *RealtimeThinker) setTerminalReason(reason string) {
 }
 
 func (rt *RealtimeThinker) emit(eventType string, data map[string]any) {
+	if rt.audioLane.active.Load() {
+		select {
+		case rt.audioLane.telemetry <- realtimeLaneTelemetry{eventType, data}:
+		default:
+			rt.audioLane.telemetryDropped.Add(1)
+		}
+		return
+	}
 	if rt.telemetry != nil {
 		rt.telemetry.Emit(eventType, rt.threadID, data)
 	}
@@ -1150,8 +1177,24 @@ func (rt *RealtimeThinker) discardQueuedOutput() (frames, bytes int) {
 
 // Caller serializes producers with outputMu. Keep later, unrelated playback.
 func (rt *RealtimeThinker) discardQueuedPlayback(item string) (frames, bytes int) {
+	remaining := rt.outputPending[:0]
+	for _, frame := range rt.outputPending {
+		if item != "" && frame.ItemID != item {
+			remaining = append(remaining, frame)
+			continue
+		}
+		frame.timing.written(frame.ResponseID, frame.ItemID, time.Time{}, len(frame.Audio), false)
+		frame.written(false)
+		frames++
+		bytes += len(frame.Audio)
+		rt.outputPendingBytes -= len(frame.Audio)
+	}
+	for i := len(remaining); i < len(rt.outputPending); i++ {
+		rt.outputPending[i] = RealtimeAudioFrame{}
+	}
+	rt.outputPending = remaining
 	if rt.audioOut == nil {
-		return 0, 0
+		return frames, bytes
 	}
 	var keep []RealtimeAudioFrame
 	defer func() {
@@ -1188,10 +1231,6 @@ func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, canc
 	generatedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
 	playedMS := generatedMS
 	if !current {
-		if !rt.capabilities.ContinuousConversation {
-			rt.outputMu.Unlock()
-			return false
-		}
 		var active bool
 		generatedMS, playedMS, active = rt.delivery.playbackPosition(expectedItemID)
 		if !active {
@@ -1241,7 +1280,7 @@ func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, canc
 	// lets updated renderers ignore stale controls; legacy renderers keep type.
 	if itemID != "" && rt.audioControl != nil {
 		control := "interrupt"
-		if rt.capabilities.ContinuousConversation {
+		if rt.capabilities.ContinuousConversation || rt.rendererScoped.Load() {
 			payload, _ := json.Marshal(map[string]any{"type": "interrupt", "item_id": itemID, "session_generation": rt.delivery.generationFor(itemID, generationForAudioFrame(rt)), "reason": reason, "requested_at_ms": time.Now().UnixMilli()})
 			control = string(payload)
 		}
@@ -1301,8 +1340,10 @@ func (rt *RealtimeThinker) Run() {
 	rt.beginRuntime()
 	rt.configureInputQueue()
 	rt.inputPaused.Store(rt.paused)
+	rt.outputPaused.Store(rt.paused)
 	intakeCtx, intakeCancel := context.WithCancel(rt.ctx)
 	intakeDone := make(chan struct{})
+	rt.startAudioLane(intakeCtx)
 	go func() { defer close(intakeDone); rt.ingestRealtimeAudio(intakeCtx) }()
 	defer rt.endRuntime()
 	rt.workerMilestone("ready", "")
@@ -1319,6 +1360,7 @@ func (rt *RealtimeThinker) Run() {
 		rt.inputPaused.Store(true)
 		intakeCancel()
 		<-intakeDone
+		rt.stopAudioLane()
 		rt.input.discard("thread_stopped")
 		rt.reportInputDrops()
 		rt.stopExecutionThread()
@@ -1328,6 +1370,8 @@ func (rt *RealtimeThinker) Run() {
 		rt.currentTiming().finish("", "", "thread_ended")
 		rt.cancel()
 		rt.replaceSession(nil)
+		rt.flushAudioTelemetry()
+		rt.audioLane.active.Store(false)
 		if rt.onStop != nil {
 			rt.onStop()
 		}
@@ -1341,6 +1385,7 @@ func (rt *RealtimeThinker) Run() {
 	rt.setConversationState("listening", RealtimeEvent{})
 	catalogDirty := false
 	for {
+		rt.flushAudioTelemetry()
 		if changed := rt.applyRuntimeMutations(); changed {
 			if rt.opening != nil && rt.opening.directive != rt.directive {
 				rt.cancelOpening()
@@ -1398,17 +1443,11 @@ func (rt *RealtimeThinker) Run() {
 				rt.recovery.Unlock()
 			}
 		}
-		if session != nil {
-			rt.drainRealtimeInput(session)
-		}
 		session = rt.currentSession()
 		if session == nil && !rt.needsSession() {
 			rt.setConversationState("waiting", RealtimeEvent{})
 		}
-		var events <-chan RealtimeEvent
-		if session != nil {
-			events = session.Events()
-		}
+		var events <-chan realtimeLaneEvent = rt.audioLane.events
 		var timer *time.Timer
 		var tick <-chan time.Time
 		next := deadline
@@ -1420,12 +1459,7 @@ func (rt *RealtimeThinker) Run() {
 		}
 		if rt.input.pending() {
 			inputNext := time.Now().Add(100 * time.Millisecond)
-			if session != nil {
-				inputNext = rt.input.nextSend
-				if inputNext.IsZero() {
-					inputNext = time.Now()
-				}
-			}
+
 			if next.IsZero() || inputNext.Before(next) {
 				next = inputNext
 			}
@@ -1444,8 +1478,11 @@ func (rt *RealtimeThinker) Run() {
 		select {
 		case <-rt.mutationWake:
 
-		case event, ok := <-events:
-			if !ok {
+		case delivered := <-events:
+			if delivered.session != rt.currentSession() {
+				break
+			}
+			if delivered.closed {
 				rt.lifecycleMu.Lock()
 				planned, reason := rt.pendingReconnectPlanned, rt.pendingReconnectReason
 				rt.lifecycleMu.Unlock()
@@ -1454,7 +1491,18 @@ func (rt *RealtimeThinker) Run() {
 				}
 				rt.closeForRecovery(session, planned, reason)
 			} else {
-				rt.handleSessionEvent(event)
+				rt.observeAudioLane()
+				rt.handleSessionEvent(delivered.event)
+			}
+		case <-rt.audioLane.wake:
+			rt.observeAudioLane()
+		case failure := <-rt.audioLane.failures:
+			if failure.session == rt.currentSession() {
+				rt.recordInputFailure(failure.err, failure.reason)
+				if strings.HasPrefix(failure.reason, "output_") {
+					rt.clearCallerInterruptedPlayback(failure.reason, false, true)
+				}
+				rt.closeForRecovery(failure.session, false, failure.reason, failure.err)
 			}
 		case <-rt.recovery.wake:
 		case <-tick:
@@ -1474,6 +1522,7 @@ func (rt *RealtimeThinker) Run() {
 		case paused := <-rt.pause:
 			rt.paused = paused
 			rt.inputPaused.Store(paused)
+			rt.outputPaused.Store(paused)
 			if paused {
 				rt.input.discard("paused")
 			}
@@ -1545,63 +1594,19 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.recovery.Unlock()
 		rt.emit("realtime.reconnect_planned", map[string]any{"reason": "provider_goaway", "planned": true, "time_left_ms": event.TimeLeft.Milliseconds()})
 	case RealtimeEventAudioOut:
-		if rt.paused {
-			rt.currentTiming().dropped(event.ResponseID, event.ItemID, len(event.Audio))
-			return
-		}
-		if rt.toolMarkupResponseSuppressed(event) {
-			rt.currentTiming().dropped(event.ResponseID, event.ItemID, len(event.Audio))
-			rt.emit("realtime.audio_drop", map[string]any{
-				"direction": "output", "bytes": len(event.Audio), "reason": "provider_tool_markup_leaked",
-				"response_id": event.ResponseID, "item_id": event.ItemID,
-			})
-			return
-		}
-		if rt.audioOut != nil {
-			rt.outputMu.Lock()
-			if rt.cancelledPlaybacks[event.ItemID] || rt.suppressOutput && (event.ItemID == "" || event.ItemID == rt.interruptedItem) {
-				rt.outputMu.Unlock()
-				rt.currentTiming().dropped(event.ResponseID, event.ItemID, len(event.Audio))
-				rt.emit("realtime.audio_drop", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "interrupted_item"})
+		if !event.audioForwarded {
+			if !rt.forwardRealtimeAudio(event, generationForAudioFrame(rt)) {
 				return
 			}
-			if rt.suppressOutput && event.ItemID != "" && event.ItemID != rt.interruptedItem {
-				rt.suppressOutput = false
-				rt.interruptedItem = ""
-			}
-			if event.ItemID != "" && event.ItemID != rt.outputItemID {
-				rt.outputItemID, rt.outputBytes = event.ItemID, 0
-				rt.playedItemID, rt.playedMS = event.ItemID, 0
-				rt.playbackTracked = false
-			}
-			endMS := (rt.outputBytes + len(event.Audio)) * 1000 / realtimePCMBytesPerSecond
-			frame := RealtimeAudioFrame{timing: rt.currentTiming(), Audio: event.Audio, SessionGeneration: generationForAudioFrame(rt), ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS, Silent: event.AudioSilence}
-			rt.lifecycleMu.Lock()
-			generation := rt.sessionGeneration
-			rt.lifecycleMu.Unlock()
-			itemKey := realtimeTimingKey(event.ResponseID, event.ItemID)
-			deliveryKey := fmt.Sprintf("%d/%s", generation, itemKey)
-			frame.delivery = rt.delivery.enqueue(deliveryKey, event.ItemID, len(event.Audio), event.AudioSilence)
-			frame.cancelled = func() bool { return rt.delivery.isCancelled(deliveryKey) }
-			rt.outputBytes += len(event.Audio)
-			frame.timing.enqueued(event.ResponseID, event.ItemID, time.Now(), min(cap(rt.audioOut), len(rt.audioOut)+1), len(event.Audio))
-			select {
-			case rt.audioOut <- frame:
-				rt.outputMu.Unlock()
-				rt.markAssistantAudioEmitted()
-				if rt.capabilities.ContinuousConversation && !event.AudioSilence {
+		}
+		if !event.AudioSilence && !rt.outputPaused.Load() {
+			rt.markAssistantAudioEmitted()
+			if rt.capabilities.ContinuousConversation {
+				rt.continuous.lastRelease = event.ObservedAt
+				if rt.continuous.lastRelease.IsZero() {
 					rt.continuous.lastRelease = time.Now()
 				}
-			default:
-				rt.outputMu.Unlock()
-				frame.timing.written(event.ResponseID, event.ItemID, time.Time{}, len(event.Audio), false)
-				frame.written(false)
-				rt.emit("realtime.audio_overflow", map[string]any{"direction": "output", "bytes": len(event.Audio), "reason": "consumer_backpressure"})
-				rt.interruptPlayback("core_output_overflow", event.ItemID, true, true)
-				return
 			}
-		}
-		if !event.AudioSilence {
 			rt.setConversationState("speaking", event)
 		}
 
@@ -1609,7 +1614,9 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		if event.ResponseID != "" || event.ItemID != "" {
 			rt.currentTiming().finish(event.ResponseID, event.ItemID, "interrupted")
 		}
-		rt.clearCallerInterruptedPlayback("provider_speech_started", false, false)
+		if !event.audioForwarded {
+			rt.clearCallerInterruptedPlayback("provider_speech_started", false, false)
+		}
 		rt.setConversationState("listening", event)
 
 	case RealtimeEventSpeechStopped:
@@ -2033,20 +2040,14 @@ func (rt *RealtimeThinker) acknowledgePlaybackClear(item string) {
 // older segment still in the player. Later speech gets a new identity and is
 // unaffected. Content checks continue to cancel only their specific item.
 func (rt *RealtimeThinker) clearCallerInterruptedPlayback(reason string, cancelProvider, requireAck bool) {
-	if rt.capabilities.ContinuousConversation {
-		rt.outputMu.Lock()
-		current := rt.outputItemID
-		ids := rt.delivery.pendingPlaybackIDs()
-		rt.outputMu.Unlock()
-		for _, item := range ids {
-			if item != current {
-				rt.interruptPlayback(reason, item, false, requireAck)
-			}
+	rt.outputMu.Lock()
+	current := rt.outputItemID
+	ids := rt.delivery.pendingPlaybackIDs()
+	rt.outputMu.Unlock()
+	for _, item := range ids {
+		if item != current {
+			rt.interruptPlayback(reason, item, false, requireAck)
 		}
-		if current != "" {
-			rt.interruptPlayback(reason, current, cancelProvider, requireAck)
-		}
-		return
 	}
-	rt.interruptPlayback(reason, "", cancelProvider, requireAck)
+	rt.interruptPlayback(reason, current, cancelProvider, requireAck)
 }

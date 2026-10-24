@@ -91,7 +91,7 @@ func (rt *RealtimeThinker) finishOpening(r realtimeOpenResult) {
 		started = a.connectedAt
 	}
 	rt.emit("realtime.reconnect", map[string]any{"success": true, "generation": generation, "reason": reason, "planned": planned, "recovery_ms": time.Since(started).Milliseconds(), "connection_ms": time.Since(a.connectedAt).Milliseconds(), "input_queue_ms": rt.input.backlog().Milliseconds()})
-	rt.input.nextSend = time.Time{}
+	rt.input.resetSender()
 	rt.flushRecoveryInput()
 }
 func (rt *RealtimeThinker) providerState(state string, err error) {

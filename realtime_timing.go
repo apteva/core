@@ -24,13 +24,16 @@ type realtimeTiming struct {
 }
 
 type realtimeUtteranceTiming struct {
-	response, item                                            string
-	firstAudio, guardRelease, enqueue, bridgeWrite, speechEnd time.Time
-	speechSource, guard, status                               string
-	bufferedBytes, droppedBytes, queueMax, pending            int
-	pendingBytes                                              int
-	done                                                      bool
-	acknowledged                                              bool
+	creditWait, creditWaitMax, rendererWrite, rendererWriteMax time.Duration
+	outputWaitTotal, outputWaitMax                             time.Duration
+	outputFrames                                               int
+	response, item                                             string
+	firstAudio, guardRelease, enqueue, bridgeWrite, speechEnd  time.Time
+	speechSource, guard, status                                string
+	bufferedBytes, droppedBytes, queueMax, pending             int
+	pendingBytes                                               int
+	done                                                       bool
+	acknowledged                                               bool
 }
 
 func newRealtimeTiming(generation uint64, emit func(string, map[string]any)) *realtimeTiming {
@@ -163,7 +166,9 @@ func (t *realtimeTiming) summary(key string, u *realtimeUtteranceTiming) map[str
 		"output_enqueue_to_bridge_write_ms":  timingMS(u.enqueue, u.bridgeWrite),
 		"provider_audio_to_bridge_write_ms":  timingMS(u.firstAudio, u.bridgeWrite),
 		"buffered_audio_ms":                  float64(u.bufferedBytes) * 1000 / realtimePCMBytesPerSecond,
-		"max_output_queue_depth":             u.queueMax, "dropped_audio_bytes": u.droppedBytes,
+		"renderer_credit_wait_ms":            float64(u.creditWait) / float64(time.Millisecond), "renderer_credit_wait_max_ms": float64(u.creditWaitMax) / float64(time.Millisecond), "renderer_transport_write_ms": float64(u.rendererWrite) / float64(time.Millisecond), "renderer_transport_write_max_ms": float64(u.rendererWriteMax) / float64(time.Millisecond),
+		"output_wait_mean_ms": float64(u.outputWaitTotal) / float64(time.Millisecond) / float64(max(1, u.outputFrames)), "output_wait_max_ms": float64(u.outputWaitMax) / float64(time.Millisecond), "output_frames": u.outputFrames,
+		"max_output_queue_depth": u.queueMax, "dropped_audio_bytes": u.droppedBytes,
 		"guard_outcome": u.guard, "completion_status": u.status,
 	}
 }
@@ -175,6 +180,13 @@ func (t *realtimeTiming) publish(data map[string]any) {
 }
 
 func (t *realtimeTiming) written(response, item string, at time.Time, bytes int, success bool) {
+	written := 0
+	if success {
+		written = bytes
+	}
+	t.writtenBytes(response, item, at, bytes, written)
+}
+func (t *realtimeTiming) writtenBytes(response, item string, at time.Time, bytes, written int) {
 	if t == nil {
 		return
 	}
@@ -182,11 +194,11 @@ func (t *realtimeTiming) written(response, item string, at time.Time, bytes int,
 	t.mu.Lock()
 	key := realtimeTimingKey(response, item)
 	if u := t.items[key]; u != nil {
-		if success && u.bridgeWrite.IsZero() {
+		if written > 0 && u.bridgeWrite.IsZero() {
 			u.bridgeWrite = at
 		}
-		if !success {
-			u.droppedBytes += bytes
+		if written < bytes {
+			u.droppedBytes += bytes - written
 			if u.status == "completed" {
 				u.status = "output_dropped"
 			}
@@ -283,5 +295,39 @@ func (t *realtimeTiming) ready(at time.Time, settings map[string]any) {
 	t.mu.Unlock()
 	if t.emit != nil {
 		t.emit("realtime.session_ready", data)
+	}
+}
+
+func (t *realtimeTiming) outputWait(response, item string, queued time.Time) {
+	if t == nil || queued.IsZero() {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if u := t.items[realtimeTimingKey(response, item)]; u != nil {
+		d := time.Since(queued)
+		u.outputWaitTotal += d
+		if d > u.outputWaitMax {
+			u.outputWaitMax = d
+		}
+		u.outputFrames++
+	}
+}
+
+func (t *realtimeTiming) rendererFlow(response, item string, wait, write time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if u := t.items[realtimeTimingKey(response, item)]; u != nil {
+		u.creditWait += wait
+		u.rendererWrite += write
+		if wait > u.creditWaitMax {
+			u.creditWaitMax = wait
+		}
+		if write > u.rendererWriteMax {
+			u.rendererWriteMax = write
+		}
 	}
 }

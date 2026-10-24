@@ -13,13 +13,17 @@ type realtimeInputFrame struct {
 }
 type realtimeInputQueue struct {
 	mu                      sync.Mutex
+	sendMu                  sync.Mutex
+	inflight                int
+	flow                    realtimeFlowMetrics
+	lastFlowReport          time.Time
 	frames                  []realtimeInputFrame
 	bytes                   int
 	bytesPerSecond          int
 	sampleBytes             int
 	policy                  RealtimeInputPolicy
 	drops                   map[string]int
-	nextSend, pressureSince time.Time // runtime loop only
+	nextSend, pressureSince time.Time // sendMu
 }
 
 func (q *realtimeInputQueue) duration(n int) time.Duration {
@@ -32,7 +36,7 @@ func (q *realtimeInputQueue) pending() bool { q.mu.Lock(); defer q.mu.Unlock(); 
 func (q *realtimeInputQueue) backlog() time.Duration {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.duration(q.bytes)
+	return q.duration(q.bytes + q.inflight)
 }
 func (q *realtimeInputQueue) dropLocked(reason string, n int) {
 	if n == 0 {
@@ -57,7 +61,7 @@ func (q *realtimeInputQueue) push(audio []byte, now time.Time) {
 	defer q.mu.Unlock()
 	q.expireLocked(now)
 	limit := int(q.policy.MaxBuffered * time.Duration(q.bytesPerSecond) / time.Second)
-	keep := min(len(audio), max(0, limit-q.bytes))
+	keep := min(len(audio), max(0, limit-q.bytes-q.inflight))
 	sampleBytes := q.sampleBytes
 	if sampleBytes == 0 {
 		sampleBytes = 2
@@ -121,8 +125,7 @@ func (rt *RealtimeThinker) ingestRealtimeAudio(ctx context.Context) {
 			if len(audio) == 0 || rt.inputPaused.Load() {
 				continue
 			}
-			rt.recordRealtimeInput(len(audio))
-			rt.queueRecoveryAudio(audio)
+			rt.admitRealtimeAudio(audio, time.Now())
 		}
 	}
 }
@@ -131,7 +134,17 @@ func (rt *RealtimeThinker) reportInputDrops() {
 	q.mu.Lock()
 	drops := q.drops
 	q.drops = nil
+	var flow map[string]any
+	if q.flow.frames > 0 && time.Since(q.lastFlowReport) >= time.Second {
+		m := q.flow
+		q.flow = realtimeFlowMetrics{}
+		q.lastFlowReport = time.Now()
+		flow = map[string]any{"frames": m.frames, "input_wait_mean_ms": float64(m.inputWait) / float64(time.Millisecond) / float64(m.frames), "input_wait_max_ms": float64(m.inputMax) / float64(time.Millisecond), "adapter_wait_mean_ms": float64(m.adapterWait) / float64(time.Millisecond) / float64(m.frames), "adapter_wait_max_ms": float64(m.adapterMax) / float64(time.Millisecond), "transport_write_mean_ms": float64(m.write) / float64(time.Millisecond) / float64(m.frames), "transport_write_max_ms": float64(m.writeMax) / float64(time.Millisecond), "queued_audio_ms": q.duration(q.bytes + q.inflight).Milliseconds(), "budget_ms": q.policy.MaxBuffered.Milliseconds(), "remote_delivery_confirmed": false}
+	}
 	q.mu.Unlock()
+	if flow != nil {
+		rt.emit("realtime.input_flow", flow)
+	}
 	for reason, n := range drops {
 		rt.emit("realtime.audio_drop", map[string]any{"direction": "input", "reason": reason, "bytes": n, "duration_ms": q.duration(n).Milliseconds(), "discontinuity": true, "generation": generationForAudioFrame(rt)})
 	}
@@ -139,8 +152,16 @@ func (rt *RealtimeThinker) reportInputDrops() {
 func (rt *RealtimeThinker) recordInputFailure(err error, operation string) {
 	rt.emit("realtime.error", map[string]any{"error": fmt.Sprint(err), "error_class": realtimeErrorClass(err), "operation": operation, "generation": generationForAudioFrame(rt), "input_queue_ms": rt.input.backlog().Milliseconds(), "remote_delivery_confirmed": false})
 }
+func (q *realtimeInputQueue) resetSender() {
+	q.sendMu.Lock()
+	q.nextSend = time.Time{}
+	q.pressureSince = time.Time{}
+	q.sendMu.Unlock()
+}
 func (rt *RealtimeThinker) drainRealtimeInput(session RealtimeSession) {
-	if rt.paused {
+	rt.input.sendMu.Lock()
+	defer rt.input.sendMu.Unlock()
+	if rt.inputPaused.Load() || !rt.audioLane.active.Load() && rt.paused {
 		rt.input.discard("paused")
 		return
 	}
@@ -159,16 +180,41 @@ func (rt *RealtimeThinker) drainRealtimeInput(session RealtimeSession) {
 		}
 		frame := q.frames[0]
 		q.mu.Unlock()
-		err := session.SendAudio(frame.audio)
+		q.mu.Lock()
+		q.inflight += len(frame.audio)
+		q.mu.Unlock()
+		var once sync.Once
+		done := func(wait, write time.Duration, delivered bool) {
+			once.Do(func() {
+				q.mu.Lock()
+				defer q.mu.Unlock()
+				q.inflight -= len(frame.audio)
+				q.flow.observe(now.Sub(frame.received), wait, write)
+				if !delivered {
+					q.dropLocked("adapter_delivery_failed", len(frame.audio))
+				}
+			})
+		}
+		var err error
+		if adapter, ok := session.(RealtimeAudioInputSession); ok {
+			err = adapter.SendAudioFrame(RealtimeInputAudio{Audio: frame.audio, ReceivedAt: frame.received, MaxAge: q.policy.MaxAge, Complete: done})
+		} else {
+			err = session.SendAudio(frame.audio)
+			if err == nil {
+				done(0, 0, true)
+			}
+		}
+		if err != nil {
+			once.Do(func() { q.mu.Lock(); q.inflight -= len(frame.audio); q.mu.Unlock() })
+		}
 		if err != nil && realtimeErrorClass(err) == RealtimeErrorPressure {
 			if q.pressureSince.IsZero() {
 				q.pressureSince = now
-				rt.recordInputFailure(err, "send_audio")
+				rt.noteInputSendFailure(session, err, "send_audio", false)
 			}
 			q.nextSend = now.Add(10 * time.Millisecond)
 			if now.Sub(q.pressureSince) >= q.policy.PressureTimeout {
-				rt.recordInputFailure(err, "sustained_input_pressure")
-				rt.closeForRecovery(session, false, "input_pressure_timeout", err)
+				rt.noteInputSendFailure(session, err, "input_pressure_timeout", true)
 				q.pressureSince = time.Time{}
 			}
 			return
@@ -189,8 +235,8 @@ func (rt *RealtimeThinker) drainRealtimeInput(session RealtimeSession) {
 			q.mu.Unlock()
 		}
 		if err != nil {
-			rt.recordInputFailure(err, "send_audio")
-			rt.closeForRecovery(session, false, "audio_delivery_failed", err)
+			rt.noteInputSendFailure(session, err, "send_audio", false)
+			rt.noteInputSendFailure(session, err, "audio_delivery_failed", true)
 			return
 		}
 		q.pressureSince = time.Time{}
@@ -204,4 +250,34 @@ func (rt *RealtimeThinker) drainRealtimeInput(session RealtimeSession) {
 			return
 		}
 	}
+}
+
+func (rt *RealtimeThinker) noteInputSendFailure(s RealtimeSession, err error, reason string, recover bool) {
+	if rt.audioLane.active.Load() {
+		if recover {
+			rt.failAudioLane(s, reason, err)
+		} else {
+			rt.recordInputFailure(err, reason)
+		}
+		return
+	}
+	operation := reason
+	if reason == "input_pressure_timeout" {
+		operation = "sustained_input_pressure"
+	}
+	rt.recordInputFailure(err, operation)
+	if recover {
+		rt.closeForRecovery(s, false, reason, err)
+	}
+}
+
+// The bridge admits directly here so transport, recovery and adapter queues
+// share one limit and the original arrival timestamp. No I/O is performed.
+func (rt *RealtimeThinker) admitRealtimeAudio(audio []byte, at time.Time) {
+	if rt.inputPaused.Load() {
+		return
+	}
+	rt.recordRealtimeInput(len(audio))
+	rt.input.push(audio, at)
+	rt.wakeRecovery()
 }

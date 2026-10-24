@@ -209,3 +209,76 @@ func TestMCPNativeMediaSurvivesDispatchAndProviderProjection(t *testing.T) {
 		}
 	}
 }
+
+// Run the real inbox builder as well as the isolated encoder. This prevents
+// test helpers from hiding the empty text part produced by a tool-only turn.
+type mediaInboxProbeProvider struct {
+	scriptedRetryProvider
+	requests chan []Message
+}
+
+func (p *mediaInboxProbeProvider) SupportsNativeTools() bool { return true }
+func (p *mediaInboxProbeProvider) Chat(_ context.Context, messages []Message, _ string, _ []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
+	for _, message := range messages {
+		if len(message.ToolResults) > 0 {
+			select {
+			case p.requests <- cloneMessages(messages):
+			default:
+			}
+			return ChatResponse{Text: "Image received."}, nil
+		}
+	}
+	return ChatResponse{ToolCalls: []NativeToolCall{{ID: "image-only-inbox", Name: "media_read", Args: map[string]string{"_reason": "Inspect the image"}}}}, nil
+}
+func TestMCPImageOnlyToolThroughThinkerInbox(t *testing.T) {
+	for _, mime := range []string{"image/png", "image/jpeg"} {
+		t.Run(mime, func(t *testing.T) {
+			pixels := []byte{0x89, 0x50, 0x4e, 0x47}
+			if mime == "image/jpeg" {
+				pixels = []byte{0xff, 0xd8, 0xff, 0xe0}
+			}
+			conn := mediaResultMCP(t, mediaResultPayload(mediaImageBlock(mime, pixels)))
+			th := newTestThinkerFull()
+			th.session = NewSession(t.TempDir(), "main")
+			probe := &mediaInboxProbeProvider{requests: make(chan []Message, 1)}
+			th.provider = probe
+			th.pool = nil
+			registerMediaFixtureTool(th, conn)
+			th.activeTools["media_read"] = true
+			th.handleTools = mainToolHandler(th)
+			done := make(chan struct{})
+			go func() { defer close(done); th.Run() }()
+			defer func() {
+				th.Stop()
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Error("thinker did not stop")
+				}
+			}()
+			var messages []Message
+			select {
+			case messages = <-probe.requests:
+			case <-time.After(5 * time.Second):
+				t.Fatal("image-only tool result did not reach inference")
+			}
+			if mime == "image/jpeg" {
+				emptyLead := false
+				for _, m := range messages {
+					if len(m.Parts) > 1 && m.Parts[0].Type == "text" && m.Parts[0].Text == "" && m.Parts[1].ImageURL != nil {
+						emptyLead = true
+					}
+				}
+				if !emptyLead {
+					t.Fatal("test did not exercise the inbox's empty leading text part")
+				}
+			}
+			items := (&OpenAINativeProvider{}).buildInput(messages)
+			assertResponsesTextBlocksPresent(t, items)
+			raw, _ := json.Marshal(items)
+			if strings.Count(string(raw), base64.StdEncoding.EncodeToString(pixels)) != 1 {
+				t.Fatal("inbox image lost or duplicated")
+			}
+		})
+	}
+}

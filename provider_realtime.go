@@ -298,6 +298,7 @@ type RealtimeUsage struct {
 // 24 kHz, mono). ItemID and AudioEndMS let the renderer report how much of an
 // assistant item was actually played without knowing the provider protocol.
 type RealtimeAudioFrame struct {
+	queuedAt          time.Time
 	SessionGeneration int64
 	Audio             []byte
 	ResponseID        string
@@ -306,12 +307,22 @@ type RealtimeAudioFrame struct {
 	Silent            bool // PCM remains ordered; silence does not imply active speech
 	timing            *realtimeTiming
 	cancelled         func() bool // invalidated playback must never reach the renderer
-	delivery          func(bool)  // bridge write receipt; never a playback acknowledgement
+	settle            func(int)
+	delivery          func(bool) // bridge write receipt; never a playback acknowledgement
 }
 
 func (f RealtimeAudioFrame) written(success bool) {
-	if f.delivery != nil {
-		f.delivery(success)
+	written := 0
+	if success {
+		written = len(f.Audio)
+	}
+	f.writtenBytes(written)
+}
+func (f RealtimeAudioFrame) writtenBytes(written int) {
+	if f.settle != nil {
+		f.settle(written)
+	} else if f.delivery != nil {
+		f.delivery(written == len(f.Audio))
 	}
 }
 
@@ -453,9 +464,10 @@ const (
 // RealtimeEvent is a single event from a session. Only the fields
 // relevant to the Type are populated.
 type RealtimeEvent struct {
-	ObservedAt time.Time      // local receipt time; never a provider wall clock
-	Settings   map[string]any // sanitized session acknowledgement
-	Type       RealtimeEventType
+	audioForwarded bool           // internal audio-lane observation; payload already delivered
+	ObservedAt     time.Time      // local receipt time; never a provider wall clock
+	Settings       map[string]any // sanitized session acknowledgement
+	Type           RealtimeEventType
 
 	// Audio (RealtimeEventAudioOut)
 	Audio []byte

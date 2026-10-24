@@ -316,6 +316,22 @@ func (rt *RealtimeThinker) drainTerminalTranscripts() {
 	if session == nil {
 		return
 	}
+	for i := 0; i < 256; i++ {
+		select {
+		case delivered := <-rt.audioLane.events:
+			if delivered.session != session {
+				continue
+			}
+			switch delivered.event.Type {
+			case RealtimeEventTranscriptInput, RealtimeEventTranscriptOutput:
+				rt.handleSessionEvent(delivered.event)
+			case RealtimeEventOutputBlocked:
+				rt.blockTranscript(delivered.event)
+			}
+		default:
+			i = 256
+		}
+	}
 	events := session.Events()
 	for i := 0; i < 256; i++ {
 		select {

@@ -41,6 +41,16 @@ type realtimeDelivery struct {
 }
 
 func (d *realtimeDelivery) enqueue(key, item string, bytes int, silent ...bool) func(bool) {
+	settle := d.enqueueBytes(key, item, bytes, silent...)
+	return func(success bool) {
+		written := 0
+		if success {
+			written = bytes
+		}
+		settle(written)
+	}
+}
+func (d *realtimeDelivery) enqueueBytes(key, item string, bytes int, silent ...bool) func(int) {
 	speech := len(silent) == 0 || !silent[0]
 	d.mu.Lock()
 	if d.items == nil {
@@ -69,7 +79,7 @@ func (d *realtimeDelivery) enqueue(key, item string, bytes int, silent ...bool) 
 	d.pending += bytes
 	d.mu.Unlock()
 	var once sync.Once
-	return func(success bool) {
+	return func(written int) {
 		once.Do(func() {
 			d.mu.Lock()
 			defer d.mu.Unlock()
@@ -78,13 +88,16 @@ func (d *realtimeDelivery) enqueue(key, item string, bytes int, silent ...bool) 
 				entry.speechPending -= bytes
 			}
 			d.pending -= bytes
-			if success {
-				entry.written += bytes
-				d.written += bytes
-			} else {
-				entry.dropped += bytes
-				d.dropped += bytes
+			if written < 0 {
+				written = 0
 			}
+			if written > bytes {
+				written = bytes
+			}
+			entry.written += written
+			d.written += written
+			entry.dropped += bytes - written
+			d.dropped += bytes - written
 		})
 	}
 }
@@ -208,10 +221,11 @@ func (rt *RealtimeThinker) finishRealtimeCompletion(session RealtimeSession) {
 	var settledAt time.Time
 	closing, finalized := false, false
 	var events <-chan RealtimeEvent
-	if session != nil {
+	if session != nil && !rt.audioLane.active.Load() {
 		events = session.Events()
 	}
 	for {
+		rt.flushAudioTelemetry()
 		select {
 		case <-rt.quit:
 			rt.setCompletionOutcome("forced_stop")
@@ -270,6 +284,26 @@ func (rt *RealtimeThinker) finishRealtimeCompletion(session RealtimeSession) {
 			return
 		case <-rt.recovery.wake:
 		case <-ticker.C:
+		case <-rt.audioLane.wake:
+			rt.observeAudioLane()
+		case delivered := <-rt.audioLane.events:
+			if delivered.session != rt.currentSession() {
+				continue
+			}
+			if delivered.closed {
+				if rt.capabilities.ContinuousConversation && !finalized {
+					rt.setCompletionOutcome("disconnected")
+					return
+				}
+				session = nil
+				continue
+			}
+			rt.observeAudioLane()
+			if delivered.event.Type == RealtimeEventSessionEnded {
+				finalized = true
+			}
+			rt.handleSessionEvent(delivered.event)
+			settledAt = time.Time{}
 		case event, ok := <-events:
 			if !ok {
 				events = nil
