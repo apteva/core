@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 const realtimeTerminalToolLimit = 256
@@ -28,6 +29,8 @@ type realtimeToolCallKey struct {
 }
 
 type realtimeToolCallRecord struct {
+	timing          *realtimeTiming
+	work            ThreadWork
 	context         context.Context
 	cancel          context.CancelFunc
 	terminal        bool
@@ -92,6 +95,7 @@ func (rt *RealtimeThinker) cancelRealtimeToolCall(session RealtimeSession, id st
 	rt.toolBatchMu.Lock()
 	rt.rememberTerminalToolCallLocked(session, id, true)
 	rt.toolBatchMu.Unlock()
+	rt.toolTiming(session, id, "cancelled")
 	rt.finishToolCall(id, true)
 	rt.emit("realtime.tool_cancelled", map[string]any{"call_id": id})
 }
@@ -120,4 +124,16 @@ func (rt *RealtimeThinker) recordCancelledToolOutcome(session RealtimeSession, i
 		}
 	}
 	return false
+}
+
+func (rt *RealtimeThinker) toolTiming(session RealtimeSession, id, stage string) {
+	rt.toolBatchMu.Lock()
+	record := rt.toolCallRecords[realtimeToolCallKey{session, id}]
+	var timing *realtimeTiming
+	var work ThreadWork
+	if record != nil {
+		timing, work = record.timing, record.work
+	}
+	rt.toolBatchMu.Unlock()
+	timing.requestStage(work, stage, time.Now())
 }

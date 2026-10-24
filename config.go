@@ -463,7 +463,7 @@ func (c *Config) GetProviders() []ProviderConfig {
 	defer c.mu.RUnlock()
 	out := make([]ProviderConfig, len(c.Providers))
 	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice, RealtimeModels: cloneRealtimeModels(p.RealtimeModels), RealtimeExecution: p.RealtimeExecution}
+		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice, RealtimeModels: cloneRealtimeModels(p.RealtimeModels), RealtimeExecution: *cloneRealtimeExecutionConfig(&p.RealtimeExecution)}
 		if p.Models != nil {
 			cp.Models = make(map[string]string)
 			for k, v := range p.Models {
@@ -714,7 +714,7 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 	if update.RealtimeModels != nil {
 		providers[index].RealtimeModels = cloneRealtimeModels(update.RealtimeModels)
 	}
-	if update.RealtimeExecution != (RealtimeExecutionConfig{}) {
+	if !update.RealtimeExecution.isZero() {
 		providers[index].RealtimeExecution = update.RealtimeExecution
 	}
 	if update.RealtimeVoice != "" {

@@ -231,6 +231,9 @@ func (rt *RealtimeThinker) forwardRealtimeAudio(event RealtimeEvent, generation 
 		frame.settle = rt.delivery.enqueueBytes(deliveryKey, event.ItemID, len(event.Audio), event.AudioSilence)
 		frame.cancelled = func() bool { return generation != generationForAudioFrame(rt) || rt.delivery.isCancelled(deliveryKey) }
 		rt.outputBytes += len(event.Audio)
+		observation := event
+		observation.AudioEndMS = endMS
+		frame.timing.outputObservation(observation, mediaVoiced(event.Audio, rt.opts.OutputConfig.Media.format()), event.ObservedAt)
 		frame.timing.enqueued(event.ResponseID, event.ItemID, time.Now(), min(cap(rt.audioOut), len(rt.audioOut)+1), len(event.Audio))
 		accepted := rt.queueRealtimeOutputLocked(frame)
 		rt.outputMu.Unlock()

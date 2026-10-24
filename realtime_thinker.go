@@ -323,6 +323,7 @@ func (rt *RealtimeThinker) replaceSession(next RealtimeSession) {
 }
 
 func (rt *RealtimeThinker) beginToolCall(event RealtimeEvent, session RealtimeSession) {
+	timing := rt.currentTiming()
 	rt.recovery.Lock()
 	if event.ToolName != "" {
 		rt.recovery.toolNames[event.ToolName] = true
@@ -331,6 +332,9 @@ func (rt *RealtimeThinker) beginToolCall(event RealtimeEvent, session RealtimeSe
 	batchID := event.ResponseID
 	rt.toolBatchMu.Lock()
 	rt.rememberActiveToolCallLocked(session, event.ToolCallID)
+	record := rt.toolCallRecords[realtimeToolCallKey{session, event.ToolCallID}]
+	record.timing = timing
+	record.work = ThreadWork{ID: "tool/" + event.ToolCallID, Revision: 1, DelegationID: event.DelegationID}
 	batch := rt.toolBatches[batchID]
 	if batch == nil {
 		batch = &realtimeToolBatch{session: session, names: map[string]bool{}}
@@ -342,6 +346,8 @@ func (rt *RealtimeThinker) beginToolCall(event RealtimeEvent, session RealtimeSe
 	}
 	rt.toolCallBatches[event.ToolCallID] = batchID
 	rt.toolBatchMu.Unlock()
+	rt.toolTiming(session, event.ToolCallID, "requested")
+	rt.toolTiming(session, event.ToolCallID, "started")
 }
 
 func (rt *RealtimeThinker) completeToolCall(callID string) {
@@ -450,7 +456,9 @@ func (rt *RealtimeThinker) submitToolResult(session RealtimeSession, callID, res
 		rt.wakeRecovery()
 		return
 	}
+	rt.toolTiming(session, callID, "result_available")
 	if err := session.SendToolResult(callID, result, isError); err != nil {
+		rt.toolTiming(session, callID, "delivery_failed")
 		if errors.Is(err, ErrRealtimeToolCallCancelled) {
 			rt.cancelRealtimeToolCall(session, callID)
 			// The result was already archived by the caller of this method.
@@ -462,6 +470,12 @@ func (rt *RealtimeThinker) submitToolResult(session RealtimeSession, callID, res
 		rt.closeForRecovery(session, false, "tool_result_delivery_failed", err)
 		return
 	}
+	rt.toolTiming(session, callID, "submitted")
+	stage := "backend_completed"
+	if isError {
+		stage = "failed"
+	}
+	rt.toolTiming(session, callID, stage)
 	rt.completeToolCall(callID)
 }
 
@@ -554,6 +568,7 @@ func (rt *RealtimeThinker) prepareSession(restore bool) (*realtimeOpenAttempt, e
 		}
 		opts.ExecutionMode = rt.backend.mode
 		opts.ExecutionModel = modelIDForProvider(rt.backend.provider, rt.backend.model)
+		opts.ExecutionReasoning = rt.backend.reasoning.String()
 		opts.ExecutionInstructions, opts.ExecutionTools = worker.Thinker.work.setup()
 	}
 	opts.timing = timing
@@ -1152,12 +1167,20 @@ func (rt *RealtimeThinker) rejectRealtimeOutput(event RealtimeEvent, toolName, p
 }
 
 func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int, generations ...int64) {
+	generation := int64(0)
+	if len(generations) > 0 {
+		generation = generations[0]
+	}
+	rt.acknowledgePlaybackEvidence(itemID, audioEndMS, generation, "")
+}
+func (rt *RealtimeThinker) acknowledgePlaybackEvidence(itemID string, audioEndMS int, requestedGeneration int64, evidence string) {
 	rt.lifecycleMu.Lock()
 	generation := rt.sessionGeneration
+	timing := rt.timing
 	rt.lifecycleMu.Unlock()
 	currentGeneration := generation
-	if len(generations) > 0 && generations[0] > 0 {
-		generation = int(generations[0])
+	if requestedGeneration > 0 {
+		generation = int(requestedGeneration)
 	}
 	if itemID != "" && audioEndMS >= 0 {
 		rt.delivery.acknowledge(fmt.Sprintf("%d/%s", generation, itemID), audioEndMS)
@@ -1165,6 +1188,12 @@ func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int, ge
 	if generation != currentGeneration || itemID == "" || audioEndMS < 0 {
 		return
 	}
+	if evidence == "" {
+		rt.delivery.mu.Lock()
+		evidence = rt.delivery.evidence
+		rt.delivery.mu.Unlock()
+	}
+	timing.playback(itemID, audioEndMS, time.Now(), evidence)
 	rt.outputMu.Lock()
 	if itemID != rt.outputItemID {
 		rt.outputMu.Unlock()
@@ -1182,7 +1211,6 @@ func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int, ge
 	}
 	rt.playbackTracked = true
 	rt.outputMu.Unlock()
-	rt.currentTiming().playback(itemID, audioEndMS, time.Now())
 	rt.wakeRecovery()
 }
 
@@ -1604,6 +1632,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 	case RealtimeEventSessionUsage:
 		rt.emit("realtime.usage", map[string]any{"model": rt.opts.Model, "session_seconds": event.Usage.SessionSeconds, "cost": calculateCostForRealtimeProvider(rt.provider, rt.opts.Model, event.Usage), "accounting": "delta"})
 	case RealtimeEventContextAcknowledged:
+		rt.currentTiming().contextAcknowledged(event.ClientEventID, event.ObservedAt)
 		rt.emit("realtime.context_acknowledged", map[string]any{"client_event_id": event.ClientEventID, "context_start_ms": event.TranscriptStartMS, "context_end_ms": event.TranscriptEndMS, "playback_confirmed": false})
 	case RealtimeEventSessionReady:
 		rt.currentTiming().ready(event.ObservedAt, event.Settings)
@@ -1673,6 +1702,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		if rt.suppressLeakedToolMarkup(event) {
 			return
 		}
+		rt.currentTiming().outputObservation(event, false, event.ObservedAt)
 		rt.trackTranscript("assistant", event)
 
 	case RealtimeEventTranscriptInput:

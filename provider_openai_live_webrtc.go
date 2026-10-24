@@ -85,7 +85,7 @@ func (p *OpenAIRealtimeProvider) openLiveRTCSession(ctx context.Context, opts Re
 	}()
 	s.guard.config = opts.OutputConfig.SpeechGuard.continuousPolicy()
 	s.guard.format = m.format()
-	s.execution = openaiLiveExecution{enabled: opts.ExecutionMode == "provider", notify: make(chan struct{}, 1), pending: map[string]bool{}, submitted: map[string]bool{}, inputHashes: map[[32]byte]bool{}}
+	s.execution = openaiLiveExecution{reasoning: opts.ExecutionReasoning, enabled: opts.ExecutionMode == "provider", notify: make(chan struct{}, 1), pending: map[string]bool{}, submitted: map[string]bool{}, inputHashes: map[[32]byte]bool{}}
 	deliver := func(msg liveMediaMessage) bool {
 		select {
 		case <-s.done:

@@ -56,7 +56,7 @@ Ne prononcez jamais les noms des outils, identifiants, JSON, API, threads ou mé
 			rt.provider = NewOpenAIRealtimeProvider(key)
 			rt.opts.Model, rt.opts.Voice = "gpt-live-1", voice
 			rt.capabilities = capabilitiesForRealtime(rt.provider, rt.opts.Model)
-			rt.config.Providers = []ProviderConfig{{Name: "openai", RealtimeExecution: RealtimeExecutionConfig{Mode: mode}}}
+			rt.config.Providers = []ProviderConfig{{Name: "openai", RealtimeExecution: RealtimeExecutionConfig{Mode: mode, Model: "large"}}}
 			rt.registry = NewToolRegistry("")
 			rt.toolAllowlist = map[string]bool{"appointment_slots": true, "appointment_book": true}
 			var lookups, bookings, phase atomic.Int32

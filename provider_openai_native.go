@@ -1192,3 +1192,10 @@ func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {
 		len(item.Arguments),
 	))
 }
+
+// WithExecutionModel isolates the voice worker's exact model from other threads.
+func (p *OpenAINativeProvider) WithExecutionModel(model string) LLMProvider {
+	clone := p.clone()
+	clone.models = map[ModelTier]string{ModelLarge: model, ModelMedium: model, ModelSmall: model}
+	return clone
+}

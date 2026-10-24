@@ -226,3 +226,124 @@ Two turns share a session by default. The existing live 2-second acceptance
 threshold remains visible; provider latency can fail it. It does not place
 PSTN calls, run a browser, measure handset acoustics, or strip model-generated
 silent PCM.
+
+## Voice execution latency policy
+
+When delegated OpenAI Live execution has no explicit provider/model override,
+Core uses the existing OpenAI API integration with `gpt-6-luna` and reasoning
+`none`. This is an execution-worker default; it does not change main-thread
+models, direct-tool voice models, or the voice model. Existing explicit model
+choices remain authoritative. Other adapters may supply their own defaults.
+
+`realtime_execution` is accepted in the provider configuration and as a full
+per-thread override. Additional optional fields:
+
+```json
+{
+  "mode": "thread",
+  "model_id": "gpt-6-luna",
+  "reasoning": "none",
+  "preload_tools": ["appointments_availability"],
+  "result_tools": [{
+    "tool": "appointments_book",
+    "success_field": "status",
+    "success_value": "confirmed",
+    "public_fields": ["status", "date", "reference"]
+  }]
+}
+```
+
+`model` still selects a configured Core tier; `model_id` selects an isolated
+exact model and is mutually exclusive with `model`. Exact-model overrides
+currently have an implementation on the OpenAI Responses adapter. Other text
+providers retain tier selection. `reasoning: auto` preserves model defaults.
+The reasoning setting is also sent in provider-managed Live delegation.
+
+Preload and result-tool configuration accepts at most 20 combined entries.
+Preloading has a 64 KB schema/description budget, is stable across assignments,
+and never grants permission: parent capabilities and `no_spawn` still apply.
+Result tools are also preloaded. Normal discovery remains available.
+
+Direct delivery is opt-in through `result_tools`, not inferred from arbitrary
+tool JSON. The success field must be a JSON string exactly matching the
+configured value. Every public field must be a present, nonempty scalar at the
+JSON top level; nested values, null, failures, images and other media use normal
+continuation. Public JSON is capped at 400 bytes, conservatively below the Live
+500-token append limit; larger receipts use normal inference. Tool results and
+attachments retain the normal history/archive behavior.
+
+Eligible schemas require the Core-only `_complete_assignment` boolean. The
+worker must explicitly choose true or false, and sets it true only when that single call will finish **all** required
+work. Core strips the hint before dispatch. A declared success does not finish
+an assignment unless the successful receipt matches its host-configured
+contract, the request/revision is current, the latest batch contains one call,
+and no other work or input is pending. For example, “book and then email me”
+must continue after the booking. A reserved-name conflict disables the shortcut.
+
+Core persists the actual tool result, publishes public facts through the
+existing idempotent parent inbox, journals completion and waits for the next
+assignment. The parent retains revision checks and delivery deduplication.
+`thread.work_direct_result` records the request/revision, delegation and call ID,
+and the one skipped narration request. It does not prove audible playback.
+`thread.work_direct_result_evaluated` records eligibility and specifically
+identifies `completion_decision_missing` or `assignment_not_complete`. Missing
+flags remain a safe ordinary continuation, never an inferred completion or a
+retry of the already executed action. The required schema and description are
+worker-local; app schemas and dispatched arguments remain unchanged.
+No raw result is promoted to instructions. The voice adapter receives these
+facts through its ordinary context/commentary interface and phrases them.
+
+This shortcut applies to Core-managed `thread` execution. `provider` mode keeps
+its required function-output/response-continuation protocol and does not also
+send a direct receipt. Tool preloading and model/reasoning configuration apply
+to both modes.
+
+Paid validation: `RUN_VOICE_EXECUTION_LIVE=1 go test . -run
+'TestVoiceExecution(LunaBookingAccuracyLive|LiveLatencyComparison)' -v` with
+`OPENAI_API_KEY` supplied at runtime. The comparison uses real GPT Live/Brise
+sessions, identical typed caller input, and a paced PCM silence clock; it
+measures backend delivery and verified confirmation-caption arrival, not PSTN
+playback or the exact onset of meaningful speech. All booking/email actions
+are local fixtures. Test candidates on the application's own tools and
+procedures before treating these bounded cases as production accuracy evidence.
+
+### Local validation, 2026-10-24
+
+Real OpenAI API checks passed for the exact booking details, a missing time
+(no booking), an unavailable slot (no false success), and booking followed by
+email (both steps completed). The confirmation-only shortcut took one inference
+request; the email workflow retained all three requests and both tool actions.
+
+Nine matched GPT Live/Brise sessions, three per variant with reversed order in
+the middle trial, produced these medians:
+
+| Execution variant | Backend result delivery | Verified confirmation caption | Backend requests |
+| --- | ---: | ---: | ---: |
+| GPT-6.1 Sol, automatic reasoning, normal continuation | 5.150 s | 13.340 s | 2 |
+| GPT-6 Luna, no reasoning, normal continuation | 4.210 s | 12.090 s | 2 |
+| GPT-6 Luna, no reasoning, direct receipt | 2.182 s | 8.701 s | 1 |
+
+The receipt variant reduced median backend delivery by 58% against Sol and
+48% against Luna with normal continuation in this small local sample. Caption
+arrival improved by 35% against Sol; it is not a playback/onset measurement.
+One additional real provider-managed Luna/none session also completed correctly
+with one booking and the normal two backend requests. No deployment or actual
+booking/email action was performed by these tests.
+
+
+### Required-decision regression validation
+
+The follow-up real `gpt-6-luna` / `none` checks ran three two-turn
+availability-then-booking conversations: all six assignments used a direct
+receipt and one model request each, with no missing decisions or duplicate
+bookings. Missing time, unavailable slots and booking-then-email checks also
+passed. Three real GPT Live/Brise booking sessions each used one backend request
+and one direct receipt. These are bounded fixture results, not a guarantee that
+any model will always comply with its schema.
+
+Run the repeated worker test with `RUN_VOICE_EXECUTION_LIVE=1 GOWORK=off go test
+-count=1 -run TestVoiceExecutionLunaMultiTurnReceiptsLive -v .`. Run the Live
+receipt path with `-run TestVoiceExecutionLiveLatencyComparison/luna_receipt`.
+Provide `OPENAI_API_KEY` only at runtime. Telephony's remote two-agent/carrier
+workflow still requires its own replay; local fake tool timings are not a
+before/after comparison against the remote application's service latency.

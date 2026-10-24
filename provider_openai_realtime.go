@@ -101,3 +101,10 @@ func (p *OpenAIRealtimeProvider) RealtimeCapabilities(model string) RealtimeCapa
 var _ RealtimeProvider = (*OpenAIRealtimeProvider)(nil)
 var _ configurableRealtimeProvider = (*OpenAIRealtimeProvider)(nil)
 var _ realtimeReasoningDefaultProvider = (*OpenAIRealtimeProvider)(nil)
+
+func (p *OpenAIRealtimeProvider) DefaultRealtimeExecution(model string) RealtimeExecutionConfig {
+	if !isOpenAILiveModel(model) {
+		return RealtimeExecutionConfig{}
+	}
+	return RealtimeExecutionConfig{Provider: "openai", ModelID: "gpt-6-luna", Reasoning: "none"}
+}

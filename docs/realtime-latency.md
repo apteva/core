@@ -309,3 +309,68 @@ These small local samples do not establish production latency percentiles or
 real carrier/handset playback. Model-generated silent PCM remains untouched.
 Incremental results intentionally wait for final delivery when they do not meet
 the conservative complete-sentence/evidence gate.
+
+## Request, audio and playback timing (October 24 follow-up)
+
+Core emits separate, provider-neutral observations rather than treating a
+caption or successful backend operation as audible completion:
+
+- `realtime.request_timing`: `requested`, `started`, `result_available`,
+  `submitted`, `context_acknowledged`, and `backend_completed` milestones.
+  Includes session generation, request ID, revision, delegation ID and stage
+  durations. `result_available` is when Core's voice runtime receives the
+  worker result, not when an external service committed an operation. Native
+  voice tool calls use `tool/<call_id>` as their request identity.
+- `realtime.utterance_timing`: existing guard, output queue, renderer and bridge
+  durations, plus first-audio-to-non-silent-audio and output association fields.
+  Non-silent means decoded audio exceeds an amplitude threshold; it does not
+  identify meaningful speech. All PCM, including silence, remains unchanged.
+- `realtime.caption_timing`: first caption receipt for a playback item, including
+  captions arriving after its audio summary. Captions never establish playback.
+- `realtime.playback_timing`: first positive renderer progress report and, when
+  explicitly associated, the first report covering the answer's non-silent
+  frame. Includes `evidence` (`carrier_mark`, `estimated`, `rtp_transmitted`, or
+  `legacy`), playback/item ID and generation. The timestamp is **Core receipt of
+  the report**, not the handset's actual playback time. Reports are bounded by
+  bytes written; stale generations, unwritten audio and cleared items cannot
+  produce successful playback timings. Older playback items remain trackable
+  after a newer item starts.
+
+Provider acknowledgements measure context injection, not speech. OpenAI Live
+correlates the first append acknowledgement using `ClientEventID`; split appends
+can take longer to inject in full. Other providers leave acknowledgement latency
+unavailable unless their adapter supplies it. Successful `AppendContext` means
+local submission/admission, not network delivery or provider consumption.
+
+`OutputWork` and `OutputPurpose` are optional **adapter-supplied evidence** for
+output attribution, never model-authored tool arguments. Without an explicit
+request/revision association and `answer` purpose, useful-answer latency is null
+and `output_association` is `unknown`. In particular, GPT Live currently does not
+identify which output audio answers a client delegation; Core does not guess
+from proximity to a result. `backchannel` output is measured separately and
+never counted as a useful answer. Superseded revisions cannot inherit a later
+receipt as a successful answer.
+
+The caller-speech-end source is reported: provider VAD receipt or a renderer's
+`input.speech_stopped` signal. If neither exists (including typed-input tests),
+caller-speech-end metrics are null. Source timestamps are not mixed across
+unsynchronized clocks. Unknown or negative durations are null, never zero.
+
+Failed, timed-out and superseded requests emit explicit stages. Session closure
+emits `tracking_closed` with the close reason and known backend outcome. Tracking
+is bounded to 64 requests and 128 context-event IDs per generation; eviction is
+reported and late callbacks cannot reopen closed session tracking. Audio-lane
+observation only updates bounded metadata, without storage or model calls.
+
+Renderer wire messages remain backward compatible. Consumers should negotiate
+`audio_protocol=1`, send their existing scoped `playback.progress` messages with
+`item_id`, `session_generation`, `audio_end_ms`, and the actual `evidence` kind.
+Core preserves that evidence in telemetry. Neither RTP transmission nor an
+estimated playback clock proves that the caller heard the answer.
+
+Validation includes deterministic stages, silent leading frames, backchannels,
+explicit and unknown associations, late captions/receipts, superseded work,
+interruption after output drain, bounds, repeated shutdown, native tool lifecycle,
+concurrent sessions and the actual renderer WebSocket control reader. Paid Live
+checks record first output, first non-silent output, confirmation-caption arrival,
+and request stages independently; their sink does not simulate carrier playback.

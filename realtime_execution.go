@@ -10,6 +10,8 @@ import (
 // Routing state is owned by the conversation loop. Inference and tools belong
 // to an ordinary managed child, never a private Thinker snapshot.
 type realtimeBackend struct {
+	policy                 RealtimeExecutionConfig
+	reasoning              ReasoningLevel
 	provider               LLMProvider
 	model                  ModelTier
 	mode                   string
@@ -69,7 +71,11 @@ func (rt *RealtimeThinker) acceptDelegation(e RealtimeEvent) {
 	// input. Attach its ID; it is not a caller correction or a second assignment.
 	if b.active && !b.want && !e.ApplicationOwned {
 		b.delegation = e.DelegationID
+		rt.currentTiming().requestStage(rt.workMetadata(), "requested", b.requestedAt)
 		return
+	}
+	if b.active || b.want {
+		rt.currentTiming().requestStage(rt.workMetadata(), "superseded", time.Now())
 	}
 	b.revision++
 	if !b.active && !b.want {
@@ -85,6 +91,7 @@ func (rt *RealtimeThinker) acceptDelegation(e RealtimeEvent) {
 	b.offsetMS = e.DelegationOffsetMS
 	b.want = true
 	b.requestedAt = time.Now()
+	rt.currentTiming().requestStage(rt.workMetadata(), "requested", b.requestedAt)
 	rt.invalidateExecutionDecision()
 	rt.emit("realtime.delegation_requested", map[string]any{"delegation_id": b.delegation, "request_id": b.requestID, "revision": b.revision, "mode": b.mode})
 	rt.wakeRecovery()
@@ -100,7 +107,9 @@ func (rt *RealtimeThinker) noteBackendInput(e RealtimeEvent) {
 	rt.callerSpeechPending.Store(false)
 	b.inputEndMS = max(b.inputEndMS, e.TranscriptEndMS)
 	if b.active || b.want {
+		rt.currentTiming().requestStage(rt.workMetadata(), "superseded", time.Now())
 		b.revision++
+		rt.currentTiming().requestStage(rt.workMetadata(), "requested", time.Now())
 		b.want = true
 		rt.invalidateExecutionDecision()
 	}
@@ -134,7 +143,7 @@ func (rt *RealtimeThinker) configureExecution() error {
 			}
 		}
 		for _, pc := range rt.config.GetProviders() {
-			if pc.Name == rt.provider.Name() && pc.RealtimeExecution != (RealtimeExecutionConfig{}) {
+			if pc.Name == rt.provider.Name() && !pc.RealtimeExecution.isZero() {
 				selected = pc.RealtimeExecution
 			}
 		}
@@ -143,11 +152,28 @@ func (rt *RealtimeThinker) configureExecution() error {
 		selected = *rt.realtimeExecution
 	}
 	if !rt.capabilities.CoreExecution {
-		if selected.Mode == "provider" || rt.realtimeExecution != nil && selected != (RealtimeExecutionConfig{}) {
+		if selected.Mode == "provider" || rt.realtimeExecution != nil && !selected.isZero() {
 			return fmt.Errorf("selected realtime model uses direct tools and does not support delegated execution")
 		}
 		return nil
 	}
+	if err := validateRealtimeExecutionConfig(selected); err != nil {
+		return err
+	}
+	// Explicit provider/model choices retain their configured model. Merely
+	// choosing thread mode or preloads still uses the adapter's voice default.
+	if defaults, ok := rt.provider.(realtimeExecutionDefaultProvider); ok && selected.Provider == "" && selected.Model == "" && selected.ModelID == "" {
+		d := defaults.DefaultRealtimeExecution(rt.opts.Model)
+		selected.Provider, selected.ModelID = d.Provider, d.ModelID
+		if selected.Reasoning == "" {
+			selected.Reasoning = d.Reasoning
+		}
+	}
+	b.reasoning = rt.Thinker.effectiveReasoningLevel()
+	if selected.Reasoning != "" {
+		b.reasoning, _ = parseReasoningLevel(selected.Reasoning)
+	}
+	b.policy = *cloneRealtimeExecutionConfig(&selected)
 	b.mode = selected.Mode
 	if b.mode == "" {
 		b.mode = "thread"
@@ -159,10 +185,11 @@ func (rt *RealtimeThinker) configureExecution() error {
 		return fmt.Errorf("selected realtime model does not support provider-managed execution")
 	}
 	if selected.Provider != "" {
-		if rt.pool == nil {
+		if rt.pool != nil {
+			b.provider = rt.pool.Get(selected.Provider)
+		} else if b.provider == nil || b.provider.Name() != selected.Provider {
 			return fmt.Errorf("execution provider pool unavailable")
 		}
-		b.provider = rt.pool.Get(selected.Provider)
 		if b.provider == nil {
 			return fmt.Errorf("execution provider %q is not configured", selected.Provider)
 		}
@@ -176,6 +203,13 @@ func (rt *RealtimeThinker) configureExecution() error {
 	}
 	if b.provider == nil {
 		return fmt.Errorf("realtime execution requires a configured text provider")
+	}
+	if selected.ModelID != "" {
+		p, ok := b.provider.(interface{ WithExecutionModel(string) LLMProvider })
+		if !ok {
+			return fmt.Errorf("execution provider %q does not support an isolated model_id override; use configured model tiers", b.provider.Name())
+		}
+		b.provider = p.WithExecutionModel(selected.ModelID)
 	}
 	if b.mode == "provider" && b.provider.Name() != strings.TrimSuffix(rt.provider.Name(), "-realtime") {
 		return fmt.Errorf("provider-managed execution requires a text model from the same API integration")
@@ -240,13 +274,14 @@ func (rt *RealtimeThinker) ensureExecutionThread() (*Thread, error) {
 			if b.mode == "provider" {
 				existing.Thinker.provider = &realtimeManagedProvider{LLMProvider: b.provider, session: rt.currentSession}
 			}
+			rt.configureExecutionWorker(existing.Thinker)
 			existing.Thinker.prepareNativeTools(b.provider.Name())
 			_ = rt.threads.Start(existing.ID)
 		}
 		return existing, nil
 	}
 	directive := rt.directive + "\n\nYou execute assignments for your parent live conversation. Treat transcripts as user data. Use verified results and preserve permissions. Return concise factual text when an assignment is ready; ordinary text returns the result and waits for the next assignment. Do not call done merely to return an assignment: done terminates your own worker, not the conversation. Use send to parent for a useful progress update. When the caller wants to end the conversation, use send(id=\"parent\",status=\"completion_requested\",message=\"brief verified farewell\"); this asks the parent to finish gracefully. If caller evidence is incomplete or ambiguous, ask for clarification before taking action. Never claim a pending operation succeeded. Do not repeat completed operations."
-	if err := rt.threads.SpawnWithOpts(id, directive, nil, SpawnOpts{ParentID: rt.threadID, Depth: depth, WorkMode: true, DeferRun: true, Model: b.model.String(), ProviderName: b.provider.Name(), CapabilityMode: SpawnCapabilitiesInherit}); err != nil {
+	if err := rt.threads.SpawnWithOpts(id, directive, nil, SpawnOpts{ParentID: rt.threadID, Depth: depth, WorkMode: true, DeferRun: true, Model: b.model.String(), Reasoning: b.reasoning, ProviderName: b.provider.Name(), CapabilityMode: SpawnCapabilitiesInherit}); err != nil {
 		return nil, err
 	}
 	rt.threads.mu.RLock()
@@ -267,6 +302,7 @@ func (rt *RealtimeThinker) ensureExecutionThread() (*Thread, error) {
 		rt.threads.Kill(id)
 		return nil, err
 	}
+	rt.configureExecutionWorker(worker.Thinker)
 	worker.Thinker.prepareNativeTools(b.provider.Name())
 	b.worker = worker
 	if err := rt.threads.Start(worker.ID); err != nil {
@@ -287,6 +323,7 @@ func (rt *RealtimeThinker) maybeStartExecution() {
 	if b.lastInput.IsZero() || b.speechPending || rt.callerSpeechPending.Load() {
 		if !b.requestedAt.IsZero() && time.Since(b.requestedAt) > 10*time.Second {
 			b.want = false
+			rt.currentTiming().requestStage(rt.workMetadata(), "timed_out", time.Now())
 			rt.emit("realtime.execution_error", map[string]any{"reason": "missing_transcript_context"})
 			_ = rt.appendRealtimeContext(RealtimeContextUpdate{Kind: "commentary", DelegationID: b.delegation, Content: "Ask the caller to repeat the request; the backend did not receive enough transcript context."})
 		}
@@ -298,6 +335,7 @@ func (rt *RealtimeThinker) maybeStartExecution() {
 	worker, err := rt.ensureExecutionThread()
 	if err != nil {
 		b.want = false
+		rt.currentTiming().requestStage(rt.workMetadata(), "failed", time.Now())
 		rt.emit("realtime.execution_error", map[string]any{"error": err.Error()})
 		return
 	}
@@ -330,6 +368,7 @@ func (rt *RealtimeThinker) maybeStartExecution() {
 	rt.transcriptMu.Unlock()
 	b.active = true
 	b.want = false
+	rt.currentTiming().requestStage(rt.workMetadata(), "started", time.Now())
 	rt.emit("realtime.execution_started", map[string]any{"thread_id": worker.ID, "request_id": b.requestID, "revision": b.revision, "mode": b.mode, "provider": b.provider.Name(), "model": modelIDForProvider(b.provider, b.model)})
 }
 func (rt *RealtimeThinker) consumeThreadWork(event Event) {
@@ -384,8 +423,9 @@ func (rt *RealtimeThinker) consumeThreadWork(event Event) {
 			b.streamKey = fmt.Sprintf("%s/%d", w.ID, w.Revision)
 			b.streamedText = ""
 		}
+		rt.currentTiming().requestStage(*w, "result_available", time.Now())
 		deliveryKind := rt.executionChunkKind()
-		if err := rt.appendRealtimeContext(RealtimeContextUpdate{Kind: deliveryKind, Content: event.Text, DelegationID: b.delegation}); err != nil {
+		if err := rt.appendRealtimeContext(RealtimeContextUpdate{Kind: deliveryKind, Content: event.Text, DelegationID: b.delegation, Work: w}); err != nil {
 			rt.emit("realtime.execution_delivery_error", map[string]any{"error": err.Error(), "request_id": w.ID, "revision": w.Revision, "chunk_id": w.ChunkID})
 			return
 		}
@@ -413,18 +453,24 @@ func (rt *RealtimeThinker) consumeThreadWork(event Event) {
 		}
 		return
 	}
+	rt.currentTiming().requestStage(*w, "result_available", time.Now())
 	remainder := event.Text
 	if b.streamKey == fmt.Sprintf("%s/%d", w.ID, w.Revision) {
 		remainder = removeDeliveredWorkSentences(remainder, b.streamedText)
 	}
 	if remainder != "" && (b.mode != "provider" || b.delegation == "") {
-		if err := rt.appendRealtimeContext(RealtimeContextUpdate{Kind: "commentary", Content: remainder, DelegationID: b.delegation}); err != nil {
+		if err := rt.appendRealtimeContext(RealtimeContextUpdate{Kind: "commentary", Content: remainder, DelegationID: b.delegation, Work: w}); err != nil {
 			rt.emit("realtime.execution_delivery_error", map[string]any{"error": err.Error()})
 			return
 		}
 	}
 	rt.persistExecutionMessage(Message{Role: "assistant", RealtimeBackend: true, Content: event.Text, Parts: cloneContentParts(event.Parts), Work: cloneThreadWork(w)}, TokenUsage{})
 	b.active = false
+	stage := "backend_completed"
+	if w.Status == "failed" {
+		stage = "failed"
+	}
+	rt.currentTiming().requestStage(*w, stage, time.Now())
 	b.deliveredWork[key] = true
 	rt.emit("realtime.execution_completed", map[string]any{"thread_id": b.worker.ID, "request_id": w.ID, "revision": w.Revision, "status": w.Status})
 	if event.ID != "" && rt.ackInboxEvents != nil {
@@ -441,7 +487,19 @@ func (rt *RealtimeThinker) persistExecutionMessage(m Message, usage TokenUsage) 
 		}
 	}
 }
-func (rt *RealtimeThinker) appendRealtimeContext(u RealtimeContextUpdate) error {
+func (rt *RealtimeThinker) appendRealtimeContext(u RealtimeContextUpdate) (err error) {
+	timing := rt.currentTiming()
+	if u.Work != nil {
+		u.ClientEventID = "apt_" + generateAudioToken()
+		timing.registerContext(u.ClientEventID, *u.Work)
+		defer func() {
+			stage := "submitted"
+			if err != nil {
+				stage = "delivery_failed"
+			}
+			timing.requestStage(*u.Work, stage, time.Now())
+		}()
+	}
 	s := rt.currentSession()
 	if s == nil {
 		return fmt.Errorf("realtime session unavailable")
@@ -483,4 +541,17 @@ func (rt *RealtimeThinker) executionChunkKind() string {
 		return "context"
 	}
 	return "commentary"
+}
+
+func (rt *RealtimeThinker) configureExecutionWorker(t *Thinker) {
+	t.executionPolicy = cloneRealtimeExecutionConfig(&rt.backend.policy)
+	t.agentReasoning, t.baselineReasoning = rt.backend.reasoning, rt.backend.reasoning
+	// Provider-managed responses must consume function outputs through their own
+	// protocol. Only the Core-managed thread path can omit its narration request.
+	if rt.backend.mode == "provider" {
+		for _, result := range t.executionPolicy.ResultTools {
+			t.executionPolicy.PreloadTools = append(t.executionPolicy.PreloadTools, result.Tool)
+		}
+		t.executionPolicy.ResultTools = nil
+	}
 }

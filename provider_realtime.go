@@ -248,6 +248,7 @@ type RealtimeSessionOpts struct {
 	ConversationInstructions string    // voice role; backend keeps the full Core prompt
 	ExecutionMode            string
 	ExecutionModel           string
+	ExecutionReasoning       string
 	ExecutionInstructions    string
 	ExecutionTools           []NativeTool
 	InitialMessage           string // trusted greeting instructions, seeded at startup
@@ -473,12 +474,15 @@ type RealtimeEvent struct {
 	Audio []byte
 
 	// Transcript (RealtimeEventTranscript*)
-	Transcript         string
-	Final              bool // true = end-of-utterance, false = partial
-	TranscriptDelta    bool // partial is an increment rather than a complete snapshot
-	TranscriptStartMS  int
-	TranscriptEndMS    int
-	TranscriptGrouped  bool // application grouping; never provider-final evidence
+	Transcript        string
+	Final             bool // true = end-of-utterance, false = partial
+	TranscriptDelta   bool // partial is an increment rather than a complete snapshot
+	TranscriptStartMS int
+	TranscriptEndMS   int
+	TranscriptGrouped bool // application grouping; never provider-final evidence
+	// Optional explicit output-to-work evidence. Never derive it from timing.
+	OutputWork         *ThreadWork
+	OutputPurpose      string // answer or backchannel; empty means unknown
 	DelegationID       string
 	ApplicationOwned   bool // work originated in Core; no provider delegation ID
 	DelegationOffsetMS int

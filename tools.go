@@ -281,6 +281,10 @@ func executeTool(t *Thinker, call toolCall) {
 			IsError:  resp.IsError,
 		}
 
+		if outcome == "success" {
+			toolResult.DirectReceipt = t.directToolReceipt(call, resp)
+		}
+
 		if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
 			Tool:    call.Name,
 			CallID:  call.NativeID,
@@ -333,6 +337,16 @@ func executeTool(t *Thinker, call toolCall) {
 }
 
 func toolDispatchArgs(t *Thinker, call toolCall) map[string]string {
+	// Core's completion hint never reaches app/tool arguments.
+	if _, ok := call.Args[completeAssignmentArg]; ok && t != nil && t.directResultPolicy(call.Name) != nil {
+		args := make(map[string]string, len(call.Args))
+		for k, v := range call.Args {
+			if k != completeAssignmentArg {
+				args[k] = v
+			}
+		}
+		call.Args = args
+	}
 	if t == nil || t.registry == nil {
 		return call.Args
 	}

@@ -57,7 +57,7 @@ func TestOpenAILiveFrenchCoreExecutionLive(t *testing.T) {
 					calls.Add(1)
 					return ToolResponse{Text: `{"verified_word":"abricot"}`}
 				}})
-				rt.config.Providers = []ProviderConfig{{Name: "openai", RealtimeExecution: RealtimeExecutionConfig{Mode: mode}}}
+				rt.config.Providers = []ProviderConfig{{Name: "openai", RealtimeExecution: RealtimeExecutionConfig{Mode: mode, Model: "large"}}}
 				ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 				defer cancel()
 				rt.cancel()

@@ -808,7 +808,7 @@ func runRealtimeAudioBridgeReader(
 							_, t := a.thinker.threads.findManagedThread(thread)
 							if t != nil && t.Realtime != nil {
 								socket.window.progress(control.Generation, control.ItemID, control.AudioEndMS)
-								t.Realtime.acknowledgePlayback(control.ItemID, control.AudioEndMS, control.Generation)
+								t.Realtime.acknowledgePlaybackEvidence(control.ItemID, control.AudioEndMS, control.Generation, control.Evidence)
 							}
 						}
 					}

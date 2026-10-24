@@ -259,17 +259,18 @@ type NativeToolCall struct {
 
 // ToolResult is sent back to the provider after executing a tool.
 type ToolResult struct {
-	CallID             string `json:"call_id"`
-	ToolName           string `json:"tool_name,omitempty"`
-	Content            string `json:"content"`         // full text for first consumption; bounded archive preview thereafter
-	Image              []byte `json:"image,omitempty"` // optional image (screenshot etc.)
-	IsError            bool   `json:"is_error,omitempty"`
-	OriginalChars      int    `json:"original_chars,omitempty"`
-	OriginalBytes      int    `json:"original_bytes,omitempty"`
-	OriginalImageBytes int    `json:"original_image_bytes,omitempty"`
-	SHA256             string `json:"sha256,omitempty"`
-	ArchiveRef         string `json:"archive_ref,omitempty"`
-	ContentIsPreview   bool   `json:"content_is_preview,omitempty"`
+	DirectReceipt      *ThreadWorkReceipt `json:"direct_receipt,omitempty"` // Core-authored, not tool-controlled
+	CallID             string             `json:"call_id"`
+	ToolName           string             `json:"tool_name,omitempty"`
+	Content            string             `json:"content"`         // full text for first consumption; bounded archive preview thereafter
+	Image              []byte             `json:"image,omitempty"` // optional image (screenshot etc.)
+	IsError            bool               `json:"is_error,omitempty"`
+	OriginalChars      int                `json:"original_chars,omitempty"`
+	OriginalBytes      int                `json:"original_bytes,omitempty"`
+	OriginalImageBytes int                `json:"original_image_bytes,omitempty"`
+	SHA256             string             `json:"sha256,omitempty"`
+	ArchiveRef         string             `json:"archive_ref,omitempty"`
+	ContentIsPreview   bool               `json:"content_is_preview,omitempty"`
 }
 
 // BuiltinTool defines a provider-side tool (executed by the LLM provider, not by us).

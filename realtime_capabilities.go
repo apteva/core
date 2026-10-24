@@ -3,11 +3,15 @@ package core
 import "context"
 
 // Optional execution override on a provider's voice configuration. Empty
-// values inherit the thread's existing Core text provider and model tier.
+// values use adapter voice defaults, or inherit the thread when none exist.
 type RealtimeExecutionConfig struct {
-	Mode     string `json:"mode,omitempty"` // thread (default) or provider
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
+	Mode         string                   `json:"mode,omitempty"` // thread (default) or provider
+	Provider     string                   `json:"provider,omitempty"`
+	Model        string                   `json:"model,omitempty"`    // existing Core tier override
+	ModelID      string                   `json:"model_id,omitempty"` // exact model for this worker only
+	Reasoning    string                   `json:"reasoning,omitempty"`
+	PreloadTools []string                 `json:"preload_tools,omitempty"`
+	ResultTools  []DirectToolResultPolicy `json:"result_tools,omitempty"`
 }
 
 // RealtimeCapabilities describes behavior, not a vendor. The zero/legacy
@@ -44,7 +48,9 @@ func capabilitiesForRealtime(p RealtimeProvider, model string) RealtimeCapabilit
 // A context update is deliberately distinct from a user message or a tool
 // result. Adapters own protocol limits and cannot promote tool data to policy.
 type RealtimeContextUpdate struct {
-	Kind, Content, DelegationID string // instructions, context, or commentary
+	ClientEventID               string      // optional correlation for provider acknowledgement
+	Work                        *ThreadWork // internal metadata; never serialized as provider input
+	Kind, Content, DelegationID string      // instructions, context, or commentary
 }
 
 type RealtimeContextSession interface {
@@ -77,5 +83,19 @@ func cloneRealtimeExecutionConfig(in *RealtimeExecutionConfig) *RealtimeExecutio
 		return nil
 	}
 	out := *in
+	out.PreloadTools = append([]string(nil), in.PreloadTools...)
+	out.ResultTools = append([]DirectToolResultPolicy(nil), in.ResultTools...)
+	for i := range out.ResultTools {
+		out.ResultTools[i].PublicFields = append([]string(nil), in.ResultTools[i].PublicFields...)
+	}
 	return &out
+}
+
+func (c RealtimeExecutionConfig) isZero() bool {
+	return c.Mode == "" && c.Provider == "" && c.Model == "" && c.ModelID == "" && c.Reasoning == "" && len(c.PreloadTools) == 0 && len(c.ResultTools) == 0
+}
+
+// Optional adapter defaults; providers without delegated execution are unchanged.
+type realtimeExecutionDefaultProvider interface {
+	DefaultRealtimeExecution(model string) RealtimeExecutionConfig
 }

@@ -380,6 +380,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 			delete(t.discoveredToolUntil, name)
 		}
 	}
+	overlay = t.preloadExecutionTools(overlay)
 	tools, definitions, active := t.visibleNativeToolSnapshot(t.toolAllowlist, t.toolMCPScopes, overlay)
 	if t.work != nil {
 		for i := range tools {
@@ -391,6 +392,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 			}
 		}
 	}
+	t.decorateDirectResultTools(tools)
 	t.recordPresentedTools(tools, definitions)
 	t.lastNativeToolCount = len(tools)
 	t.lastActiveMCPCount = countActiveMCPTools(active)

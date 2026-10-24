@@ -157,3 +157,53 @@ func BenchmarkRendererInputAdmission(b *testing.B) {
 		<-input
 	}
 }
+
+func TestRendererProgressWireRetainsEvidenceAndRejectsStaleGeneration(t *testing.T) {
+	rt, _ := completionFixture(t)
+	rt.sessionGeneration = 3
+	rt.outputItemID = "newer-output"
+	receipts := make(chan map[string]any, 4)
+	rt.timing = newRealtimeTiming(3, func(k string, d map[string]any) {
+		if k == "realtime.playback_timing" {
+			receipts <- d
+		}
+	})
+	at := time.Now()
+	rt.timing.audio("r", "old-output", at)
+	rt.timing.enqueued("r", "old-output", at, 1, 960)
+	rt.timing.written("r", "old-output", at, 960, true)
+	rt.timing.finish("r", "old-output", "completed")
+	parent := newTestThinker()
+	defer parent.Stop()
+	parent.threads.threads["voice"] = &Thread{ID: "voice", Realtime: rt, Thinker: rt.Thinker, IsRealtime: true}
+	api := &APIServer{thinker: parent}
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- runRealtimeAudioBridgeReader(context.Background(), &realtimeBridgeSocket{conn: conn}, &audioBridgeRegistration{}, api, "voice")
+	}()
+	for _, payload := range []string{
+		`{"type":"playback.progress","item_id":"old-output","audio_end_ms":20,"session_generation":2,"evidence":"carrier_mark"}`,
+		`{"type":"playback.progress","item_id":"old-output","audio_end_ms":20,"session_generation":3,"evidence":"invented"}`,
+		`{"type":"playback.progress","item_id":"old-output","audio_end_ms":20,"session_generation":3,"evidence":"rtp_transmitted"}`,
+	} {
+		if err := wsutil.WriteClientMessage(peer, ws.OpText, []byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	peer.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not stop")
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("receipts=%d", len(receipts))
+	}
+	receipt := <-receipts
+	if receipt["evidence"] != "rtp_transmitted" || receipt["audible_playback_confirmed"] != false {
+		t.Fatalf("lost receipt meaning: %v", receipt)
+	}
+}

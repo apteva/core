@@ -881,7 +881,8 @@ type Thinker struct {
 	directive string
 
 	// Hooks — set these to customize behavior. nil = defaults.
-	work              *threadWorkState // optional correlated assignments; owned by this managed thread
+	executionPolicy   *RealtimeExecutionConfig // immutable managed-worker policy
+	work              *threadWorkState         // optional correlated assignments; owned by this managed thread
 	realtimeExecution *RealtimeExecutionConfig
 	handleTools       ToolHandler
 	rebuildPrompt     func(toolDocs string) string // rebuild system prompt with current tool docs
@@ -2802,6 +2803,19 @@ func (t *Thinker) Run() {
 					}
 				}
 			}
+		}
+
+		if completed, err := t.completeDirectToolResult(toolResults, hasExternalEvent || len(mediaParts) > 0); err != nil {
+			t.recordPersistenceFailure(err)
+			return
+		} else if completed {
+			t.settleEventExecutions("direct_tool_result")
+			t.activeWork = false
+			t.publishRuntimeStatus()
+			if !t.waitForRestoredWake() {
+				return
+			}
+			continue
 		}
 
 		t.sanitizeConversationMessages()

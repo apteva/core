@@ -128,7 +128,11 @@ func buildOpenAILiveStart(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 		if opts.ExecutionModel == "" {
 			return nil, fmt.Errorf("managed execution requires a backend model")
 		}
-		delegation = map[string]any{"type": "responses", "responses": map[string]any{"model": opts.ExecutionModel, "instructions": opts.ExecutionInstructions, "tools": liveExecutionTools(opts.ExecutionTools), "parallel_tool_calls": false}}
+		settings := map[string]any{"model": opts.ExecutionModel, "instructions": opts.ExecutionInstructions, "tools": liveExecutionTools(opts.ExecutionTools), "parallel_tool_calls": false}
+		if opts.ExecutionReasoning != "" && opts.ExecutionReasoning != "auto" {
+			settings["reasoning"] = map[string]string{"effort": opts.ExecutionReasoning}
+		}
+		delegation = map[string]any{"type": "responses", "responses": settings}
 	}
 	return json.Marshal(map[string]any{"type": "session.start", "session": map[string]any{
 		"model": opts.Model, "instructions": instructions,
@@ -177,7 +181,7 @@ func (p *OpenAIRealtimeProvider) openLiveSession(ctx context.Context, opts Realt
 		writeTimeout: 250 * time.Millisecond, conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer), outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), audioOutbox: make(chan realtimeOutboundFrame, 8), done: make(chan struct{}),
 		timing: opts.timing, providerName: "openai-realtime", settings: map[string]any{"source": "session_started", "model": opts.Model, "voice": opts.Voice, "delegation": "client", "speech_guard": opts.OutputConfig.SpeechGuard.continuousPolicy()},
 	}, ready: make(chan error, 1), instructions: opts.Instructions, tools: opts.Tools}
-	s.execution = openaiLiveExecution{enabled: opts.ExecutionMode == "provider", notify: make(chan struct{}, 1), pending: map[string]bool{}, submitted: map[string]bool{}, inputHashes: map[[32]byte]bool{}}
+	s.execution = openaiLiveExecution{reasoning: opts.ExecutionReasoning, enabled: opts.ExecutionMode == "provider", notify: make(chan struct{}, 1), pending: map[string]bool{}, submitted: map[string]bool{}, inputHashes: map[[32]byte]bool{}}
 	s.media = opts.OutputConfig.Media
 	s.guard.format = s.media.format()
 	s.settings["transport"] = "websocket"
@@ -366,12 +370,16 @@ func (s *openaiLiveSession) AppendContext(u RealtimeContextUpdate) error {
 	}
 	// At most one token per UTF-8 byte is a conservative bound for these
 	// text appends. Split at rune boundaries; never silently truncate results.
-	for _, part := range splitRealtimeContext(u.Content, 480) {
+	for i, part := range splitRealtimeContext(u.Content, 480) {
+		eventID := "apt_" + generateAudioToken()
+		if i == 0 && u.ClientEventID != "" {
+			eventID = u.ClientEventID
+		}
 		var id any
 		if u.DelegationID != "" {
 			id = u.DelegationID
 		}
-		if err := s.enqueue(map[string]any{"type": "session." + kind + ".append", "event_id": "apt_" + generateAudioToken(), "delegation_id": id, "content": part}); err != nil {
+		if err := s.enqueue(map[string]any{"type": "session." + kind + ".append", "event_id": eventID, "delegation_id": id, "content": part}); err != nil {
 			return err
 		}
 	}

@@ -12,6 +12,7 @@ import (
 // tool. It collects completed output items, including calls omitted from the
 // provider's response.completed snapshot, for the managed child to consume.
 type openaiLiveExecution struct {
+	reasoning    string
 	mu           sync.Mutex
 	notify       chan struct{}
 	queue        []realtimeExecutionResult
@@ -120,6 +121,9 @@ func (s *openaiLiveSession) Execute(ctx context.Context, messages []Message, mod
 		return ChatResponse{}, fmt.Errorf("Live session is not using Responses delegation")
 	}
 	settings := map[string]any{"model": model, "tools": liveExecutionTools(tools), "parallel_tool_calls": false}
+	if x.reasoning != "" && x.reasoning != "auto" {
+		settings["reasoning"] = map[string]string{"effort": x.reasoning}
+	}
 	if len(messages) > 0 {
 		settings["instructions"] = messages[0].Content
 	}

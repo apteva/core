@@ -98,7 +98,7 @@ func TestRealtimeTimingPlaybackReceiptAfterSummary(t *testing.T) {
 	at := time.Now()
 	timing.audio("r", "i", at)
 	timing.enqueued("r", "i", at, 1)
-	timing.written("r", "i", at.Add(time.Millisecond), 2, true)
+	timing.written("r", "i", at.Add(time.Millisecond), 1920, true)
 	timing.finish("r", "i", "completed")
 	timing.playback("i", 0, at)
 	timing.playback("i", 20, at.Add(51*time.Millisecond))

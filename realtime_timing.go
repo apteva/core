@@ -10,31 +10,43 @@ import (
 // Bridges retain their session's tracker so a reconnect cannot misattribute a
 // frame to the new session generation.
 type realtimeTiming struct {
-	bytesPerSecond  int
-	mu              sync.Mutex
-	generation      uint64
-	connectedAt     time.Time
-	readyEmitted    bool
-	emit            func(string, map[string]any)
-	items           map[string]*realtimeUtteranceTiming
-	closed          map[string]bool
-	closedOrder     []string
-	completed       map[string]*realtimeUtteranceTiming
-	speechEnd       time.Time
-	speechEndSource string
+	trackingClosed   bool
+	bytesPerSecond   int
+	mu               sync.Mutex
+	generation       uint64
+	connectedAt      time.Time
+	readyEmitted     bool
+	emit             func(string, map[string]any)
+	items            map[string]*realtimeUtteranceTiming
+	closed           map[string]bool
+	closedOrder      []string
+	completed        map[string]*realtimeUtteranceTiming
+	speechEnd        time.Time
+	speechEndSource  string
+	lastSpeechEnd    time.Time
+	lastSpeechSource string
+	requests         map[string]*realtimeRequestTiming
+	requestOrder     []string
+	contextRequests  map[string]string
+	contextOrder     []string
 }
 
 type realtimeUtteranceTiming struct {
-	creditWait, creditWaitMax, rendererWrite, rendererWriteMax time.Duration
-	outputWaitTotal, outputWaitMax                             time.Duration
-	outputFrames                                               int
-	response, item                                             string
-	firstAudio, guardRelease, enqueue, bridgeWrite, speechEnd  time.Time
-	speechSource, guard, status                                string
-	bufferedBytes, droppedBytes, queueMax, pending             int
-	pendingBytes                                               int
-	done                                                       bool
-	acknowledged                                               bool
+	creditWait, creditWaitMax, rendererWrite, rendererWriteMax      time.Duration
+	outputWaitTotal, outputWaitMax                                  time.Duration
+	outputFrames                                                    int
+	response, item                                                  string
+	firstAudio, guardRelease, enqueue, bridgeWrite, speechEnd       time.Time
+	speechSource, guard, status                                     string
+	bufferedBytes, droppedBytes, queueMax, pending                  int
+	pendingBytes                                                    int
+	done                                                            bool
+	acknowledged                                                    bool
+	work                                                            ThreadWork
+	purpose                                                         string
+	firstCaption, firstNonSilent, requestSpeechEnd, resultSubmitted time.Time
+	nonSilentEndMS, writtenBytes                                    int
+	usefulAcknowledged                                              bool
 }
 
 func newRealtimeTiming(generation uint64, emit func(string, map[string]any)) *realtimeTiming {
@@ -78,6 +90,7 @@ func (t *realtimeTiming) speechStopped(at time.Time, source string) {
 	}
 	t.mu.Lock()
 	t.speechEnd, t.speechEndSource = at, source
+	t.lastSpeechEnd, t.lastSpeechSource = at, source
 	t.mu.Unlock()
 }
 
@@ -159,7 +172,7 @@ func (t *realtimeTiming) summary(key string, u *realtimeUtteranceTiming) map[str
 		delete(t.completed, t.closedOrder[0])
 		t.closedOrder = t.closedOrder[1:]
 	}
-	return map[string]any{
+	data := map[string]any{
 		"generation": t.generation, "response_id": u.response, "item_id": u.item,
 		"speech_end_to_provider_audio_ms": timingMS(u.speechEnd, u.firstAudio), "speech_end_source": u.speechSource,
 		"provider_audio_to_guard_release_ms": timingMS(u.firstAudio, u.guardRelease),
@@ -172,6 +185,8 @@ func (t *realtimeTiming) summary(key string, u *realtimeUtteranceTiming) map[str
 		"max_output_queue_depth": u.queueMax, "dropped_audio_bytes": u.droppedBytes,
 		"guard_outcome": u.guard, "completion_status": u.status,
 	}
+	t.outputData(u, data)
+	return data
 }
 
 func (t *realtimeTiming) publish(data map[string]any) {
@@ -195,6 +210,7 @@ func (t *realtimeTiming) writtenBytes(response, item string, at time.Time, bytes
 	t.mu.Lock()
 	key := realtimeTimingKey(response, item)
 	if u := t.items[key]; u != nil {
+		u.writtenBytes += written
 		if written > 0 && u.bridgeWrite.IsZero() {
 			u.bridgeWrite = at
 		}
@@ -222,6 +238,11 @@ func (t *realtimeTiming) finish(response, item, status string) {
 	}
 	var results []map[string]any
 	t.mu.Lock()
+	if item != "" && status != "completed" {
+		if u := t.completed[item]; u != nil {
+			u.status = status
+		}
+	}
 	for key, u := range t.items {
 		if (item != "" && key != item) || (item == "" && response != "" && u.response != response) {
 			continue
@@ -245,13 +266,20 @@ func (t *realtimeTiming) finish(response, item, status string) {
 	for _, data := range results {
 		t.publish(data)
 	}
+	if response == "" && item == "" && status != "completed" && status != "interrupted" {
+		t.finishRequests(status)
+	}
 }
 
 // Optional client receipt, allowed after the utterance summary. Core's receive
 // timestamp is local; this must never be described as carrier playback.
-func (t *realtimeTiming) playback(item string, endMS int, at time.Time) {
+func (t *realtimeTiming) playback(item string, endMS int, at time.Time, evidence ...string) {
 	if t == nil || endMS <= 0 {
 		return
+	}
+	source := "legacy"
+	if len(evidence) > 0 && validPlaybackEvidence(evidence[0]) {
+		source = evidence[0]
 	}
 	var data map[string]any
 	t.mu.Lock()
@@ -259,11 +287,26 @@ func (t *realtimeTiming) playback(item string, endMS int, at time.Time) {
 	if u == nil {
 		u = t.completed[item]
 	}
-	if u != nil && !u.acknowledged {
-		u.acknowledged = true
-		data = map[string]any{"generation": t.generation, "response_id": u.response, "item_id": item,
-			"source": "client_reported_progress_received", "audio_end_ms": endMS,
-			"bridge_write_to_playback_report_ms": timingMS(u.bridgeWrite, at)}
+	// Require bytes actually written and clamp untrusted client progress. A
+	// queued frame, a clear, or RTP transmission does not prove audible playback.
+	if u != nil && !u.bridgeWrite.IsZero() && u.status != "interrupted" && u.status != "blocked" {
+		endMS = min(endMS, u.writtenBytes*1000/defaultMediaRate(t.bytesPerSecond))
+		useful := t.usefulOutput(u) && u.droppedBytes == 0 && !u.firstNonSilent.IsZero() && u.nonSilentEndMS > 0 && endMS >= u.nonSilentEndMS
+		if endMS > 0 && (!u.acknowledged || useful && !u.usefulAcknowledged) {
+			u.acknowledged = true
+			u.usefulAcknowledged = u.usefulAcknowledged || useful
+			data = map[string]any{"generation": t.generation, "response_id": u.response, "item_id": item, "playback_id": item,
+				"source": "client_reported_progress_received", "evidence": source, "audio_end_ms": endMS,
+				"bridge_write_to_playback_report_ms":      timingMS(u.bridgeWrite, at),
+				"enqueue_to_playback_report_ms":           timingMS(u.enqueue, at),
+				"speech_end_to_useful_playback_report_ms": nil, "audible_playback_confirmed": false}
+			t.outputData(u, data)
+			if useful {
+				data["speech_end_to_useful_playback_report_ms"] = timingMS(u.requestSpeechEnd, at)
+			}
+			data["useful_audio_covered"] = useful
+			data["playback_report_is_estimate"] = source == "estimated"
+		}
 	}
 	t.mu.Unlock()
 	if data != nil && t.emit != nil {
