@@ -2,11 +2,13 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"sort"
@@ -488,12 +490,30 @@ func mcpProxyHandlerContext(server MCPConn, toolName string, opts ...any) func(c
 		if err != nil {
 			return ToolResponse{Text: fmt.Sprintf("error: %v", err), IsError: true}
 		}
-		var image []byte
 		result, image := extractMCPResultImage(resp.Text)
 		if blobs != nil {
 			result = blobs.RewriteBinaryToHandle(result)
 		}
-		return ToolResponse{Text: result, Image: image, IsError: resp.IsError}
+		// The transport already decoded standard MCP images/audio into Image
+		// and Parts. Only transform the text; rebuilding the response here
+		// silently discarded those native content blocks.
+		resp.Text = result
+		if len(image) > 0 {
+			if len(resp.Image) == 0 {
+				resp.Image = image
+			} else if !bytes.Equal(resp.Image, image) {
+				// A legacy JSON screenshot may coexist with native content.
+				// Retain both, without mutating the original Parts backing array.
+				mime := http.DetectContentType(image)
+				if !strings.HasPrefix(mime, "image/") {
+					mime = "image/png"
+				}
+				resp.Parts = append(append([]ContentPart(nil), resp.Parts...), ContentPart{
+					Type: "image_url", ImageURL: &ImageURL{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)},
+				})
+			}
+		}
+		return resp
 	}
 }
 
