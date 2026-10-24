@@ -178,7 +178,7 @@ func TestRealtimeInputDurationBoundsAndFreshness(t *testing.T) {
 			}
 			q.push([]byte{1, 2}, now.Add(2*time.Second))
 			if q.drops["stale_input"] != tc.bps/10 || q.bytes != 2 {
-				t.Fatalf("stale input not replaced: %+v", q)
+				t.Fatalf("stale input not replaced: bytes=%d drops=%v", q.bytes, q.drops)
 			}
 		})
 	}
