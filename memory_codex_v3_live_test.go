@@ -22,13 +22,13 @@ func TestIntegration_CodexGPT6SolMemory(t *testing.T) {
 	}
 	newProvider := func() LLMProvider {
 		p := NewOpenAICodexProvider(token).(*OpenAINativeProvider)
-		p.models = map[ModelTier]string{ModelLarge: "gpt-6-sol", ModelMedium: "gpt-6-sol", ModelSmall: "gpt-6-sol"}
+		p.models = map[ModelTier]string{ModelLarge: "gpt-6.1-sol", ModelMedium: "gpt-6.1-sol", ModelSmall: "gpt-6.1-sol"}
 		// Use only the test credential, never a configured production connection.
 		p.runtimeTokenURL = ""
 		p.serverAPIKey = ""
 		return p
 	}
-	t.Log("live provider=openai-codex model=gpt-6-sol; synthetic data in temporary directories")
+	t.Log("live provider=openai-codex model=gpt-6.1-sol; synthetic data in temporary directories")
 	t.Run("lexical_recall", func(t *testing.T) {
 		runUsesLexicalMemoryWithoutEmbeddings(t, newProvider())
 	})
@@ -104,11 +104,11 @@ func runCodexMemoryToolLoop(t *testing.T, provider LLMProvider, directive, promp
 	var calls []string
 	for step := 0; step < 16; step++ {
 		started := time.Now()
-		resp, err := provider.Chat(ctx, messages, "gpt-6-sol", tools, nil, nil, nil)
+		resp, err := provider.Chat(ctx, messages, "gpt-6.1-sol", tools, nil, nil, nil)
 		if err != nil {
-			t.Fatalf("live gpt-6-sol request failed: %v", err)
+			t.Fatalf("live gpt-6.1-sol request failed: %v", err)
 		}
-		t.Logf("gpt-6-sol step=%d duration=%s tool_calls=%d", step+1, time.Since(started).Round(time.Millisecond), len(resp.ToolCalls))
+		t.Logf("gpt-6.1-sol step=%d duration=%s tool_calls=%d", step+1, time.Since(started).Round(time.Millisecond), len(resp.ToolCalls))
 		messages = append(messages, Message{Role: "assistant", Content: resp.Text, Reasoning: resp.Reasoning, ToolCalls: resp.ToolCalls, ProviderState: resp.ProviderState})
 		if len(resp.ToolCalls) == 0 {
 			return resp.Text, calls

@@ -131,8 +131,21 @@ func TestActiveImmutableRealtimeUpdateIsNoOpOrRequiresExplicitRestart(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Changed || !result.RealtimeRestarted || session.closes != 1 {
-		t.Fatalf("explicit update = %#v, closes=%d", result, session.closes)
+	// Session teardown is asynchronous so provider Close cannot stall the
+	// realtime owner. Verify it finishes without requiring Update to block.
+	deadline := time.Now().Add(time.Second)
+	closes := 0
+	for {
+		session.mu.Lock()
+		closes = session.closes
+		session.mu.Unlock()
+		if closes > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !result.Changed || !result.RealtimeRestarted || closes != 1 {
+		t.Fatalf("explicit update = %#v, closes=%d", result, closes)
 	}
 }
 

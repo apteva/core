@@ -47,7 +47,7 @@ func NewGoogleRealtimeProvider(apiKey string) *GoogleRealtimeProvider {
 func (p *GoogleRealtimeProvider) Name() string { return "google-realtime" }
 
 func (p *GoogleRealtimeProvider) RealtimeCapabilities(string) RealtimeCapabilities {
-	return RealtimeCapabilities{AudioTruncation: true}
+	return RealtimeCapabilities{AudioTruncation: true, InputSpeechEvents: true}
 }
 
 func (p *GoogleRealtimeProvider) Models() map[ModelTier]string {
@@ -522,7 +522,7 @@ func (s *googleRealtimeSession) readLoop() {
 				return
 			default:
 			}
-			signalErr := fmt.Errorf("google-realtime read: %w", err)
+			signalErr := realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("google-realtime read: %w", err))
 			s.signalReady(signalErr)
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: signalErr})
 			ended := RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.dropped.Load()}
@@ -542,7 +542,7 @@ func (s *googleRealtimeSession) readLoop() {
 		var message googleLiveServerMessage
 		s.receivedAt = time.Now()
 		if err := json.Unmarshal(data, &message); err != nil {
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime decode: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("google-realtime decode: %w", err))})
 			continue
 		}
 		s.translate(&message)
@@ -838,8 +838,9 @@ func (s *googleRealtimeSession) writeLoop() {
 		case <-s.done:
 			return
 		case frame := <-s.outbox:
+			_ = s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
-				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime write: %w", err)})
+				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("google-realtime write: %w", err))})
 				_ = s.Close()
 				return
 			}
@@ -863,16 +864,16 @@ func (s *googleRealtimeSession) pingLoop() {
 func (s *googleRealtimeSession) enqueueFrame(frame realtimeOutboundFrame) error {
 	select {
 	case <-s.done:
-		return fmt.Errorf("google-realtime session closed")
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("google-realtime session closed"))
 	default:
 	}
 	select {
 	case s.outbox <- frame:
 		return nil
 	case <-s.done:
-		return fmt.Errorf("google-realtime session closed")
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("google-realtime session closed"))
 	default:
-		return fmt.Errorf("google-realtime outbox full")
+		return realtimeAdapterError(RealtimeErrorPressure, fmt.Errorf("google-realtime outbox full"))
 	}
 }
 

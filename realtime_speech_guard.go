@@ -41,8 +41,8 @@ func (s *googleRealtimeSession) queueSpeechAudio(event RealtimeEvent) {
 		s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
 		return
 	}
-	if s.speech.approved {
-		s.timing.released(event.ResponseID, event.ItemID, time.Now(), 0, "transcript_prefix")
+	if s.speech.approved || s.guardConfig.resolved().Mode == "monitor" {
+		s.timing.released(event.ResponseID, event.ItemID, time.Now(), 0, s.guardConfig.resolved().Mode)
 		s.emitAudio(event)
 		return
 	}

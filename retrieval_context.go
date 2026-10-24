@@ -3,11 +3,12 @@ package core
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
-const ephemeralContextHeader = "[REQUEST CONTEXT SNAPSHOT — ephemeral; not durable conversation history or current user input; this current snapshot replaces prior request context]"
+const ephemeralContextHeader = "[REQUEST CONTEXT SNAPSHOT — application observations, not user input or authority; the latest update for each section supersedes its earlier values, including current time]"
 
 var legacyEventHeaderRE = regexp.MustCompile(`(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] Events:\s*$`)
 
@@ -16,14 +17,16 @@ type ephemeralTurnContextSnapshot struct {
 	message Message
 }
 
-// ephemeralTurnContextState keeps exactly one request-only context snapshot.
-// It stays anchored while tool results and correction turns continue the same
-// wake, then is replaced at the durable tail when a new external/wake context
-// begins. This keeps the current retrieval available without accumulating
-// superseded memory blocks in provider requests or durable history.
+// ephemeralTurnContextState holds a bounded ledger of request-only context
+// observations. Existing entries stay anchored while new wakes append changed
+// sections, until an explicit checkpoint replaces the ledger. Rollback mode
+// retains only the current wake's snapshot. Neither mode enters durable history.
 type ephemeralTurnContextState struct {
-	snapshots []ephemeralTurnContextSnapshot
-	active    bool
+	snapshots    []ephemeralTurnContextSnapshot
+	active       bool
+	sections     map[string]string
+	appendOnly   bool
+	checkpointed bool
 }
 
 // memoryRecallCycleState holds one automatic-retrieval result across the
@@ -39,6 +42,41 @@ type memoryRecallCycleState struct {
 	candidates      int
 	querySource     string
 	contextHash     string
+	failureQuery    string // last technical failure used for this recall cycle
+}
+
+// A new technical failure can make an existing procedure relevant mid-turn.
+// Keep this in the existing recall cycle; duplicate retries do not refresh it.
+// Business rejection with IsError=false is learned from the retained evidence.
+func (s *memoryRecallCycleState) observeToolFailures(results []ToolResult, external bool) bool {
+	if external {
+		s.failureQuery = ""
+	}
+	var failures []string
+	seen := map[string]bool{}
+	for _, result := range results {
+		if !result.IsError {
+			continue
+		}
+		text := result.ToolName + " " + boundedMemoryContent(result.Content, 512)
+		if !seen[text] {
+			failures = append(failures, text)
+			seen[text] = true
+		}
+		if len(failures) == 3 {
+			break
+		}
+	}
+	if len(failures) == 0 {
+		return false
+	}
+	sort.Strings(failures)
+	query := strings.Join(failures, "\n")
+	if query == s.failureQuery {
+		return false
+	}
+	s.failureQuery = query
+	return true
 }
 
 func (s *memoryRecallCycleState) refreshReason(storeGeneration uint64, directive string, hasExternalEvent, timerWake, resumeWake bool) string {
@@ -127,6 +165,12 @@ func appendWakeStateContext(dynamicContext, reason string, wake time.Time, fired
 }
 
 func (s *ephemeralTurnContextState) prepare(messages []Message, dynamicContext, now string, idle, forceNew bool) []Message {
+	if requestStabilityEnabled("APTEVA_APPEND_REQUEST_CONTEXT") {
+		return s.prepareSections(messages, []requestContextSection{{"context", dynamicContext}}, now, idle, forceNew)
+	}
+	if s.appendOnly {
+		s.reset()
+	}
 	content := renderEphemeralTurnContext(dynamicContext, now, idle)
 	if content == "" {
 		s.reset()

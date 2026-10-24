@@ -23,6 +23,7 @@ type responsesSessionProviderProfile struct {
 	advertiseBuiltinTools       bool
 	allowConfiguredBuiltinTools bool
 	sendPromptCacheHints        bool
+	sessionHeader               string
 	refreshBeforeRequest        bool
 	retryAfterAuthError         bool
 	replaceIdentityOnRefresh    bool
@@ -101,6 +102,7 @@ var openAICodexSessionProviderProfile = responsesSessionProviderProfile{
 	advertiseBuiltinTools:       false,
 	allowConfiguredBuiltinTools: true,
 	sendPromptCacheHints:        true,
+	sessionHeader:               "session_id",
 	refreshBeforeRequest:        true,
 	retryAfterAuthError:         true,
 	applyRequestHeaders: func(headers http.Header, state responsesSessionSnapshot, _ string) {

@@ -13,6 +13,9 @@ func validateCompatibleRealtimeOutput(opts RealtimeSessionOpts) error {
 	if c.ToolMode == "async" {
 		return fmt.Errorf("this realtime adapter does not support async tools")
 	}
+	if c.SpeechGuard.Mode == "monitor" && c.SpeechGuard.PrefixBytes == 0 && c.SpeechGuard.MaxBufferedAudioMS == 0 {
+		return nil
+	}
 	if c.SpeechGuard != (RealtimeSpeechGuardConfig{}) {
 		return fmt.Errorf("this realtime adapter does not support a pre-audio transcript_prefix guard")
 	}

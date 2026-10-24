@@ -212,12 +212,19 @@ func (t *Thinker) prepareAutomaticTools(c AutomaticToolLoadingConfig) map[string
 	}
 	// Revalidate frozen names against the live catalog, grants and schema
 	// budget each time. Explicit search can still introduce newly needed tools.
-	if previous.context == contextKey && len(previous.names) > 0 {
+	sticky := requestStabilityEnabled("APTEVA_STABLE_TOOL_SELECTION")
+	if (sticky || previous.context == contextKey) && len(previous.names) > 0 {
 		for _, name := range previous.names {
 			intents = append(intents, compileDiscoveryIntent(name, nil, DiscoveryAccessAny, 1, previous.reasons[name], 90, available)...)
 		}
-	} else {
+	}
+	if len(previous.names) == 0 || previous.context != contextKey {
 		for _, q := range queries {
+			// Short acknowledgements are not evidence for new capabilities.
+			// Explicit tool/server references still work even as one-word input.
+			if sticky && len(previous.names) > 0 && !t.automaticToolExpansion(q.Text, available) {
+				continue
+			}
 			priority := 70
 			if q.Source == "memory" {
 				priority = 20
@@ -250,4 +257,13 @@ func (t *Thinker) prepareAutomaticTools(c AutomaticToolLoadingConfig) map[string
 		t.telemetry.Emit("tool.autoload", t.threadID, map[string]any{"iteration": t.iteration, "selected": discovery.Loaded, "reasons": reasons, "schema_tokens_est": discovery.SchemaTokens, "max_tools": c.MaxTools, "max_schema_tokens": c.MaxSchemaTokens, "skipped_budget": discovery.SkippedBudget, "catalog_revision": discovery.CatalogRevision, "duration_us": time.Since(started).Microseconds(), "context_hash": contextKey})
 	}
 	return selected
+}
+
+func (t *Thinker) automaticToolExpansion(query string, servers []string) bool {
+	for _, server := range servers {
+		if containsServerReference(query, server) {
+			return true
+		}
+	}
+	return len(toolNameTokens(query)) >= 3
 }

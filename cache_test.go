@@ -356,10 +356,16 @@ func TestIntegration_CacheHitRatio_OpenAICodex(t *testing.T) {
 		Out    int
 	}
 	var stats []turnStat
+	var nextCodexCacheRequest time.Time
 	for i, turn := range turns {
 		messages = append(messages, Message{Role: "user", Content: turn})
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		resp, err := provider.Chat(ctx, messages, "gpt-5.5", nil, nil, nil, nil)
+		if err := waitSolCacheUntil(ctx, nextCodexCacheRequest); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		nextCodexCacheRequest = time.Now().Add(5 * time.Second)
+		resp, err := provider.Chat(ctx, messages, "gpt-6.1-sol", nil, nil, nil, nil)
 		cancel()
 		if err != nil {
 			if isExpiredCodexCredentialError(err) {
@@ -387,8 +393,8 @@ func TestIntegration_CacheHitRatio_OpenAICodex(t *testing.T) {
 	}
 	fmt.Fprintf(os.Stdout, "[CACHE-RATIO] openai-codex turns=%d ratio=%.1f%% prompt=%d cached=%d\n",
 		len(stats), ratio, promptSum, cachedSum)
-	if cachedSum == 0 {
-		t.Fatalf("Codex live cache test reported zero cached tokens across steady-state turns")
+	if ratio < 100*solCacheAcceptanceRate {
+		t.Fatalf("Sol Codex steady-state cache rate %.2f%% is below %.0f%%", ratio, 100*solCacheAcceptanceRate)
 	}
 }
 

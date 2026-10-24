@@ -29,6 +29,7 @@ type requestBudget struct {
 	ContextWindowSource string `json:"context_window_source"`
 	InputBudget         int    `json:"input_budget"`
 	OverBudget          bool   `json:"over_budget"`
+	CacheKeyHash        string `json:"cache_key_hash,omitempty"`
 }
 
 type contextBudgetError struct{ Budget requestBudget }
@@ -150,6 +151,9 @@ func observeProviderRequest(ctx context.Context, provider, model string, body []
 	}
 
 	b := requestBudget{Provider: provider, Model: model, Stage: "serialized", SerializedBytes: len(body), Fingerprint: requestFingerprint(body)}
+	if key, ok := root["prompt_cache_key"].(string); ok && key != "" {
+		b.CacheKeyHash = promptCacheShortHash([]byte(key))
+	}
 	// Walk provider structures rather than dividing base64 media bytes by four.
 	// A base64 string inside ordinary tool arguments IS text and is counted.
 	var walk func(any) int

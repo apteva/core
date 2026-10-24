@@ -13,6 +13,8 @@ type RealtimeExecutionConfig struct {
 // RealtimeCapabilities describes behavior, not a vendor. The zero/legacy
 // profile preserves the existing turn-based direct-tool contract.
 type RealtimeCapabilities struct {
+	InputSpeechEvents      bool `json:"input_speech_events"`
+	RendererInterruption   bool `json:"renderer_interruption_required"`
 	ContinuousConversation bool `json:"continuous_conversation"`
 	ProviderExecution      bool `json:"provider_execution"`
 	CoreExecution          bool `json:"core_execution"`
@@ -36,7 +38,7 @@ func capabilitiesForRealtime(p RealtimeProvider, model string) RealtimeCapabilit
 	if p, ok := p.(realtimeCapabilityProvider); ok {
 		return p.RealtimeCapabilities(model)
 	}
-	return RealtimeCapabilities{AudioTruncation: true}
+	return RealtimeCapabilities{AudioTruncation: true, InputSpeechEvents: true}
 }
 
 // A context update is deliberately distinct from a user message or a tool

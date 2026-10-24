@@ -15,7 +15,7 @@ type RealtimeOutputConfig struct {
 }
 
 type RealtimeSpeechGuardConfig struct {
-	Mode               string `json:"mode,omitempty"` // default, transcript_prefix
+	Mode               string `json:"mode,omitempty"` // default, monitor, transcript_prefix
 	PrefixBytes        int    `json:"prefix_bytes,omitempty"`
 	MaxBufferedAudioMS int    `json:"max_buffered_audio_ms,omitempty"`
 }
@@ -29,9 +29,9 @@ func (c RealtimeOutputConfig) normalized() (RealtimeOutputConfig, error) {
 		return c, fmt.Errorf("realtime tool_mode must be default, blocking, or async")
 	}
 	switch c.SpeechGuard.Mode {
-	case "", "default", "transcript_prefix":
+	case "", "default", "monitor", "transcript_prefix":
 	default:
-		return c, fmt.Errorf("speech_guard mode must be default or transcript_prefix")
+		return c, fmt.Errorf("speech_guard mode must be default, monitor, or transcript_prefix")
 	}
 	if c.SpeechGuard.PrefixBytes < 0 || c.SpeechGuard.PrefixBytes > 1024 {
 		return c, fmt.Errorf("speech_guard prefix_bytes must be between 0 and 1024")
@@ -54,7 +54,9 @@ func (c RealtimeOutputConfig) isZero() bool {
 }
 
 func (c RealtimeSpeechGuardConfig) resolved() RealtimeSpeechGuardConfig {
-	c.Mode = "transcript_prefix"
+	if c.Mode == "" || c.Mode == "default" {
+		c.Mode = "transcript_prefix"
+	}
 	if c.PrefixBytes == 0 {
 		c.PrefixBytes = 32
 	}
@@ -84,3 +86,12 @@ func cloneRealtimeOutputConfig(c *RealtimeOutputConfig) *RealtimeOutputConfig {
 type realtimeSettingsSession interface{ RealtimeSettings() map[string]any }
 
 type realtimeReadySession interface{ RealtimeReadyAt() time.Time }
+
+// Continuous streams have no provider-final transcript boundary. Monitoring is
+// the default there; callers can explicitly opt into bounded prefix buffering.
+func (c RealtimeSpeechGuardConfig) continuousPolicy() RealtimeSpeechGuardConfig {
+	if c.Mode == "" || c.Mode == "default" {
+		c.Mode = "monitor"
+	}
+	return c.resolved()
+}

@@ -422,7 +422,22 @@ func (t *Thinker) evictActiveToolsLRU(limit int) {
 		age  int
 	}
 	all := make([]aged, 0, len(t.activeTools))
+	protected := map[string]bool{}
+	t.pendingTools.Range(func(_, value any) bool {
+		if name, ok := value.(string); ok {
+			protected[name] = true
+		}
+		return true
+	})
+	for _, action := range t.requiredActions(t.currentEventExecutions()) {
+		if name := t.requiredToolNameFor(action, t.toolAllowlist, t.toolMCPScopes); name != "" {
+			protected[name] = true
+		}
+	}
 	for n := range t.activeTools {
+		if protected[n] {
+			continue
+		}
 		all = append(all, aged{n, t.activeToolAge[n]})
 	}
 	sort.Slice(all, func(i, j int) bool {
@@ -432,7 +447,11 @@ func (t *Thinker) evictActiveToolsLRU(limit int) {
 		return all[i].age < all[j].age
 	})
 	keep := limit * 7 / 10
-	for i := 0; i < len(all)-keep; i++ {
+	drop := len(t.activeTools) - keep
+	if drop > len(all) {
+		drop = len(all)
+	}
+	for i := 0; i < drop; i++ {
 		delete(t.activeTools, all[i].name)
 		delete(t.activeToolAge, all[i].name)
 	}

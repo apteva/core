@@ -93,9 +93,9 @@ func isOpenAILiveModel(model string) bool {
 
 func (p *OpenAIRealtimeProvider) RealtimeCapabilities(model string) RealtimeCapabilities {
 	if isOpenAILiveModel(model) {
-		return RealtimeCapabilities{ContinuousConversation: true, CoreExecution: true, ProviderExecution: true, TranscriptFragments: true, ProviderInterruption: true}
+		return RealtimeCapabilities{RendererInterruption: true, ContinuousConversation: true, CoreExecution: true, ProviderExecution: true, TranscriptFragments: true, ProviderInterruption: true}
 	}
-	return RealtimeCapabilities{AudioTruncation: true}
+	return RealtimeCapabilities{AudioTruncation: true, InputSpeechEvents: true}
 }
 
 var _ RealtimeProvider = (*OpenAIRealtimeProvider)(nil)

@@ -437,7 +437,11 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	}
 	cacheHints := openAIPromptCacheHints{}
 	if p.sessionProfile == nil || p.sessionProfile.sendPromptCacheHints {
-		cacheHints = openAIPromptCacheHintsForScope(p.Name(), model, stablePrefix, apiTools, openAIPromptCacheScopeFromContext(ctx))
+		scope := openAIPromptCacheScopeFromContext(ctx)
+		if scope.Account == "" {
+			scope.Account = p.account()
+		}
+		cacheHints = openAIPromptCacheHintsForScope(p.Name(), model, stablePrefix, apiTools, scope)
 	}
 	cacheState := p.promptCacheState()
 	if !cacheState.enabled() {
@@ -484,6 +488,15 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 			p.sessionProfile.applyRequestHeaders(req.Header, p.currentSessionSnapshot(), model)
 		} else if accountID := p.account(); p.Name() == "openai-codex" && accountID != "" {
 			req.Header.Set("ChatGPT-Account-ID", accountID)
+		}
+		if p.sessionProfile != nil && p.sessionProfile.sessionHeader != "" && requestStabilityEnabled("APTEVA_PROVIDER_SESSION_ROUTING") {
+			id := providerSessionFromContext(ctx)
+			if id == "" {
+				id = reqBody.PromptCacheKey
+			}
+			if id != "" {
+				req.Header.Set(p.sessionProfile.sessionHeader, id)
+			}
 		}
 		return tracedProviderHTTP(req)
 	}

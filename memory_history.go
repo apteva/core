@@ -26,10 +26,25 @@ type MemoryPolicy struct {
 }
 
 type historyMemoryEntry struct {
-	Source    MemorySource `json:"source"`
-	Timestamp time.Time    `json:"timestamp"`
-	Content   string       `json:"content"`
-	Truncated bool         `json:"truncated,omitempty"`
+	Source                MemorySource          `json:"source"`
+	Timestamp             time.Time             `json:"timestamp"`
+	Content               string                `json:"content"`
+	Truncated             bool                  `json:"truncated,omitempty"`
+	ToolResults           []historyMemoryResult `json:"tool_results,omitempty"`
+	ToolMetadataTruncated bool                  `json:"tool_metadata_truncated,omitempty"`
+}
+
+// Bounded history projection keeps operational evidence alongside the text.
+// Arguments, opaque state and media stay excluded. IsError describes execution,
+// not whether a business objective succeeded. Existing source hashes stay stable.
+type historyMemoryCall struct {
+	CallID   string `json:"call_id"`
+	ToolName string `json:"tool_name"`
+}
+type historyMemoryResult struct {
+	historyMemoryCall
+	IsError          bool `json:"is_error"`
+	ContentIsPreview bool `json:"content_is_preview,omitempty"`
 }
 type memoryReviewBatch struct {
 	ID       string               `json:"batch_id"`
@@ -135,7 +150,19 @@ func historyEntry(thread string, entry SessionEntry, contentLimit ...int) (histo
 	if truncated {
 		content = boundedMemoryContent(content, limit)
 	}
-	return historyMemoryEntry{Source: MemorySource{ThreadID: thread, EntryID: hex.EncodeToString(sum[:]), Sequence: entry.Sequence, Role: entry.Role}, Timestamp: entry.Timestamp, Content: content, Truncated: truncated}, true
+	projected := historyMemoryEntry{Source: MemorySource{ThreadID: thread, EntryID: hex.EncodeToString(sum[:]), Sequence: entry.Sequence, Role: entry.Role}, Timestamp: entry.Timestamp, Content: content, Truncated: truncated}
+	metadataBytes := 2 // JSON array delimiters
+	for _, result := range entry.ToolResults {
+		item := historyMemoryResult{historyMemoryCall: historyMemoryCall{CallID: result.CallID, ToolName: result.ToolName}, IsError: result.IsError, ContentIsPreview: result.ContentIsPreview}
+		encoded, _ := json.Marshal(item)
+		if metadataBytes+len(encoded)+1 > 4096 {
+			projected.ToolMetadataTruncated = true
+			continue
+		}
+		metadataBytes += len(encoded) + 1 // include a separating comma
+		projected.ToolResults = append(projected.ToolResults, item)
+	}
+	return projected, true
 }
 
 // Only complete JSONL records are consumed. A concurrently appended partial
@@ -289,11 +316,13 @@ func (h *memoryHistory) review(ctx context.Context, args map[string]string) Tool
 				if h.state.Seen[e.Source.EntryID] {
 					return true
 				}
-				if bytesUsed+len(e.Content) > 48*1024 {
+				metadata, _ := json.Marshal(e.ToolResults)
+				entryBytes := len(e.Content) + len(metadata)
+				if bytesUsed+entryBytes > 48*1024 {
 					return false
 				}
 				batch.Entries = append(batch.Entries, e)
-				bytesUsed += len(e.Content)
+				bytesUsed += entryBytes
 				return len(batch.Entries) < limit
 			})
 			if err != nil {

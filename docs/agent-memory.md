@@ -4,6 +4,87 @@ Core retains the existing append-only memory journal and cached, indexed
 automatic recall. The background unconscious now consolidates eligible retained
 thread histories, not just the last 50 lines of main.
 
+## Learning from experience
+
+The existing memory thread also consolidates conditional working lessons:
+when an approach applies, what was attempted and observed, which alternative
+has support, what remains uncertain, and when the evidence was confirmed.
+These are ordinary memory content and free-form tags, using the same
+`review_history`, search, remember, supersede and drop tools. There is no
+additional learning thread, journal, evaluator, foreground reflection call,
+model training, or automatic publication of private lessons.
+
+Main, worker, managed-execution and realtime prompts tell the agent to use
+relevant experience, adapt to observed failures within its existing authority,
+and keep uncertain patterns revisable. Inferred lessons must not be retained
+by calling `evolve` or `update`; directive edits still require authoritative
+owner/parent instructions. The editable directive itself is unchanged.
+
+Consolidation keeps bounded result metadata alongside retained text: call ID,
+tool name, execution error status, and whether the result was previewed.
+This metadata is limited to 4 KiB per entry and charged against the review
+batch budget. Existing source hashes remain stable across this projection
+upgrade. Tool arguments, reasoning, provider state and media remain excluded.
+A tool execution completing is not proof of an appointment, sale or other
+business outcome. Pending feedback remains unknown, and retries, duplicate
+delivery, assistant claims and repeated recall are not independent evidence.
+
+A new technical tool failure can refresh the existing automatic recall cycle
+using a bounded query from up to three error results. Identical failures on
+retries keep the selected block stable. External requests clear that failure
+query; ordinary successful tool continuations retain the current memory block.
+Business rejection in a successful tool result is interpreted from historical
+evidence by the memory thread, rather than a new hardcoded domain classifier.
+
+Background learning requires the existing `unconscious` setting. It is limited
+to retained histories and existing source-thread memory scopes. A cold context
+for the same owner can recall its durable lessons; an unrelated conversation
+cannot inherit them automatically. Existing explicit management publication,
+exclusions, forgetting and provenance rules apply unchanged.
+
+Real Sol 6.1 tests use the ordinary Thinker, native tool dispatcher, automatic
+recall and auto-spawned memory thread. Six training episodes produce actual
+model-selected attempts against a controlled service fixture with two hidden
+profile-specific preferences. Twelve paired cold-context assessments compare
+the persisted model-written memories against an empty memory store. Assessment
+directories contain no training transcript, and directive/tool definitions are
+identical in both arms. The gate requires at least 10/12 learned successes and
+at least four additional successes over the control. Separate live cases cover
+contradictory evidence, pending/duplicate outcomes, source isolation and
+forgetting. This measures behavioral reuse of experience in a synthetic
+environment; it does not establish real-world business conversion gains.
+
+```sh
+GOWORK=off RUN_CODEX_EXPERIENCE_LIVE=1 go test -v -count=1 \
+  -run '^TestIntegration_SolExperience' -timeout 25m .
+```
+
+Local Sol 6.1 verification on October 23, 2026 completed two independent
+training/consolidation/comparison runs:
+
+| Run | Empty memory control | Model-written experience memory |
+| --- | --- | --- |
+| First | 2/12 accepted requests | 12/12 accepted requests |
+| Repeat | 3/12 accepted requests | 12/12 accepted requests |
+
+Across completed runs this is 5/24 versus 24/24. Each assessment starts with
+fresh history for the same permitted owner, and the treatment reloads only the
+durable memory journal. This comparison isolates learned memory within the new
+Core build; it is not an old-binary/new-binary comparison or a real-world
+conversion-rate estimate. An intermediate repeat was interrupted by upstream
+overload. The harness now lets Core's existing bounded overload retry finish
+instead of treating each attempt's `llm.error` as terminal; thresholds and
+operation limits remain unchanged. The interrupted run is preserved with the
+other evidence under ignored `test-artifacts/memory-experience/`.
+
+The final four-case experience battery passed, including revision, outcome
+grounding, isolation and forgetting. The full short suite, focused race checks
+and Core build also passed. Running the older memory suite on Sol 6.1 exposed a
+progress-only answer: recall found the correct fact, but the agent idled before
+delivering it. The common memory-use contract now requires the requested fact
+in the specified response channel; the unchanged three-turn live answer test
+passed on recheck. The other four older live memory cases passed as well.
+
 ## Consolidation and recovery
 
 When `unconscious` is enabled, `review_history` returns one thread's batch at a
@@ -99,7 +180,7 @@ so background inference volume is not guaranteed to stay unchanged.
 
 ## Live Codex verification
 
-The opt-in suite pins every model tier to `gpt-6-sol` and uses the existing
+The opt-in suite pins every model tier to `gpt-6.1-sol` and uses the existing
 Codex test credential (environment or local auth file), without printing it.
 All test facts, histories, journals, and checkpoints are synthetic and temporary.
 

@@ -34,10 +34,12 @@ type realtimeOutboundFrame struct {
 // The outbox is never closed: Close signals done and closes the connection,
 // eliminating the enqueue-vs-close send-on-closed-channel race.
 type openaiRealtimeSession struct {
-	conn   net.Conn
-	events chan RealtimeEvent
-	outbox chan realtimeOutboundFrame
-	done   chan struct{}
+	writeTimeout time.Duration
+	audioOutbox  chan realtimeOutboundFrame
+	conn         net.Conn
+	events       chan RealtimeEvent
+	outbox       chan realtimeOutboundFrame
+	done         chan struct{}
 
 	providerName             string
 	buildConfigurationUpdate func(string, []NativeTool) map[string]any
@@ -315,7 +317,7 @@ func (s *openaiRealtimeSession) readLoop() {
 				return
 			default:
 			}
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("ws read: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("ws read: %w", err))})
 			s.emitControl(RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.droppedAudio.Load()})
 			_ = s.Close()
 			return
@@ -326,7 +328,7 @@ func (s *openaiRealtimeSession) readLoop() {
 		var event openaiRealtimeEvent
 		s.receivedAt = time.Now()
 		if err := json.Unmarshal(data, &event); err != nil {
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("decode event: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("decode event: %w", err))})
 			continue
 		}
 		s.translate(&event)
@@ -381,7 +383,7 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 	case "response.output_audio.delta", "response.audio.delta":
 		pcm, err := base64.StdEncoding.DecodeString(event.Delta)
 		if err != nil {
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("decode output audio: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("decode output audio: %w", err))})
 			return
 		}
 		s.audioOutBytes.Add(uint64(len(pcm)))
@@ -484,17 +486,67 @@ func (s *openaiRealtimeSession) emitControl(event RealtimeEvent) {
 }
 
 func (s *openaiRealtimeSession) writeLoop() {
+	write := func(frame realtimeOutboundFrame) bool {
+		budget := s.writeTimeout
+		if budget == 0 {
+			budget = 5 * time.Second
+		}
+		_ = s.conn.SetWriteDeadline(time.Now().Add(budget))
+		if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("ws write: %w", err))})
+			_ = s.Close()
+			return false
+		}
+		return true
+	}
 	for {
 		select {
 		case <-s.done:
 			return
+		default:
+		}
+		select {
 		case frame := <-s.outbox:
-			if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
-				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("ws write: %w", err)})
-				_ = s.Close()
+			if !write(frame) {
+				return
+			}
+			continue
+		default:
+		}
+		select {
+		case <-s.done:
+			return
+		case frame := <-s.outbox:
+			if !write(frame) {
+				return
+			}
+		case frame := <-s.audioOutbox:
+			if !write(frame) {
 				return
 			}
 		}
+	}
+}
+func (s *openaiRealtimeSession) enqueueAudio(payload map[string]any) error {
+	if s.audioOutbox == nil {
+		return s.enqueue(payload)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-s.done:
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("realtime session closed"))
+	default:
+	}
+	select {
+	case s.audioOutbox <- realtimeOutboundFrame{op: ws.OpText, data: data}:
+		return nil
+	case <-s.done:
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("realtime session closed"))
+	default:
+		return realtimeAdapterError(RealtimeErrorPressure, fmt.Errorf("realtime microphone queue full"))
 	}
 }
 
@@ -514,16 +566,16 @@ func (s *openaiRealtimeSession) pingLoop() {
 func (s *openaiRealtimeSession) enqueueFrame(frame realtimeOutboundFrame) error {
 	select {
 	case <-s.done:
-		return fmt.Errorf("realtime session closed")
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("realtime session closed"))
 	default:
 	}
 	select {
 	case s.outbox <- frame:
 		return nil
 	case <-s.done:
-		return fmt.Errorf("realtime session closed")
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("realtime session closed"))
 	default:
-		return fmt.Errorf("realtime outbox full")
+		return realtimeAdapterError(RealtimeErrorPressure, fmt.Errorf("realtime outbox full"))
 	}
 }
 

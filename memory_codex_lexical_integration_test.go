@@ -230,7 +230,7 @@ func runUsesEphemeralMemoryAcrossTurns(t *testing.T, provider LLMProvider) {
 		if !turnAnswered {
 			events, _ := thinker.telemetry.StoredEvents(0)
 			for _, event := range events {
-				if event.Type == "llm.done" || event.Type == "llm.error" || event.Type == "memory.recall" {
+				if event.Type == "llm.done" || event.Type == "llm.error" || event.Type == "memory.recall" || event.Type == "tool.call" || event.Type == "tool.result" {
 					t.Logf("turn=%d thread=%s %s: %.2500s", turn, event.ThreadID, event.Type, event.Data)
 				}
 			}

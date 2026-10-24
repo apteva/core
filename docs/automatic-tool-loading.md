@@ -1,7 +1,10 @@
 # Automatic tool loading
 
-Automatic selections remain stable within a phase defined by the full current
-instruction, standing directive, active execution IDs and loading policy.
+Automatic selections remain sticky across follow-up messages within their
+configured budgets. New selection inputs can add tools while space remains;
+explicit discovery remains available when the automatic budget is full.
+Small acknowledgements do not reselect unrelated tools. Set
+`APTEVA_STABLE_TOOL_SELECTION=0` to restore instruction-based phase replacement.
 Memory refreshes and required-action bookkeeping do not reselect the schemas
 on ordinary tool continuations. Each request still checks the live catalog,
 authorization and schema budget; revocations take effect immediately and
@@ -56,8 +59,9 @@ process. `search_tools` remains available as a fallback.
    execution reason/prerequisite, standing directive, and optionally the memory
    context already selected by automatic recall. Interleave ranked sources so
    the directive cannot consume all available slots.
-3. Retain selections across unchanged continuation context. On a context change,
-   current candidates have priority and older selections fill remaining space.
+3. Retain valid selections across context changes. New candidates fill remaining
+   space; configured workflow tools have priority. Explicit search/use retains
+   its independent activation and batch LRU budgets.
 4. Resolve every name against the live registry, reapply capabilities and
    `no_spawn`, and attach the real native schemas before the provider request.
 

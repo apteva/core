@@ -8,13 +8,13 @@ import (
 	"testing"
 )
 
-func TestOpenAIPromptCacheScopeSeparatesAgentThreadAndEpoch(t *testing.T) {
+func TestOpenAIPromptCacheScopeSeparatesAgentsAndThreads(t *testing.T) {
 	base := openAIPromptCacheHintsForScope("openai", "gpt-5.5", "system", []any{"tool"}, openAIPromptCacheScope{
 		Identity: "agent:10/thread:main",
 		Epoch:    3,
 	})
-	if !strings.HasPrefix(base.Key, "apteva-v2-") || base.Retention != "24h" {
-		t.Fatalf("base hints = %+v, want scoped v2 key with existing 24h retention", base)
+	if !strings.HasPrefix(base.Key, "apteva-v3-") || base.Retention != "24h" {
+		t.Fatalf("base hints = %+v, want scoped v3 key with existing 24h retention", base)
 	}
 	if same := openAIPromptCacheHintsForScope("openai", "gpt-5.5", "system", []any{"tool"}, openAIPromptCacheScope{
 		Identity: "agent:10/thread:main",
@@ -25,7 +25,6 @@ func TestOpenAIPromptCacheScopeSeparatesAgentThreadAndEpoch(t *testing.T) {
 	for _, changed := range []openAIPromptCacheScope{
 		{Identity: "agent:11/thread:main", Epoch: 3},
 		{Identity: "agent:10/thread:worker", Epoch: 3},
-		{Identity: "agent:10/thread:main", Epoch: 4},
 	} {
 		got := openAIPromptCacheHintsForScope("openai", "gpt-5.5", "system", []any{"tool"}, changed)
 		if got.Key == base.Key {

@@ -1,6 +1,8 @@
 package core
 
 import (
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,9 +22,11 @@ type realtimeCompletion struct {
 }
 
 type realtimeDeliveredItem struct {
+	speechPending, speechEnd                  int
 	item                                      string
 	queued, pending, written, played, dropped int
 	waitPlayback                              bool
+	cancelled                                 bool
 }
 
 // Tracks every queued frame, including one removed from the channel while the
@@ -31,11 +35,13 @@ type realtimeDeliveredItem struct {
 type realtimeDelivery struct {
 	mu                                        sync.Mutex
 	items                                     map[string]*realtimeDeliveredItem
+	evidence                                  string
 	supportsPlayback                          bool
 	queued, pending, written, played, dropped int
 }
 
-func (d *realtimeDelivery) enqueue(key, item string, bytes int) func(bool) {
+func (d *realtimeDelivery) enqueue(key, item string, bytes int, silent ...bool) func(bool) {
+	speech := len(silent) == 0 || !silent[0]
 	d.mu.Lock()
 	if d.items == nil {
 		d.items = map[string]*realtimeDeliveredItem{}
@@ -54,6 +60,10 @@ func (d *realtimeDelivery) enqueue(key, item string, bytes int) func(bool) {
 		d.items[key] = entry
 	}
 	entry.queued += bytes
+	if speech {
+		entry.speechPending += bytes
+		entry.speechEnd = entry.queued
+	}
 	entry.pending += bytes
 	d.queued += bytes
 	d.pending += bytes
@@ -64,6 +74,9 @@ func (d *realtimeDelivery) enqueue(key, item string, bytes int) func(bool) {
 			d.mu.Lock()
 			defer d.mu.Unlock()
 			entry.pending -= bytes
+			if speech {
+				entry.speechPending -= bytes
+			}
 			d.pending -= bytes
 			if success {
 				entry.written += bytes
@@ -80,7 +93,7 @@ func (d *realtimeDelivery) acknowledge(key string, endMS int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	entry := d.items[key]
-	if entry == nil {
+	if entry == nil || entry.cancelled {
 		return
 	}
 	d.supportsPlayback = true
@@ -97,7 +110,9 @@ func (d *realtimeDelivery) playbackReady() {
 	defer d.mu.Unlock()
 	d.supportsPlayback = true
 	for _, entry := range d.items {
-		entry.waitPlayback = true
+		if !entry.cancelled {
+			entry.waitPlayback = true
+		}
 	}
 }
 
@@ -109,6 +124,7 @@ func (d *realtimeDelivery) abandonPlayback(item string) {
 	for _, entry := range d.items {
 		if item == "" || entry.item == item {
 			entry.waitPlayback = false
+			entry.cancelled = true
 		}
 	}
 }
@@ -117,17 +133,20 @@ func (d *realtimeDelivery) snapshot() (pending, awaiting int, data map[string]an
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, item := range d.items {
-		if item.waitPlayback {
+		if item.waitPlayback && !item.cancelled {
 			awaiting += max(0, item.queued-item.dropped-item.played)
 		}
 	}
 	return d.pending, awaiting, map[string]any{
-		"queued_audio_ms":         float64(d.queued) * 1000 / realtimePCMBytesPerSecond,
-		"pending_audio_ms":        float64(d.pending) * 1000 / realtimePCMBytesPerSecond,
-		"bridge_written_audio_ms": float64(d.written) * 1000 / realtimePCMBytesPerSecond,
-		"acknowledged_audio_ms":   float64(d.played) * 1000 / realtimePCMBytesPerSecond,
-		"dropped_audio_ms":        float64(d.dropped) * 1000 / realtimePCMBytesPerSecond,
-		"playback_ack_supported":  d.supportsPlayback,
+		"queued_audio_ms":            float64(d.queued) * 1000 / realtimePCMBytesPerSecond,
+		"pending_audio_ms":           float64(d.pending) * 1000 / realtimePCMBytesPerSecond,
+		"bridge_written_audio_ms":    float64(d.written) * 1000 / realtimePCMBytesPerSecond,
+		"acknowledged_audio_ms":      float64(d.played) * 1000 / realtimePCMBytesPerSecond,
+		"dropped_audio_ms":           float64(d.dropped) * 1000 / realtimePCMBytesPerSecond,
+		"playback_ack_supported":     d.supportsPlayback,
+		"playback_evidence":          d.evidence,
+		"audible_playback_confirmed": d.evidence == "carrier_mark" && d.played > 0 && d.played >= d.written && d.pending == 0 && awaiting == 0 && d.dropped == 0,
+		"awaiting_playback_ms":       float64(awaiting) * 1000 / realtimePCMBytesPerSecond,
 	}
 }
 
@@ -213,6 +232,7 @@ func (rt *RealtimeThinker) finishRealtimeCompletion(session RealtimeSession) {
 		}
 		pending, awaiting, _ := rt.delivery.snapshot()
 		if rt.capabilities.ContinuousConversation {
+			pending, awaiting = rt.delivery.pendingSpeechPlayback()
 			done = rt.continuous.lastAudio.IsZero() || time.Since(rt.continuous.lastAudio) >= realtimeObservedQuiet
 		}
 		ready := !awaitOutput && (done || !rt.responseInProgress() || session == nil) && pending == 0 && awaiting == 0 && !rt.backend.active
@@ -333,4 +353,92 @@ func (rt *RealtimeThinker) recordSessionClosure(reason string, planned bool, ext
 		data[key] = value
 	}
 	rt.emitDurableLifecycle("realtime.session_closed", data)
+}
+
+func (d *realtimeDelivery) isCancelled(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.items[key] != nil && d.items[key].cancelled
+}
+
+// Used for presentation only. Socket delivery without a client receipt never
+// becomes a claim that the caller heard the speech.
+func (d *realtimeDelivery) hasPendingPlayback() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, item := range d.items {
+		if !item.cancelled && (item.speechPending > 0 || item.waitPlayback && item.played+item.dropped < item.speechEnd) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *realtimeDelivery) pendingSpeechPlayback() (pending, awaiting int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, item := range d.items {
+		if item.cancelled {
+			continue
+		}
+		pending += item.speechPending
+		if item.waitPlayback {
+			awaiting += max(0, item.speechEnd-item.played-item.dropped)
+		}
+	}
+	return
+}
+
+func (d *realtimeDelivery) playbackPosition(item string) (queuedMS, playedMS int, active bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, entry := range d.items {
+		if entry.item != item || entry.cancelled {
+			continue
+		}
+		queuedMS += entry.queued * 1000 / realtimePCMBytesPerSecond
+		playedMS += entry.played * 1000 / realtimePCMBytesPerSecond
+		active = active || entry.pending > 0 || entry.waitPlayback && entry.played+entry.dropped < entry.queued
+	}
+	return
+}
+
+func (d *realtimeDelivery) pendingPlaybackIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	seen := map[string]bool{}
+	var ids []string
+	for _, entry := range d.items {
+		if !entry.cancelled && entry.item != "" && (entry.pending > 0 || entry.waitPlayback && entry.played+entry.dropped < entry.queued) && !seen[entry.item] {
+			seen[entry.item] = true
+			ids = append(ids, entry.item)
+		}
+	}
+	return ids
+}
+
+func (d *realtimeDelivery) setEvidence(e string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e == "" {
+		e = "legacy"
+	}
+	d.evidence = e
+}
+
+func (d *realtimeDelivery) generationFor(item string, fallback int64) int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if entry := d.items[strconv.FormatInt(fallback, 10)+"/"+item]; entry != nil {
+		return fallback
+	}
+	for key, e := range d.items {
+		if e.item == item {
+			prefix, _, _ := strings.Cut(key, "/")
+			if generation, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+				return generation
+			}
+		}
+	}
+	return fallback
 }

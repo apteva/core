@@ -78,7 +78,7 @@ func TestEphemeralTurnContextAlwaysIncludesCurrentUTC(t *testing.T) {
 	base := []Message{{Role: "system", Content: "stable"}}
 	first := state.prepare(base, "", "2026-07-13T12:03:00Z", true, true)
 	second := state.prepare(base, "", "2026-07-14T12:03:00Z", true, true)
-	if len(first) != 2 || len(second) != 2 {
+	if len(first) != 2 || len(second) != 3 {
 		t.Fatalf("timer wake accumulated request context: first=%+v second=%+v", first, second)
 	}
 	latest := second[len(second)-1].Content
@@ -133,7 +133,7 @@ func TestEphemeralTurnContextStatePreservesAppendOnlyPrefix(t *testing.T) {
 	}
 }
 
-func TestEphemeralTurnContextNewSemanticTurnReplacesSnapshot(t *testing.T) {
+func TestEphemeralTurnContextNewSemanticTurnAppendsSnapshot(t *testing.T) {
 	state := ephemeralTurnContextState{}
 	durable := []Message{{Role: "system", Content: "stable"}, {Role: "user", Content: "first task"}}
 	first := state.prepare(durable, "[ACTIVE THREADS]\n- worker-a", "2026-07-10T14:00:00Z", false, true)
@@ -146,7 +146,7 @@ func TestEphemeralTurnContextNewSemanticTurnReplacesSnapshot(t *testing.T) {
 		Message{Role: "user", Content: "second task"},
 	)
 	second := state.prepare(durable, "[ACTIVE THREADS]\n- worker-b", "2026-07-10T14:05:00Z", false, true)
-	if len(second) != len(durable)+1 {
+	if len(second) != len(durable)+2 {
 		t.Fatalf("new semantic turn accumulated context: durable=%d second=%+v", len(durable), second)
 	}
 	latest := second[len(second)-1]
@@ -154,8 +154,8 @@ func TestEphemeralTurnContextNewSemanticTurnReplacesSnapshot(t *testing.T) {
 		t.Fatalf("latest context snapshot = %+v", latest)
 	}
 	serialized, _ := json.Marshal(second)
-	if strings.Contains(string(serialized), "worker-a") || strings.Count(string(serialized), ephemeralContextHeader) != 1 {
-		t.Fatalf("superseded request context survived replacement: %s", serialized)
+	if !strings.Contains(string(serialized), "worker-a") || strings.Count(string(serialized), ephemeralContextHeader) != 2 {
+		t.Fatalf("earlier request context was rewritten: %s", serialized)
 	}
 }
 
@@ -769,8 +769,8 @@ func TestThinkerRecallIsEphemeralAndReplacedAcrossManyTurns(t *testing.T) {
 				foundIndex = j
 			}
 		}
-		if markers != 1 || requestContexts != 1 {
-			t.Fatalf("request %d has memory_blocks=%d request_contexts=%d, want exactly one current snapshot", i+1, markers, requestContexts)
+		if markers != 1 || requestContexts < 1 || requestContexts > requestContextMaxUpdates {
+			t.Fatalf("request %d has memory_blocks=%d request_contexts=%d, want one memory block and bounded context updates", i+1, markers, requestContexts)
 		}
 		if foundIndex < 0 || !strings.HasPrefix(request[foundIndex].Content, ephemeralContextHeader) {
 			t.Fatalf("request %d is missing marked ephemeral context: %+v", i+1, request)

@@ -33,7 +33,7 @@ func NewXAIRealtimeProvider(apiKey string) *XAIRealtimeProvider {
 func (p *XAIRealtimeProvider) Name() string { return "xai-realtime" }
 
 func (p *XAIRealtimeProvider) RealtimeCapabilities(string) RealtimeCapabilities {
-	return RealtimeCapabilities{AudioTruncation: true}
+	return RealtimeCapabilities{AudioTruncation: true, InputSpeechEvents: true}
 }
 
 func (p *XAIRealtimeProvider) Models() map[ModelTier]string {

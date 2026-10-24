@@ -206,3 +206,62 @@ References: [Google Live capabilities](https://ai.google.dev/gemini-api/docs/liv
 [tool response scheduling](https://ai.google.dev/gemini-api/docs/live-api/tools),
 [SDK FunctionResponse fields](https://googleapis.github.io/js-genai/release_docs/classes/types.FunctionResponse.html),
 [best practices](https://ai.google.dev/gemini-api/docs/live-api/best-practices).
+
+## Input admission and provider recovery
+
+Core drains external audio independently of provider connection work and
+transcript persistence. A replacement connection opens, resumes and restores in
+an asynchronous attempt. Only the runtime loop may install it, after checking
+cancellation and the expected session generation. Superseded or late sessions
+are closed. Each connection attempt has a 30-second budget; retries retain the
+existing exponential backoff and circuit cooldown. Initial thread creation still
+opens synchronously so invalid configuration fails before exposing the thread.
+
+`RealtimeSession.SendAudio` acknowledges **local admission**, not remote receipt.
+The shared `RealtimeAdapterError` classes are `pressure`, `closed`, `transport`
+and `protocol`. Pressure and closed errors guarantee that the frame was not
+accepted. Temporary pressure retries the same frame at a 10 ms interval without
+reconnecting; one second of sustained pressure initiates session recovery. An
+ambiguous failed frame is reported as `delivery_uncertain` and is not replayed.
+Previously admitted frames are never replayed solely because a session failed.
+
+The default input policy allows five seconds of buffered audio and a maximum
+frame age of five seconds, using the declared encoding and sample rate. Overflow
+rejects excess incoming audio; expired audio is discarded before delivery. Both
+produce `realtime.audio_drop` events with bytes, duration, generation, reason and
+`discontinuity: true`. Remaining input is reported when the thread stops. Receipt
+accounting happens once, rather than again during recovery delivery.
+
+Input is split into at most 20 ms frames and drained incrementally. Continuous
+conversation models receive buffered input at its recorded sample rate instead
+of a reconnect burst. Turn-based providers drain bounded batches and yield to
+lifecycle events between batches. Providers can supply `RealtimeInputPolicy`
+overrides for buffering, freshness, frame size, pressure tolerance and pacing.
+
+`realtime.error` retains the underlying error and classification, operation,
+generation and queued input duration. `realtime.reconnect` distinguishes total
+recovery duration from connection-attempt duration. Audio bytes and credentials
+are not included in these diagnostics.
+
+Clients negotiating `audio_protocol=1` receive `provider_state` in the
+`X-Apteva-Audio-Session` handshake and `session.state` controls containing `state`
+(`recovering`, `ready`, `failed`) and `session_generation`. These describe the
+provider session, independently of the external socket. State updates coalesce
+to the latest value on a separate lane, so a full playback-control queue cannot
+hide readiness. `failed` describes the last attempt; Core may retry after
+backoff. These notifications do not change the PCM framing or replace playback
+acknowledgements. Legacy clients receive no additional control types.
+
+Deterministic coverage lives in `realtime_input_test.go` and
+`realtime_recovery_test.go`. The paid recovery acceptance test runs with:
+
+```sh
+RUN_OPENAI_LIVE_RECOVERY=1 GOWORK=off go test -race \
+  -run '^TestOpenAILiveRecoveryWithContinuousIntakeLive$' -count=1 -v .
+```
+
+Set `OPENAI_API_KEY` in the runtime environment. This test deliberately injects
+a local send failure and a slow reconnect, while both provider sessions and the
+French audio/transcription use the real API. It checks continued external intake
+and a meaningful spoken reply after recovery; it does not establish the cause
+of an earlier production send failure.

@@ -175,7 +175,7 @@ func TestContinuousTranscriptCheckpointsOverlapAndInterruptions(t *testing.T) {
 }
 
 func TestContinuousSpeechGuardBuffersRejectsAndRecovers(t *testing.T) {
-	g := realtimeContinuousGuard{}
+	g := realtimeContinuousGuard{config: RealtimeSpeechGuardConfig{Mode: "transcript_prefix"}}
 	now := time.Now()
 	audio := RealtimeEvent{Type: RealtimeEventAudioOut, ObservedAt: now, Audio: []byte{255, 127, 255, 127}}
 	if got := g.audio(audio, nil); len(got) != 0 {
@@ -194,8 +194,8 @@ func TestContinuousSpeechGuardBuffersRejectsAndRecovers(t *testing.T) {
 	if got := g.transcript(RealtimeEvent{Type: RealtimeEventTranscriptOutput, ObservedAt: audio.ObservedAt, Transcript: "Reprenons."}, nil, nil); len(got) != 2 {
 		t.Fatalf("guard did not recover: %#v", got)
 	}
-	if got := g.audio(RealtimeEvent{ObservedAt: audio.ObservedAt, Audio: make([]byte, realtimePCMBytesPerSecond)}, nil); len(got) != 0 {
-		t.Fatal("silence became an utterance")
+	if got := g.audio(RealtimeEvent{ObservedAt: audio.ObservedAt, Audio: make([]byte, realtimePCMBytesPerSecond)}, nil); len(got) != 1 || len(got[0].Audio) != realtimePCMBytesPerSecond {
+		t.Fatal("ordered silence was removed")
 	}
 }
 
@@ -423,6 +423,20 @@ func TestContinuousCorrectionKeepsInferenceAliveAndRejectsItsOldAction(t *testin
 	case <-p.started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("delegation incorrectly required transcript to reach a later notification timestamp")
+	}
+	// Interrupt actual playback while the delegated inference is still running.
+	s.events <- RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "progress-speech", Audio: make([]byte, 4800)}
+	select {
+	case frame := <-rt.audioOut:
+		frame.written(true)
+	case <-time.After(time.Second):
+		t.Fatal("progress speech missing")
+	}
+	rt.rendererSpeechStarted()
+	select {
+	case <-p.cancelled:
+		t.Fatal("local interruption cancelled delegated inference")
+	default:
 	}
 	s.events <- RealtimeEvent{Type: RealtimeEventTranscriptInput, Transcript: "Non, vendredi.", TranscriptDelta: true, TranscriptStartMS: 1100, TranscriptEndMS: 1800}
 	// Wait for the event loop to consume the correction before releasing inference.

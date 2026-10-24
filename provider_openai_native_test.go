@@ -150,7 +150,7 @@ func TestOpenAINativeChat_SendsPromptCacheHints(t *testing.T) {
 		t.Fatalf("Codex request sent unsupported prompt_cache_retention: %#v", body)
 	}
 	key, _ := body["prompt_cache_key"].(string)
-	if !strings.HasPrefix(key, "apteva-v2-") {
+	if !strings.HasPrefix(key, "apteva-v3-") {
 		t.Fatalf("prompt_cache_key = %q", key)
 	}
 	wantKey := openAIPromptCacheHintsForScope("openai-codex", "gpt-5.5", "stable system", p.buildAPITools("gpt-5.5", tools), scope).Key

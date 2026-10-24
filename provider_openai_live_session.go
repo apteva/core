@@ -163,11 +163,11 @@ func (p *OpenAIRealtimeProvider) openLiveSession(ctx context.Context, opts Realt
 		return nil, fmt.Errorf("OpenAI Live dial: %w", err)
 	}
 	s := &openaiLiveSession{openaiRealtimeSession: &openaiRealtimeSession{
-		conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer), outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), done: make(chan struct{}),
-		timing: opts.timing, providerName: "openai-realtime", settings: map[string]any{"source": "session_started", "model": opts.Model, "voice": opts.Voice, "delegation": "client"},
+		writeTimeout: 250 * time.Millisecond, conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer), outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), audioOutbox: make(chan realtimeOutboundFrame, 8), done: make(chan struct{}),
+		timing: opts.timing, providerName: "openai-realtime", settings: map[string]any{"source": "session_started", "model": opts.Model, "voice": opts.Voice, "delegation": "client", "speech_guard": opts.OutputConfig.SpeechGuard.continuousPolicy()},
 	}, ready: make(chan error, 1), instructions: opts.Instructions, tools: opts.Tools}
 	s.execution = openaiLiveExecution{enabled: opts.ExecutionMode == "provider", notify: make(chan struct{}, 1), pending: map[string]bool{}, submitted: map[string]bool{}, inputHashes: map[[32]byte]bool{}}
-	s.guard.config = opts.OutputConfig.SpeechGuard.resolved()
+	s.guard.config = opts.OutputConfig.SpeechGuard.continuousPolicy()
 	s.outbox <- realtimeOutboundFrame{op: ws.OpText, data: payload}
 	s.lifecycle.start(s.events, s.readLiveLoop, s.writeLoop, s.pingLoop, s.flushLiveSpeech)
 	go func() {
@@ -207,7 +207,7 @@ func (s *openaiLiveSession) readLiveLoop() {
 				return
 			default:
 			}
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("Live read: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("Live read: %w", err))})
 			return
 		}
 		if op != ws.OpText {
@@ -215,7 +215,7 @@ func (s *openaiLiveSession) readLiveLoop() {
 		}
 		var e openaiLiveEvent
 		if err := json.Unmarshal(data, &e); err != nil {
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("invalid Live event: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("invalid Live event: %w", err))})
 			continue
 		}
 		s.translateLive(e)
@@ -242,10 +242,11 @@ func (s *openaiLiveSession) translateLive(e openaiLiveEvent) {
 		event := RealtimeEvent{Type: kind, ObservedAt: now, Transcript: e.Delta, TranscriptDelta: true, TranscriptStartMS: e.StartMS, TranscriptEndMS: e.EndMS}
 		if kind == RealtimeEventTranscriptOutput {
 			s.guardMu.Lock()
-			for _, ev := range s.guard.transcript(event, s.tools, s.timing) {
+			events := s.guard.transcript(event, s.tools, s.timing)
+			s.guardMu.Unlock()
+			for _, ev := range events {
 				s.emitControl(ev)
 			}
-			s.guardMu.Unlock()
 		} else {
 			s.emitControl(event)
 		}
@@ -256,10 +257,11 @@ func (s *openaiLiveSession) translateLive(e openaiLiveEvent) {
 			return
 		}
 		s.guardMu.Lock()
-		for _, ev := range s.guard.audio(RealtimeEvent{Type: RealtimeEventAudioOut, ObservedAt: now, Audio: audio}, s.timing) {
+		events := s.guard.audio(RealtimeEvent{Type: RealtimeEventAudioOut, ObservedAt: now, Audio: audio}, s.timing)
+		s.guardMu.Unlock()
+		for _, ev := range events {
 			s.emitControl(ev)
 		}
-		s.guardMu.Unlock()
 	case "response.event":
 		s.translateExecution(e.Event)
 	case "session.delegation.created":
@@ -276,10 +278,11 @@ func (s *openaiLiveSession) translateLive(e openaiLiveEvent) {
 		}
 		if e.Type == "session.closed" {
 			s.guardMu.Lock()
-			for _, ev := range s.guard.finish() {
+			events := s.guard.finish()
+			s.guardMu.Unlock()
+			for _, ev := range events {
 				s.emitControl(ev)
 			}
-			s.guardMu.Unlock()
 			s.emitControl(RealtimeEvent{Type: RealtimeEventSessionEnded, CloseReason: e.Reason, Terminal: e.Reason == "content" || e.Reason == "remote_hangup", ObservedAt: now})
 		}
 	case "error":
@@ -307,24 +310,26 @@ func (s *openaiLiveSession) flushLiveSpeech() {
 			return
 		case <-ticker.C:
 			s.guardMu.Lock()
-			if s.guard.bytes > 0 && !s.guard.lastAudio.IsZero() && time.Since(s.guard.lastAudio) >= realtimeObservedQuiet && s.guard.text != "" {
-				for _, e := range s.guard.finish() {
-					s.emitControl(e)
-				}
+			var events []RealtimeEvent
+			if !s.guard.lastAudio.IsZero() && time.Since(s.guard.lastAudio) >= realtimeObservedQuiet {
+				events = s.guard.finish()
 			}
 			s.guardMu.Unlock()
+			for _, e := range events {
+				s.emitControl(e)
+			}
 		}
 	}
 }
 
 func (s *openaiLiveSession) SendAudio(pcm []byte) error {
 	if len(pcm)%2 != 0 {
-		return fmt.Errorf("PCM16 requires complete samples")
+		return realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("PCM16 requires complete samples"))
 	}
 	if len(pcm) == 0 {
 		return nil
 	}
-	return s.enqueue(map[string]any{"type": "session.input_audio.append", "audio": base64.StdEncoding.EncodeToString(pcm)})
+	return s.enqueueAudio(map[string]any{"type": "session.input_audio.append", "audio": base64.StdEncoding.EncodeToString(pcm)})
 }
 
 func (s *openaiLiveSession) AppendContext(u RealtimeContextUpdate) error {
@@ -410,3 +415,12 @@ func (s *openaiLiveSession) UpdateConfiguration(instructions string, tools []Nat
 }
 
 var _ RealtimeSession = (*openaiLiveSession)(nil)
+
+// DiscardPlayback only invalidates local audio/check state. Live's own yield
+// policy is separate, and backend work is deliberately unaffected.
+func (s *openaiLiveSession) DiscardPlayback(item string) {
+	s.guardMu.Lock()
+	s.guard.discard(item)
+	s.guardMu.Unlock()
+}
+func (s *openaiLiveSession) RealtimeInterruptCommand() string { return "session.instructions.append" }

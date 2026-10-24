@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -11,14 +12,23 @@ import (
 // RealtimeTranscriptMetadata describes evidence from the provider. Even a
 // provider-final assistant transcript is not evidence of audible playback.
 type RealtimeTranscriptMetadata struct {
-	ID                 string `json:"id"`
-	Generation         int    `json:"generation"`
-	ResponseID         string `json:"response_id,omitempty"`
-	ItemID             string `json:"item_id,omitempty"`
-	Status             string `json:"status"` // provider_final, interrupted, or blocked
-	FinalizationReason string `json:"finalization_reason"`
-	StartMS            int    `json:"start_ms,omitempty"`
-	EndMS              int    `json:"end_ms,omitempty"`
+	ID                 string                       `json:"id"`
+	Generation         int                          `json:"generation"`
+	ResponseID         string                       `json:"response_id,omitempty"`
+	ItemID             string                       `json:"item_id,omitempty"`
+	Status             string                       `json:"status"` // provider_final, interrupted, or blocked
+	FinalizationReason string                       `json:"finalization_reason"`
+	StartMS            int                          `json:"start_ms,omitempty"`
+	EndMS              int                          `json:"end_ms,omitempty"`
+	Fragments          []RealtimeTranscriptFragment `json:"fragments,omitempty"`
+}
+
+// Preserve provider timing independently of arrival order and display grouping.
+// A delayed caller caption can separate output that was already checkpointed.
+type RealtimeTranscriptFragment struct {
+	Text    string `json:"text"`
+	StartMS int    `json:"start_ms"`
+	EndMS   int    `json:"end_ms"`
 }
 
 type realtimeTranscriptTurn struct {
@@ -51,7 +61,7 @@ func (s *Session) UpsertRealtimeTranscript(msg Message, iteration int) error {
 	entry := SessionEntry{Timestamp: time.Now(), Role: msg.Role, Content: msg.Content, RealtimeTranscript: msg.RealtimeTranscript, Iteration: iteration}
 	if index >= 0 {
 		old := entries[index]
-		if old.Content == msg.Content && *old.RealtimeTranscript == *msg.RealtimeTranscript {
+		if old.Content == msg.Content && reflect.DeepEqual(old.RealtimeTranscript, msg.RealtimeTranscript) {
 			return nil
 		}
 		entry.Timestamp = old.Timestamp
@@ -104,10 +114,27 @@ func (rt *RealtimeThinker) trackTranscript(role string, event RealtimeEvent) {
 	if turn.message.RealtimeTranscript.Status == "provider_final" || turn.message.RealtimeTranscript.Status == "blocked" {
 		return
 	}
+	// A previous checkpoint can still be owned by telemetry/history readers.
+	// Do not revise its timeline in place while building the next checkpoint.
+	snapshot := *turn.message.RealtimeTranscript
+	turn.message.RealtimeTranscript = &snapshot
 	if event.TranscriptDelta && !event.Final {
 		turn.message.Content += event.Transcript
 	} else {
 		turn.message.Content = event.Transcript
+	}
+	if event.TranscriptGrouped {
+		meta := *turn.message.RealtimeTranscript
+		// Checkpoints already sent to persistence/telemetry must remain immutable.
+		fragments := meta.Fragments
+		if !event.TranscriptDelta {
+			fragments = nil
+		}
+		meta.Fragments = append(append([]RealtimeTranscriptFragment(nil), fragments...), RealtimeTranscriptFragment{
+			Text: event.Transcript, StartMS: event.TranscriptStartMS, EndMS: event.TranscriptEndMS,
+		})
+		meta.StartMS = min(meta.StartMS, event.TranscriptStartMS)
+		turn.message.RealtimeTranscript = &meta
 	}
 	turn.message.RealtimeTranscript.EndMS = max(turn.message.RealtimeTranscript.EndMS, event.TranscriptEndMS)
 	if event.TranscriptGrouped {

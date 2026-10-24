@@ -13,7 +13,7 @@ type realtimeRecovery struct {
 	want                          bool
 	continueTurn                  bool
 	input                         []Event
-	audio                         []byte
+	started                       time.Time
 	deadline                      time.Time
 	retryAt                       time.Time
 	retry                         realtimeRecoveryRetry
@@ -54,16 +54,23 @@ func (rt *RealtimeThinker) needsSession() bool {
 	rt.lifecycleMu.Unlock()
 	rt.recovery.Lock()
 	defer rt.recovery.Unlock()
-	return bridge || planned || rt.recovery.want || len(rt.recovery.input) > 0 || len(rt.recovery.audio) > 0
+	return bridge || planned || rt.recovery.want || len(rt.recovery.input) > 0 || rt.input.pending()
 }
 
 func (rt *RealtimeThinker) playbackSettled() bool {
+	pending, awaiting, _ := rt.delivery.snapshot()
+	if rt.capabilities.ContinuousConversation {
+		pending, awaiting = rt.delivery.pendingSpeechPlayback()
+	}
+	if pending > 0 || awaiting > 0 {
+		return false
+	}
 	rt.outputMu.Lock()
 	defer rt.outputMu.Unlock()
 	return !rt.playbackTracked || rt.playedMS >= rt.outputBytes*1000/realtimePCMBytesPerSecond
 }
 
-func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned bool, reason string) {
+func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned bool, reason string, cause ...error) {
 	if session == nil || session != rt.currentSession() {
 		return
 	}
@@ -84,6 +91,9 @@ func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned boo
 	now := time.Now()
 	rt.recovery.Lock()
 	r := &rt.recovery
+	if r.started.IsZero() {
+		r.started = now
+	}
 	r.resume = nil
 	if !busy && !tools {
 		r.resume = session
@@ -100,7 +110,7 @@ func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned boo
 	for _, name := range pendingNames {
 		r.blockedTools[name] = true
 	}
-	if !planned && (r.want || len(r.input) > 0 || len(r.audio) > 0) {
+	if !planned && (r.want || len(r.input) > 0 || rt.input.pending()) {
 		if r.hadInput && now.Sub(r.opened) >= 2*time.Minute {
 			r.retry.failures = 0
 		}
@@ -116,6 +126,11 @@ func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned boo
 	data := map[string]any{"reason": reason, "planned": planned, "generation": generation,
 		"session_age_ms": now.Sub(r.opened).Milliseconds(), "bridge_connected": bridge,
 		"input_audio_bytes": r.inputBytes, "output_audio_bytes": r.outputBytes, "recovery_failures": r.retry.failures}
+	if len(cause) > 0 && cause[0] != nil {
+		data["error"] = cause[0].Error()
+		data["error_class"] = realtimeErrorClass(cause[0])
+	}
+	data["input_queue_ms"] = rt.input.backlog().Milliseconds()
 	if !r.lastInput.IsZero() {
 		data["since_input_ms"] = now.Sub(r.lastInput).Milliseconds()
 	}
@@ -126,6 +141,7 @@ func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned boo
 	rt.currentTiming().finish("", "", "session_closed")
 	rt.recordSessionClosure(reason, planned, data)
 	rt.replaceSession(nil)
+	rt.providerState("recovering", nil)
 }
 
 func (rt *RealtimeThinker) recordRealtimeInput(audioBytes int) {
@@ -144,38 +160,19 @@ func (rt *RealtimeThinker) newRealtimeCallerTurn() {
 }
 
 func (rt *RealtimeThinker) queueRecoveryAudio(audio []byte) {
-	// Bound buffered audio to five seconds. Preserve the beginning of the
-	// utterance and report overflow instead of silently growing memory forever.
-	const limit = 5 * realtimePCMBytesPerSecond
-	rt.recovery.Lock()
-	keep := min(len(audio), limit-len(rt.recovery.audio))
-	rt.recovery.audio = append(rt.recovery.audio, audio[:keep]...)
-	rt.recovery.want = true
-	rt.recovery.Unlock()
-	if keep < len(audio) {
-		rt.emit("realtime.audio_drop", map[string]any{"direction": "input", "reason": "recovery_buffer_full", "bytes": len(audio) - keep})
-	}
+	rt.input.push(audio, time.Now())
+	rt.wakeRecovery()
 }
 
 func (rt *RealtimeThinker) flushRecoveryInput() {
 	rt.recovery.Lock()
-	input, audio := rt.recovery.input, rt.recovery.audio
-	rt.recovery.input, rt.recovery.audio = nil, nil
+	input := rt.recovery.input
+	rt.recovery.input = nil
 	rt.recovery.Unlock()
 	for _, event := range input {
 		rt.handleBusEvent(event)
 	}
-	if len(audio) > 0 {
-		session := rt.currentSession()
-		if session == nil {
-			rt.queueRecoveryAudio(audio)
-			return
-		}
-		if err := session.SendAudio(audio); err != nil {
-			rt.queueRecoveryAudio(audio)
-			rt.closeForRecovery(session, false, "audio_delivery_failed")
-		} else {
-			rt.recordRealtimeInput(len(audio))
-		}
+	if session := rt.currentSession(); session != nil {
+		rt.drainRealtimeInput(session)
 	}
 }
