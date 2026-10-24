@@ -36,16 +36,18 @@ func realtimeErrorClass(err error) RealtimeErrorClass {
 }
 
 // RealtimeInputPolicy is optional adapter policy, shared by all wire protocols.
-// Pace limits catch-up to the recorded sample rate for continuous models.
+// Pace sends one frame per deadline. CatchUpRate bounds recovery of captured
+// backlog; 1 enforces strict real-time pacing, zero selects the default.
 // PressureTimeout bounds retry-safe local saturation before session recovery.
 type RealtimeInputPolicy struct {
 	MaxBuffered, MaxAge, FrameDuration, PressureTimeout time.Duration
 	Pace                                                bool
+	CatchUpRate                                         float64
 }
 type RealtimeInputPolicyProvider interface{ RealtimeInputPolicy() RealtimeInputPolicy }
 
 func defaultRealtimeInputPolicy(continuous bool) RealtimeInputPolicy {
-	return RealtimeInputPolicy{MaxBuffered: 5 * time.Second, MaxAge: 5 * time.Second, FrameDuration: 20 * time.Millisecond, PressureTimeout: time.Second, Pace: continuous}
+	return RealtimeInputPolicy{MaxBuffered: 5 * time.Second, MaxAge: 5 * time.Second, FrameDuration: 20 * time.Millisecond, PressureTimeout: time.Second, Pace: continuous, CatchUpRate: 1.25}
 }
 
 // Complete releases the shared Core reservation only after transport write or

@@ -3496,7 +3496,9 @@ func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider 
 		return ChatResponse{}, fmt.Errorf("no provider configured")
 	}
 
+	workStream := t.newThreadWorkStream(messages)
 	onChunk := func(chunk string) {
+		workStream.append(chunk)
 		request.output("text", chunk != "")
 		t.bus.Publish(Event{Type: EventChunk, From: t.threadID, Text: chunk, Iteration: t.iteration})
 		if t.telemetry != nil && chunk != "" {

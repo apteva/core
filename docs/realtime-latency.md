@@ -265,3 +265,47 @@ a local send failure and a slow reconnect, while both provider sessions and the
 French audio/transcription use the real API. It checks continued external intake
 and a meaningful spoken reply after recovery; it does not establish the cause
 of an earlier production send failure.
+
+## Local validation — 24 October 2026
+
+Build: `2026-10-24-realtime-latency-123813Z`.
+
+- Full Core short suite: passed (120.3 s); realtime/managed-work race suite:
+  passed (13.1 s).
+- Real `gpt-6.1-sol` verified-result streaming: first eligible sentence reached
+  the voice context adapter 489 ms before backend completion. This measures
+  context delivery, not the caller hearing that sentence.
+- Real `gpt-live-1` / Brise interruption and slow-reconnect tests: passed,
+  including recognition of the French caller and a meaningful reply.
+- Matched two-turn deterministic replay: 14 turns across direct PCM, Twilio
+  inbound/outbound, PCMA inbound/outbound and G.722 inbound/outbound. All passed.
+  A 400 ms sender stall recovered in 2.015–2.297 s through the real local
+  Core/Server/Telephony paths. Queue age settled near 40 ms; PCM ordering is
+  separately asserted byte-for-byte in the deterministic Core tests.
+- Matched two-turn real voice replay: eight turns across direct PCM, Twilio
+  inbound/outbound and PCM round-tripped through the phone codec. All passed.
+  Expected-answer transcript onset was 909–1346 ms after caller speech ended;
+  first post-question audible output was 1048–1554 ms. Backchannels and earlier
+  output are reported separately. These replay questions ask the model to name
+  the day heard in the identical French recording; backend streaming is tested
+  separately with verified pricing evidence.
+
+The original injected-stall characterization asserted a 150 ms *peak* ceiling
+and still failed, as expected, during its deliberate 400 ms stall. The reusable
+Core replay helper preserves that peak in the report and additionally checks
+that the final two flow windows recovered below 150 ms. Healthy runs retain
+the original peak ceiling. This distinguishes recovery from the unavoidable
+peak without deleting the recorded evidence.
+
+Logs/replay artifacts for this local run:
+
+- `/tmp/core-latency-release-suite.log`
+- `/tmp/core-latency-release-race.log`
+- `/tmp/core-latency-release-real.log`
+- `/tmp/core-latency-release-transport-stall/`
+- `/tmp/core-latency-release-transport-live/`
+
+These small local samples do not establish production latency percentiles or
+real carrier/handset playback. Model-generated silent PCM remains untouched.
+Incremental results intentionally wait for final delivery when they do not meet
+the conservative complete-sentence/evidence gate.

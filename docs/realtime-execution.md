@@ -157,3 +157,72 @@ Core supplies this functionality; server and UI changes are separate:
 References: [Live delegation](https://developers.openai.com/api/docs/guides/live-delegation),
 [migration](https://developers.openai.com/api/docs/guides/live-migration), and
 [session lifecycle](https://developers.openai.com/api/docs/guides/live-conversations).
+
+## Caller evidence and incremental results
+
+Delegation offsets do not imply that a transcript must cover intervening
+silence. Stable caller evidence can start execution once partial captions have
+settled for 250 ms; provider-final captions are immediately eligible. New
+speech without captions and entirely missing caller evidence retain a bounded
+10-second failure path. Late captions still advance the assignment revision
+and invalidate stale tool decisions. An incomplete or ambiguous request must
+be clarified before an action. These admission rules do not infer semantic
+completeness from punctuation.
+
+Thread execution may now publish `ThreadWork.kind=result_chunk` through the
+ordinary durable parent inbox. Runtime metadata carries request ID, revision,
+delegation ID and a deterministic content hash. Only **complete public answer
+sentences matching successful, unshortened tool evidence verbatim** are eligible.
+JSON string values in results are supported. This conservative lexical check
+is not semantic verification: paraphrases, unsupported conclusions, large
+sentences and incomplete text wait for the ordinary final result. It does not
+stream reasoning or partial tool arguments, or infer success from a pending
+operation. No additional model call is used to approve chunks.
+
+The collector is bounded to 16 KiB per response and sentences to 480 bytes.
+An eligible sentence is emitted once its following whitespace arrives, before
+worker completion. Failed tool results and preview-only archives cannot justify
+an early sentence. Revisions are checked before publishing and consuming.
+Provider-managed delegation retains its existing provider delivery path.
+
+Delivered sentences are recorded with their work metadata. Duplicate chunks,
+replayed inbox entries and chunks arriving after the final result are ignored.
+The final result removes only complete previously delivered sentences; it
+preserves changed wording and corrections. Speech interruption keeps backend
+work running. While new caller speech awaits captions, chunks supply quiet
+context instead of requesting speech; they remain eligible for the later final
+spoken result. Context admission is not proof of model speech or playback.
+
+`realtime.execution_chunk` records correlation and explicitly reports
+`speech_confirmed=false`. Use output transcript, audio and playback timing for
+meaningful answer onset, separately from acknowledgements and backchannels.
+
+## Latency regression commands
+
+```sh
+GOWORK=off go test -race -short -run 'TestRealtime|TestManagedAssignment|TestQueuedToolRejects|TestLive' .
+RUN_REALTIME_LATENCY_LIVE=1 GOWORK=off go test -race -run '^TestRealtimeVerifiedStreamSolLive$' -v .
+```
+
+`realtime_latency_test.go` covers repeated 400 ms stalls, continuous ordered PCM,
+jitter, concurrent session isolation, strict-pacing controls, silence, late
+captions, revisions, duplicates, unsafe output, interruption and inbox replay.
+The paid Sol test measures arrival of the first eligible result at the voice
+context adapter before backend completion; it does not measure spoken onset.
+
+For matched multi-turn tests using an existing compatible Telephony checkout:
+
+```sh
+python3 scripts/realtime_transport_replay.py \
+  --telephony /path/to/apps/mcp/telephony --server /path/to/server \
+  --output /tmp/new-replay-results --pause-ms 400
+```
+
+Add `--live` with `OPENAI_API_KEY` in the environment for GPT Live. The helper
+uses Go overlays, leaving Telephony and Server sources untouched. It exercises
+direct PCM and actual loopback carrier handlers through the Server/Core audio
+connection. It retains peak delay but separately checks post-stall recovery.
+Two turns share a session by default. The existing live 2-second acceptance
+threshold remains visible; provider latency can fail it. It does not place
+PSTN calls, run a browser, measure handset acoustics, or strip model-generated
+silent PCM.

@@ -33,7 +33,7 @@ admission error confirms local admission, not provider receipt or processing.
 Pressure/closed errors guarantee no admission. Other send failures may be
 ambiguous and must not be blindly replayed. Adapter Close settles outstanding
 reservations exactly once. Transport deadlines also respect the remaining age
-budget. Continuous providers retain sample-rate catch-up pacing.
+budget. Continuous providers use bounded frame pacing as described below.
 
 Connection/restoration/Close work remains asynchronous, cancellable and guarded
 by session generation. `session.state` distinguishes provider recovering, ready
@@ -113,3 +113,26 @@ credits and partial receipts. Existing recovery, completion, guard, backend and
 interruption tests also run under the race detector. Opt-in paid acceptance tests
 are `TestOpenAILivePacedInterruptionPlaybackLive` and
 `TestOpenAILiveRecoveryWithContinuousIntakeLive`.
+
+## Recovering temporary input stalls
+
+Paced input normally follows the recorded sample rate. Captured frames older
+than three frame intervals (60 ms by default) can drain at **at most 1.25×**
+until the queue catches up. Each send enforces a bounded next deadline while preserving normal cadence; there is no
+accumulated burst credit, PCM alteration, silence deletion or recovery-only
+speech drop. The existing shared duration/age budget still applies. Adapters
+can set `RealtimeInputPolicy.CatchUpRate = 1` for strict pacing, or a lower
+catch-up ceiling. A slower transport can still require explicit recovery.
+
+The 1.25× cap is a Core policy validated with local tests and GPT Live, not a
+published OpenAI quota or a guarantee for every provider. OpenAI's
+[WebSocket guidance](https://developers.openai.com/api/docs/guides/voice-websockets?api=live)
+requires a paced continuous microphone stream rather than an immediate file
+upload. Core only accelerates an already captured backlog in bounded frames.
+
+`realtime.input_flow` additionally records `oldest_input_age_ms`,
+`catch_up_rate_limit`, `recovery_active`, `last_recovery_ms`,
+`recovery_peak_age_ms`, and `recoveries`. Recovery episodes start above 100 ms
+of residence and finish at 60 ms or below. `last_recovery_ms` measures the
+successful draining phase, not connection setup or the unavoidable sender
+stall. Assess the age series and recovery duration separately from peak wait.

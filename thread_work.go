@@ -11,12 +11,15 @@ import (
 // ThreadWork correlates an assignment and its revisions independently of a
 // provider connection. IDs and statuses are runtime metadata, never model-authored.
 type ThreadWork struct {
-	ID       string `json:"id"`
-	Revision uint64 `json:"revision"`
-	Origin   string `json:"origin"`
-	Worker   string `json:"worker,omitempty"`
-	Kind     string `json:"kind"` // request, progress, result
-	Status   string `json:"status,omitempty"`
+	DelegationID  string `json:"delegation_id,omitempty"`
+	StreamResults bool   `json:"stream_results,omitempty"`
+	ChunkID       string `json:"chunk_id,omitempty"`
+	ID            string `json:"id"`
+	Revision      uint64 `json:"revision"`
+	Origin        string `json:"origin"`
+	Worker        string `json:"worker,omitempty"`
+	Kind          string `json:"kind"` // request, progress, result_chunk, result
+	Status        string `json:"status,omitempty"`
 }
 
 func cloneThreadWork(w *ThreadWork) *ThreadWork {
@@ -72,7 +75,13 @@ func (s *threadWorkState) current(w ThreadWork) bool {
 	return w.ID != "" && w.ID == s.latest.ID && w.Revision == s.latest.Revision
 }
 
-func workEventID(w ThreadWork) string { return fmt.Sprintf("work/%s/%d/%s", w.ID, w.Revision, w.Kind) }
+func workEventID(w ThreadWork) string {
+	key := fmt.Sprintf("work/%s/%d/%s", w.ID, w.Revision, w.Kind)
+	if w.Kind == "result_chunk" {
+		key += "/" + w.ChunkID
+	}
+	return key
+}
 func newThreadWorkEvent(w ThreadWork, text string, parts []ContentPart) PersistentThreadEvent {
 	payload, _ := json.Marshal(struct {
 		Text  string

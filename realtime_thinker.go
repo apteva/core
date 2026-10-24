@@ -48,22 +48,23 @@ type RealtimeThinker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	sessionMu          sync.RWMutex
-	rtSession          RealtimeSession
-	recovery           realtimeRecovery
-	input              realtimeInputQueue
-	audioLane          realtimeAudioLane
-	outputPending      []RealtimeAudioFrame
-	outputPendingBytes int
-	inputPaused        atomic.Bool
-	outputPaused       atomic.Bool
-	rendererScoped     atomic.Bool
-	opening            *realtimeOpenAttempt
-	openResults        chan realtimeOpenResult
-	sessionCancel      context.CancelFunc
-	providerStateMu    sync.Mutex
-	providerStatus     string
-	providerStateWake  chan struct{}
+	sessionMu           sync.RWMutex
+	rtSession           RealtimeSession
+	recovery            realtimeRecovery
+	input               realtimeInputQueue
+	audioLane           realtimeAudioLane
+	outputPending       []RealtimeAudioFrame
+	outputPendingBytes  int
+	inputPaused         atomic.Bool
+	callerSpeechPending atomic.Bool
+	outputPaused        atomic.Bool
+	rendererScoped      atomic.Bool
+	opening             *realtimeOpenAttempt
+	openResults         chan realtimeOpenResult
+	sessionCancel       context.CancelFunc
+	providerStateMu     sync.Mutex
+	providerStatus      string
+	providerStateWake   chan struct{}
 
 	audioIn      <-chan []byte
 	audioOut     chan RealtimeAudioFrame
@@ -1324,6 +1325,7 @@ func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, canc
 }
 
 func (rt *RealtimeThinker) rendererSpeechStarted() {
+	rt.callerSpeechPending.Store(true)
 	rt.clearCallerInterruptedPlayback("renderer_speech_started", !rt.capabilities.ProviderInterruption, true)
 	rt.setConversationState("listening", RealtimeEvent{})
 }
@@ -1611,6 +1613,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		}
 
 	case RealtimeEventSpeechStarted:
+		rt.backend.speechPending = true
 		if event.ResponseID != "" || event.ItemID != "" {
 			rt.currentTiming().finish(event.ResponseID, event.ItemID, "interrupted")
 		}

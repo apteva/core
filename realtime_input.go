@@ -12,18 +12,21 @@ type realtimeInputFrame struct {
 	received time.Time
 }
 type realtimeInputQueue struct {
-	mu                      sync.Mutex
-	sendMu                  sync.Mutex
-	inflight                int
-	flow                    realtimeFlowMetrics
-	lastFlowReport          time.Time
-	frames                  []realtimeInputFrame
-	bytes                   int
-	bytesPerSecond          int
-	sampleBytes             int
-	policy                  RealtimeInputPolicy
-	drops                   map[string]int
-	nextSend, pressureSince time.Time // sendMu
+	recoveryStarted            time.Time     // mu
+	recoveryLast, recoveryPeak time.Duration // mu
+	recoveryCount              int           // mu
+	mu                         sync.Mutex
+	sendMu                     sync.Mutex
+	inflight                   int
+	flow                       realtimeFlowMetrics
+	lastFlowReport             time.Time
+	frames                     []realtimeInputFrame
+	bytes                      int
+	bytesPerSecond             int
+	sampleBytes                int
+	policy                     RealtimeInputPolicy
+	drops                      map[string]int
+	nextSend, pressureSince    time.Time // sendMu
 }
 
 func (q *realtimeInputQueue) duration(n int) time.Duration {
@@ -100,6 +103,12 @@ func (rt *RealtimeThinker) configureInputQueue() {
 			p.PressureTimeout = v.PressureTimeout
 		}
 		p.Pace = p.Pace || v.Pace
+		if v.CatchUpRate > 0 {
+			p.CatchUpRate = min(1.25, v.CatchUpRate)
+			if p.CatchUpRate < 1 {
+				p.CatchUpRate = 1
+			}
+		}
 	}
 	rt.input.mu.Lock()
 	rt.input.policy = p
@@ -139,7 +148,11 @@ func (rt *RealtimeThinker) reportInputDrops() {
 		m := q.flow
 		q.flow = realtimeFlowMetrics{}
 		q.lastFlowReport = time.Now()
-		flow = map[string]any{"frames": m.frames, "input_wait_mean_ms": float64(m.inputWait) / float64(time.Millisecond) / float64(m.frames), "input_wait_max_ms": float64(m.inputMax) / float64(time.Millisecond), "adapter_wait_mean_ms": float64(m.adapterWait) / float64(time.Millisecond) / float64(m.frames), "adapter_wait_max_ms": float64(m.adapterMax) / float64(time.Millisecond), "transport_write_mean_ms": float64(m.write) / float64(time.Millisecond) / float64(m.frames), "transport_write_max_ms": float64(m.writeMax) / float64(time.Millisecond), "queued_audio_ms": q.duration(q.bytes + q.inflight).Milliseconds(), "budget_ms": q.policy.MaxBuffered.Milliseconds(), "remote_delivery_confirmed": false}
+		oldestAge := time.Duration(0)
+		if len(q.frames) > 0 {
+			oldestAge = time.Since(q.frames[0].received)
+		}
+		flow = map[string]any{"frames": m.frames, "oldest_input_age_ms": oldestAge.Milliseconds(), "catch_up_rate_limit": q.policy.CatchUpRate, "recovery_active": !q.recoveryStarted.IsZero(), "last_recovery_ms": q.recoveryLast.Milliseconds(), "recovery_peak_age_ms": q.recoveryPeak.Milliseconds(), "recoveries": q.recoveryCount, "input_wait_mean_ms": float64(m.inputWait) / float64(time.Millisecond) / float64(m.frames), "input_wait_max_ms": float64(m.inputMax) / float64(time.Millisecond), "adapter_wait_mean_ms": float64(m.adapterWait) / float64(time.Millisecond) / float64(m.frames), "adapter_wait_max_ms": float64(m.adapterMax) / float64(time.Millisecond), "transport_write_mean_ms": float64(m.write) / float64(time.Millisecond) / float64(m.frames), "transport_write_max_ms": float64(m.writeMax) / float64(time.Millisecond), "queued_audio_ms": q.duration(q.bytes + q.inflight).Milliseconds(), "budget_ms": q.policy.MaxBuffered.Milliseconds(), "remote_delivery_confirmed": false}
 	}
 	q.mu.Unlock()
 	if flow != nil {
@@ -159,6 +172,9 @@ func (q *realtimeInputQueue) resetSender() {
 	q.sendMu.Unlock()
 }
 func (rt *RealtimeThinker) drainRealtimeInput(session RealtimeSession) {
+	rt.drainRealtimeInputAt(session, time.Time{})
+}
+func (rt *RealtimeThinker) drainRealtimeInputAt(session RealtimeSession, now time.Time) {
 	rt.input.sendMu.Lock()
 	defer rt.input.sendMu.Unlock()
 	if rt.inputPaused.Load() || !rt.audioLane.active.Load() && rt.paused {
@@ -166,8 +182,11 @@ func (rt *RealtimeThinker) drainRealtimeInput(session RealtimeSession) {
 		return
 	}
 	q := &rt.input
+	realtimeClock := now.IsZero()
 	for batch := 0; batch < 8; batch++ {
-		now := time.Now()
+		if realtimeClock {
+			now = time.Now()
+		}
 		if now.Before(q.nextSend) {
 			return
 		}
@@ -241,12 +260,11 @@ func (rt *RealtimeThinker) drainRealtimeInput(session RealtimeSession) {
 		}
 		q.pressureSince = time.Time{}
 		if q.policy.Pace {
-			duration := q.duration(len(frame.audio))
-			base := q.nextSend
-			if base.IsZero() || now.Sub(base) > duration {
-				base = now
+			sentAt := now
+			if realtimeClock {
+				sentAt = time.Now()
 			}
-			q.nextSend = base.Add(duration)
+			q.nextSend = q.sendDeadline(sentAt, frame)
 			return
 		}
 	}
@@ -280,4 +298,45 @@ func (rt *RealtimeThinker) admitRealtimeAudio(audio []byte, at time.Time) {
 	rt.recordRealtimeInput(len(audio))
 	rt.input.push(audio, at)
 	rt.wakeRecovery()
+}
+
+// Never borrow future microphone audio or release an unbounded burst. A modest
+// recovery rate applies only to old captured frames. Each send establishes a
+// bounded deadline, so scheduler stalls cannot accumulate burst credit.
+func (q *realtimeInputQueue) sendDeadline(now time.Time, frame realtimeInputFrame) time.Time {
+	interval := q.duration(len(frame.audio))
+	age := now.Sub(frame.received)
+	q.mu.Lock()
+	if age > 100*time.Millisecond && q.recoveryStarted.IsZero() {
+		q.recoveryStarted = now
+		q.recoveryPeak = age
+	}
+	if !q.recoveryStarted.IsZero() {
+		if age > q.recoveryPeak {
+			q.recoveryPeak = age
+		}
+		if age <= 3*q.policy.FrameDuration {
+			q.recoveryLast = now.Sub(q.recoveryStarted)
+			q.recoveryStarted = time.Time{}
+			q.recoveryCount++
+		}
+	}
+	q.mu.Unlock()
+	minimumInterval := interval
+	if q.policy.CatchUpRate > 1 {
+		minimumInterval = time.Duration(float64(interval) / min(q.policy.CatchUpRate, 1.25))
+		if age > 3*q.policy.FrameDuration {
+			interval = minimumInterval
+		}
+	}
+	deadline := q.nextSend.Add(interval)
+	if q.nextSend.IsZero() {
+		return now.Add(interval)
+	}
+	// Retain cadence across ordinary scheduler jitter, but never spend old
+	// deadline debt as a burst after a stall.
+	if earliest := now.Add(minimumInterval); deadline.Before(earliest) {
+		deadline = earliest
+	}
+	return deadline
 }
