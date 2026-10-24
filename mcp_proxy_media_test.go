@@ -176,9 +176,11 @@ func dispatchMediaFixtureTool(t *testing.T, th *Thinker, call NativeToolCall) Ev
 func mediaEventMessages(event Event) []Message {
 	messages := []Message{{Role: "user", ToolResults: []ToolResult{*event.ToolResult}}}
 	// Core's inbox keeps native images in the paired ToolResult, and other
-	// content parts in the following multimodal user message.
+	// content parts in the following multimodal user message. With no separate
+	// text event, the inbox currently prepends an empty text part.
 	if len(event.Parts) > 0 {
-		messages = append(messages, Message{Role: "user", Parts: event.Parts})
+		parts := append([]ContentPart{{Type: "text", Text: ""}}, event.Parts...)
+		messages = append(messages, Message{Role: "user", Parts: parts})
 	}
 	return messages
 }
@@ -197,6 +199,7 @@ func TestMCPNativeMediaSurvivesDispatchAndProviderProjection(t *testing.T) {
 	messages := append([]Message{{Role: "assistant", ToolCalls: []NativeToolCall{call}}}, mediaEventMessages(event)...)
 	// Both the Responses/Codex and Chat Completions projections must carry
 	// each original image exactly once, including the additional JPEG part.
+	assertResponsesTextBlocksPresent(t, (&OpenAINativeProvider{}).buildInput(messages))
 	for name, request := range map[string]any{"responses": (&OpenAINativeProvider{}).buildInput(messages), "chat_completions": toOpenAIMessages(messages)} {
 		raw, _ := json.Marshal(request)
 		for _, data := range [][]byte{png, jpeg} {

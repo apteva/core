@@ -748,13 +748,15 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			for _, tr := range m.ToolResults {
 				if tr.Image != nil {
 					imageURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tr.Image)
+					var blocks []oaiContentBlock
+					if tr.Content != "" {
+						blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: tr.Content})
+					}
+					blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: imageURL, Detail: "high"})
 					items = append(items, oaiInputItem{
 						Type:   "function_call_output",
 						CallID: tr.CallID,
-						Output: []oaiContentBlock{
-							{Type: "input_text", Text: tr.Content},
-							{Type: "input_image", ImageURL: imageURL, Detail: "high"},
-						},
+						Output: blocks,
 					})
 				} else {
 					// Function call output
@@ -807,7 +809,11 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 				logMsg("OPENAI-NATIVE", fmt.Sprintf("  part type=%s", part.Type))
 				switch part.Type {
 				case "text":
-					blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: part.Text})
+					// Empty text uses omitempty on the wire, leaving an invalid
+					// input_text block without its required text property.
+					if part.Text != "" {
+						blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: part.Text})
+					}
 				case "image_url":
 					if part.ImageURL != nil {
 						blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: part.ImageURL.URL, Detail: "high"})
@@ -816,7 +822,9 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 					// OpenAI Responses API does not support audio input — skip silently
 				}
 			}
-			items = append(items, oaiInputItem{Type: "message", Role: role, Content: blocks})
+			if len(blocks) > 0 {
+				items = append(items, oaiInputItem{Type: "message", Role: role, Content: blocks})
+			}
 		} else if m.Content != "" {
 			items = append(items, oaiInputItem{Type: "message", Role: role, Content: m.Content})
 		}

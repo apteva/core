@@ -42,14 +42,23 @@ func TestIntegration_CodexGPT61SolMCPNativeVision(t *testing.T) {
 	for _, tc := range []struct {
 		name, mime string
 		data       []byte
-	}{{"png_tool_image", "image/png", pngData}, {"jpeg_content_part", "image/jpeg", jpegData.Bytes()}} {
+		imageOnly  bool
+	}{{"png_tool_image", "image/png", pngData, false}, {"jpeg_content_part", "image/jpeg", jpegData.Bytes(), false}, {"png_image_only", "image/png", pngData, true}, {"jpeg_image_only_empty_text_event", "image/jpeg", jpegData.Bytes(), true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			const appointment = "Tuesday at 10:00"
-			conn := mediaResultMCP(t, mediaResultPayload(map[string]any{"type": "text", "text": "Content retrieved successfully."}, mediaImageBlock(tc.mime, tc.data), map[string]any{"type": "resource", "resource": map[string]any{"uri": "document:appointment", "mimeType": "text/plain", "text": "The agreed appointment is " + appointment + "."}}))
+			payload := mediaResultPayload(map[string]any{"type": "text", "text": "Content retrieved successfully."}, mediaImageBlock(tc.mime, tc.data), map[string]any{"type": "resource", "resource": map[string]any{"uri": "document:appointment", "mimeType": "text/plain", "text": "The agreed appointment is " + appointment + "."}})
+			if tc.imageOnly {
+				payload = mediaResultPayload(mediaImageBlock(tc.mime, tc.data))
+			}
+			conn := mediaResultMCP(t, payload)
 			th := newTestThinker()
 			defer th.Stop()
 			def := registerMediaFixtureTool(th, conn)
 			messages := []Message{{Role: "system", Content: "Call media_read exactly once to retrieve the source image and document. Inspect the returned pixels; never guess if content is absent. Then reply only with a JSON object containing top_left, top_right, bottom_left, bottom_right as lowercase basic color names, and appointment as the agreed day/time exactly as stated in the document. Do not use markdown."}, {Role: "user", Content: "Read the image's four quadrants and the appointment in its accompanying document."}}
+			if tc.imageOnly {
+				messages[0].Content = "Call media_read exactly once to retrieve the source image. Inspect the returned pixels; never guess if content is absent. Then reply only with a JSON object containing top_left, top_right, bottom_left, bottom_right as lowercase basic color names. Do not use markdown."
+				messages[1].Content = "Read the four quadrants of the supplied image."
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 			first, err := p.Chat(ctx, messages, toolReasonLiveModel, []NativeTool{def.native}, nil, nil, nil)
@@ -70,12 +79,16 @@ func TestIntegration_CodexGPT61SolMCPNativeVision(t *testing.T) {
 			if err := json.Unmarshal([]byte(strings.TrimSpace(result.Text)), &report); err != nil {
 				t.Fatalf("invalid visual report: %v; text=%q", err, result.Text)
 			}
-			for key, want := range map[string]string{"top_left": "red", "top_right": "green", "bottom_left": "blue", "bottom_right": "yellow", "appointment": appointment} {
+			expected := map[string]string{"top_left": "red", "top_right": "green", "bottom_left": "blue", "bottom_right": "yellow"}
+			if !tc.imageOnly {
+				expected["appointment"] = appointment
+			}
+			for key, want := range expected {
 				if report[key] != want {
 					t.Fatalf("%s=%q want %q; report=%q", key, report[key], want, result.Text)
 				}
 			}
-			t.Logf("model=%s source=%s verified real tool call, four image quadrants and accompanying document; image_bytes=%d parts=%d", toolReasonLiveModel, tc.mime, len(event.ToolResult.Image), len(event.Parts))
+			t.Logf("model=%s source=%s verified real tool call, four image quadrants; image_only=%v image_bytes=%d parts=%d", toolReasonLiveModel, tc.mime, tc.imageOnly, len(event.ToolResult.Image), len(event.Parts))
 		})
 	}
 }

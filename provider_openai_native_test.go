@@ -682,3 +682,84 @@ func TestOpenAINativeStreamResponseReturnsScannerError(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestOpenAINativeBuildInputSkipsEmptyMultimodalText(t *testing.T) {
+	imageA := ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: "data:image/png;base64,AQID"}}
+	imageB := ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: "data:image/jpeg;base64,BAUG"}}
+	first := oaiContentBlock{Type: "input_image", ImageURL: imageA.ImageURL.URL, Detail: "high"}
+	second := oaiContentBlock{Type: "input_image", ImageURL: imageB.ImageURL.URL, Detail: "high"}
+	for _, tc := range []struct {
+		name    string
+		message Message
+		want    []oaiContentBlock
+	}{
+		{"storage_image_without_text_event", Message{Role: "user", Parts: []ContentPart{{Type: "text", Text: ""}, imageA}}, []oaiContentBlock{first}},
+		{"empty_text_between_images", Message{Role: "user", Parts: []ContentPart{imageA, {Type: "text"}, imageB}}, []oaiContentBlock{first, second}},
+		{"preserve_nonempty_text", Message{Role: "user", Content: "message text", Parts: []ContentPart{{Type: "text"}, imageA, {Type: "text", Text: "caption"}, {Type: "text"}, imageB}}, []oaiContentBlock{{Type: "input_text", Text: "message text"}, first, {Type: "input_text", Text: "caption"}, second}},
+		{"preserve_whitespace_text", Message{Role: "user", Parts: []ContentPart{{Type: "text", Text: " \n"}, imageA}}, []oaiContentBlock{{Type: "input_text", Text: " \n"}, first}},
+		{"empty_parts_only", Message{Role: "user", Parts: []ContentPart{{Type: "text"}}}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			items := (&OpenAINativeProvider{}).buildInput([]Message{tc.message})
+			if len(tc.want) == 0 {
+				if len(items) != 0 {
+					t.Fatalf("empty message retained: %+v", items)
+				}
+				return
+			}
+			if len(items) != 1 || !reflect.DeepEqual(items[0].Content, tc.want) {
+				t.Fatalf("content=%+v want %+v", items, tc.want)
+			}
+			assertResponsesTextBlocksPresent(t, items)
+		})
+	}
+}
+
+func TestOpenAINativeBuildInputSkipsEmptyImageToolOutputText(t *testing.T) {
+	for _, text := range []string{"", "caption", " \n"} {
+		t.Run(text, func(t *testing.T) {
+			messages := []Message{{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "image-only", Name: "read_image"}}}, {Role: "user", ToolResults: []ToolResult{{CallID: "image-only", Image: []byte{1, 2, 3}, Content: text}}}}
+			items := (&OpenAINativeProvider{}).buildInput(messages)
+			blocks := items[1].Output.([]oaiContentBlock)
+			want := []oaiContentBlock{}
+			if text != "" {
+				want = append(want, oaiContentBlock{Type: "input_text", Text: text})
+			}
+			want = append(want, oaiContentBlock{Type: "input_image", ImageURL: "data:image/png;base64,AQID", Detail: "high"})
+			if !reflect.DeepEqual(blocks, want) {
+				t.Fatalf("output=%+v want %+v", blocks, want)
+			}
+			assertResponsesTextBlocksPresent(t, items)
+		})
+	}
+}
+
+// Check the serialized request, where omitempty used to erase the required
+// text property even though an input_text block remained in the Go value.
+func assertResponsesTextBlocksPresent(t *testing.T, items []oaiInputItem) {
+	t.Helper()
+	raw, err := json.Marshal(oaiResponsesRequest{Model: "test", Input: items})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for i, item := range wire.Input {
+		for _, field := range []string{"content", "output"} {
+			blocks, _ := item[field].([]any)
+			for j, value := range blocks {
+				block := value.(map[string]any)
+				if block["type"] == "input_text" {
+					text, ok := block["text"].(string)
+					if !ok || text == "" {
+						t.Errorf("input[%d].%s[%d] missing required nonempty text: %s", i, field, j, raw)
+					}
+				}
+			}
+		}
+	}
+}
