@@ -67,7 +67,7 @@ func (rt *RealtimeThinker) playbackSettled() bool {
 	}
 	rt.outputMu.Lock()
 	defer rt.outputMu.Unlock()
-	return !rt.playbackTracked || rt.playedMS >= rt.outputBytes*1000/realtimePCMBytesPerSecond
+	return !rt.playbackTracked || rt.playedMS >= rt.outputBytes*1000/rt.outputRate()
 }
 
 func (rt *RealtimeThinker) closeForRecovery(session RealtimeSession, planned bool, reason string, cause ...error) {

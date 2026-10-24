@@ -224,7 +224,7 @@ func (rt *RealtimeThinker) forwardRealtimeAudio(event RealtimeEvent, generation 
 			rt.playedItemID, rt.playedMS = event.ItemID, 0
 			rt.playbackTracked = false
 		}
-		endMS := (rt.outputBytes + len(event.Audio)) * 1000 / realtimePCMBytesPerSecond
+		endMS := (rt.outputBytes + len(event.Audio)) * 1000 / rt.outputRate()
 		frame := RealtimeAudioFrame{timing: rt.currentTiming(), Audio: event.Audio, SessionGeneration: generation, queuedAt: time.Now(), ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS, Silent: event.AudioSilence}
 		itemKey := realtimeTimingKey(event.ResponseID, event.ItemID)
 		deliveryKey := fmt.Sprintf("%d/%s", generation, itemKey)
@@ -249,7 +249,7 @@ const realtimeOutputBufferDuration = 15 * time.Second
 // Includes the public channel and any frame currently being written by the bridge.
 func (rt *RealtimeThinker) queueRealtimeOutputLocked(frame RealtimeAudioFrame) bool {
 	pending, _, _ := rt.delivery.snapshot()
-	if pending > int(realtimeOutputBufferDuration/time.Second)*realtimePCMBytesPerSecond {
+	if pending > int(realtimeOutputBufferDuration/time.Second)*rt.outputRate() {
 		return false
 	}
 	if len(rt.outputPending) == 0 {

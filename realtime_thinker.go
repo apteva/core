@@ -75,6 +75,8 @@ type RealtimeThinker struct {
 	transcriptAnonymous    map[string]int
 	transcriptFinalOrder   []string
 	transcriptOrdinal      int
+	completionReview       realtimeCompletionReview
+	lastCallerVoice        atomic.Int64
 	completion             realtimeCompletion
 	delivery               realtimeDelivery
 	shutdownOnce           sync.Once
@@ -495,6 +497,7 @@ func (rt *RealtimeThinker) currentTiming() *realtimeTiming {
 func startRealtimeThinkerWithOutput(ctx context.Context, thinker *Thinker, provider RealtimeProvider, voice string, audioIn <-chan []byte, audioOut chan RealtimeAudioFrame, audioControl chan<- string, turn RealtimeTurnDetectionConfig, output RealtimeOutputConfig, initialMessage ...string) (*RealtimeThinker, error) {
 	rt := newRealtimeThinker(ctx, thinker, provider, voice, audioIn, audioOut, audioControl, turn)
 	rt.opts.OutputConfig = output
+	rt.configureMedia()
 	if len(initialMessage) > 0 {
 		rt.setInitialMessage(initialMessage[0])
 	}
@@ -506,12 +509,23 @@ func startRealtimeThinkerWithOutput(ctx context.Context, thinker *Thinker, provi
 }
 
 func (rt *RealtimeThinker) prepareSession(restore bool) (*realtimeOpenAttempt, error) {
+	if rt.opts.OutputConfig.Media != (RealtimeMediaConfig{}) {
+		provider, ok := rt.provider.(realtimeMediaProvider)
+		if !ok {
+			return nil, fmt.Errorf("provider does not support explicit realtime media selection")
+		}
+		if err := provider.ValidateRealtimeMedia(rt.opts.Model, rt.opts.OutputConfig.Media); err != nil {
+			return nil, err
+		}
+	}
+
 	connectedAt := time.Now()
 	rt.lifecycleMu.Lock()
 	nextGeneration := rt.sessionGeneration + 1
 	rt.lifecycleMu.Unlock()
 	timing := newRealtimeTiming(uint64(nextGeneration), rt.emit)
 	timing.connectedAt = connectedAt
+	timing.bytesPerSecond = rt.outputRate()
 	rt.refreshCurrentTimeContext()
 	instructions, tools := rt.configurationSnapshot()
 	rt.transcriptMu.Lock()
@@ -1156,7 +1170,7 @@ func (rt *RealtimeThinker) acknowledgePlayback(itemID string, audioEndMS int, ge
 		rt.outputMu.Unlock()
 		return
 	}
-	generatedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
+	generatedMS := rt.outputBytes * 1000 / rt.outputRate()
 	if audioEndMS > generatedMS {
 		audioEndMS = generatedMS
 	}
@@ -1229,7 +1243,7 @@ func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, canc
 	rt.outputMu.Lock()
 	itemID := rt.outputItemID
 	current := expectedItemID == "" || itemID == expectedItemID
-	generatedMS := rt.outputBytes * 1000 / realtimePCMBytesPerSecond
+	generatedMS := rt.outputBytes * 1000 / rt.outputRate()
 	playedMS := generatedMS
 	if !current {
 		var active bool
@@ -1339,6 +1353,11 @@ func (rt *RealtimeThinker) rendererPlaybackOverflow(itemID string) {
 // Run survives normal provider-enforced session endings. Only explicit thread
 // stop/cancellation ends the worker and invokes the normal cleanup path.
 func (rt *RealtimeThinker) Run() {
+	defer func() {
+		if rt.completionReview.cancel != nil {
+			rt.completionReview.cancel()
+		}
+	}()
 	rt.beginRuntime()
 	rt.configureInputQueue()
 	rt.inputPaused.Store(rt.paused)
@@ -1382,7 +1401,7 @@ func (rt *RealtimeThinker) Run() {
 	logMsg("REALTIME", fmt.Sprintf("[%s] session up, model=%s voice=%s", rt.threadID, rt.opts.Model, rt.voice))
 	rt.emit("realtime.session_started", map[string]any{
 		"model": rt.opts.Model, "voice": rt.voice, "provider": rt.provider.Name(),
-		"turn_detection": rt.opts.TurnDetection.telemetryData(),
+		"turn_detection": rt.effectiveTurnDetectionTelemetry(),
 	})
 	rt.setConversationState("listening", RealtimeEvent{})
 	catalogDirty := false
@@ -1402,6 +1421,7 @@ func (rt *RealtimeThinker) Run() {
 		rt.observeContinuousIdle()
 		rt.checkpointContinuousTranscripts()
 		rt.maybeStartExecution()
+		rt.pollCompletionReview(time.Now())
 		if rt.completionRequested() {
 			rt.cancelOpening()
 			rt.inputPaused.Store(true)
@@ -1646,6 +1666,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.rejectRealtimeOutput(event, "", event.OutputBlockReason, "")
 
 	case RealtimeEventTranscriptOutput:
+		rt.noteCompletionTranscript(event)
 		if strings.TrimSpace(event.Transcript) != "" {
 			rt.currentTiming().observed(event.ResponseID, event.ItemID)
 		}
@@ -1655,6 +1676,7 @@ func (rt *RealtimeThinker) handleSessionEvent(event RealtimeEvent) {
 		rt.trackTranscript("assistant", event)
 
 	case RealtimeEventTranscriptInput:
+		rt.noteCompletionTranscript(event)
 		rt.noteBackendInput(event)
 		if strings.TrimSpace(event.Transcript) != "" {
 			rt.recovery.Lock()

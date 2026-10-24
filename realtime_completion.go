@@ -33,6 +33,7 @@ type realtimeDeliveredItem struct {
 // bridge is still writing it. Written audio and renderer acknowledgements are
 // distinct evidence. No wall-clock estimate is substituted for playback.
 type realtimeDelivery struct {
+	bytesPerSecond                            int
 	mu                                        sync.Mutex
 	items                                     map[string]*realtimeDeliveredItem
 	evidence                                  string
@@ -111,7 +112,7 @@ func (d *realtimeDelivery) acknowledge(key string, endMS int) {
 	}
 	d.supportsPlayback = true
 	entry.waitPlayback = true
-	played := min(entry.queued, endMS*realtimePCMBytesPerSecond/1000)
+	played := min(entry.queued, endMS*defaultMediaRate(d.bytesPerSecond)/1000)
 	if played > entry.played {
 		d.played += played - entry.played
 		entry.played = played
@@ -151,15 +152,15 @@ func (d *realtimeDelivery) snapshot() (pending, awaiting int, data map[string]an
 		}
 	}
 	return d.pending, awaiting, map[string]any{
-		"queued_audio_ms":            float64(d.queued) * 1000 / realtimePCMBytesPerSecond,
-		"pending_audio_ms":           float64(d.pending) * 1000 / realtimePCMBytesPerSecond,
-		"bridge_written_audio_ms":    float64(d.written) * 1000 / realtimePCMBytesPerSecond,
-		"acknowledged_audio_ms":      float64(d.played) * 1000 / realtimePCMBytesPerSecond,
-		"dropped_audio_ms":           float64(d.dropped) * 1000 / realtimePCMBytesPerSecond,
+		"queued_audio_ms":            float64(d.queued) * 1000 / float64(defaultMediaRate(d.bytesPerSecond)),
+		"pending_audio_ms":           float64(d.pending) * 1000 / float64(defaultMediaRate(d.bytesPerSecond)),
+		"bridge_written_audio_ms":    float64(d.written) * 1000 / float64(defaultMediaRate(d.bytesPerSecond)),
+		"acknowledged_audio_ms":      float64(d.played) * 1000 / float64(defaultMediaRate(d.bytesPerSecond)),
+		"dropped_audio_ms":           float64(d.dropped) * 1000 / float64(defaultMediaRate(d.bytesPerSecond)),
 		"playback_ack_supported":     d.supportsPlayback,
 		"playback_evidence":          d.evidence,
 		"audible_playback_confirmed": d.evidence == "carrier_mark" && d.played > 0 && d.played >= d.written && d.pending == 0 && awaiting == 0 && d.dropped == 0,
-		"awaiting_playback_ms":       float64(awaiting) * 1000 / realtimePCMBytesPerSecond,
+		"awaiting_playback_ms":       float64(awaiting) * 1000 / float64(defaultMediaRate(d.bytesPerSecond)),
 	}
 }
 
@@ -170,6 +171,10 @@ func (rt *RealtimeThinker) completionRequested() bool {
 }
 
 func (rt *RealtimeThinker) requestCompletion(callID string) {
+	rt.requestCompletionWithClosing(callID, true)
+}
+
+func (rt *RealtimeThinker) requestCompletionWithClosing(callID string, closingNeeded bool) {
 	rt.lifecycleMu.Lock()
 	if rt.completion.requested {
 		rt.lifecycleMu.Unlock()
@@ -178,10 +183,14 @@ func (rt *RealtimeThinker) requestCompletion(callID string) {
 	rt.completion.requested = true
 	rt.completion.requestedAt = time.Now()
 	rt.completion.initiator, rt.completion.callID = "model", callID
-	rt.completion.awaitOutput = rt.capabilities.ContinuousConversation
+	rt.completion.awaitOutput = rt.capabilities.ContinuousConversation && closingNeeded
 	rt.terminalReason = "done_tool"
+	if !closingNeeded {
+		rt.completion.initiator = "application_review"
+		rt.terminalReason = "completion_review"
+	}
 	rt.lifecycleMu.Unlock()
-	if rt.capabilities.ContinuousConversation {
+	if rt.capabilities.ContinuousConversation && closingNeeded {
 		_ = rt.appendRealtimeContext(RealtimeContextUpdate{Kind: "instructions", Content: "The conversation is ending. Give a brief closing in the caller's language, using only verified facts, then stop speaking and listen. Do not start new backend work."})
 	}
 	rt.emit("realtime.completion_requested", rt.shutdownData())
@@ -339,7 +348,7 @@ func (rt *RealtimeThinker) shutdownData() map[string]any {
 	rt.lifecycleMu.Unlock()
 	_, _, data := rt.delivery.snapshot()
 	initiator := completion.initiator
-	if reason != "done_tool" {
+	if reason != "done_tool" && reason != "completion_review" {
 		initiator = "core"
 	}
 	if initiator == "" {
@@ -430,8 +439,8 @@ func (d *realtimeDelivery) playbackPosition(item string) (queuedMS, playedMS int
 		if entry.item != item || entry.cancelled {
 			continue
 		}
-		queuedMS += entry.queued * 1000 / realtimePCMBytesPerSecond
-		playedMS += entry.played * 1000 / realtimePCMBytesPerSecond
+		queuedMS += entry.queued * 1000 / defaultMediaRate(d.bytesPerSecond)
+		playedMS += entry.played * 1000 / defaultMediaRate(d.bytesPerSecond)
 		active = active || entry.pending > 0 || entry.waitPlayback && entry.played+entry.dropped < entry.queued
 	}
 	return
@@ -475,4 +484,22 @@ func (d *realtimeDelivery) generationFor(item string, fallback int64) int64 {
 		}
 	}
 	return fallback
+}
+
+// An explicit lifecycle signal on the authenticated bridge, distinct from an
+// ordinary normal close (which might be replacement or operator cleanup).
+func (rt *RealtimeThinker) completionCloseReason() string {
+	rt.lifecycleMu.Lock()
+	defer rt.lifecycleMu.Unlock()
+	if !rt.completion.requested || (rt.terminalReason != "done_tool" && rt.terminalReason != "completion_review") {
+		return ""
+	}
+	switch rt.completion.outcome {
+	case "completed":
+		return "realtime conversation completed"
+	case "timed_out":
+		return "realtime completion timed out"
+	default:
+		return ""
+	}
 }

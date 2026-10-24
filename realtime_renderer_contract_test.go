@@ -53,7 +53,7 @@ func TestRendererCapabilitiesSeparateProviderVADFromInterruption(t *testing.T) {
 	if json.Unmarshal([]byte(raw), &caps) != nil {
 		t.Fatal("missing contract")
 	}
-	if caps["continuous_conversation"] != true || caps["input_speech_events"] != false || caps["local_interruption_required"] != true {
+	if caps["continuous_conversation"] != true || caps["input_speech_events"] != false || caps["local_interruption_required"] != false || caps["provider_interruption"] != true {
 		t.Fatal(caps)
 	}
 	request = httptest.NewRequest("GET", "/realtime/audio", nil)

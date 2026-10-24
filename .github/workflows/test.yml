@@ -19,3 +19,8 @@ jobs:
       - run: bash scripts/test-modules.sh
       - run: go build -o /tmp/apteva-core ./cmd/apteva-core
       - run: /tmp/apteva-core --version
+      - name: Test CGO-free media runtime on Alpine
+        run: |
+          CGO_ENABLED=0 go test -c -o /tmp/apteva-core-media.test .
+          docker run --rm -v /tmp/apteva-core-media.test:/tests/core.test:ro alpine:3.21 \
+            sh -ec 'apk add --no-cache gcompat opus; exec /tests/core.test -test.run "^(TestRealtimeNativeOpusRoundTrip|TestOpenAILiveWebRTCG711MediaAndControl|TestRealtimeRTP.*)$" -test.v -test.timeout=60s'

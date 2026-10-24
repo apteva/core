@@ -890,6 +890,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			opts.TurnDetection,
 		)
 		thread.Realtime.opts.OutputConfig = opts.RealtimeOutput
+		thread.Realtime.configureMedia()
 		thread.Realtime.setInitialMessage(thread.initialMessage)
 	}
 
@@ -2557,7 +2558,11 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 	if thread != nil && thread.Realtime != nil {
 		thread.Realtime.finishShutdown()
 	}
-	unregisterAudioBridge(id)
+	completionReason := ""
+	if thread != nil && thread.Realtime != nil {
+		completionReason = thread.Realtime.completionCloseReason()
+	}
+	unregisterAudioBridge(id, completionReason)
 
 	// Cascade: kill all children first
 	if thread != nil && thread.Children != nil && !thread.Thinker.shuttingDown.Load() {

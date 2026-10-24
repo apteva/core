@@ -10,6 +10,7 @@ import (
 // Bridges retain their session's tracker so a reconnect cannot misattribute a
 // frame to the new session generation.
 type realtimeTiming struct {
+	bytesPerSecond  int
 	mu              sync.Mutex
 	generation      uint64
 	connectedAt     time.Time
@@ -165,7 +166,7 @@ func (t *realtimeTiming) summary(key string, u *realtimeUtteranceTiming) map[str
 		"guard_release_to_output_enqueue_ms": timingMS(u.guardRelease, u.enqueue),
 		"output_enqueue_to_bridge_write_ms":  timingMS(u.enqueue, u.bridgeWrite),
 		"provider_audio_to_bridge_write_ms":  timingMS(u.firstAudio, u.bridgeWrite),
-		"buffered_audio_ms":                  float64(u.bufferedBytes) * 1000 / realtimePCMBytesPerSecond,
+		"buffered_audio_ms":                  float64(u.bufferedBytes) * 1000 / float64(defaultMediaRate(t.bytesPerSecond)),
 		"renderer_credit_wait_ms":            float64(u.creditWait) / float64(time.Millisecond), "renderer_credit_wait_max_ms": float64(u.creditWaitMax) / float64(time.Millisecond), "renderer_transport_write_ms": float64(u.rendererWrite) / float64(time.Millisecond), "renderer_transport_write_max_ms": float64(u.rendererWriteMax) / float64(time.Millisecond),
 		"output_wait_mean_ms": float64(u.outputWaitTotal) / float64(time.Millisecond) / float64(max(1, u.outputFrames)), "output_wait_max_ms": float64(u.outputWaitMax) / float64(time.Millisecond), "output_frames": u.outputFrames,
 		"max_output_queue_depth": u.queueMax, "dropped_audio_bytes": u.droppedBytes,

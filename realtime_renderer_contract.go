@@ -24,19 +24,22 @@ func (a *APIServer) realtimeRendererContract(thread string, r *http.Request) str
 		}
 		return ""
 	}
-	continuous, inputSpeech, localInterruption := false, false, false
+	continuous, inputSpeech, localInterruption, providerInterruption := false, false, false, false
+	media := RealtimeMediaConfig{}
 	providerState := "recovering"
 	if a.thinker != nil && a.thinker.threads != nil {
 		_, t := a.thinker.threads.findManagedThread(thread)
 		if t != nil && t.Realtime != nil {
 			t.Realtime.rendererScoped.Store(true)
+			media = t.Realtime.opts.OutputConfig.Media
 			providerState = t.Realtime.providerStateSnapshot()
 			continuous = t.Realtime.capabilities.ContinuousConversation
 			inputSpeech = t.Realtime.capabilities.InputSpeechEvents
-			localInterruption = t.Realtime.capabilities.RendererInterruption
+			providerInterruption = t.Realtime.capabilities.ProviderInterruption
+			localInterruption = t.Realtime.capabilities.RendererInterruption && !providerInterruption
 		}
 	}
-	raw, _ := json.Marshal(map[string]any{"version": 1, "provider_state": providerState, "provider_state_events": true, "continuous_conversation": continuous, "input_speech_events": inputSpeech, "local_interruption_required": localInterruption, "scoped_cancellation": true, "receipt_evidence": true, "playback_flow_control": true, "max_input_buffer_ms": 5000, "max_output_buffer_ms": 15000})
+	raw, _ := json.Marshal(map[string]any{"version": 1, "audio_format": media.format(), "sample_rate": media.rate(), "channels": 1, "provider_state": providerState, "provider_state_events": true, "continuous_conversation": continuous, "input_speech_events": inputSpeech, "local_interruption_required": localInterruption, "provider_interruption": providerInterruption, "scoped_cancellation": true, "receipt_evidence": true, "playback_flow_control": true, "max_input_buffer_ms": 5000, "max_output_buffer_ms": 15000})
 	return string(raw)
 }
 

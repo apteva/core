@@ -270,7 +270,11 @@ func renewAudioBridge(threadID string, audioIn chan []byte, audioOut chan Realti
 // unregisterAudioBridge removes any registrations bound to threadID.
 // Used when a realtime spawn fails post-token-issuance, or when the
 // thread is killed before a bridge connected.
-func unregisterAudioBridge(threadID string) {
+func unregisterAudioBridge(threadID string, completionReason ...string) {
+	reason := "audio bridge unregistered"
+	if len(completionReason) > 0 && (completionReason[0] == "realtime conversation completed" || completionReason[0] == "realtime completion timed out") {
+		reason = completionReason[0]
+	}
 	audioBridgeMu.Lock()
 	for tok, reg := range audioBridgeByTok {
 		if reg.threadID == threadID {
@@ -283,7 +287,7 @@ func unregisterAudioBridge(threadID string) {
 	if live != nil {
 		live.cancel(newRealtimeBridgeEnd(
 			"core", "close", ws.StatusNormalClosure,
-			"audio bridge unregistered", "", true,
+			reason, "", true,
 		))
 	}
 }
@@ -465,6 +469,13 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if r.URL.Query().Get("audio_protocol") != "1" && a.thinker != nil && a.thinker.threads != nil {
+		_, managed := a.thinker.threads.findManagedThread(thread)
+		if managed != nil && managed.Realtime != nil && managed.Realtime.opts.OutputConfig.Media.format() != AudioPCM16 {
+			http.Error(w, "negotiated audio protocol required", http.StatusBadRequest)
+			return
+		}
+	}
 	contract := a.realtimeRendererContract(thread, r)
 	if contract != "" {
 		w.Header().Set(realtimeAudioSessionHeader, contract)
@@ -495,6 +506,10 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 	}
 	connectedAt := time.Now()
 	socket := &realtimeBridgeSocket{conn: conn}
+	socket.window.bytesPerSecond = realtimePCMBytesPerSecond
+	if providerStateSource != nil {
+		socket.window.bytesPerSecond = providerStateSource.outputRate()
+	}
 	if contract != "" {
 		socket.writeTimeout = realtimeLiveBridgeWriteTimeout
 	}
@@ -502,9 +517,13 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 	if contract == "" && a.thinker != nil && a.thinker.threads != nil {
 		a.thinker.threads.realtimeBridgeConnected(thread)
 	}
+	bridgeMedia := RealtimeMediaConfig{}
+	if providerStateSource != nil {
+		bridgeMedia = providerStateSource.opts.OutputConfig.Media
+	}
 	if a.thinker != nil && a.thinker.telemetry != nil {
 		a.thinker.telemetry.Emit("realtime.bridge_connected", thread, map[string]any{
-			"encoding": "pcm16", "sample_rate": 24000, "channels": 1,
+			"encoding": bridgeMedia.format(), "sample_rate": bridgeMedia.rate(), "channels": 1,
 		})
 	}
 
@@ -811,7 +830,7 @@ func runRealtimeAudioBridgeReader(
 		if header.OpCode != ws.OpBinary || len(data) == 0 {
 			continue
 		}
-		if len(data)%2 != 0 {
+		if defaultMediaRate(socket.window.bytesPerSecond) == realtimePCMBytesPerSecond && len(data)%2 != 0 {
 			return newRealtimeBridgeEnd("client", "read", ws.StatusInvalidFramePayloadData, "unaligned PCM16 audio", "protocol", false)
 		}
 		// Managed input goes straight to the duration-budgeted queue; never wait

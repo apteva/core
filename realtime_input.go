@@ -295,6 +295,9 @@ func (rt *RealtimeThinker) admitRealtimeAudio(audio []byte, at time.Time) {
 	if rt.inputPaused.Load() {
 		return
 	}
+	if rt.capabilities.ContinuousConversation && mediaVoiced(audio, rt.opts.AudioInFmt) {
+		rt.lastCallerVoice.Store(at.UnixNano())
+	}
 	rt.recordRealtimeInput(len(audio))
 	rt.input.push(audio, at)
 	rt.wakeRecovery()

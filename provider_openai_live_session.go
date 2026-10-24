@@ -17,7 +17,9 @@ import (
 // Live is a second wire protocol of the existing OpenAI API integration.
 // It reuses its credentials and transport machinery, never a hosted agent.
 type openaiLiveSession struct {
-	execution openaiLiveExecution
+	media       RealtimeMediaConfig
+	rtcMessages <-chan liveMediaMessage
+	execution   openaiLiveExecution
 	*openaiRealtimeSession
 	ready          chan error
 	closeRequested sync.Once
@@ -55,9 +57,15 @@ func buildOpenAILiveStart(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 	if opts.Model == "" {
 		return nil, fmt.Errorf("OpenAI Live model is required")
 	}
-	if opts.AudioInFmt != "" && opts.AudioInFmt != AudioPCM16 || opts.AudioOutFmt != "" && opts.AudioOutFmt != AudioPCM16 || opts.AudioInRate != 0 && opts.AudioInRate != 24000 || opts.AudioOutRate != 0 && opts.AudioOutRate != 24000 {
-		return nil, fmt.Errorf("Core OpenAI Live bridge requires PCM16 at 24000 Hz")
+	m, err := opts.OutputConfig.Media.normalized()
+	if err != nil {
+		return nil, err
 	}
+	if opts.AudioInFmt != "" && opts.AudioInFmt != m.format() || opts.AudioOutFmt != "" && opts.AudioOutFmt != m.format() || opts.AudioInRate != 0 && opts.AudioInRate != m.rate() || opts.AudioOutRate != 0 && opts.AudioOutRate != m.rate() {
+		return nil, fmt.Errorf("Live media format does not match bridge contract")
+	}
+	wireFormat := map[AudioFormat]string{AudioPCM16: "audio/pcm", AudioG711ULaw: "audio/pcmu", AudioG711ALaw: "audio/pcma"}[m.format()]
+
 	if !opts.TurnDetection.isZero() && opts.TurnDetection.Profile != RealtimeTurnProfileTelephony {
 		return nil, fmt.Errorf("continuous conversation does not support explicit VAD turn thresholds")
 	}
@@ -124,7 +132,7 @@ func buildOpenAILiveStart(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 	}
 	return json.Marshal(map[string]any{"type": "session.start", "session": map[string]any{
 		"model": opts.Model, "instructions": instructions,
-		"audio":      map[string]any{"format": map[string]any{"type": "audio/pcm", "rate": 24000}, "output": map[string]any{"voice": voiceConfig}},
+		"audio":      map[string]any{"format": map[string]any{"type": wireFormat, "rate": m.rate()}, "output": map[string]any{"voice": voiceConfig}},
 		"delegation": delegation, "input": input, "store": false,
 	}})
 }
@@ -148,6 +156,9 @@ func openAILiveInstructions(instructions string, tools []NativeTool) string {
 }
 
 func (p *OpenAIRealtimeProvider) openLiveSession(ctx context.Context, opts RealtimeSessionOpts) (*openaiLiveSession, error) {
+	if opts.OutputConfig.Media.Transport == "webrtc" {
+		return p.openLiveRTCSession(ctx, opts)
+	}
 	payload, err := buildOpenAILiveStart(opts, p.DefaultVoice())
 	if err != nil {
 		return nil, err
@@ -167,6 +178,11 @@ func (p *OpenAIRealtimeProvider) openLiveSession(ctx context.Context, opts Realt
 		timing: opts.timing, providerName: "openai-realtime", settings: map[string]any{"source": "session_started", "model": opts.Model, "voice": opts.Voice, "delegation": "client", "speech_guard": opts.OutputConfig.SpeechGuard.continuousPolicy()},
 	}, ready: make(chan error, 1), instructions: opts.Instructions, tools: opts.Tools}
 	s.execution = openaiLiveExecution{enabled: opts.ExecutionMode == "provider", notify: make(chan struct{}, 1), pending: map[string]bool{}, submitted: map[string]bool{}, inputHashes: map[[32]byte]bool{}}
+	s.media = opts.OutputConfig.Media
+	s.guard.format = s.media.format()
+	s.settings["transport"] = "websocket"
+	s.settings["audio_format"] = s.media.format()
+	s.settings["sample_rate"] = s.media.rate()
 	s.guard.config = opts.OutputConfig.SpeechGuard.continuousPolicy()
 	s.outbox <- realtimeOutboundFrame{op: ws.OpText, data: payload}
 	s.lifecycle.start(s.events, s.readLiveLoop, s.writeLoop, s.pingLoop, s.flushLiveSpeech)
@@ -200,7 +216,23 @@ func (p *OpenAIRealtimeProvider) openLiveSession(ctx context.Context, opts Realt
 func (s *openaiLiveSession) readLiveLoop() {
 	defer s.Close()
 	for {
-		data, op, err := wsutil.ReadServerData(s.conn)
+		var data []byte
+		var op ws.OpCode
+		var err error
+		if s.rtcMessages != nil {
+			select {
+			case <-s.done:
+				return
+			case m := <-s.rtcMessages:
+				if m.audio != nil {
+					s.acceptLiveAudio(m.audio, time.Now())
+					continue
+				}
+				data, op, err = m.data, ws.OpText, m.err
+			}
+		} else {
+			data, op, err = wsutil.ReadServerData(s.conn)
+		}
 		if err != nil {
 			select {
 			case <-s.done:
@@ -252,16 +284,11 @@ func (s *openaiLiveSession) translateLive(e openaiLiveEvent) {
 		}
 	case "session.output_audio.delta":
 		audio, err := base64.StdEncoding.DecodeString(e.Delta)
-		if err != nil || len(audio)%2 != 0 {
+		if err != nil || s.media.format() == AudioPCM16 && len(audio)%2 != 0 {
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("invalid Live PCM audio")})
 			return
 		}
-		s.guardMu.Lock()
-		events := s.guard.audio(RealtimeEvent{Type: RealtimeEventAudioOut, ObservedAt: now, Audio: audio}, s.timing)
-		s.guardMu.Unlock()
-		for _, ev := range events {
-			s.emitControl(ev)
-		}
+		s.acceptLiveAudio(audio, now)
 	case "response.event":
 		s.translateExecution(e.Event)
 	case "session.delegation.created":
@@ -323,7 +350,7 @@ func (s *openaiLiveSession) flushLiveSpeech() {
 }
 
 func (s *openaiLiveSession) SendAudio(pcm []byte) error {
-	if len(pcm)%2 != 0 {
+	if s.media.format() == AudioPCM16 && len(pcm)%2 != 0 {
 		return realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("PCM16 requires complete samples"))
 	}
 	if len(pcm) == 0 {
@@ -426,8 +453,17 @@ func (s *openaiLiveSession) DiscardPlayback(item string) {
 func (s *openaiLiveSession) RealtimeInterruptCommand() string { return "session.instructions.append" }
 
 func (s *openaiLiveSession) SendAudioFrame(f RealtimeInputAudio) error {
-	if len(f.Audio)%2 != 0 {
+	if s.media.format() == AudioPCM16 && len(f.Audio)%2 != 0 {
 		return realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("PCM16 requires complete samples"))
 	}
 	return s.sendAudioFrame(f, map[string]any{"type": "session.input_audio.append", "audio": base64.StdEncoding.EncodeToString(f.Audio)})
+}
+
+func (s *openaiLiveSession) acceptLiveAudio(audio []byte, at time.Time) {
+	s.guardMu.Lock()
+	events := s.guard.audio(RealtimeEvent{Type: RealtimeEventAudioOut, ObservedAt: at, Audio: audio}, s.timing)
+	s.guardMu.Unlock()
+	for _, event := range events {
+		s.emitControl(event)
+	}
 }

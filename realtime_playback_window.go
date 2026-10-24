@@ -13,9 +13,10 @@ type realtimePlaybackCredit struct{ sent, played int }
 // Socket-local credits require exact generation/item receipts. Late receipts
 // cannot open the window of a replacement session or another playback.
 type realtimePlaybackWindow struct {
-	mu       sync.Mutex
-	capacity int
-	items    map[string]realtimePlaybackCredit
+	bytesPerSecond int
+	mu             sync.Mutex
+	capacity       int
+	items          map[string]realtimePlaybackCredit
 }
 
 func playbackCreditKey(g int64, item string) string { return fmt.Sprintf("%d/%s", g, item) }
@@ -28,7 +29,7 @@ func (w *realtimePlaybackWindow) configure(ms int) {
 	if ms > 15000 {
 		ms = 15000
 	}
-	w.capacity = ms * realtimePCMBytesPerSecond / 1000
+	w.capacity = ms * defaultMediaRate(w.bytesPerSecond) / 1000
 	if w.items == nil {
 		w.items = map[string]realtimePlaybackCredit{}
 	}
@@ -41,7 +42,7 @@ func (w *realtimePlaybackWindow) progress(g int64, item string, ms int) {
 	if !ok {
 		return
 	}
-	end := min(p.sent, ms*realtimePCMBytesPerSecond/1000)
+	end := min(p.sent, ms*defaultMediaRate(w.bytesPerSecond)/1000)
 	if end > p.played {
 		p.played = end
 	}
@@ -91,12 +92,12 @@ func (s *realtimeBridgeSocket) writeFlowControlledAudio(ctx context.Context, f R
 	started := time.Now()
 	frameBytes := len(f.Audio)
 	if s.window.enabled() {
-		frameBytes = 960
+		frameBytes = defaultMediaRate(s.window.bytesPerSecond) / 50
 	}
 	if frameBytes == 0 {
 		return 0, nil
 	}
-	startBytes := f.AudioEndMS*realtimePCMBytesPerSecond/1000 - len(f.Audio)
+	startBytes := f.AudioEndMS*defaultMediaRate(s.window.bytesPerSecond)/1000 - len(f.Audio)
 	offset := 0
 	waitingSince := time.Now()
 	for offset < len(f.Audio) {
@@ -120,7 +121,7 @@ func (s *realtimeBridgeSocket) writeFlowControlledAudio(ctx context.Context, f R
 			}
 			continue
 		}
-		metadata, _ := json.Marshal(map[string]any{"type": "audio.frame", "response_id": f.ResponseID, "item_id": f.ItemID, "audio_end_ms": (startBytes + end) * 1000 / realtimePCMBytesPerSecond, "silence": f.Silent, "session_generation": f.SessionGeneration})
+		metadata, _ := json.Marshal(map[string]any{"type": "audio.frame", "response_id": f.ResponseID, "item_id": f.ItemID, "audio_end_ms": (startBytes + end) * 1000 / defaultMediaRate(s.window.bytesPerSecond), "silence": f.Silent, "session_generation": f.SessionGeneration})
 		writeStarted := time.Now()
 		written, err := s.writePlaybackAudio(metadata, f.Audio[offset:end], f.cancelled)
 		f.timing.rendererFlow(f.ResponseID, f.ItemID, writeStarted.Sub(waitingSince), time.Since(writeStarted))

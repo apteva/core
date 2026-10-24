@@ -10,8 +10,10 @@ import (
 // the existing provider policy; unsupported explicit safety/tool modes fail
 // at session setup rather than silently weakening the requested policy.
 type RealtimeOutputConfig struct {
-	ToolMode    string                    `json:"tool_mode,omitempty"` // default, blocking, async
-	SpeechGuard RealtimeSpeechGuardConfig `json:"speech_guard,omitempty"`
+	CompletionMode string                    `json:"completion_mode,omitempty"` // auto, semantic, or delegation
+	Media          RealtimeMediaConfig       `json:"media,omitempty,omitzero"`
+	ToolMode       string                    `json:"tool_mode,omitempty"` // default, blocking, async
+	SpeechGuard    RealtimeSpeechGuardConfig `json:"speech_guard,omitempty"`
 }
 
 type RealtimeSpeechGuardConfig struct {
@@ -21,6 +23,17 @@ type RealtimeSpeechGuardConfig struct {
 }
 
 func (c RealtimeOutputConfig) normalized() (RealtimeOutputConfig, error) {
+	var err error
+	c.CompletionMode = strings.ToLower(strings.TrimSpace(c.CompletionMode))
+	switch c.CompletionMode {
+	case "", "auto", "semantic", "delegation":
+	default:
+		return c, fmt.Errorf("completion_mode must be auto, semantic, or delegation")
+	}
+	c.Media, err = c.Media.normalized()
+	if err != nil {
+		return c, err
+	}
 	c.ToolMode = strings.ToLower(strings.TrimSpace(c.ToolMode))
 	c.SpeechGuard.Mode = strings.ToLower(strings.TrimSpace(c.SpeechGuard.Mode))
 	switch c.ToolMode {

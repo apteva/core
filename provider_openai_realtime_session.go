@@ -35,6 +35,8 @@ type realtimeOutboundFrame struct {
 // The outbox is never closed: Close signals done and closes the connection,
 // eliminating the enqueue-vs-close send-on-closed-channel race.
 type openaiRealtimeSession struct {
+	writeTransport    func(realtimeOutboundFrame, time.Duration) error
+	closeTransport    func() error
 	inputReservations realtimeInputReservations
 	writeTimeout      time.Duration
 	audioOutbox       chan realtimeOutboundFrame
@@ -506,10 +508,16 @@ func (s *openaiRealtimeSession) writeLoop() {
 				budget = remaining
 			}
 		}
-		_ = s.conn.SetWriteDeadline(time.Now().Add(budget))
-		if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
+		var err error
+		if s.writeTransport != nil {
+			err = s.writeTransport(frame, budget)
+		} else {
+			_ = s.conn.SetWriteDeadline(time.Now().Add(budget))
+			err = wsutil.WriteClientMessage(s.conn, frame.op, frame.data)
+		}
+		if err != nil {
 			frame.input.settle(false, time.Since(started))
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("ws write: %w", err))})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("realtime transport write: %w", err))})
 			_ = s.Close()
 			return false
 		}
@@ -700,6 +708,9 @@ func (s *openaiRealtimeSession) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.done)
 		s.inputReservations.close()
+		if s.closeTransport != nil {
+			err = s.closeTransport()
+		}
 		if s.conn != nil {
 			err = s.conn.Close()
 		}

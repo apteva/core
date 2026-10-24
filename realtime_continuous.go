@@ -1,7 +1,6 @@
 package core
 
 import (
-	"encoding/binary"
 	"fmt"
 	"strings"
 	"time"
@@ -109,6 +108,7 @@ func (rt *RealtimeThinker) observeContinuousIdle() {
 // Reusable bounded prefix guard for continuous audio. Its segment boundaries
 // are observed gaps/silence; they are never exposed as provider-final text.
 type realtimeContinuousGuard struct {
+	format             AudioFormat
 	config             RealtimeSpeechGuardConfig
 	pending            []RealtimeEvent
 	bytes              int
@@ -150,17 +150,10 @@ func (g *realtimeContinuousGuard) audio(e RealtimeEvent, timing *realtimeTiming)
 		g.lastAudio = e.ObservedAt
 		return append(old, g.audio(e, timing)...)
 	}
-	voiced := false
-	for i := 0; i+1 < len(e.Audio); i += 2 {
-		v := int(int16(binary.LittleEndian.Uint16(e.Audio[i:])))
-		if v > 128 || v < -128 {
-			voiced = true
-			break
-		}
-	}
+	voiced := mediaVoiced(e.Audio, g.format)
 	// Silence may delimit an application playback segment, but it remains
 	// ordered PCM. Never remove time from the renderer's audio timeline.
-	if voiced && g.silenceBytes >= realtimePCMBytesPerSecond*300/1000 {
+	if voiced && g.silenceBytes >= mediaBytesPerSecond(g.format)*300/1000 {
 		old := g.finish()
 		g.reset()
 		g.lastAudio = e.ObservedAt
@@ -183,7 +176,7 @@ func (g *realtimeContinuousGuard) audio(e RealtimeEvent, timing *realtimeTiming)
 		timing.released("", e.ItemID, time.Now(), 0, g.config.continuousPolicy().Mode)
 		return []RealtimeEvent{e}
 	}
-	if g.bytes+len(e.Audio) > g.config.resolved().MaxBufferedAudioMS*realtimePCMBytesPerSecond/1000 {
+	if g.bytes+len(e.Audio) > g.config.resolved().MaxBufferedAudioMS*mediaBytesPerSecond(g.format)/1000 {
 		timing.dropped("", e.ItemID, len(e.Audio))
 		return g.missingTranscript()
 	}
