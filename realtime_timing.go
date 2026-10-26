@@ -10,28 +10,38 @@ import (
 // Bridges retain their session's tracker so a reconnect cannot misattribute a
 // frame to the new session generation.
 type realtimeTiming struct {
-	trackingClosed   bool
-	bytesPerSecond   int
-	mu               sync.Mutex
-	generation       uint64
-	connectedAt      time.Time
-	readyEmitted     bool
-	emit             func(string, map[string]any)
-	items            map[string]*realtimeUtteranceTiming
-	closed           map[string]bool
-	closedOrder      []string
-	completed        map[string]*realtimeUtteranceTiming
-	speechEnd        time.Time
-	speechEndSource  string
-	lastSpeechEnd    time.Time
-	lastSpeechSource string
-	requests         map[string]*realtimeRequestTiming
-	requestOrder     []string
-	contextRequests  map[string]string
-	contextOrder     []string
+	callerLastReport              time.Time
+	caller                        *realtimeCallerTiming
+	callerSequence, inputSequence uint64
+	callerReports                 []map[string]any
+	callerReportsDropped          int
+	callerClosed                  bool
+	inputQuiet                    time.Duration
+	inputAcoustic, outputAcoustic realtimeAcousticDetector
+	lastOutputAcoustic            time.Time
+	trackingClosed                bool
+	bytesPerSecond                int
+	mu                            sync.Mutex
+	generation                    uint64
+	connectedAt                   time.Time
+	readyEmitted                  bool
+	emit                          func(string, map[string]any)
+	items                         map[string]*realtimeUtteranceTiming
+	closed                        map[string]bool
+	closedOrder                   []string
+	completed                     map[string]*realtimeUtteranceTiming
+	speechEnd                     time.Time
+	speechEndSource               string
+	lastSpeechEnd                 time.Time
+	lastSpeechSource              string
+	requests                      map[string]*realtimeRequestTiming
+	requestOrder                  []string
+	contextRequests               map[string]string
+	contextOrder                  []string
 }
 
 type realtimeUtteranceTiming struct {
+	providerBytes                                                   int
 	creditWait, creditWaitMax, rendererWrite, rendererWriteMax      time.Duration
 	outputWaitTotal, outputWaitMax                                  time.Duration
 	outputFrames                                                    int
@@ -91,6 +101,7 @@ func (t *realtimeTiming) speechStopped(at time.Time, source string) {
 	t.mu.Lock()
 	t.speechEnd, t.speechEndSource = at, source
 	t.lastSpeechEnd, t.lastSpeechSource = at, source
+	t.callerSignalLocked(at, source)
 	t.mu.Unlock()
 }
 
@@ -211,6 +222,9 @@ func (t *realtimeTiming) writtenBytes(response, item string, at time.Time, bytes
 	key := realtimeTimingKey(response, item)
 	if u := t.items[key]; u != nil {
 		u.writtenBytes += written
+		if c := t.caller; c != nil && c.acousticItem == key && !c.firstAcoustic.IsZero() && c.bridge.IsZero() && written > 0 && u.droppedBytes == 0 && u.writtenBytes >= c.acousticEndBytes && !at.Before(c.firstAcoustic) {
+			c.bridge, c.dirty = at, true
+		}
 		if written > 0 && u.bridgeWrite.IsZero() {
 			u.bridgeWrite = at
 		}
@@ -268,6 +282,9 @@ func (t *realtimeTiming) finish(response, item, status string) {
 	}
 	if response == "" && item == "" && status != "completed" && status != "interrupted" {
 		t.finishRequests(status)
+		if status != "application_observed_quiet" {
+			t.reportCallerTiming(status)
+		}
 	}
 }
 

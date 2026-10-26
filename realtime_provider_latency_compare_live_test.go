@@ -25,22 +25,33 @@ func TestRealtimeProviderLatencyComparison(t *testing.T) {
 	if len(phrase) == 0 || len(phrase)%2 != 0 {
 		t.Fatal("expected mono PCM16 at 24kHz")
 	}
-	for _, name := range []string{"OPENAI_API_KEY", "GOOGLE_API_KEY"} {
-		if os.Getenv(name) == "" {
-			t.Fatalf("%s required", name)
-		}
+	variants := []string{"openai_websocket", "openai_webrtc", "gemini_750", "gemini_500"}
+	if selected := os.Getenv("REALTIME_COMPARE_VARIANTS"); selected != "" {
+		variants = strings.Split(selected, ",")
 	}
 	for trial := 1; trial <= 3; trial++ {
-		for _, variant := range []string{"openai_webrtc", "gemini_750", "gemini_500"} {
+		for _, variant := range variants {
 			t.Run(fmt.Sprintf("%s_%d", variant, trial), func(t *testing.T) {
+				keyName := "GOOGLE_API_KEY"
+				if strings.HasPrefix(variant, "openai_") {
+					keyName = "OPENAI_API_KEY"
+				}
+				if os.Getenv(keyName) == "" {
+					t.Fatalf("%s required", keyName)
+				}
+				switch variant {
+				case "openai_websocket", "openai_webrtc", "gemini_750", "gemini_500":
+				default:
+					t.Fatalf("unknown variant %q", variant)
+				}
 				var p RealtimeProvider = NewGoogleRealtimeProvider(os.Getenv("GOOGLE_API_KEY"))
 				instruction := "Vous êtes un assistant francophone. Attendez la question audio et répondez directement en une seule phrase courte. Aucune recherche ni outil pour les questions simples de culture générale. Ne saluez pas et ne posez pas de question."
 				opts := RealtimeSessionOpts{Model: "gemini-3.8-live", Voice: "Kore", Instructions: instruction, ConversationInstructions: instruction, AudioInFmt: AudioPCM16, AudioOutFmt: AudioPCM16, AudioInRate: 24000, AudioOutRate: 24000, TranscribeInput: true, TurnDetection: RealtimeTurnDetectionConfig{Profile: "telephony"}}
-				if variant == "openai_webrtc" {
+				if strings.HasPrefix(variant, "openai_") {
 					p = NewOpenAIRealtimeProvider(os.Getenv("OPENAI_API_KEY"))
 					opts.Model = "gpt-live-1"
 					opts.Voice = "brise"
-					opts.OutputConfig.Media = RealtimeMediaConfig{Transport: "webrtc", Format: AudioPCM16}
+					opts.OutputConfig.Media = RealtimeMediaConfig{Transport: strings.TrimPrefix(variant, "openai_"), Format: AudioPCM16}
 				}
 				if variant == "gemini_500" {
 					opts.TurnDetection.SilenceDurationMS = 500
@@ -55,7 +66,14 @@ func TestRealtimeProviderLatencyComparison(t *testing.T) {
 				defer s.Close()
 				setup := time.Since(start)
 				var mu sync.Mutex
-				var lastInput, firstPacket, firstAudible time.Time
+				input := make([]byte, 48000+len(phrase)+6*48000)
+				copy(input[48000:], phrase)
+				endpoint := replayAcousticEndpoint(input)
+				if endpoint == 0 {
+					t.Fatal("no input speech above documented acoustic threshold")
+				}
+				origin := time.Now()
+				observation := realtimeReplayAcousticTiming{endpoint: origin.Add(endpoint)}
 				var output []byte
 				var captions []string
 				var failures, shutdownErrors, assistantText []string
@@ -80,21 +98,11 @@ func TestRealtimeProviderLatencyComparison(t *testing.T) {
 						}
 						if len(ev.Audio) > 0 {
 							output = append(output, ev.Audio...)
-							if !lastInput.IsZero() {
-								if firstPacket.IsZero() {
-									firstPacket = time.Now()
-								}
-								if firstAudible.IsZero() && replayRMS(ev.Audio, AudioPCM16) > 150 {
-									firstAudible = time.Now()
-								}
-							}
+							observation.audio(ev.Audio, time.Now())
 						}
 						mu.Unlock()
 					}
 				}()
-				input := make([]byte, 48000+len(phrase)+6*48000)
-				copy(input[48000:], phrase)
-				origin := time.Now()
 				for off := 0; off < len(input); off += 960 {
 					delay := time.Until(origin.Add(time.Duration(off) * time.Second / 48000))
 					if delay > 0 {
@@ -105,11 +113,6 @@ func TestRealtimeProviderLatencyComparison(t *testing.T) {
 						}
 					}
 					frame := input[off:min(off+960, len(input))]
-					mu.Lock()
-					if replayRMS(frame, AudioPCM16) > 150 {
-						lastInput = time.Now()
-					}
-					mu.Unlock()
 					if err := s.SendAudio(frame); err != nil {
 						t.Fatal(err)
 					}
@@ -126,12 +129,14 @@ func TestRealtimeProviderLatencyComparison(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				report := map[string]any{"variant": variant, "trial": trial, "setup_ms": setup.Milliseconds(), "transcript": captions, "errors": failures, "shutdown_errors": shutdownErrors, "assistant_transcript": assistantText, "output_bytes": len(output)}
-				if !firstAudible.IsZero() && !lastInput.IsZero() {
-					report["first_audible_ms"] = firstAudible.Sub(lastInput).Milliseconds()
-				}
-				if !firstPacket.IsZero() && !lastInput.IsZero() {
-					report["first_packet_ms"] = firstPacket.Sub(lastInput).Milliseconds()
-				}
+				report["first_acoustic_ms"] = timingMS(observation.endpoint, observation.firstAcoustic)
+				report["first_packet_ms"] = timingMS(observation.endpoint, observation.firstPacket)
+				report["overlap_or_continuation_possible"] = observation.overlap
+				report["eligible_latency_sample"] = !observation.overlap && !observation.firstAcoustic.IsZero()
+				report["missed_acoustic_response"] = observation.firstAcoustic.IsZero()
+				report["quality_gate"] = "diagnostic_only_requires_semantic_and_playback_review"
+				report["speech_end_source"] = "recording_acoustic_endpoint"
+				report["acoustic_evidence"] = "two_consecutive_10ms_rms_windows"
 				data, _ := json.MarshalIndent(report, "", "  ")
 				t.Log(string(data))
 				if dir := os.Getenv("REALTIME_MEDIA_REPORT_DIR"); dir != "" {
@@ -149,7 +154,7 @@ func TestRealtimeProviderLatencyComparison(t *testing.T) {
 				if expected := os.Getenv("REALTIME_MEDIA_EXPECTED_TEXT"); expected != "" && !strings.Contains(strings.ToLower(strings.Join(assistantText, "")), strings.ToLower(expected)) {
 					t.Error("response did not include expected answer")
 				}
-				if firstAudible.IsZero() {
+				if observation.firstAcoustic.IsZero() {
 					t.Error("no audible response")
 				}
 				if len(failures) > 0 {

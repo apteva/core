@@ -35,6 +35,8 @@ type realtimeOutboundFrame struct {
 // The outbox is never closed: Close signals done and closes the connection,
 // eliminating the enqueue-vs-close send-on-closed-channel race.
 type openaiRealtimeSession struct {
+	audioOutFormat    AudioFormat
+	audioOutRate      int
 	writeTransport    func(realtimeOutboundFrame, time.Duration) error
 	closeTransport    func() error
 	inputReservations realtimeInputReservations
@@ -176,6 +178,8 @@ func openAICompatibleRealtimeSession(ctx context.Context, opts RealtimeSessionOp
 		providerName: config.providerName, buildConfigurationUpdate: config.buildConfigurationUpdate,
 		itemPhases:             make(map[string]string),
 		audioInBytesPerSecond:  audioBytesPerSecond(opts.AudioInFmt, opts.AudioInRate),
+		audioOutFormat:         opts.AudioOutFmt,
+		audioOutRate:           opts.AudioOutRate,
 		audioOutBytesPerSecond: audioBytesPerSecond(opts.AudioOutFmt, opts.AudioOutRate),
 	}
 
@@ -391,7 +395,7 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 			return
 		}
 		s.audioOutBytes.Add(uint64(len(pcm)))
-		s.timing.audio(base.ResponseID, base.ItemID, at)
+		s.timing.providerAudio(base.ResponseID, base.ItemID, at, pcm, s.audioOutFormat, s.audioOutRate)
 		s.timing.released(base.ResponseID, base.ItemID, at, 0, "provider_stream")
 		base.Type, base.Audio = RealtimeEventAudioOut, pcm
 		s.emitAudio(base)

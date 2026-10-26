@@ -96,6 +96,52 @@ summary; it is not carrier playback or an independently measured playback time.
 
 ## Verification
 
+### Caller-to-acoustic-output observations
+
+`realtime.caller_timing` is a bounded, session-generation-scoped observation
+independent of playback item boundaries. Silent output segments cannot consume
+its caller endpoint. It reports first decoded provider audio, first sustained
+acoustic output, packet cadence during that wait, pre-acoustic audio duration,
+and the bridge write covering the first acoustic packet. Provider observations
+are recorded before speech-guard filtering; bridge writes are separate evidence.
+
+When no provider/client endpoint is available, Core observes admitted input with
+two consecutive 10 ms RMS windows above 20 (decoded int16 scale) and 300 ms of
+subsequent quiet audio. The endpoint is the last active frame's **Core ingress
+time**, labelled `core_input_acoustic_estimate`. It is not microphone capture
+time, provider VAD, or semantic end-of-turn. Explicit endpoint signal receipt is
+recorded separately. An incomplete input observation at shutdown is labelled
+`input_interrupted`, with endpoint-dependent latencies unavailable.
+
+Output measurement requires two consecutive 10 ms RMS windows above 100. This
+rejects isolated sample peaks and supports PCM16 and decoded G.711. It is
+acoustic evidence, not proof of intelligible speech or a useful answer. Existing
+amplitude activity fields and interruption/segmentation policy are unchanged.
+`overlap_or_continuation_possible` excludes recent ongoing model speech from
+eligible acoustic latency samples; semantic response validation is still needed.
+
+Final active input frames carry a session-local sequence and independently
+record successful adapter submission and local transport-write completion.
+Adapters without a write-completion callback report admission only. No local
+write is labelled provider receipt; GPT Live audio appends have no receipt ack.
+Likewise, a bridge write does not prove that a caller heard audio.
+
+Publication occurs at most once per second on the actor reporting path, plus
+closure summaries. Audio callbacks retain only bounded metadata, no audio or
+transcripts, and perform no telemetry I/O. This instrumentation does not gate,
+trim or reorder audio, send commits, change provider settings, or manufacture
+acknowledgements.
+
+The paid `TestRealtimeProviderLatencyComparison` accepts
+`REALTIME_COMPARE_VARIANTS=openai_websocket` (also `openai_webrtc`, `gemini_750`,
+`gemini_500`, comma-separated). Only selected providers require credentials.
+Supply one caller utterance as mono PCM16/24kHz via `REALTIME_MEDIA_REPLAY_PCM`;
+it runs three trials with continuous paced silence and persistent sessions.
+The recording's final acoustic endpoint is computed before playback, so early
+greetings/backchannels cannot become reply latency. Continuations are flagged
+and missing acoustic replies remain failures. Reports remain diagnostic until
+semantic, first-word, interruption and renderer-playback checks are completed.
+
 The deterministic tests cover audio-first and fragmented transcripts,
 same-envelope leakage, PCM overflow, interruption, failed bridge writes,
 generation isolation, unavailable measurements, settings persistence,

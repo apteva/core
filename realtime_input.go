@@ -8,8 +8,9 @@ import (
 )
 
 type realtimeInputFrame struct {
-	audio    []byte
-	received time.Time
+	observation *realtimeInputObservation
+	audio       []byte
+	received    time.Time
 }
 type realtimeInputQueue struct {
 	recoveryStarted            time.Time     // mu
@@ -24,6 +25,8 @@ type realtimeInputQueue struct {
 	bytes                      int
 	bytesPerSecond             int
 	sampleBytes                int
+	format                     AudioFormat
+	sampleRate                 int
 	policy                     RealtimeInputPolicy
 	drops                      map[string]int
 	nextSend, pressureSince    time.Time // sendMu
@@ -59,7 +62,7 @@ func (q *realtimeInputQueue) expireLocked(now time.Time) {
 		q.dropLocked("stale_input", n)
 	}
 }
-func (q *realtimeInputQueue) push(audio []byte, now time.Time) {
+func (q *realtimeInputQueue) push(audio []byte, now time.Time, timing ...*realtimeTiming) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.expireLocked(now)
@@ -74,7 +77,11 @@ func (q *realtimeInputQueue) push(audio []byte, now time.Time) {
 	frameBytes -= frameBytes % sampleBytes
 	for offset := 0; offset < keep; offset += frameBytes {
 		end := min(offset+frameBytes, keep)
-		q.frames = append(q.frames, realtimeInputFrame{append([]byte(nil), audio[offset:end]...), now})
+		frame := realtimeInputFrame{audio: append([]byte(nil), audio[offset:end]...), received: now}
+		if len(timing) > 0 && timing[0] != nil {
+			frame.observation = timing[0].inputObserved(frame.audio, now, q.format, q.sampleRate)
+		}
+		q.frames = append(q.frames, frame)
 	}
 	q.bytes += keep
 	q.dropLocked("input_buffer_full", len(audio)-keep)
@@ -112,6 +119,7 @@ func (rt *RealtimeThinker) configureInputQueue() {
 	}
 	rt.input.mu.Lock()
 	rt.input.policy = p
+	rt.input.format, rt.input.sampleRate = rt.opts.AudioInFmt, rt.opts.AudioInRate
 	rt.input.bytesPerSecond = int(audioBytesPerSecond(rt.opts.AudioInFmt, rt.opts.AudioInRate))
 	rt.input.sampleBytes = 2
 	if rt.opts.AudioInFmt == AudioG711ULaw || rt.opts.AudioInFmt == AudioG711ALaw {
@@ -139,6 +147,7 @@ func (rt *RealtimeThinker) ingestRealtimeAudio(ctx context.Context) {
 	}
 }
 func (rt *RealtimeThinker) reportInputDrops() {
+	rt.currentTiming().reportCallerTiming("")
 	q := &rt.input
 	q.mu.Lock()
 	drops := q.drops
@@ -202,13 +211,26 @@ func (rt *RealtimeThinker) drainRealtimeInputAt(session RealtimeSession, now tim
 		q.mu.Lock()
 		q.inflight += len(frame.audio)
 		q.mu.Unlock()
+		observation := frame.observation
+		tracker := rt.currentTiming()
+		if tracker != nil && (observation == nil || observation.tracker != tracker) {
+			observation = tracker.inputObserved(frame.audio, frame.received, q.format, q.sampleRate)
+			q.mu.Lock()
+			if len(q.frames) > 0 && &q.frames[0].audio[0] == &frame.audio[0] {
+				q.frames[0].observation = observation
+			}
+			q.mu.Unlock()
+		}
+		_, writeKnown := session.(RealtimeAudioInputSession)
+		submittedAt := now
 		var once sync.Once
 		done := func(wait, write time.Duration, delivered bool) {
 			once.Do(func() {
+				observation.settled(time.Now(), delivered, writeKnown)
 				q.mu.Lock()
 				defer q.mu.Unlock()
 				q.inflight -= len(frame.audio)
-				q.flow.observe(now.Sub(frame.received), wait, write)
+				q.flow.observe(submittedAt.Sub(frame.received), wait, write)
 				if !delivered {
 					q.dropLocked("adapter_delivery_failed", len(frame.audio))
 				}
@@ -222,6 +244,9 @@ func (rt *RealtimeThinker) drainRealtimeInputAt(session RealtimeSession, now tim
 			if err == nil {
 				done(0, 0, true)
 			}
+		}
+		if err == nil {
+			observation.submittedAt(now)
 		}
 		if err != nil {
 			once.Do(func() { q.mu.Lock(); q.inflight -= len(frame.audio); q.mu.Unlock() })
@@ -299,7 +324,7 @@ func (rt *RealtimeThinker) admitRealtimeAudio(audio []byte, at time.Time) {
 		rt.lastCallerVoice.Store(at.UnixNano())
 	}
 	rt.recordRealtimeInput(len(audio))
-	rt.input.push(audio, at)
+	rt.input.push(audio, at, rt.currentTiming())
 	rt.wakeRecovery()
 }
 

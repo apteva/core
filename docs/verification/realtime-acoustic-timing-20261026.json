@@ -1,0 +1,58 @@
+{
+  "scope": "Core observational timing and replay regression fix; no deployment or provider setting changes",
+  "provider": {
+    "model": "gpt-live-1",
+    "voice": "brise",
+    "transport": "websocket",
+    "audio": "PCM16 mono 24kHz"
+  },
+  "validation": {
+    "full_short_suite": "passed",
+    "focused_realtime_race_suite": "passed",
+    "new_acoustic_and_replay_race_tests": "passed",
+    "live_replays": "3/3 passed"
+  },
+  "trials": [
+    {
+      "variant": "openai_websocket",
+      "trial": 1,
+      "first_acoustic_ms": 963.372917,
+      "first_packet_ms": 75.176458,
+      "eligible_latency_sample": true,
+      "missed_acoustic_response": false,
+      "errors": null
+    },
+    {
+      "variant": "openai_websocket",
+      "trial": 2,
+      "first_acoustic_ms": 1749.233541,
+      "first_packet_ms": 28.654875,
+      "eligible_latency_sample": true,
+      "missed_acoustic_response": false,
+      "errors": null
+    },
+    {
+      "variant": "openai_websocket",
+      "trial": 3,
+      "first_acoustic_ms": 1704.971417,
+      "first_packet_ms": 32.738292,
+      "eligible_latency_sample": true,
+      "missed_acoustic_response": false,
+      "errors": null
+    }
+  ],
+  "summary": {
+    "trials": 3,
+    "eligible_acoustic_samples": 3,
+    "missed_acoustic_responses": 0,
+    "median_ms": 1704.971417,
+    "sample_p95_nearest_rank_ms": 1749.233541
+  },
+  "limits": [
+    "Three trials do not establish population p95 or a conversational quality gate.",
+    "Acoustic activity is not semantic answer correctness or proof of caller playback.",
+    "No matched Conversations-versus-Telephony end-to-end comparison performed.",
+    "No claim of upstream latency improvement; this change corrects measurement.",
+    "Original quiet caller question retained at its recorded input level; dedicated overlap and first-word evidence is deterministic regression coverage, not a live phone-call quality score."
+  ]
+}

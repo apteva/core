@@ -672,7 +672,7 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 					s.mu.Lock()
 					s.turnOutputSinceTool = true
 					s.mu.Unlock()
-					s.timing.audio(responseID, itemID, receivedAt)
+					s.timing.providerAudio(responseID, itemID, receivedAt, pcm, AudioPCM16, 24000)
 					audioEvents = append(audioEvents, RealtimeEvent{
 						Type: RealtimeEventAudioOut, Audio: pcm,
 						ResponseID: responseID, ItemID: itemID,

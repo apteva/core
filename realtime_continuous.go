@@ -167,7 +167,7 @@ func (g *realtimeContinuousGuard) audio(e RealtimeEvent, timing *realtimeTiming)
 	g.lastAudio = e.ObservedAt
 	e.AudioSilence = !voiced
 	e.ItemID = g.id()
-	timing.audio("", e.ItemID, e.ObservedAt)
+	timing.providerAudio("", e.ItemID, e.ObservedAt, e.Audio, g.format, 0)
 	if g.rejected {
 		timing.dropped("", e.ItemID, len(e.Audio))
 		return nil
