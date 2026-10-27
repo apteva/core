@@ -225,7 +225,7 @@ func (rt *RealtimeThinker) forwardRealtimeAudio(event RealtimeEvent, generation 
 			rt.playbackTracked = false
 		}
 		endMS := (rt.outputBytes + len(event.Audio)) * 1000 / rt.outputRate()
-		frame := RealtimeAudioFrame{timing: rt.currentTiming(), Audio: event.Audio, SessionGeneration: generation, queuedAt: time.Now(), ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS, Silent: event.AudioSilence}
+		frame := RealtimeAudioFrame{providerObservedAt: event.ObservedAt, timing: rt.currentTiming(), Audio: event.Audio, SessionGeneration: generation, queuedAt: time.Now(), ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS, Silent: event.AudioSilence}
 		itemKey := realtimeTimingKey(event.ResponseID, event.ItemID)
 		deliveryKey := fmt.Sprintf("%d/%s", generation, itemKey)
 		frame.settle = rt.delivery.enqueueBytes(deliveryKey, event.ItemID, len(event.Audio), event.AudioSilence)

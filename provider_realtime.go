@@ -299,17 +299,18 @@ type RealtimeUsage struct {
 // 24 kHz, mono). ItemID and AudioEndMS let the renderer report how much of an
 // assistant item was actually played without knowing the provider protocol.
 type RealtimeAudioFrame struct {
-	queuedAt          time.Time
-	SessionGeneration int64
-	Audio             []byte
-	ResponseID        string
-	ItemID            string
-	AudioEndMS        int
-	Silent            bool // PCM remains ordered; silence does not imply active speech
-	timing            *realtimeTiming
-	cancelled         func() bool // invalidated playback must never reach the renderer
-	settle            func(int)
-	delivery          func(bool) // bridge write receipt; never a playback acknowledgement
+	providerObservedAt time.Time
+	queuedAt           time.Time
+	SessionGeneration  int64
+	Audio              []byte
+	ResponseID         string
+	ItemID             string
+	AudioEndMS         int
+	Silent             bool // PCM remains ordered; silence does not imply active speech
+	timing             *realtimeTiming
+	cancelled          func() bool // invalidated playback must never reach the renderer
+	settle             func(int)
+	delivery           func(bool) // bridge write receipt; never a playback acknowledgement
 }
 
 func (f RealtimeAudioFrame) written(success bool) {

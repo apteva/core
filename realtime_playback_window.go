@@ -13,6 +13,7 @@ type realtimePlaybackCredit struct{ sent, played int }
 // Socket-local credits require exact generation/item receipts. Late receipts
 // cannot open the window of a replacement session or another playback.
 type realtimePlaybackWindow struct {
+	timingTrace    bool
 	bytesPerSecond int
 	mu             sync.Mutex
 	capacity       int
@@ -121,8 +122,12 @@ func (s *realtimeBridgeSocket) writeFlowControlledAudio(ctx context.Context, f R
 			}
 			continue
 		}
-		metadata, _ := json.Marshal(map[string]any{"type": "audio.frame", "response_id": f.ResponseID, "item_id": f.ItemID, "audio_end_ms": (startBytes + end) * 1000 / defaultMediaRate(s.window.bytesPerSecond), "silence": f.Silent, "session_generation": f.SessionGeneration})
 		writeStarted := time.Now()
+		meta := map[string]any{"type": "audio.frame", "response_id": f.ResponseID, "item_id": f.ItemID, "audio_end_ms": (startBytes + end) * 1000 / defaultMediaRate(s.window.bytesPerSecond), "silence": f.Silent, "session_generation": f.SessionGeneration}
+		if s.window.traceEnabled() {
+			meta["timing"] = realtimeFrameTiming(f, writeStarted, (end-offset)*1000/defaultMediaRate(s.window.bytesPerSecond))
+		}
+		metadata, _ := json.Marshal(meta)
 		written, err := s.writePlaybackAudio(metadata, f.Audio[offset:end], f.cancelled)
 		f.timing.rendererFlow(f.ResponseID, f.ItemID, writeStarted.Sub(waitingSince), time.Since(writeStarted))
 		if !written || err != nil {
@@ -132,4 +137,29 @@ func (s *realtimeBridgeSocket) writeFlowControlledAudio(ctx context.Context, f R
 		waitingSince = time.Now()
 	}
 	return offset, nil
+}
+
+func (w *realtimePlaybackWindow) configureTrace(enabled bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.timingTrace = enabled
+}
+func (w *realtimePlaybackWindow) traceEnabled() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.timingTrace
+}
+
+// Only local monotonic durations. UTC timestamps are correlation anchors, not
+// measured cross-host transit times. This is preparation, not write completion.
+func realtimeFrameTiming(f RealtimeAudioFrame, at time.Time, durationMS int) map[string]any {
+	t := map[string]any{"core_write_started_at": at.UTC().Format(time.RFC3339Nano), "duration_ms": durationMS}
+	if !f.providerObservedAt.IsZero() && !at.Before(f.providerObservedAt) {
+		t["provider_received_at"] = f.providerObservedAt.UTC().Format(time.RFC3339Nano)
+		t["provider_to_write_ms"] = float64(at.Sub(f.providerObservedAt)) / float64(time.Millisecond)
+	}
+	if !f.queuedAt.IsZero() && !at.Before(f.queuedAt) {
+		t["core_queue_ms"] = float64(at.Sub(f.queuedAt)) / float64(time.Millisecond)
+	}
+	return t
 }

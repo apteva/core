@@ -768,17 +768,19 @@ func runRealtimeAudioBridgeReader(
 		}
 		if header.OpCode == ws.OpText {
 			var control struct {
-				Type       string `json:"type"`
-				ItemID     string `json:"item_id"`
-				AudioEndMS int    `json:"audio_end_ms"`
-				Evidence   string `json:"evidence"`
-				Scope      string `json:"scope"`
-				Generation int64  `json:"session_generation"`
-				CapacityMS int    `json:"capacity_ms"`
+				Type        string `json:"type"`
+				ItemID      string `json:"item_id"`
+				AudioEndMS  int    `json:"audio_end_ms"`
+				Evidence    string `json:"evidence"`
+				Scope       string `json:"scope"`
+				Generation  int64  `json:"session_generation"`
+				CapacityMS  int    `json:"capacity_ms"`
+				TimingTrace bool   `json:"timing_trace"`
 			}
 			if json.Unmarshal(data, &control) == nil && a.thinker != nil && a.thinker.threads != nil {
 				switch control.Type {
 				case "playback.ready":
+					socket.window.configureTrace(control.TimingTrace)
 					if socket.writeTimeout > 0 && control.CapacityMS > 0 {
 						socket.window.configure(control.CapacityMS)
 					}
