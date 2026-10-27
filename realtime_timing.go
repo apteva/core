@@ -230,7 +230,7 @@ func (t *realtimeTiming) writtenBytes(response, item string, at time.Time, bytes
 		}
 		if written < bytes {
 			u.droppedBytes += bytes - written
-			if u.status == "completed" {
+			if u.status == "completed" || u.status == "application_observed_quiet" {
 				u.status = "output_dropped"
 			}
 		}
@@ -251,6 +251,9 @@ func (t *realtimeTiming) finish(response, item, status string) {
 		return
 	}
 	var results []map[string]any
+	// Quiet is an observation, not cancellation. Silence can still be in a
+	// bridge write; retain its accounting until that write actually settles.
+	waitForWrites := status == "completed" || status == "application_observed_quiet"
 	t.mu.Lock()
 	if item != "" && status != "completed" {
 		if u := t.completed[item]; u != nil {
@@ -262,17 +265,17 @@ func (t *realtimeTiming) finish(response, item, status string) {
 			continue
 		}
 		u.done = true
-		if status != "completed" || u.status == "completed" {
+		if u.status == "completed" || status != "completed" && status != "application_observed_quiet" {
 			u.status = status
 		}
 		if status == "blocked" {
 			u.guard = "blocked"
 		}
-		if status != "completed" {
+		if !waitForWrites {
 			u.droppedBytes += u.pendingBytes
 			u.pendingBytes = 0
 		}
-		if u.pending == 0 || status != "completed" {
+		if u.pending == 0 || !waitForWrites {
 			results = append(results, t.summary(key, u))
 		}
 	}
