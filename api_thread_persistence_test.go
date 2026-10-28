@@ -158,8 +158,12 @@ func TestAPICreatedThreadPersistsEffectiveStateAndRestores(t *testing.T) {
 	restarted := NewThinker("", provider, reloaded)
 	t.Cleanup(func() {
 		provider.Release()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := restarted.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown restored thread fixture: %v", err)
+		}
 		restarted.threads.KillAll()
-		restarted.Stop()
 	})
 	if findThinkerByID(restarted, "chat-persisted") == nil {
 		t.Fatal("persisted API thread was not restored after restart")
@@ -175,7 +179,6 @@ func TestAPICreatedThreadPersistsEffectiveStateAndRestores(t *testing.T) {
 		t.Fatalf("restored tool scope changed:\n stored=%#v\nrestored=%#v", stored, restored)
 	}
 }
-
 
 func TestAPIRealtimeTurnDetectionPersistsAndRestoresIntoSession(t *testing.T) {
 	api, thinker, textProvider := newPersistentThreadTestAPI(t)
@@ -222,7 +225,13 @@ func TestAPIRealtimeTurnDetectionPersistsAndRestoresIntoSession(t *testing.T) {
 	}
 
 	restoredParent := newTestThinker()
-	defer restoredParent.Stop()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := restoredParent.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown restored voice fixture: %v", err)
+		}
+	})
 	restoredParent.config = reloaded
 	restoredRealtimeProvider := &fakeRealtimeProvider{}
 	restoredParent.pool = &ProviderPool{

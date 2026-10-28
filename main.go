@@ -232,7 +232,7 @@ func runCore() error {
 			logMsg("EXIT", err.Error())
 		}
 	}()
-	go thinker.Run()
+	thinker.startRunLoop(thinker.Run)
 	serveErr := make(chan error, 1)
 	go func() {
 		err := server.Serve(apiListener)

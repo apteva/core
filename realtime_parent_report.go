@@ -144,7 +144,12 @@ func (t *Thinker) startParentReportRetry() {
 		return
 	}
 	t.parentReportOnce.Do(func() {
+		done := make(chan struct{})
+		t.parentReportMu.Lock()
+		t.parentReportDone = done
+		t.parentReportMu.Unlock()
 		go func() {
+			defer close(done)
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for {

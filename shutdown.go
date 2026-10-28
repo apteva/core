@@ -11,7 +11,9 @@ func (t *Thinker) Shutdown(ctx context.Context) error {
 	var all []*Thinker
 	var collect func(*Thinker)
 	collect = func(current *Thinker) {
+		current.runLaunchMu.Lock()
 		current.shuttingDown.Store(true)
+		current.runLaunchMu.Unlock()
 		all = append(all, current)
 		if current.threads == nil {
 			return
@@ -35,9 +37,26 @@ func (t *Thinker) Shutdown(ctx context.Context) error {
 		var wg sync.WaitGroup
 		for _, current := range all {
 			wg.Add(1)
-			go func(th *Thinker) { defer wg.Done(); th.runMu.Lock(); th.runMu.Unlock() }(current)
+			go func(th *Thinker) {
+				defer wg.Done()
+				th.runScheduled.Wait()
+				th.runMu.Lock()
+				th.runMu.Unlock()
+			}(current)
 		}
 		wg.Wait()
+		// A child can stage a parent report from its Run cleanup. Join report
+		// workers only after all Run loops finish, so none can be created after
+		// we inspect their completion channels. Shutdown must not return while
+		// a report worker can still write configuration or inbox files.
+		for _, current := range all {
+			current.parentReportMu.Lock()
+			reportDone := current.parentReportDone
+			current.parentReportMu.Unlock()
+			if reportDone != nil {
+				<-reportDone
+			}
+		}
 		close(done)
 	}()
 	select {
@@ -55,4 +74,17 @@ func (t *Thinker) Shutdown(ctx context.Context) error {
 		t.telemetry.Stop()
 	}
 	return nil
+}
+
+// Register before launching: Run may not acquire runMu until after Shutdown
+// starts. The launch gate prevents WaitGroup additions after shutdown starts.
+func (t *Thinker) startRunLoop(run func()) bool {
+	t.runLaunchMu.Lock()
+	defer t.runLaunchMu.Unlock()
+	if t.shuttingDown.Load() {
+		return false
+	}
+	t.runScheduled.Add(1)
+	go func() { defer t.runScheduled.Done(); run() }()
+	return true
 }

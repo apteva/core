@@ -973,9 +973,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			thread.Realtime = rt
 			tm.mu.Unlock()
 			rt.setInitialMessage(thread.initialMessage)
-			go rt.Run()
+			thinker.startRunLoop(rt.Run)
 		} else {
-			go thinker.Run()
+			thinker.startRunLoop(thinker.Run)
 		}
 	} else {
 		logMsg("SPAWN", fmt.Sprintf("deferred Run() for id=%q (batch respawn)", id))
@@ -1933,9 +1933,9 @@ func (tm *ThreadManager) StartAll() {
 	tm.mu.Unlock()
 	for _, thread := range threads {
 		if thread.Realtime != nil {
-			go thread.Realtime.Run()
+			thread.Thinker.startRunLoop(thread.Realtime.Run)
 		} else {
-			go thread.Thinker.Run()
+			thread.Thinker.startRunLoop(thread.Thinker.Run)
 		}
 		if thread.Children != nil {
 			thread.Children.StartAll()
@@ -1975,9 +1975,9 @@ func (tm *ThreadManager) Start(id string) error {
 				return fmt.Errorf("realtime open: %w", err)
 			}
 		}
-		go thread.Realtime.Run()
+		thread.Thinker.startRunLoop(thread.Realtime.Run)
 	} else {
-		go thread.Thinker.Run()
+		thread.Thinker.startRunLoop(thread.Thinker.Run)
 	}
 	return nil
 }

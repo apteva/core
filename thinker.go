@@ -795,6 +795,7 @@ type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies 
 type Thinker struct {
 	parentReportMu      sync.Mutex
 	parentReportOnce    sync.Once
+	parentReportDone    chan struct{} // guarded by parentReportMu; closed after retry writes stop
 	parentReportPending map[string]PendingParentReport
 	traceOnce           sync.Once
 	trace               *executionTrace
@@ -818,6 +819,8 @@ type Thinker struct {
 	pause               chan bool
 	quit                chan struct{}
 	runMu               sync.Mutex
+	runLaunchMu         sync.Mutex
+	runScheduled        sync.WaitGroup
 	runContextMu        sync.Mutex
 	runCancel           context.CancelFunc
 	stopOnce            sync.Once
@@ -1765,7 +1768,7 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 		}
 	}
 
-	go t.Run()
+	t.startRunLoop(t.Run)
 	return nil
 }
 
@@ -2487,6 +2490,13 @@ func (t *Thinker) waitForRestoredWake() bool {
 func (t *Thinker) Run() {
 	t.runMu.Lock()
 	defer t.runMu.Unlock()
+	// A scheduled goroutine may start after shutdown has already joined an
+	// idle runMu. It must not publish milestones or touch persistence then.
+	select {
+	case <-t.quit:
+		return
+	default:
+	}
 	t.workerMilestone("ready", "")
 	defer t.workerMilestone("finished", "cancelled")
 	t.beginRuntime()

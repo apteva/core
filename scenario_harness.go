@@ -336,7 +336,7 @@ func RunScenario(t *testing.T, s Scenario) {
 		}
 	}()
 
-	go thinker.Run()
+	thinker.startRunLoop(thinker.Run)
 	defer func() {
 		stopped.Store(true)
 		thinker.Stop()

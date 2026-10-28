@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -25,7 +26,14 @@ func parentReportFixture(t *testing.T) (*Thinker, *Thread, *fakeRealtimeSession)
 	thread := parent.threads.threads["voice"]
 	thread.Realtime.replaceSession(session)
 	thread.Realtime.sessionGeneration = 1
-	t.Cleanup(func() { parent.Stop(); thread.Thinker.Stop(); thread.Realtime.cancel() })
+	t.Cleanup(func() {
+		thread.Realtime.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := parent.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown parent report fixture: %v", err)
+		}
+	})
 	return parent, thread, session
 }
 func readParentReport(t *testing.T, parent *Thinker) (PersistentThreadEvent, realtimeParentReport) {

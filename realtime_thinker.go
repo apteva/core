@@ -1475,6 +1475,10 @@ func (rt *RealtimeThinker) rendererPlaybackOverflow(itemID string) {
 // Run survives normal provider-enforced session endings. Only explicit thread
 // stop/cancellation ends the worker and invokes the normal cleanup path.
 func (rt *RealtimeThinker) Run() {
+	// Share the lifetime barrier used by Thinker.Shutdown, including terminal
+	// transcript/report persistence in the deferred cleanup below.
+	rt.runMu.Lock()
+	defer rt.runMu.Unlock()
 	defer func() {
 		if rt.completionReview.cancel != nil {
 			rt.completionReview.cancel()
