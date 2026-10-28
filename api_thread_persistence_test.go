@@ -71,15 +71,27 @@ func newPersistentThreadTestAPI(t *testing.T) (*APIServer, *Thinker, *parkedAPIP
 	thinker.registry = NewToolRegistry("")
 	thinker.toolIndex = NewToolIndex()
 	thinker.activeTools = map[string]bool{}
-	thinker.config.path = configFile
+	// Workers persist asynchronously. Keep their config anchored to this
+	// fixture even when a later test changes the process working directory.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	thinker.config.path = filepath.Join(cwd, configFile)
 	thinker.model = ModelLarge
 	thinker.agentModel = ModelLarge
 	thinker.agentReasoning = ReasoningAuto
 	thinker.publishRuntimeStatus()
 	t.Cleanup(func() {
 		provider.Release()
+		// Join workers before deleting their files or restoring the working
+		// directory; Stop/KillAll alone can leave final persistence in flight.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := thinker.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown persistent thread fixture: %v", err)
+		}
 		thinker.threads.KillAll()
-		thinker.Stop()
 	})
 	return api, thinker, provider
 }
