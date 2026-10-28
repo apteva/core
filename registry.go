@@ -17,6 +17,9 @@ type ToolResponse struct {
 	Text    string        // text result (always present)
 	Image   []byte        // optional image (screenshot etc.) — sent as part of tool result to LLM
 	IsError bool          // true when the tool returned an MCP-level isError result
+	// StructuredContent is the MCP structuredContent value, kept verbatim for
+	// machine checks. Text holds the model-facing copy.
+	StructuredContent json.RawMessage
 }
 
 type WakeOnResultPolicy string

@@ -144,12 +144,13 @@ func (t *Thinker) decorateDirectResultTools(tools []NativeTool) {
 
 func (t *Thinker) directToolReceipt(call toolCall, response ToolResponse) (receipt *ThreadWorkReceipt) {
 	policy := t.directResultPolicy(call.Name)
+	// Set by the result checks below. Never includes result contents.
+	reason := "result_not_eligible"
 	if policy != nil {
 		defer func() {
 			if t.telemetry == nil {
 				return
 			}
-			reason := "result_not_eligible"
 			if receipt != nil {
 				reason = "eligible"
 			} else if _, ok := call.Args[completeAssignmentArg]; !ok {
@@ -177,12 +178,24 @@ func (t *Thinker) directToolReceipt(call toolCall, response ToolResponse) (recei
 			}
 		}
 	}
+	// The result must be exactly one JSON object. When structured content is
+	// present, the model-facing text must be that same object: extra text or a
+	// differing mirror could carry an error the receipt would hide.
 	var result map[string]json.RawMessage
-	if json.Unmarshal([]byte(response.Text), &result) != nil {
+	if json.Unmarshal([]byte(response.Text), &result) != nil || result == nil {
+		reason = "malformed_result"
+		if len(response.StructuredContent) > 0 && json.Unmarshal(response.StructuredContent, &result) == nil && result != nil {
+			reason = "conflicting_representations"
+		}
+		return nil
+	}
+	if len(response.StructuredContent) > 0 && !equivalentJSON([]byte(response.Text), response.StructuredContent) {
+		reason = "conflicting_representations"
 		return nil
 	}
 	var status string
 	if json.Unmarshal(result[policy.SuccessField], &status) != nil || status != policy.SuccessValue {
+		reason = "success_status_failed"
 		return nil
 	}
 	facts := map[string]json.RawMessage{}

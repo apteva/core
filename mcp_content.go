@@ -2,11 +2,14 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 )
 
@@ -48,10 +51,49 @@ func decodeMCPResult(result mcpCallResult) (ToolResponse, error) {
 		}
 	}
 	if len(result.StructuredContent) > 0 {
-		texts = append(texts, string(result.StructuredContent))
+		out.StructuredContent = append(json.RawMessage(nil), result.StructuredContent...)
+		// MCP recommends mirroring structured output in a text block. Show the
+		// model one copy; anything distinct from the mirror is kept.
+		if !mirrorsStructuredContent(texts, result.StructuredContent) {
+			texts = append(texts, string(result.StructuredContent))
+		}
 	}
 	out.Text = strings.Join(texts, "\n")
 	return out, nil
+}
+
+func mirrorsStructuredContent(texts []string, structured json.RawMessage) bool {
+	for _, text := range texts {
+		if equivalentJSON([]byte(text), structured) {
+			return true
+		}
+	}
+	return false
+}
+
+// equivalentJSON reports whether a and b each hold exactly one JSON value and
+// those values are equal, ignoring whitespace and object key order.
+func equivalentJSON(a, b []byte) bool {
+	va, err := decodeSingleJSON(a)
+	if err != nil {
+		return false
+	}
+	vb, err := decodeSingleJSON(b)
+	return err == nil && reflect.DeepEqual(va, vb)
+}
+
+// decodeSingleJSON rejects trailing documents or prose after the value.
+func decodeSingleJSON(data []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("unexpected data after JSON value")
+	}
+	return v, nil
 }
 
 func listAllMCPTools(call func(string, any) (json.RawMessage, error)) ([]mcpToolDef, error) {
