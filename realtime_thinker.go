@@ -55,6 +55,7 @@ type RealtimeThinker struct {
 	audioLane           realtimeAudioLane
 	outputPending       []RealtimeAudioFrame
 	outputPendingBytes  int
+	outputSeq           uint64 // guarded by outputMu
 	inputPaused         atomic.Bool
 	callerSpeechPending atomic.Bool
 	outputPaused        atomic.Bool
@@ -92,6 +93,9 @@ type RealtimeThinker struct {
 	cancelledPlaybacks     map[string]bool
 	cancelledPlaybackOrder []string
 	playbackClearRequested map[string]time.Time
+	// Renderer controls not yet accepted by the bridge control channel. Audio is
+	// held back while non-empty so a clear always precedes later playback.
+	pendingControls        []realtimePendingControl
 	toolMarkupRecoveryKeys map[string]bool
 	responseMu             sync.Mutex
 	responseActive         bool
@@ -1239,17 +1243,22 @@ func (rt *RealtimeThinker) discardQueuedPlayback(item string) (frames, bytes int
 	if rt.audioOut == nil {
 		return frames, bytes
 	}
+	// Never block on rt.audioOut while holding outputMu. Producers hold
+	// outputMu, so a full drain leaves the channel empty; kept frames return in
+	// order ahead of the backlog. They were already accepted, so the backlog's
+	// age limit is not re-applied; any that do not fit stay at its head.
 	var keep []RealtimeAudioFrame
-	defer func() {
-		for _, frame := range keep {
-			rt.audioOut <- frame
-		}
-	}()
-	for i, n := 0, len(rt.audioOut); i < n; i++ {
+	gate := audioOutputGateFor(rt.audioOut)
+	gate.mu.Lock()
+drain:
+	for {
 		select {
 		case frame, ok := <-rt.audioOut:
 			if !ok {
-				return frames, bytes
+				break drain
+			}
+			if frame.wake {
+				continue
 			}
 			if item != "" && frame.ItemID != item {
 				keep = append(keep, frame)
@@ -1260,10 +1269,89 @@ func (rt *RealtimeThinker) discardQueuedPlayback(item string) (frames, bytes int
 			frames++
 			bytes += len(frame.Audio)
 		default:
-			return frames, bytes
+			break drain
+		}
+	}
+	parked := gate.requeue[:0]
+	for _, frame := range gate.requeue {
+		if item != "" && frame.ItemID != item {
+			parked = append(parked, frame)
+			continue
+		}
+		frame.timing.written(frame.ResponseID, frame.ItemID, time.Time{}, len(frame.Audio), false)
+		frame.written(false)
+		frames++
+		bytes += len(frame.Audio)
+	}
+	gate.requeue = append(parked, keep...)
+	waiting := len(gate.requeue) > 0
+	gate.mu.Unlock()
+	if waiting {
+		// The drain emptied the channel and producers wait on outputMu, so
+		// the marker fits; it wakes an idle writer to collect parked frames.
+		select {
+		case rt.audioOut <- RealtimeAudioFrame{wake: true}:
+		default:
 		}
 	}
 	return frames, bytes
+}
+
+type realtimePendingControl struct{ key, payload string }
+
+// Caller holds outputMu. Repeated clears for the same generation/item (or the
+// single legacy interrupt) coalesce to the latest payload in their original slot.
+func (rt *RealtimeThinker) queueRendererControlLocked(key, payload string) {
+	for i := range rt.pendingControls {
+		if rt.pendingControls[i].key == key {
+			rt.pendingControls[i].payload = payload
+			return
+		}
+	}
+	rt.pendingControls = append(rt.pendingControls, realtimePendingControl{key: key, payload: payload})
+}
+
+// Caller holds outputMu. Never blocks; reports whether the backlog is empty.
+func (rt *RealtimeThinker) flushRendererControlsLocked() bool {
+	for len(rt.pendingControls) > 0 {
+		if rt.audioControl == nil {
+			rt.pendingControls = nil
+			return true
+		}
+		select {
+		case rt.audioControl <- rt.pendingControls[0].payload:
+			rt.pendingControls[0] = realtimePendingControl{}
+			rt.pendingControls = rt.pendingControls[1:]
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// A newly connected renderer has a fresh player: clears addressed to the
+// previous connection's audio are stale. Uncancelled audio keeps flowing.
+func (rt *RealtimeThinker) discardStaleRendererControls(control <-chan string) {
+	rt.outputMu.Lock()
+	pending := len(rt.pendingControls)
+	rt.pendingControls = nil
+	queued := 0
+drain:
+	for control != nil {
+		select {
+		case _, ok := <-control:
+			if !ok {
+				break drain
+			}
+			queued++
+		default:
+			break drain
+		}
+	}
+	rt.outputMu.Unlock()
+	if pending+queued > 0 {
+		rt.emit("realtime.renderer_controls_discarded", map[string]any{"queued": queued, "pending": pending, "reason": "bridge_connected"})
+	}
 }
 
 func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, cancelProvider, requirePlaybackAck bool) bool {
@@ -1322,16 +1410,18 @@ func (rt *RealtimeThinker) interruptPlayback(reason, expectedItemID string, canc
 	// Queue the clear before another playback can be enqueued. Scoped metadata
 	// lets updated renderers ignore stale controls; legacy renderers keep type.
 	if itemID != "" && rt.audioControl != nil {
-		control := "interrupt"
+		control, key := "interrupt", "interrupt"
 		if rt.capabilities.ContinuousConversation || rt.rendererScoped.Load() {
-			payload, _ := json.Marshal(map[string]any{"type": "interrupt", "item_id": itemID, "session_generation": rt.delivery.generationFor(itemID, generationForAudioFrame(rt)), "reason": reason, "requested_at_ms": time.Now().UnixMilli()})
-			control = string(payload)
+			generation := rt.delivery.generationFor(itemID, generationForAudioFrame(rt))
+			payload, _ := json.Marshal(map[string]any{"type": "interrupt", "item_id": itemID, "session_generation": generation, "reason": reason, "requested_at_ms": time.Now().UnixMilli()})
+			control, key = string(payload), fmt.Sprintf("%d/%s", generation, itemID)
 		}
-		select {
-		case rt.audioControl <- control:
-		case <-rt.ctx.Done():
-		case <-time.After(100 * time.Millisecond):
-			rt.emit("realtime.control_overflow", map[string]any{"control": "interrupt", "reason": reason})
+		// Never wait on the bridge while holding outputMu: the audio lane and
+		// every other interrupt would stall behind it. The backlog is flushed
+		// on each lane tick and holds later audio back until it is delivered.
+		rt.queueRendererControlLocked(key, control)
+		if !rt.flushRendererControlsLocked() {
+			rt.emit("realtime.control_deferred", map[string]any{"control": "interrupt", "reason": reason, "pending": len(rt.pendingControls)})
 		}
 	}
 	rt.outputMu.Unlock()

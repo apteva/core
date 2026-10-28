@@ -207,3 +207,67 @@ func TestRendererProgressWireRetainsEvidenceAndRejectsStaleGeneration(t *testing
 		t.Fatalf("lost receipt meaning: %v", receipt)
 	}
 }
+
+// Telephony sends playback.cleared (scope local, discarded_after_cancel) for an
+// item already cancelled by playback.overflow. It must only free that item's
+// credit and acknowledge the clear: never re-interrupt or touch a newer reply.
+func TestRendererClearedAfterOverflowIsIdempotentForNewerReply(t *testing.T) {
+	rt, _ := completionFixture(t)
+	rt.capabilities = RealtimeCapabilities{ContinuousConversation: true}
+	rt.sessionGeneration = 3
+	rt.outputItemID = "old"
+	rt.outputBytes = 960
+	rt.delivery.enqueue("3/old", "old", 960)(true)
+	rt.rendererPlaybackOverflowForGeneration("old", 3)
+	if !rt.cancelledPlaybacks["old"] || rt.playbackClearRequested["old"].IsZero() {
+		t.Fatal("overflow did not cancel old item")
+	}
+	rt.outputItemID = "newer"
+	rt.outputBytes = 960
+	rt.delivery.enqueue("3/newer", "newer", 960)(true)
+
+	parent := newTestThinker()
+	defer parent.Stop()
+	parent.threads.threads["voice"] = &Thread{ID: "voice", Realtime: rt, Thinker: rt.Thinker, IsRealtime: true}
+	api := &APIServer{thinker: parent}
+	socket := &realtimeBridgeSocket{}
+	socket.window.configure(1000)
+	socket.window.items[playbackCreditKey(3, "old")] = realtimePlaybackCredit{sent: 960}
+	socket.window.items[playbackCreditKey(3, "newer")] = realtimePlaybackCredit{sent: 960}
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	socket.conn = conn
+	done := make(chan error, 1)
+	go func() {
+		done <- runRealtimeAudioBridgeReader(context.Background(), socket, &audioBridgeRegistration{}, api, "voice")
+	}()
+	cleared := `{"type":"playback.cleared","item_id":"old","session_generation":3,"scope":"local","reason":"discarded_after_cancel","local_discarded_ms":20}`
+	for range 2 {
+		if err := wsutil.WriteClientMessage(peer, ws.OpText, []byte(cleared)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	peer.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not stop")
+	}
+	rt.outputMu.Lock()
+	defer rt.outputMu.Unlock()
+	if rt.outputItemID != "newer" || rt.outputBytes != 960 || rt.cancelledPlaybacks["newer"] || rt.delivery.isCancelled("3/newer") {
+		t.Fatal("cleared after overflow interrupted the newer reply")
+	}
+	if _, pending := rt.playbackClearRequested["old"]; pending {
+		t.Fatal("clear for cancelled item not acknowledged")
+	}
+	socket.window.mu.Lock()
+	defer socket.window.mu.Unlock()
+	if _, ok := socket.window.items[playbackCreditKey(3, "old")]; ok {
+		t.Fatal("old credit not freed")
+	}
+	if _, ok := socket.window.items[playbackCreditKey(3, "newer")]; !ok {
+		t.Fatal("newer credit freed")
+	}
+}
