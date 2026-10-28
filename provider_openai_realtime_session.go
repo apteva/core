@@ -61,6 +61,10 @@ type openaiRealtimeSession struct {
 	timing                   *realtimeTiming
 	settings                 map[string]any
 	receivedAt               time.Time
+	// Reader-goroutine only: stamps around the WebSocket read of the current
+	// event, attached to audio deltas for the opt-in frame trace.
+	readStartedAt  time.Time
+	readReturnedAt time.Time
 }
 
 type openAICompatibleRealtimeConfig struct {
@@ -318,7 +322,9 @@ func buildSessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, 
 
 func (s *openaiRealtimeSession) readLoop() {
 	for {
+		readStarted := time.Now()
 		data, op, err := wsutil.ReadServerData(s.conn)
+		s.readStartedAt, s.readReturnedAt = readStarted, time.Now()
 		if err != nil {
 			select {
 			case <-s.done:
@@ -398,6 +404,8 @@ func (s *openaiRealtimeSession) translate(event *openaiRealtimeEvent) {
 		s.timing.providerAudio(base.ResponseID, base.ItemID, at, pcm, s.audioOutFormat, s.audioOutRate)
 		s.timing.released(base.ResponseID, base.ItemID, at, 0, "provider_stream")
 		base.Type, base.Audio = RealtimeEventAudioOut, pcm
+		base.providerReadStartedAt, base.providerReadReturnedAt = s.readStartedAt, s.readReturnedAt
+		base.providerDeltaDurationMS = float64(len(pcm)) * 1000 / audioBytesPerSecond(s.audioOutFormat, s.audioOutRate)
 		s.emitAudio(base)
 	case "response.output_audio_transcript.delta", "response.output_text.delta", "response.text.delta":
 		base.Type, base.Transcript, base.Final = RealtimeEventTranscriptOutput, event.Delta, false

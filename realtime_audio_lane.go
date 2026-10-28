@@ -225,7 +225,9 @@ func (rt *RealtimeThinker) forwardRealtimeAudio(event RealtimeEvent, generation 
 			rt.playbackTracked = false
 		}
 		endMS := (rt.outputBytes + len(event.Audio)) * 1000 / rt.outputRate()
-		frame := RealtimeAudioFrame{providerObservedAt: event.ObservedAt, timing: rt.currentTiming(), Audio: event.Audio, SessionGeneration: generation, queuedAt: time.Now(), ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS, Silent: event.AudioSilence}
+		frame := RealtimeAudioFrame{providerObservedAt: event.ObservedAt, timing: rt.currentTiming(), Audio: event.Audio, SessionGeneration: generation, queuedAt: time.Now(), ResponseID: event.ResponseID, ItemID: event.ItemID, AudioEndMS: endMS, audioEndBytes: rt.outputBytes + len(event.Audio), Silent: event.AudioSilence}
+		frame.providerReadStartedAt, frame.providerReadReturnedAt = event.providerReadStartedAt, event.providerReadReturnedAt
+		frame.providerDeltaDurationMS = event.providerDeltaDurationMS
 		itemKey := realtimeTimingKey(event.ResponseID, event.ItemID)
 		deliveryKey := fmt.Sprintf("%d/%s", generation, itemKey)
 		frame.settle = rt.delivery.enqueueBytes(deliveryKey, event.ItemID, len(event.Audio), event.AudioSilence)
@@ -255,7 +257,9 @@ func (rt *RealtimeThinker) queueRealtimeOutputLocked(frame RealtimeAudioFrame) b
 	if pending > int(realtimeOutputBufferDuration/time.Second)*rt.outputRate() {
 		return false
 	}
-	if len(rt.outputPending) == 0 {
+	rt.outputSeq++
+	frame.seq = rt.outputSeq
+	if len(rt.outputPending) == 0 && rt.flushRendererControlsLocked() {
 		select {
 		case rt.audioOut <- frame:
 			return true
@@ -269,6 +273,12 @@ func (rt *RealtimeThinker) queueRealtimeOutputLocked(frame RealtimeAudioFrame) b
 func (rt *RealtimeThinker) pumpRealtimeOutput() {
 	rt.outputMu.Lock()
 	defer rt.outputMu.Unlock()
+	if !rt.flushRendererControlsLocked() {
+		return
+	}
+	rt.pumpRealtimeOutputLocked()
+}
+func (rt *RealtimeThinker) pumpRealtimeOutputLocked() {
 	for len(rt.outputPending) > 0 {
 		f := rt.outputPending[0]
 		if f.cancelled != nil && f.cancelled() {

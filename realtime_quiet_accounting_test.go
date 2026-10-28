@@ -98,3 +98,44 @@ func TestRealtimeRepeatedQuietPreservesWriteFailure(t *testing.T) {
 		t.Fatal(result)
 	}
 }
+
+func TestRealtimeQuietPreservesDelegationsAndLateContextAcknowledgements(t *testing.T) {
+	var stages []map[string]any
+	timing := newRealtimeTiming(3, func(kind string, data map[string]any) {
+		if kind == "realtime.request_timing" {
+			stages = append(stages, data)
+		}
+	})
+	base := time.Now()
+	first := ThreadWork{ID: "first", Revision: 1, DelegationID: "delegation-1"}
+	timing.requestStage(first, "requested", base)
+	timing.requestStage(first, "submitted", base.Add(time.Second))
+	timing.registerContext("context-1", first)
+	for range 3 {
+		timing.finish("", "", "application_observed_quiet")
+	}
+	if timing.trackingClosed || timing.callerClosed || len(stages) != 2 {
+		t.Fatal("ordinary quiet closed the session timeline")
+	}
+	timing.contextAcknowledged("context-1", base.Add(2*time.Second))
+	if last := stages[len(stages)-1]; last["stage"] != "context_acknowledged" || last["submission_to_context_ack_ms"] != float64(1000) {
+		t.Fatalf("late context acknowledgement lost: %v", last)
+	}
+	second := ThreadWork{ID: "second", Revision: 1, DelegationID: "delegation-2"}
+	timing.requestStage(second, "requested", base.Add(3*time.Second))
+	if timing.requests[requestTimingKey(second)] == nil {
+		t.Fatal("next delegation was not tracked after quiet")
+	}
+	// Real termination still closes both requests exactly once and rejects
+	// late work on this generation.
+	timing.finish("", "", "session_ended")
+	count := len(stages)
+	if !timing.trackingClosed || !timing.callerClosed || count != 6 {
+		t.Fatalf("termination failed to close requests: %v", stages)
+	}
+	timing.finish("", "", "session_ended")
+	timing.requestStage(ThreadWork{ID: "late", Revision: 1}, "requested", time.Now())
+	if len(stages) != count || len(timing.requests) != 0 {
+		t.Fatal("duplicate termination or late generation admitted")
+	}
+}

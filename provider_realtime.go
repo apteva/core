@@ -301,16 +301,23 @@ type RealtimeUsage struct {
 type RealtimeAudioFrame struct {
 	providerObservedAt time.Time
 	queuedAt           time.Time
-	SessionGeneration  int64
-	Audio              []byte
-	ResponseID         string
-	ItemID             string
-	AudioEndMS         int
-	Silent             bool // PCM remains ordered; silence does not imply active speech
-	timing             *realtimeTiming
-	cancelled          func() bool // invalidated playback must never reach the renderer
-	settle             func(int)
-	delivery           func(bool) // bridge write receipt; never a playback acknowledgement
+	// Trace-only provider read stamps copied from RealtimeEvent.
+	providerReadStartedAt   time.Time
+	providerReadReturnedAt  time.Time
+	providerDeltaDurationMS float64
+	SessionGeneration       int64
+	Audio                   []byte
+	ResponseID              string
+	ItemID                  string
+	AudioEndMS              int
+	audioEndBytes           int    // byte-exact item end; AudioEndMS is truncated
+	seq                     uint64 // queue order; restores order after a concurrent drain
+	wake                    bool   // carries no audio; tells the writer frames were parked
+	Silent                  bool   // PCM remains ordered; silence does not imply active speech
+	timing                  *realtimeTiming
+	cancelled               func() bool // invalidated playback must never reach the renderer
+	settle                  func(int)
+	delivery                func(bool) // bridge write receipt; never a playback acknowledgement
 }
 
 func (f RealtimeAudioFrame) written(success bool) {
@@ -466,10 +473,15 @@ const (
 // RealtimeEvent is a single event from a session. Only the fields
 // relevant to the Type are populated.
 type RealtimeEvent struct {
-	audioForwarded bool           // internal audio-lane observation; payload already delivered
-	ObservedAt     time.Time      // local receipt time; never a provider wall clock
-	Settings       map[string]any // sanitized session acknowledgement
-	Type           RealtimeEventType
+	audioForwarded bool // internal audio-lane observation; payload already delivered
+	// Opt-in trace only: local monotonic stamps around the provider WebSocket
+	// read that delivered this audio delta. Zero for WebRTC media.
+	providerReadStartedAt   time.Time
+	providerReadReturnedAt  time.Time
+	providerDeltaDurationMS float64
+	ObservedAt              time.Time      // local receipt time; never a provider wall clock
+	Settings                map[string]any // sanitized session acknowledgement
+	Type                    RealtimeEventType
 
 	// Audio (RealtimeEventAudioOut)
 	Audio []byte

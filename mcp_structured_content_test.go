@@ -92,6 +92,73 @@ func TestDecodeMCPResultDeduplicatesMirroredStructuredContent(t *testing.T) {
 	}
 }
 
+func TestStructuredJSONRejectsAmbiguousKeys(t *testing.T) {
+	for _, raw := range []string{
+		`{"status":"failed","status":"confirmed"}`,
+		`{"status":"confirmed","status":"confirmed"}`,
+		`{"status":"failed","\u0073tatus":"confirmed"}`,
+		`{"nested":{"error":true,"error":false}}`,
+		`[{"status":"failed","status":"confirmed"}]`,
+		`{} {}`, `{} trailing`, `{"x":1,}`, `[1,]`, `{"x":`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if _, err := decodeSingleJSON([]byte(raw)); err == nil {
+				t.Fatal("ambiguous or malformed JSON accepted")
+			}
+			if equivalentJSON([]byte(raw), []byte(raw)) {
+				t.Fatal("ambiguous JSON eligible for deduplication")
+			}
+		})
+	}
+	// Repeated names in different objects are unambiguous. Preserve exact
+	// large numbers, nulls, empty containers and escaped JSON strings.
+	a := `{"items":[{"id":12345678901234567890},{"id":2}],"empty":[],"nil":null,"s":"a\\b"}`
+	b := `{"s":"a\\b","nil":null,"empty":[],"items":[{"id":12345678901234567890},{"id":2}]}`
+	if !equivalentJSON([]byte(a), []byte(b)) {
+		t.Fatal("valid reordered structured result no longer deduplicates")
+	}
+	deep := strings.Repeat("[", 1002) + "0" + strings.Repeat("]", 1002)
+	if _, err := decodeSingleJSON([]byte(deep)); err == nil {
+		t.Fatal("eligibility parser has no nesting bound")
+	}
+}
+
+func TestDirectReceiptRejectsDuplicateKeysWithoutLosingEvidence(t *testing.T) {
+	for _, raw := range []string{
+		`{"status":"failed","status":"confirmed","date":"Tuesday","reference":"R42"}`,
+		`{"status":"failed","\u0073tatus":"confirmed","date":"Tuesday","reference":"R42"}`,
+		`{"status":"confirmed","date":"Tuesday","reference":"R42","detail":{"failed":true,"failed":false}}`,
+	} {
+		for _, shape := range []string{"text_only", "structured_only", "conflicting_mirror", "identical_mirror"} {
+			t.Run(shape+raw, func(t *testing.T) {
+				var payload map[string]any
+				switch shape {
+				case "text_only":
+					payload = structuredPayload("", textBlock(raw))
+				case "structured_only":
+					payload = structuredPayload(raw)
+				case "conflicting_mirror":
+					payload = structuredPayload(bookingJSON, textBlock(raw))
+				case "identical_mirror":
+					payload = structuredPayload(raw, textBlock(raw))
+				}
+				resp := decodeWirePayload(t, payload)
+				if !strings.Contains(resp.Text, raw) {
+					t.Fatal("ambiguous evidence removed from normal continuation")
+				}
+				if shape == "conflicting_mirror" && resp.Text != raw+"\n"+bookingJSON {
+					t.Fatal("conflicting representations incorrectly merged")
+				}
+				th, w := receiptThinker(t)
+				call := toolCall{Name: "book", NativeID: "call", Args: map[string]string{completeAssignmentArg: "true"}, work: &w}
+				if receipt := th.directToolReceipt(call, resp); receipt != nil {
+					t.Fatalf("ambiguous result produced direct confirmation: %s", receipt.Content)
+				}
+			})
+		}
+	}
+}
+
 func TestDecodeMCPResultKeepsMediaWithMirroredStructuredContent(t *testing.T) {
 	resp := decodeWirePayload(t, structuredPayload(bookingJSON,
 		textBlock(bookingJSON),

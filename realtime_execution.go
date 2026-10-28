@@ -359,6 +359,8 @@ func (rt *RealtimeThinker) maybeStartExecution() {
 			}
 		}
 	}
+	data := map[string]any{"thread_id": worker.ID, "request_id": b.requestID, "revision": b.revision, "delegation_id": b.delegation, "mode": b.mode, "provider": b.provider.Name(), "model": modelIDForProvider(b.provider, b.model), "state": "queued", "measurement_stage": "assignment_ready"}
+	rt.emit("realtime.execution_queued", data)
 	if err = rt.threads.QueueWork(worker.ID, rt.workMetadata(), text.String(), parts); err != nil {
 		rt.emit("realtime.execution_error", map[string]any{"error": err.Error()})
 		return
@@ -369,7 +371,8 @@ func (rt *RealtimeThinker) maybeStartExecution() {
 	b.active = true
 	b.want = false
 	rt.currentTiming().requestStage(rt.workMetadata(), "started", time.Now())
-	rt.emit("realtime.execution_started", map[string]any{"thread_id": worker.ID, "request_id": b.requestID, "revision": b.revision, "mode": b.mode, "provider": b.provider.Name(), "model": modelIDForProvider(b.provider, b.model)})
+	data["measurement_stage"] = "assignment_dispatched"
+	rt.emit("realtime.execution_started", data) // Legacy event retains its dispatch semantics.
 }
 func (rt *RealtimeThinker) consumeThreadWork(event Event) {
 	b := &rt.backend
@@ -479,6 +482,12 @@ func (rt *RealtimeThinker) consumeThreadWork(event Event) {
 }
 func (rt *RealtimeThinker) persistExecutionMessage(m Message, usage TokenUsage) {
 	rt.transcriptMu.Lock()
+	if m.Work != nil && m.Work.Kind == "result" {
+		rt.parentReportBackendResults = append(rt.parentReportBackendResults, realtimeParentBackendResult{Work: *m.Work, Text: reportText(m.Content, 1200)})
+		if len(rt.parentReportBackendResults) > 3 {
+			rt.parentReportBackendResults = rt.parentReportBackendResults[len(rt.parentReportBackendResults)-3:]
+		}
+	}
 	rt.messages = append(rt.messages, m)
 	rt.transcriptMu.Unlock()
 	if rt.Thinker.session != nil {

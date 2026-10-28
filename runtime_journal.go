@@ -12,6 +12,7 @@ import (
 // Runtime deltas are committed independently of the comparatively large static
 // thread/provider configuration. The snapshot's sequence is a replay checkpoint.
 type runtimeDelta struct {
+	ParentReports  *[]PendingParentReport     `json:"parent_reports,omitempty"`
 	ExecutionOrder []string                   `json:"execution_order,omitempty"`
 	OutboxOrder    []string                   `json:"outbox_order,omitempty"`
 	ThreadEvents   map[string]json.RawMessage `json:"thread_events,omitempty"`
@@ -21,10 +22,11 @@ type runtimeDelta struct {
 	MainEvents     *[]PersistentThreadEvent   `json:"main_events,omitempty"`
 }
 type runtimeState struct {
-	ThreadEvents map[string][]PersistentThreadEvent
-	Executions   []PersistentEventExecution
-	Outbox       []EventLifecycleTransition
-	MainEvents   []PersistentThreadEvent
+	ParentReports []PendingParentReport
+	ThreadEvents  map[string][]PersistentThreadEvent
+	Executions    []PersistentEventExecution
+	Outbox        []EventLifecycleTransition
+	MainEvents    []PersistentThreadEvent
 }
 
 func (c *Config) runtimeStateLocked() runtimeState {
@@ -34,7 +36,7 @@ func (c *Config) runtimeStateLocked() runtimeState {
 			events[thread.ID] = thread.Events
 		}
 	}
-	return runtimeState{ThreadEvents: events, Executions: c.EventExecutions, Outbox: c.EventLifecycleOutbox, MainEvents: c.MainEvents}
+	return runtimeState{ParentReports: c.ParentReports, ThreadEvents: events, Executions: c.EventExecutions, Outbox: c.EventLifecycleOutbox, MainEvents: c.MainEvents}
 }
 func keyedJSON[T any](values []T, key func(T) string) map[string]json.RawMessage {
 	out := map[string]json.RawMessage{}
@@ -94,6 +96,9 @@ func applyJSONDelta[T any](values []T, delta map[string]json.RawMessage, key fun
 }
 func (c *Config) applyRuntimeDeltaLocked(d runtimeDelta) error {
 	var err error
+	if d.ParentReports != nil {
+		c.ParentReports = *d.ParentReports
+	}
 	c.EventExecutions, err = applyJSONDelta(c.EventExecutions, d.Executions, func(v PersistentEventExecution) string { return v.ExecutionID }, d.ExecutionOrder)
 	if err != nil {
 		return err
@@ -198,6 +203,7 @@ func (c *Config) updateRuntime(fn func()) error {
 		c.EventExecutions = before.Executions
 		c.EventLifecycleOutbox = before.Outbox
 		c.MainEvents = before.MainEvents
+		c.ParentReports = before.ParentReports
 		for i := range c.Threads {
 			c.Threads[i].Events = before.ThreadEvents[c.Threads[i].ID]
 		}
@@ -218,7 +224,12 @@ func (c *Config) updateRuntime(fn func()) error {
 	if !bytes.Equal(a, b) {
 		d.MainEvents = &after.MainEvents
 	}
-	if len(d.Executions) == 0 && len(d.Outbox) == 0 && d.MainEvents == nil && len(d.ThreadEvents) == 0 {
+	a, _ = json.Marshal(before.ParentReports)
+	b, _ = json.Marshal(after.ParentReports)
+	if !bytes.Equal(a, b) {
+		d.ParentReports = &after.ParentReports
+	}
+	if len(d.Executions) == 0 && len(d.Outbox) == 0 && d.MainEvents == nil && len(d.ThreadEvents) == 0 && d.ParentReports == nil {
 		return nil
 	}
 	// JSON object iteration cannot carry insertion order. Preserve it explicitly
@@ -250,6 +261,7 @@ func (c *Config) updateRuntime(fn func()) error {
 			c.EventExecutions = after.Executions
 			c.EventLifecycleOutbox = after.Outbox
 			c.MainEvents = after.MainEvents
+			c.ParentReports = after.ParentReports
 			for i := range c.Threads {
 				c.Threads[i].Events = after.ThreadEvents[c.Threads[i].ID]
 			}

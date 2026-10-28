@@ -228,6 +228,7 @@ func (s *openaiLiveSession) readLiveLoop() {
 			case <-s.done:
 				return
 			case m := <-s.rtcMessages:
+				s.readStartedAt, s.readReturnedAt = time.Time{}, time.Time{}
 				if m.audio != nil {
 					s.acceptLiveAudio(m.audio, time.Now())
 					continue
@@ -235,7 +236,9 @@ func (s *openaiLiveSession) readLiveLoop() {
 				data, op, err = m.data, ws.OpText, m.err
 			}
 		} else {
+			readStarted := time.Now()
 			data, op, err = wsutil.ReadServerData(s.conn)
+			s.readStartedAt, s.readReturnedAt = readStarted, time.Now()
 		}
 		if err != nil {
 			select {
@@ -469,7 +472,12 @@ func (s *openaiLiveSession) SendAudioFrame(f RealtimeInputAudio) error {
 
 func (s *openaiLiveSession) acceptLiveAudio(audio []byte, at time.Time) {
 	s.guardMu.Lock()
-	events := s.guard.audio(RealtimeEvent{Type: RealtimeEventAudioOut, ObservedAt: at, Audio: audio}, s.timing)
+	event := RealtimeEvent{Type: RealtimeEventAudioOut, ObservedAt: at, Audio: audio}
+	if !s.readStartedAt.IsZero() {
+		event.providerReadStartedAt, event.providerReadReturnedAt = s.readStartedAt, s.readReturnedAt
+		event.providerDeltaDurationMS = float64(len(audio)) * 1000 / audioBytesPerSecond(s.media.format(), s.media.rate())
+	}
+	events := s.guard.audio(event, s.timing)
 	s.guardMu.Unlock()
 	for _, event := range events {
 		s.emitControl(event)

@@ -206,13 +206,18 @@ type ThreadInfo struct {
 }
 
 type Thread struct {
-	RealtimeExecution *RealtimeExecutionConfig
-	WorkMode          bool
-	profileUpdateMu   sync.Mutex // serializes profile reconciliation through event acceptance
-	cachedToolNames   []string
-	ID                string
-	Name              string // human-readable label, separate from ID. ID is immutable;
-	System            bool   // platform-managed thread, not an agent-addressable worker
+	completionMu           sync.Mutex
+	completionMessage      string
+	completionExecutionIDs []string
+	finalParentReport      *PendingParentReport
+	parentReportStaged     bool
+	RealtimeExecution      *RealtimeExecutionConfig
+	WorkMode               bool
+	profileUpdateMu        sync.Mutex // serializes profile reconciliation through event acceptance
+	cachedToolNames        []string
+	ID                     string
+	Name                   string // human-readable label, separate from ID. ID is immutable;
+	System                 bool   // platform-managed thread, not an agent-addressable worker
 	// Name can be edited via update without touching parent_id
 	// references or session storage. Empty means "use ID for display".
 	ParentID  string   // "main" or parent thread ID
@@ -1638,6 +1643,9 @@ func (tm *ThreadManager) KillWithReason(id, reason string) {
 		return
 	}
 	if thread.Realtime != nil {
+		thread.completionMu.Lock()
+		thread.completionExecutionIDs = thread.Thinker.currentEventExecutions()
+		thread.completionMu.Unlock()
 		thread.Realtime.setTerminalReason(reason)
 	}
 	if reason != "server_shutdown" {
@@ -2556,6 +2564,7 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 	delete(tm.threads, id)
 	tm.mu.Unlock()
 	if thread != nil && thread.Realtime != nil {
+		thread.Realtime.captureTerminalWork()
 		thread.Realtime.finishShutdown()
 	}
 	completionReason := ""
@@ -2563,6 +2572,9 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 		completionReason = thread.Realtime.completionCloseReason()
 	}
 	unregisterAudioBridge(id, completionReason)
+	if thread != nil && thread.Realtime != nil {
+		thread.reportRealtimeTermination()
+	}
 
 	// Cascade: kill all children first
 	if thread != nil && thread.Children != nil && !thread.Thinker.shuttingDown.Load() {

@@ -1038,6 +1038,10 @@ func (a *APIServer) control(w http.ResponseWriter, r *http.Request) {
 		a.thinker.execution = NewExecutionController(a.thinker.config.GetExecutionControl())
 	}
 	if strings.ToLower(strings.TrimSpace(body.Action)) == "restore_checkpoint" {
+		if body.Scope != "" && body.Scope != "instance" {
+			http.Error(w, "checkpoint restore requires instance scope", http.StatusBadRequest)
+			return
+		}
 		meta, err := a.thinker.restoreExecutionCheckpoint(body.CheckpointID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)

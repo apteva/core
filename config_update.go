@@ -98,6 +98,12 @@ func (a *APIServer) decodeConfigUpdate(w http.ResponseWriter, r *http.Request) (
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return body, false
 	}
+	if body.Execution != nil {
+		if err := validateExecutionControl(*body.Execution); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return body, false
+		}
+	}
 	if err := validateMemoryPolicy(body.MemoryPolicy); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return body, false

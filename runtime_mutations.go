@@ -53,6 +53,9 @@ func (t *Thinker) enqueueRuntimeMutation(fn func() error, invalidatesRequest boo
 }
 
 func (t *Thinker) beginRuntime() {
+	if t.threadID == "main" {
+		t.startParentReportRetry()
+	}
 	t.mutationMu.Lock()
 	defer t.mutationMu.Unlock()
 	if t.mutationWake == nil {

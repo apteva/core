@@ -283,11 +283,11 @@ func (t *realtimeTiming) finish(response, item, status string) {
 	for _, data := range results {
 		t.publish(data)
 	}
-	if response == "" && item == "" && status != "completed" && status != "interrupted" {
+	// Ordinary quiet ends an observed utterance, not the provider session or
+	// its delegation timeline. Keep request/context-ack tracking across pauses.
+	if response == "" && item == "" && status != "completed" && status != "interrupted" && status != "application_observed_quiet" {
 		t.finishRequests(status)
-		if status != "application_observed_quiet" {
-			t.reportCallerTiming(status)
-		}
+		t.reportCallerTiming(status)
 	}
 }
 

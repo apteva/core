@@ -182,7 +182,8 @@ func (t *Thinker) directToolReceipt(call toolCall, response ToolResponse) (recei
 	// present, the model-facing text must be that same object: extra text or a
 	// differing mirror could carry an error the receipt would hide.
 	var result map[string]json.RawMessage
-	if json.Unmarshal([]byte(response.Text), &result) != nil || result == nil {
+	_, strictErr := decodeSingleJSON([]byte(response.Text))
+	if strictErr != nil || json.Unmarshal([]byte(response.Text), &result) != nil || result == nil {
 		reason = "malformed_result"
 		if len(response.StructuredContent) > 0 && json.Unmarshal(response.StructuredContent, &result) == nil && result != nil {
 			reason = "conflicting_representations"

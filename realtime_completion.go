@@ -345,6 +345,8 @@ func (rt *RealtimeThinker) setCompletionOutcome(outcome string) {
 func (rt *RealtimeThinker) shutdownData() map[string]any {
 	rt.lifecycleMu.Lock()
 	reason, generation, connected, completion := rt.terminalReason, rt.sessionGeneration, rt.bridgeConnected, rt.completion
+	pendingWork := append([]ThreadWork(nil), rt.terminalWork...)
+	pendingTools := rt.terminalToolsPending
 	rt.lifecycleMu.Unlock()
 	_, _, data := rt.delivery.snapshot()
 	initiator := completion.initiator
@@ -359,6 +361,7 @@ func (rt *RealtimeThinker) shutdownData() map[string]any {
 	data["tool_call_id"] = completion.callID
 	data["response_id"], data["item_id"] = completion.responseID, completion.itemID
 	data["pending_transcripts"] = rt.pendingTranscriptCount()
+	data["pending_assignments"], data["pending_tool_work"] = pendingWork, pendingTools
 	data["graceful_completion_requested"] = completion.requested
 	data["graceful_completion_outcome"] = completion.outcome
 	if completion.requested {

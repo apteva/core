@@ -97,6 +97,7 @@ type ProviderConfig struct {
 }
 
 type Config struct {
+	ParentReports        []PendingParentReport       `json:"parent_reports,omitempty"`
 	MemoryPolicy         MemoryPolicy                `json:"memory_policy,omitempty"`
 	AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
 	RuntimeSequence      uint64                      `json:"runtime_sequence,omitempty"`
@@ -161,6 +162,9 @@ func (c *Config) load() error {
 		return err
 	}
 	if err := validateMemoryPolicy(&c.MemoryPolicy); err != nil {
+		return err
+	}
+	if err := validateExecutionControl(c.Execution); err != nil {
 		return err
 	}
 	return c.loadRuntimeJournalLocked()
@@ -443,17 +447,14 @@ func (c *Config) GetMCPServers() []MCPServerConfig {
 func (c *Config) GetExecutionControl() ExecutionControlConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := c.Execution
-	if len(c.Execution.Breakpoints) > 0 {
-		out.Breakpoints = append([]string(nil), c.Execution.Breakpoints...)
-	}
-	return out
+	return cloneExecutionControl(c.Execution)
 }
 
 func (c *Config) SetExecutionControl(ec ExecutionControlConfig) error {
-	if len(ec.Breakpoints) > 0 {
-		ec.Breakpoints = append([]string(nil), ec.Breakpoints...)
+	if err := validateExecutionControl(ec); err != nil {
+		return err
 	}
+	ec = cloneExecutionControl(ec)
 	return c.update(func() { c.Execution = ec })
 }
 

@@ -89,3 +89,45 @@ instructions on the authenticated thread socket. Ordinary cleanup retains
 `audio bridge unregistered`; it does not authorize a carrier hangup. Receivers
 must scope the signal to the current call owner and preserve the completion
 outcome in diagnostics. A completed model session alone never emits this signal.
+
+## Final report to the parent
+
+Every terminal realtime cleanup stages one parent report using the existing
+runtime journal and durable inbox contract. This applies to `done`, caller
+hangup, disconnect expiry, explicit stop, shutdown and terminal failures.
+Temporary bridge disconnects and provider renewal do not end the thread and do
+not produce this report. Telephony supplies carrier facts and the stop reason;
+Core owns reporting to the actual parent, including nested parents.
+
+Realtime `done(message)` retains its model-authored summary for the terminal
+report instead of publishing an early completion. Cleanup finalizes available
+transcripts and lifecycle telemetry, closes the audio bridge, then queues the
+report without another inference call. Normal text-worker completion is
+unchanged. The event has a stable `realtime-completion/<worker-run-id>` identity;
+repeated cleanup and delivery retry cannot invent another identity. Reusing a
+thread ID in a new run produces a distinct report.
+
+The report contains the lifecycle reason/outcome, model-authored summary if
+available, up to four guarded transcript excerpts from this runtime, up to three
+backend assignment reports, pending assignments/tool work, history filename and
+playback evidence. Partial text remains labelled interrupted. The report never
+asserts that ending the call completed its task or that generated speech reached
+the caller. Excerpts and backend/model reports are explicitly untrusted data.
+
+The root retries journaled pending reports independently of its model execution
+gate, including after restart. Parent pause/step, permissions and ordinary
+scheduling still apply to consumption. An unavailable/full parent inbox leaves
+the report pending. For an ephemeral parent, the durable outbox is retained until
+its session records consumption. If persistence itself fails, Core emits
+`realtime.parent_report_pending` and retains the frozen report in memory for
+retry; an unrecoverable disk failure followed by process loss cannot guarantee
+recovery. `realtime.parent_report_delivered` means inbox acceptance (or durable
+consumption for ephemeral parents), not task execution by the parent.
+
+Verification: `TestRealtimeParentReport*` covers terminal paths, duplicate
+cleanup, journal failures, retry/restart, nested parents, ephemeral parents,
+speech-guard protection and pending work. The paid opt-in
+`TestRealtimeParentReportOpenAILive` opens an actual GPT Live/Brise thread,
+requires voiced output plus a provider transcript, simulates caller hangup and
+checks one durable parent event while the parent gate remains paused. It uses no
+carrier or external business tools.

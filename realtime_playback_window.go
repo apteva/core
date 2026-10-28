@@ -31,9 +31,9 @@ func (w *realtimePlaybackWindow) configure(ms int) {
 		ms = 15000
 	}
 	w.capacity = ms * defaultMediaRate(w.bytesPerSecond) / 1000
-	if w.items == nil {
-		w.items = map[string]realtimePlaybackCredit{}
-	}
+	// A repeated playback.ready means the renderer reset its player. Credits for
+	// audio it will never report are stale and must not shrink the new window.
+	w.items = map[string]realtimePlaybackCredit{}
 }
 func (w *realtimePlaybackWindow) progress(g int64, item string, ms int) {
 	w.mu.Lock()
@@ -44,6 +44,11 @@ func (w *realtimePlaybackWindow) progress(g int64, item string, ms int) {
 		return
 	}
 	end := min(p.sent, ms*defaultMediaRate(w.bytesPerSecond)/1000)
+	// Wire offsets are truncated to whole ms; a receipt within one ms of the
+	// byte-exact reservation means the whole reservation was played.
+	if p.sent-end < defaultMediaRate(w.bytesPerSecond)/1000 {
+		end = p.sent
+	}
 	if end > p.played {
 		p.played = end
 	}
@@ -53,6 +58,20 @@ func (w *realtimePlaybackWindow) clear(g int64, item string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.items, playbackCreditKey(g, item))
+}
+
+// release returns credit reserved for audio that was never written, e.g. a
+// chunk skipped by cancellation after reserve succeeded.
+func (w *realtimePlaybackWindow) release(g int64, item string, end int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	key := playbackCreditKey(g, item)
+	p, ok := w.items[key]
+	if !ok || end >= p.sent {
+		return
+	}
+	p.sent = max(end, p.played)
+	w.items[key] = p
 }
 func (w *realtimePlaybackWindow) enabled() bool {
 	w.mu.Lock()
@@ -98,10 +117,18 @@ func (s *realtimeBridgeSocket) writeFlowControlledAudio(ctx context.Context, f R
 	if frameBytes == 0 {
 		return 0, nil
 	}
-	startBytes := f.AudioEndMS*defaultMediaRate(s.window.bytesPerSecond)/1000 - len(f.Audio)
+	// Byte-exact item offsets; AudioEndMS is truncated and only a fallback.
+	endBytes := f.audioEndBytes
+	if endBytes <= 0 {
+		endBytes = f.AudioEndMS * defaultMediaRate(s.window.bytesPerSecond) / 1000
+	}
+	startBytes := endBytes - len(f.Audio)
 	offset := 0
 	waitingSince := time.Now()
 	for offset < len(f.Audio) {
+		if err := ctx.Err(); err != nil {
+			return offset, context.Cause(ctx)
+		}
 		if err := controls(); err != nil {
 			return offset, err
 		}
@@ -131,6 +158,7 @@ func (s *realtimeBridgeSocket) writeFlowControlledAudio(ctx context.Context, f R
 		written, err := s.writePlaybackAudio(metadata, f.Audio[offset:end], f.cancelled)
 		f.timing.rendererFlow(f.ResponseID, f.ItemID, writeStarted.Sub(waitingSince), time.Since(writeStarted))
 		if !written || err != nil {
+			s.window.release(f.SessionGeneration, f.ItemID, startBytes+offset)
 			return offset, err
 		}
 		offset = end
@@ -160,6 +188,12 @@ func realtimeFrameTiming(f RealtimeAudioFrame, at time.Time, durationMS int) map
 	}
 	if !f.queuedAt.IsZero() && !at.Before(f.queuedAt) {
 		t["core_queue_ms"] = float64(at.Sub(f.queuedAt)) / float64(time.Millisecond)
+	}
+	// Provider WebSocket read only; WebRTC media has no read to measure.
+	if !f.providerReadStartedAt.IsZero() && !f.providerReadReturnedAt.Before(f.providerReadStartedAt) {
+		t["provider_read_started_at"] = f.providerReadStartedAt.UTC().Format(time.RFC3339Nano)
+		t["provider_read_wait_ms"] = float64(f.providerReadReturnedAt.Sub(f.providerReadStartedAt)) / float64(time.Millisecond)
+		t["provider_delta_duration_ms"] = f.providerDeltaDurationMS
 	}
 	return t
 }

@@ -133,3 +133,73 @@ tool receipts retain their previous durability behavior.
 - `RUN_CODEX_EXECUTION_TELEMETRY=1 go test -run '^TestCodexExecutionTelemetry$' -v .`
 - Server: `go test -short -run 'TestExecutionTelemetryAdditiveCompatibility|TestTelemetry' .`
 - Dashboard: `bun test src/components/AgentView.executionTelemetry.test.ts`
+
+## Scoped execution control
+
+Execution pauses are cooperative breakpoints, controlled independently of the
+realtime transport. Existing configurations and unscoped `POST /control` actions
+retain instance-wide behavior. To pause only the root before it does background
+work, configure Core before startup:
+
+```json
+{
+  "execution_control": {
+    "mode": "auto",
+    "scope": "instance",
+    "threads": {
+      "main": {"mode": "paused", "breakpoints": ["iteration.start"]}
+    }
+  }
+}
+```
+
+Thread rules target exact IDs, are persisted with configuration, and are not
+inherited by children. All threads still share the instance controller. An
+instance breakpoint takes precedence: a thread-scoped run or step cannot release
+it. Instance `run` resumes the instance gate while retaining explicit thread
+pauses. An explicit instance `step` can release one selected gate, as before.
+Step credits are temporary and are not restored after a restart.
+
+The existing Core `POST /control` endpoint accepts:
+
+```json
+{"action":"pause","scope":"thread","thread_id":"main","breakpoints":["iteration.start"]}
+{"action":"step","scope":"thread","thread_id":"main"}
+{"action":"run","scope":"thread","thread_id":"main"}
+```
+
+Omitting breakpoints on a new rule uses the existing default execution
+breakpoints; use `iteration.start` explicitly to stop before inference. Thread
+`run` removes the exact rule. Unknown scopes, invalid IDs and unknown breakpoints
+are rejected. Checkpoint restoration remains instance-scoped. Cancellation still
+exits a blocked worker; permissions, approvals and tool checks remain in the
+ordinary worker path.
+
+For Server runtime spawning, the equivalent opt-in startup request is:
+
+```json
+{"start_paused":true,"start_paused_scope":"thread","start_paused_thread_id":"main"}
+```
+
+Omitted startup scope retains the existing instance-wide pause. Voice Evals and
+simulated voice callers explicitly use the root-only scope. Text Evals retain
+instance-wide pause and stepping. These fields require coordinated SDK, Server,
+Environments and Evals releases; older servers do not implement their semantics.
+
+Execution state is observable separately from provider latency:
+
+- `realtime.execution_queued`: an assignment is ready for worker dispatch, with
+  request, revision, delegation and worker IDs.
+- `execution.waiting`: a worker is blocked, with `state: blocked`, its exact
+  `phase` and the blocking `scope` (`instance` or `thread`). `/status` includes
+  every waiter and its current blocking scope, even after controls change.
+- `execution.running`: the worker passed its execution gates and entered request
+  preparation/inference, with assignment correlation. Provider HTTP admission is
+  still measured by `llm.request.started` and `llm.http.started`.
+- Legacy `realtime.execution_started` remains a dispatch event, explicitly marked
+  `state: queued` and `measurement_stage: assignment_dispatched`. It does not
+  prove that the worker passed a pause gate.
+
+This control does not alter audio buffering, provider turn-taking, playback or
+forced response/commit behavior. It does not resolve the independent realtime
+finalization timeout.

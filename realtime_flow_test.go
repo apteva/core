@@ -199,9 +199,10 @@ func TestRealtimeOutputBurstsFirstAndLaterStayOrderedAndScoped(t *testing.T) {
 	}
 	rt.capabilities.ContinuousConversation = true
 	rt.interruptPlayback("test", "old", false, true)
+	next := orderedAudioReader(rt.audioOut)
 	for i := 0; i < 16; i++ {
 		rt.pumpRealtimeOutput()
-		f := <-rt.audioOut
+		f := next()
 		if f.ItemID != "new" {
 			t.Fatal("unrelated playback lost")
 		}

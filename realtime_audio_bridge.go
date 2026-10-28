@@ -10,7 +10,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gobwas/ws"
@@ -21,6 +23,9 @@ const (
 	maxRealtimeAudioFrameBytes       = 1 << 20
 	realtimeBridgeWriteTimeout       = 15 * time.Second
 	realtimeBridgeCloseHandshakeWait = 250 * time.Millisecond
+	// A replacement bridge waits at most this long for the previous writer to
+	// stop reading the shared output channel.
+	realtimeBridgeReplaceWait = 500 * time.Millisecond
 )
 
 // realtimeAudioBridge holds the in-memory mapping between a
@@ -52,10 +57,141 @@ var (
 	audioBridgeByTok = map[string]*audioBridgeRegistration{}
 	audioBridgeLive  = map[string]*audioBridgeConnection{}
 	audioBridgeTTL   = 5 * time.Minute
+	// Exactly one bridge writer reads a thread's output channel. Keyed by the
+	// channel itself so a renamed thread or a renewed token keeps one owner.
+	audioBridgeOutputs = map[chan RealtimeAudioFrame]*audioBridgeConnection{}
+	// Frames an outgoing writer received but never wrote, handed in order to
+	// the next owner before it reads the channel.
+	audioBridgeCarried = map[chan RealtimeAudioFrame][]RealtimeAudioFrame{}
+	audioOutputGates   = map[chan RealtimeAudioFrame]*audioOutputGate{}
 )
 
+// audioOutputGate orders a producer-side drain against the bridge writer.
+// The drain holds mu while it empties the channel and parks the frames it
+// keeps in requeue; the writer takes mu after every receive and writes the
+// parked frames and its own frame in seq order. A frame received mid-drain
+// therefore waits for the drain and can never overtake earlier audio.
+type audioOutputGate struct {
+	mu      sync.Mutex
+	requeue []RealtimeAudioFrame
+}
+
+func audioOutputGateFor(output chan RealtimeAudioFrame) *audioOutputGate {
+	audioBridgeMu.Lock()
+	defer audioBridgeMu.Unlock()
+	gate := audioOutputGates[output]
+	if gate == nil {
+		gate = &audioOutputGate{}
+		audioOutputGates[output] = gate
+	}
+	return gate
+}
+
+// takeOrderedAudio returns parked frames plus a received one in seq order.
+// A wake marker only signals that frames were parked.
+func takeOrderedAudio(output chan RealtimeAudioFrame, received RealtimeAudioFrame) []RealtimeAudioFrame {
+	gate := audioOutputGateFor(output)
+	gate.mu.Lock()
+	batch := gate.requeue
+	gate.requeue = nil
+	gate.mu.Unlock()
+	if !received.wake {
+		batch = append(batch, received)
+	}
+	sort.SliceStable(batch, func(i, j int) bool { return batch[i].seq < batch[j].seq })
+	return batch
+}
+
 type audioBridgeConnection struct {
-	cancel context.CancelCauseFunc
+	cancel   context.CancelCauseFunc
+	socket   *realtimeBridgeSocket
+	output   chan RealtimeAudioFrame
+	released chan struct{} // closed once this writer stops reading output
+	reading  bool          // guarded by audioBridgeMu
+}
+
+// acquireAudioBridgeOutput makes live the only writer for its output channel.
+// A previous owner is abandoned (in-flight writes abort at once) and given a
+// bounded opportunity to release the channel; its carried frames come first.
+func acquireAudioBridgeOutput(live *audioBridgeConnection) []RealtimeAudioFrame {
+	if live.output == nil {
+		return nil
+	}
+	audioBridgeMu.Lock()
+	previous := audioBridgeOutputs[live.output]
+	audioBridgeOutputs[live.output] = live
+	audioBridgeMu.Unlock()
+	if previous != nil && previous != live {
+		// Cancel first so any writer that observes the abandoned flag also sees
+		// the replacement as its context cause.
+		previous.cancel(newRealtimeBridgeEnd(
+			"core", "close", ws.StatusGoingAway,
+			"audio bridge replaced", "replaced", true,
+		))
+		previous.socket.abandon()
+		timer := time.NewTimer(realtimeBridgeReplaceWait)
+		select {
+		case <-previous.released:
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+	audioBridgeMu.Lock()
+	carried := audioBridgeCarried[live.output]
+	delete(audioBridgeCarried, live.output)
+	live.reading = true
+	audioBridgeMu.Unlock()
+	return carried
+}
+
+// carryAudioBridgeFrame keeps an unwritten frame for the next owner. Once a
+// successor is already streaming, the older frame would play out of order.
+func carryAudioBridgeFrame(live *audioBridgeConnection, frame RealtimeAudioFrame) {
+	audioBridgeMu.Lock()
+	owner := audioBridgeOutputs[live.output]
+	if live.output == nil || owner != nil && owner != live && owner.reading {
+		audioBridgeMu.Unlock()
+		frame.written(false)
+		return
+	}
+	audioBridgeCarried[live.output] = append(audioBridgeCarried[live.output], frame)
+	audioBridgeMu.Unlock()
+}
+
+// releaseAudioBridgeOutput reports whether live was still the output owner.
+// A replaced bridge must not report the thread's bridge as disconnected.
+func releaseAudioBridgeOutput(live *audioBridgeConnection) bool {
+	if live.output == nil {
+		return true
+	}
+	audioBridgeMu.Lock()
+	defer audioBridgeMu.Unlock()
+	if audioBridgeOutputs[live.output] != live {
+		return false
+	}
+	delete(audioBridgeOutputs, live.output)
+	return true
+}
+
+func discardCarriedAudio(output chan RealtimeAudioFrame) {
+	if output == nil {
+		return
+	}
+	audioBridgeMu.Lock()
+	carried := audioBridgeCarried[output]
+	delete(audioBridgeCarried, output)
+	gate := audioOutputGates[output]
+	delete(audioOutputGates, output)
+	audioBridgeMu.Unlock()
+	if gate != nil {
+		gate.mu.Lock()
+		carried = append(carried, gate.requeue...)
+		gate.requeue = nil
+		gate.mu.Unlock()
+	}
+	for _, frame := range carried {
+		frame.written(false)
+	}
 }
 
 // realtimeBridgeDisconnectData is deliberately provider-neutral. The audio
@@ -106,6 +242,20 @@ type realtimeBridgeSocket struct {
 	closeSent    bool
 	writeTimeout time.Duration
 	readyOnce    sync.Once
+	// abandoned is set when a replacement bridge takes the output. Every write
+	// checks it after setting its deadline, and abandon forces the deadline to
+	// now, so an in-flight write aborts and no later write can start.
+	abandoned atomic.Bool
+}
+
+func (s *realtimeBridgeSocket) abandon() {
+	if s == nil {
+		return
+	}
+	s.abandoned.Store(true)
+	if s.conn != nil {
+		_ = s.conn.SetWriteDeadline(time.Now())
+	}
 }
 
 func (s *realtimeBridgeSocket) writeBudget() time.Duration {
@@ -132,6 +282,9 @@ func (s *realtimeBridgeSocket) writePlaybackAudio(metadata, audio []byte, cancel
 	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
 		return false, err
 	}
+	if s.abandoned.Load() {
+		return false, net.ErrClosed
+	}
 	// Keep metadata and its audio frame adjacent. Control frames may legally
 	// occur between data frames, but the bridge's application protocol treats
 	// this pair as one unit.
@@ -151,6 +304,9 @@ func (s *realtimeBridgeSocket) writeText(payload []byte) error {
 	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
 		return err
 	}
+	if s.abandoned.Load() {
+		return net.ErrClosed
+	}
 	return wsutil.WriteServerMessage(s.conn, ws.OpText, payload)
 }
 
@@ -162,6 +318,9 @@ func (s *realtimeBridgeSocket) writeClose(code ws.StatusCode, reason string) err
 	}
 	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
 		return err
+	}
+	if s.abandoned.Load() {
+		return net.ErrClosed
 	}
 	if err := wsutil.WriteServerMessage(s.conn, ws.OpClose, ws.NewCloseFrameBody(code, reason)); err != nil {
 		return err
@@ -198,6 +357,9 @@ func (s *realtimeBridgeSocket) handleControl(header ws.Header, reader io.Reader)
 	}
 	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
 		return &realtimeBridgeControlError{op: header.OpCode, err: err}
+	}
+	if s.abandoned.Load() {
+		return &realtimeBridgeControlError{op: header.OpCode, err: net.ErrClosed}
 	}
 	err := wsutil.ControlFrameHandler(s.conn, ws.StateServerSide)(header, reader)
 	if header.OpCode == ws.OpClose {
@@ -285,6 +447,7 @@ func unregisterAudioBridge(threadID string, completionReason ...string) {
 	delete(audioBridgeLive, threadID)
 	audioBridgeMu.Unlock()
 	if live != nil {
+		discardCarriedAudio(live.output)
 		live.cancel(newRealtimeBridgeEnd(
 			"core", "close", ws.StatusNormalClosure,
 			reason, "", true,
@@ -531,7 +694,7 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 	// frames. Both paths share realtimeBridgeSocket, which serializes entire
 	// WebSocket frames (including reader-generated pong and close responses).
 	ctx, cancel := context.WithCancelCause(r.Context())
-	live := &audioBridgeConnection{cancel: cancel}
+	live := &audioBridgeConnection{cancel: cancel, socket: socket, output: reg.audioOut, released: make(chan struct{})}
 	audioBridgeMu.Lock()
 	audioBridgeLive[thread] = live
 	audioBridgeMu.Unlock()
@@ -573,8 +736,95 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		return nil
 	}
 	var termination *realtimeBridgeEnd
-bridgeLoop:
-	for {
+	// writeFrame returns false once the bridge must stop. A frame this writer
+	// could not start because the bridge is ending is carried, in order, to the
+	// next owner of the output channel instead of being lost.
+	writeFrame := func(frame RealtimeAudioFrame) bool {
+		if ctx.Err() != nil || socket.abandoned.Load() {
+			carryAudioBridgeFrame(live, frame)
+			termination = classifyRealtimeBridgeError("context", "close", context.Cause(ctx))
+			return false
+		}
+		// A new playback may win select while an older clear is already queued.
+		// Flush those controls before writing this frame, including for legacy players.
+	flushControls:
+		for {
+			select {
+			case control, ok := <-reg.control:
+				if !ok {
+					reg.control = nil
+					break flushControls
+				}
+				if err := writeControl(control); err != nil {
+					frame.written(false)
+					termination = classifyRealtimeBridgeError("core", "write", err)
+					cancel(termination)
+					return false
+				}
+			default:
+				break flushControls
+			}
+		}
+		frame.timing.outputWait(frame.ResponseID, frame.ItemID, frame.queuedAt)
+		written, err := socket.writeFlowControlledAudio(ctx, frame, func() error {
+			for {
+				select {
+				case control, ok := <-reg.control:
+					if !ok {
+						reg.control = nil
+						return nil
+					}
+					if err := writeControl(control); err != nil {
+						return err
+					}
+				case <-providerStates:
+					if err := writeControl(providerStateSource.providerStateControl()); err != nil {
+						return err
+					}
+				default:
+					return nil
+				}
+			}
+		})
+		if err != nil {
+			if written == 0 && (ctx.Err() != nil || socket.abandoned.Load()) {
+				carryAudioBridgeFrame(live, frame)
+			} else {
+				frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
+				frame.writtenBytes(written)
+			}
+			logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
+			termination = classifyRealtimeBridgeError("core", "write", err)
+			if ctx.Err() != nil {
+				termination = classifyRealtimeBridgeError("context", "close", context.Cause(ctx))
+			}
+			cancel(termination)
+			return false
+		}
+		frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
+		frame.writtenBytes(written)
+		return true
+	}
+
+	// Take sole ownership of the output channel before reading it. Controls
+	// queued for the previous renderer are stale for this fresh player.
+	carried := acquireAudioBridgeOutput(live)
+	if a.thinker != nil && a.thinker.threads != nil {
+		_, t := a.thinker.threads.findManagedThread(thread)
+		if t != nil && t.Realtime != nil {
+			t.Realtime.discardStaleRendererControls(reg.control)
+		}
+	}
+	for i, frame := range carried {
+		if !writeFrame(frame) {
+			for _, rest := range carried[i+1:] {
+				carryAudioBridgeFrame(live, rest)
+			}
+			break
+		}
+	}
+
+	for termination == nil {
 		select {
 		case control, ok := <-reg.control:
 			if !ok {
@@ -584,7 +834,6 @@ bridgeLoop:
 			if err := writeControl(control); err != nil {
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
-				break bridgeLoop
 			}
 			continue
 		default:
@@ -594,71 +843,28 @@ bridgeLoop:
 			if err := writeControl(providerStateSource.providerStateControl()); err != nil {
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
-				break bridgeLoop
 			}
 		case <-ctx.Done():
 			termination = classifyRealtimeBridgeError("context", "close", context.Cause(ctx))
-			break bridgeLoop
 		case frame, ok := <-reg.audioOut:
 			if !ok {
+				discardCarriedAudio(reg.audioOut)
 				termination = newRealtimeBridgeEnd(
 					"core", "close", ws.StatusNormalClosure,
 					"audio output closed", "", true,
 				)
 				cancel(termination)
-				break bridgeLoop
+				break
 			}
-			// A new playback may win select while an older clear is already queued.
-			// Flush those controls before writing this frame, including for legacy players.
-		flushControls:
-			for {
-				select {
-				case control, ok := <-reg.control:
-					if !ok {
-						reg.control = nil
-						break flushControls
+			batch := takeOrderedAudio(reg.audioOut, frame)
+			for i, f := range batch {
+				if !writeFrame(f) {
+					for _, rest := range batch[i+1:] {
+						carryAudioBridgeFrame(live, rest)
 					}
-					if err := writeControl(control); err != nil {
-						frame.written(false)
-						termination = classifyRealtimeBridgeError("core", "write", err)
-						cancel(termination)
-						break bridgeLoop
-					}
-				default:
-					break flushControls
+					break
 				}
 			}
-			frame.timing.outputWait(frame.ResponseID, frame.ItemID, frame.queuedAt)
-			written, err := socket.writeFlowControlledAudio(ctx, frame, func() error {
-				for {
-					select {
-					case control, ok := <-reg.control:
-						if !ok {
-							reg.control = nil
-							return nil
-						}
-						if err := writeControl(control); err != nil {
-							return err
-						}
-					case <-providerStates:
-						if err := writeControl(providerStateSource.providerStateControl()); err != nil {
-							return err
-						}
-					default:
-						return nil
-					}
-				}
-			})
-			if err != nil {
-				frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
-				frame.writtenBytes(written)
-				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
-				termination = classifyRealtimeBridgeError("core", "write", err)
-				cancel(termination)
-				break bridgeLoop
-			}
-			frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
-			frame.writtenBytes(written)
 		case control, ok := <-reg.control:
 			if !ok {
 				reg.control = nil
@@ -668,15 +874,16 @@ bridgeLoop:
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("control write end for thread=%s: %v", thread, err))
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
-				break bridgeLoop
 			}
 		}
 	}
+	// This writer no longer reads the output channel; a replacement may start.
+	close(live.released)
 
 	if termination == nil {
 		termination = classifyRealtimeBridgeError("context", "close", context.Cause(ctx))
 	}
-	if realtimeBridgeShouldSendClose(termination) && !socket.hasSentClose() {
+	if realtimeBridgeShouldSendClose(termination) && !socket.hasSentClose() && !socket.abandoned.Load() {
 		code := realtimeBridgeCloseCode(termination)
 		reason := termination.data.CloseReason
 		if err := socket.writeClose(code, reason); err != nil {
@@ -722,7 +929,10 @@ bridgeLoop:
 	if a.thinker != nil && a.thinker.telemetry != nil {
 		a.thinker.telemetry.Emit("realtime.bridge_disconnected", thread, termination.data)
 	}
-	if a.thinker != nil && a.thinker.threads != nil {
+	// Only the bridge that still owns the output reports a disconnect. A
+	// replaced bridge must not end provider input or arm the kill timer for a
+	// call that is healthy on its successor.
+	if releaseAudioBridgeOutput(live) && a.thinker != nil && a.thinker.threads != nil {
 		a.thinker.threads.realtimeBridgeDisconnected(thread)
 	}
 }
@@ -816,6 +1026,9 @@ func runRealtimeAudioBridgeReader(
 					}
 				case "playback.overflow":
 					if control.ItemID != "" {
+						// The renderer dropped this item's audio; its credit will never be
+						// reported as played and must not keep the window closed.
+						socket.window.clear(control.Generation, control.ItemID)
 						_, t := a.thinker.threads.findManagedThread(thread)
 						if t != nil && t.Realtime != nil {
 							t.Realtime.rendererPlaybackOverflowForGeneration(control.ItemID, control.Generation)

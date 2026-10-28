@@ -281,7 +281,8 @@ func TestContinuousLateCheckCancelsOnlyItsOlderQueuedPlayback(t *testing.T) {
 	if !rt.interruptPlayback("confirmed_content_suppression", "older", true, true) {
 		t.Fatal("older queued playback was not cancelled")
 	}
-	if len(rt.audioOut) != 1 || (<-rt.audioOut).ItemID != "newer" {
+	// Kept playback is parked for the writer, behind a wake marker.
+	if next := orderedAudioReader(rt.audioOut)(); next.ItemID != "newer" || len(rt.audioOut) != 0 {
 		t.Fatal("late check removed newer playback")
 	}
 	if rt.outputItemID != "newer" {

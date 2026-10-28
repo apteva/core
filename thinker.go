@@ -793,43 +793,46 @@ type APIEvent struct {
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 type Thinker struct {
-	traceOnce        sync.Once
-	trace            *executionTrace
-	inferenceMu      sync.Mutex
-	inferenceHealth  InferenceHealth
-	shuttingDown     atomic.Bool
-	compactionActive atomic.Bool
-	mutationMu       sync.Mutex
-	mutationWake     chan struct{}
-	mutations        []runtimeMutation
-	runtimeRunning   bool
-	requestCancel    context.CancelFunc
-	snapshotMu       sync.Mutex
-	owner            *ThreadManager
-	apiKey           string
-	pool             *ProviderPool // all available providers (shared across threads)
-	provider         LLMProvider   // current active provider for this thinker
-	messages         []Message
-	bus              *EventBus
-	sub              *Subscription
-	pause            chan bool
-	quit             chan struct{}
-	runMu            sync.Mutex
-	runContextMu     sync.Mutex
-	runCancel        context.CancelFunc
-	stopOnce         sync.Once
-	iteration        int
-	paused           bool
-	llmActive        atomic.Bool
-	rate             ThinkRate
-	agentRate        ThinkRate
-	agentSleep       time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
-	nextWakeAt       time.Time     // one pending agent-owned timer persisted by pace
-	resumeWakeAt     time.Time     // one-shot startup gate restored from config
-	waitForEvents    bool          // explicit pace(clear_wake) decision, renewed after the next input
-	paceDurable      bool          // true after an explicit or restored pace
-	paceRevision     uint64        // increments only when the agent replaces or clears its pending wake
-	wakeReason       string        // reason supplied to the next request-context snapshot
+	parentReportMu      sync.Mutex
+	parentReportOnce    sync.Once
+	parentReportPending map[string]PendingParentReport
+	traceOnce           sync.Once
+	trace               *executionTrace
+	inferenceMu         sync.Mutex
+	inferenceHealth     InferenceHealth
+	shuttingDown        atomic.Bool
+	compactionActive    atomic.Bool
+	mutationMu          sync.Mutex
+	mutationWake        chan struct{}
+	mutations           []runtimeMutation
+	runtimeRunning      bool
+	requestCancel       context.CancelFunc
+	snapshotMu          sync.Mutex
+	owner               *ThreadManager
+	apiKey              string
+	pool                *ProviderPool // all available providers (shared across threads)
+	provider            LLMProvider   // current active provider for this thinker
+	messages            []Message
+	bus                 *EventBus
+	sub                 *Subscription
+	pause               chan bool
+	quit                chan struct{}
+	runMu               sync.Mutex
+	runContextMu        sync.Mutex
+	runCancel           context.CancelFunc
+	stopOnce            sync.Once
+	iteration           int
+	paused              bool
+	llmActive           atomic.Bool
+	rate                ThinkRate
+	agentRate           ThinkRate
+	agentSleep          time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
+	nextWakeAt          time.Time     // one pending agent-owned timer persisted by pace
+	resumeWakeAt        time.Time     // one-shot startup gate restored from config
+	waitForEvents       bool          // explicit pace(clear_wake) decision, renewed after the next input
+	paceDurable         bool          // true after an explicit or restored pace
+	paceRevision        uint64        // increments only when the agent replaces or clears its pending wake
+	wakeReason          string        // reason supplied to the next request-context snapshot
 	// wakeDeadlineFired remains true while the model processes a timer wake.
 	// The expired deadline stays persisted until that turn completes so a
 	// crash re-delivers rather than silently loses scheduled work.
@@ -1644,10 +1647,13 @@ func (t *Thinker) executionGate(phase ExecutionPhase, meta ExecutionGate) bool {
 	}
 	meta.ThreadID = t.threadID
 	meta.Phase = phase
+	if work := t.work.snapshot(); work.ID != "" && t.work.current(work) {
+		meta.RequestID, meta.Revision, meta.DelegationID = work.ID, work.Revision, work.DelegationID
+	}
 	if meta.Iteration == 0 {
 		meta.Iteration = t.iteration
 	}
-	if t.checkpoints != nil && t.execution.ShouldGate(phase) {
+	if t.checkpoints != nil && t.execution.ShouldGateThread(t.threadID, phase) {
 		t.checkpoints.Capture(t, meta)
 	}
 	t.mutationMu.Lock()
@@ -2954,6 +2960,9 @@ func (t *Thinker) Run() {
 			case <-t.mutationWake:
 			}
 			continue
+		}
+		if t.telemetry != nil {
+			t.telemetry.Emit("execution.running", t.threadID, ExecutionPhaseData{ThreadID: t.threadID, Phase: string(ExecutionPhaseLLMStart), State: "running", Iteration: t.iteration, RequestID: workAtRequest.ID, Revision: workAtRequest.Revision, DelegationID: workAtRequest.DelegationID})
 		}
 		chatResp, err := t.callLLMWithRuntimeMutations(runCtx, requestMessages)
 		if t.work != nil && !t.work.current(workAtRequest) {
@@ -4423,6 +4432,9 @@ func (t *Thinker) Stop() {
 	t.stopOnce.Do(func() {
 		if t.quit != nil {
 			close(t.quit)
+		}
+		if t.execution != nil {
+			t.execution.CancelThread(t.threadID)
 		}
 	})
 }
