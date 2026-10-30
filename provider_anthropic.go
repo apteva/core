@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 )
 
@@ -83,6 +84,7 @@ type AnthropicProvider struct {
 	builtinTools    []string // enabled built-in tools: "code_execution", "web_search"
 	builtinConfigs  map[string]BuiltinToolConfig
 	maxOutputTokens int
+	reasoning       ReasoningSettings
 }
 
 func NewAnthropicProvider(apiKey string) LLMProvider {
@@ -90,17 +92,107 @@ func NewAnthropicProvider(apiKey string) LLMProvider {
 		apiKey: apiKey,
 		url:    "https://api.anthropic.com/v1/messages",
 		models: map[ModelTier]string{
-			ModelLarge:  "claude-sonnet-4-6",
-			ModelMedium: "claude-haiku-4-5-20251001",
-			ModelSmall:  "claude-haiku-4-5-20251001",
+			ModelLarge:  "claude-opus-5-5",
+			ModelMedium: "claude-sonnet-5-5",
+			ModelSmall:  "claude-haiku-5-5",
 		},
 	}
 }
 
-func (p *AnthropicProvider) Name() string                           { return "anthropic" }
-func (p *AnthropicProvider) Models() map[ModelTier]string           { return p.models }
-func (p *AnthropicProvider) CostPer1M() (float64, float64, float64) { return 3.00, 0.30, 15.00 }
-func (p *AnthropicProvider) SupportsNativeTools() bool              { return true }
+// anthropicPricing is first-party API pricing per 1M tokens (input, cache
+// read, output). Haiku 5.5 is the up-to-100K-prompt rate.
+var anthropicPricing = map[string][3]float64{
+	"claude-fable-5-1":  {10.00, 0.25, 50.00},
+	"claude-fable-5":    {10.00, 1.00, 50.00},
+	"claude-opus-5-5":   {4.00, 0.20, 20.00},
+	"claude-opus-5":     {5.00, 0.50, 25.00},
+	"claude-opus-4-8":   {5.00, 0.50, 25.00},
+	"claude-opus-4-7":   {5.00, 0.50, 25.00},
+	"claude-opus-4-6":   {5.00, 0.50, 25.00},
+	"claude-sonnet-5-5": {2.00, 0.20, 10.00},
+	"claude-sonnet-5":   {2.00, 0.20, 10.00},
+	"claude-sonnet-4-6": {3.00, 0.30, 15.00},
+	"claude-haiku-5-5":  {0.10, 0.01, 0.50},
+	"claude-haiku-4-5":  {1.00, 0.10, 5.00},
+}
+
+// anthropicModelKey strips a trailing date snapshot (claude-haiku-4-5-20251001).
+func anthropicModelKey(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if i := strings.LastIndex(model, "-"); i > 0 && len(model)-i-1 == 8 && strings.Trim(model[i+1:], "0123456789") == "" {
+		return model[:i]
+	}
+	return model
+}
+
+func (p *AnthropicProvider) Name() string                 { return "anthropic" }
+func (p *AnthropicProvider) Models() map[ModelTier]string { return p.models }
+func (p *AnthropicProvider) CostPer1M() (float64, float64, float64) {
+	if price, ok := anthropicPricing[anthropicModelKey(p.models[ModelLarge])]; ok {
+		return price[0], price[1], price[2]
+	}
+	return 3.00, 0.30, 15.00
+}
+func (p *AnthropicProvider) SupportsNativeTools() bool { return true }
+
+func (p *AnthropicProvider) WithReasoning(settings ReasoningSettings) LLMProvider {
+	clone := *p
+	clone.reasoning = settings
+	return &clone
+}
+
+// anthropicGeneration returns the family and major version of a Claude model
+// ID ("opus", 5 for claude-opus-5-5), or "", 0 when it isn't one.
+func anthropicGeneration(model string) (string, int) {
+	parts := strings.Split(anthropicModelKey(model), "-")
+	if len(parts) < 3 || parts[0] != "claude" {
+		return "", 0
+	}
+	major := 0
+	for _, c := range parts[2] {
+		if c < '0' || c > '9' {
+			return "", 0
+		}
+		major = major*10 + int(c-'0')
+	}
+	return parts[1], major
+}
+
+// anthropicAlwaysThinks reports models where thinking runs by default (all
+// Claude 5.x). Their thinking blocks must be replayed in tool loops.
+func anthropicAlwaysThinks(model string) bool {
+	family, major := anthropicGeneration(model)
+	return major >= 5 && family != ""
+}
+
+// anthropicEffort maps an agent reasoning level to output_config.effort, or ""
+// to leave the model default. Claude 5.x cannot turn thinking off, so none and
+// minimal become low. Effort is only sent to models that accept it.
+func anthropicEffort(level ReasoningLevel, model string) string {
+	family, major := anthropicGeneration(model)
+	key := anthropicModelKey(model)
+	is46 := key == "claude-opus-4-6" || key == "claude-sonnet-4-6"
+	if major < 5 && !is46 && key != "claude-opus-4-7" && key != "claude-opus-4-8" {
+		return ""
+	}
+	if family == "" {
+		return ""
+	}
+	switch normalizeReasoningLevel(level) {
+	case ReasoningNone, ReasoningMinimal, ReasoningLow:
+		return "low"
+	case ReasoningMedium:
+		return "medium"
+	case ReasoningHigh:
+		return "high"
+	case ReasoningXHigh:
+		if is46 {
+			return "high"
+		}
+		return "xhigh"
+	}
+	return ""
+}
 
 func anthropicMaxTokens(model string) int {
 	parts := strings.Split(strings.ToLower(strings.TrimSpace(model)), "-")
@@ -147,13 +239,33 @@ func (p *AnthropicProvider) WithBuiltins(builtins []string) LLMProvider {
 // --- Request types ---
 
 type anthropicRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	Stream    bool               `json:"stream"`
-	System    any                `json:"system,omitempty"` // string or []anthropicSystemBlock
-	Messages  []anthropicMessage `json:"messages"`
-	Tools     []any              `json:"tools,omitempty"` // mixed: anthropicTool or provider builtin maps
+	Model        string                 `json:"model"`
+	MaxTokens    int                    `json:"max_tokens"`
+	Stream       bool                   `json:"stream"`
+	System       any                    `json:"system,omitempty"` // string or []anthropicSystemBlock
+	Messages     []anthropicMessage     `json:"messages"`
+	Tools        []any                  `json:"tools,omitempty"` // mixed: anthropicTool or provider builtin maps
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
 }
+
+type anthropicThinking struct {
+	Type         string                 `json:"type"` // "adaptive"
+	BlockBinding *anthropicBlockBinding `json:"block_binding,omitempty"`
+}
+
+type anthropicBlockBinding struct {
+	PrefixMismatchBehavior string `json:"prefix_mismatch_behavior"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// Core rebuilds system prompts and compacts history, which invalidates earlier
+// thinking blocks. drop_block lets those requests continue without the stale
+// reasoning instead of failing with a 400.
+const anthropicThinkingBindingBeta = "thinking-binding-controls-2026-08-01"
 
 type anthropicSystemBlock struct {
 	Type         string                 `json:"type"`
@@ -227,14 +339,17 @@ type anthropicStreamEvent struct {
 type anthropicDelta struct {
 	Type         string `json:"type"`
 	Text         string `json:"text,omitempty"`
+	Thinking     string `json:"thinking,omitempty"`     // thinking_delta
+	Signature    string `json:"signature,omitempty"`    // signature_delta
 	PartialJSON  string `json:"partial_json,omitempty"` // for tool_use input streaming
 	StopReason   string `json:"stop_reason,omitempty"`
 	StopSequence string `json:"stop_sequence,omitempty"`
 }
 
 type anthropicBlockStart struct {
-	Type  string         `json:"type"` // "text", "tool_use", "server_tool_use", "code_execution_tool_result"
+	Type  string         `json:"type"` // "text", "thinking", "redacted_thinking", "tool_use", "server_tool_use", "code_execution_tool_result"
 	Text  string         `json:"text,omitempty"`
+	Data  string         `json:"data,omitempty"` // redacted_thinking
 	ID    string         `json:"id,omitempty"`   // tool_use
 	Name  string         `json:"name,omitempty"` // tool_use / server_tool_use
 	Input map[string]any `json:"input"`          // tool_use (may be empty at start)
@@ -291,6 +406,12 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 				blocks = append(blocks, block)
 			}
 			anthropicMsgs = append(anthropicMsgs, anthropicMessage{Role: "user", Content: blocks})
+			continue
+		}
+
+		// Assistant turns that carried thinking go back exactly as produced.
+		if replay := anthropicReplayContent(m); replay != nil {
+			anthropicMsgs = append(anthropicMsgs, anthropicMessage{Role: "assistant", Content: replay})
 			continue
 		}
 
@@ -386,6 +507,16 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		Messages:  anthropicMsgs,
 		Tools:     anthropicTools,
 	}
+	alwaysThinks := anthropicAlwaysThinks(model)
+	if alwaysThinks {
+		reqBody.Thinking = &anthropicThinking{Type: "adaptive", BlockBinding: &anthropicBlockBinding{PrefixMismatchBehavior: "drop_block"}}
+	}
+	requestedEffort := normalizeReasoningLevel(p.reasoning.Level).String()
+	effectiveEffort := "provider-default"
+	if effort := anthropicEffort(p.reasoning.Level, model); effort != "" {
+		reqBody.OutputConfig = &anthropicOutputConfig{Effort: effort}
+		effectiveEffort = effort
+	}
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -406,6 +537,9 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", p.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	if alwaysThinks {
+		req.Header.Set("anthropic-beta", anthropicThinkingBindingBeta)
+	}
 	resp, err := tracedProviderHTTP(req)
 	if err != nil {
 		return ChatResponse{}, err
@@ -432,6 +566,12 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		json strings.Builder
 	}
 	var currentTool *pendingTool
+	var reasoning strings.Builder
+	// replay holds the assistant content blocks in stream order so a turn with
+	// thinking can be sent back unchanged. Unknown block types disable replay.
+	var replay []map[string]any
+	var currentBlock map[string]any
+	replayable := true
 
 	// Wrap resp.Body so a silent stream is killed after the idle window
 	// instead of hanging the thinker indefinitely. Each byte received
@@ -463,6 +603,21 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 			return ChatResponse{}, fmt.Errorf("Anthropic stream error")
 		case "content_block_start":
 			if event.ContentBlock != nil {
+				currentBlock = nil
+				switch event.ContentBlock.Type {
+				case "thinking":
+					currentBlock = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
+				case "redacted_thinking":
+					currentBlock = map[string]any{"type": "redacted_thinking", "data": event.ContentBlock.Data}
+				case "text":
+					currentBlock = map[string]any{"type": "text", "text": event.ContentBlock.Text}
+				case "tool_use":
+				default:
+					replayable = false
+				}
+				if currentBlock != nil {
+					replay = append(replay, currentBlock)
+				}
 				switch event.ContentBlock.Type {
 				case "tool_use":
 					currentTool = &pendingTool{
@@ -512,6 +667,21 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 					if onChunk != nil {
 						onChunk(event.Delta.Text)
 					}
+					if currentBlock != nil && currentBlock["type"] == "text" {
+						currentBlock["text"] = currentBlock["text"].(string) + event.Delta.Text
+					}
+				}
+				if event.Delta.Type == "thinking_delta" && currentBlock != nil && currentBlock["type"] == "thinking" {
+					currentBlock["thinking"] = currentBlock["thinking"].(string) + event.Delta.Thinking
+					if event.Delta.Thinking != "" {
+						reasoning.WriteString(event.Delta.Thinking)
+						if onThinking != nil {
+							onThinking(event.Delta.Thinking)
+						}
+					}
+				}
+				if event.Delta.Type == "signature_delta" && currentBlock != nil && currentBlock["type"] == "thinking" {
+					currentBlock["signature"] = currentBlock["signature"].(string) + event.Delta.Signature
 				}
 				if event.Delta.Type == "input_json_delta" && currentTool != nil {
 					logMsg("ANTHROPIC-STREAM", fmt.Sprintf("tool=%s chunk_len=%d chunk=%q", currentTool.name, len(event.Delta.PartialJSON), truncateStr(event.Delta.PartialJSON, 80)))
@@ -550,8 +720,10 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 					RawArgs:       currentTool.json.String(),
 					CanonicalArgs: json.RawMessage(currentTool.json.String()),
 				})
+				replay = append(replay, map[string]any{"type": "tool_use", "id": currentTool.id, "name": currentTool.name, "input": json.RawMessage(currentTool.json.String())})
 				currentTool = nil
 			}
+			currentBlock = nil
 		case "message_start":
 			if event.Message != nil && event.Message.Usage != nil {
 				u := event.Message.Usage
@@ -608,11 +780,89 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		return ChatResponse{}, fmt.Errorf("Anthropic stream ended before message_stop")
 	}
 	return validateProviderToolOutput(ChatResponse{
-		Text:          full.String(),
-		ToolCalls:     toolCalls,
-		ServerResults: serverResults,
-		Usage:         usage,
+		Text:                     full.String(),
+		Reasoning:                reasoning.String(),
+		RequestedReasoningEffort: requestedEffort,
+		EffectiveReasoningEffort: effectiveEffort,
+		ToolCalls:                toolCalls,
+		ServerResults:            serverResults,
+		ProviderState:            anthropicResponseState(replay, replayable),
+		Usage:                    usage,
 	})
+}
+
+// anthropicResponseState keeps the turn's content blocks only when it holds
+// thinking; turns without thinking are rebuilt from structured history.
+func anthropicResponseState(blocks []map[string]any, replayable bool) *ProviderResponseState {
+	if !replayable {
+		return nil
+	}
+	thinking := false
+	for _, b := range blocks {
+		thinking = thinking || b["type"] == "thinking" || b["type"] == "redacted_thinking"
+	}
+	if !thinking {
+		return nil
+	}
+	state := &ProviderResponseState{Provider: "anthropic"}
+	for _, b := range blocks {
+		if b["type"] == "text" && b["text"] == "" {
+			continue // the API rejects empty text blocks
+		}
+		raw, err := json.Marshal(b)
+		if err != nil {
+			return nil
+		}
+		state.Items = append(state.Items, raw)
+	}
+	return state
+}
+
+// anthropicReplayContent returns the stored blocks of an assistant turn when
+// they still match its structured history (same tool calls in order, same
+// text). Any divergence means history was edited, so the turn is rebuilt.
+func anthropicReplayContent(m Message) []json.RawMessage {
+	if m.Role != "assistant" || m.ProviderState == nil || m.ProviderState.Provider != "anthropic" || len(m.ProviderState.Items) == 0 {
+		return nil
+	}
+	var text strings.Builder
+	calls := 0
+	for _, raw := range m.ProviderState.Items {
+		var block struct {
+			Type  string          `json:"type"`
+			Text  string          `json:"text"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		}
+		if json.Unmarshal(raw, &block) != nil {
+			return nil
+		}
+		switch block.Type {
+		case "text":
+			text.WriteString(block.Text)
+		case "tool_use":
+			if calls >= len(m.ToolCalls) || m.ToolCalls[calls].ID != block.ID || m.ToolCalls[calls].Name != block.Name {
+				return nil
+			}
+			var inputs [2]any
+			for i, raw := range []json.RawMessage{block.Input, toolCallArguments(m.ToolCalls[calls])} {
+				decoder := json.NewDecoder(bytes.NewReader(raw))
+				decoder.UseNumber()
+				if decoder.Decode(&inputs[i]) != nil {
+					return nil
+				}
+			}
+			if !reflect.DeepEqual(inputs[0], inputs[1]) {
+				return nil
+			}
+			calls++
+		}
+	}
+	if calls != len(m.ToolCalls) || strings.TrimSpace(text.String()) != strings.TrimSpace(m.Content) || m.HasParts() {
+		return nil
+	}
+	return append([]json.RawMessage(nil), m.ProviderState.Items...)
 }
 
 // toAnthropicBlocks converts our ContentParts to Anthropic content blocks.

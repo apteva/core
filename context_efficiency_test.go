@@ -261,4 +261,12 @@ func TestContextEfficiencyAnthropicBudgetIgnoresResponsesState(t *testing.T) {
 	if a.InputTokens != b.InputTokens || messages[0].Reasoning == "" {
 		t.Fatal("budget includes unsupported replay or changes source")
 	}
+	messages[0].ProviderState = &ProviderResponseState{Provider: "openai", Items: []json.RawMessage{json.RawMessage(`"` + strings.Repeat("x", 40000) + `"`)}}
+	if c := estimatePreparedRequest("anthropic", "claude-sonnet-4-6", messages, nil); c.InputTokens != b.InputTokens {
+		t.Fatal("budget counts another provider's state")
+	}
+	messages[0].ProviderState.Provider = "anthropic"
+	if c := estimatePreparedRequest("anthropic", "claude-sonnet-4-6", messages, nil); c.InputTokens <= b.InputTokens {
+		t.Fatal("budget ignores replayed thinking blocks")
+	}
 }

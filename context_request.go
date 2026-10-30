@@ -99,11 +99,14 @@ func requestFingerprint(body []byte) string {
 }
 func estimatePreparedRequest(provider, model string, messages []Message, tools []NativeTool) requestBudget {
 	if provider == "anthropic" {
-		// Responses state and reasoning replay are not part of Anthropic's
-		// wire representation. Do not reject fallback for bytes it never sends.
+		// Other providers' state and reasoning replay are not part of
+		// Anthropic's wire representation. Do not reject fallback for bytes it
+		// never sends; its own thinking-block state is sent and counted.
 		messages = cloneMessages(messages)
 		for i := range messages {
-			messages[i].ProviderState = nil
+			if messages[i].ProviderState != nil && messages[i].ProviderState.Provider != "anthropic" {
+				messages[i].ProviderState = nil
+			}
 			messages[i].Reasoning = ""
 		}
 	}
