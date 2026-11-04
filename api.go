@@ -1332,7 +1332,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 
 		cfg := a.thinker.config
 		providers := cfg.GetProviders()
-		savedProviders := cfg.providerConfigSnapshot()
+		savedProviders := providers
 		providerChanged := len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil
 		var pool *ProviderPool
 		enabled := cfg.RealtimeEnabledFlag()
@@ -1399,8 +1399,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			a.thinker.provider = pool.Default()
 			// Settings saves usually resend the providers unchanged, and moving a
 			// worker cancels its in-flight LLM request, so act only on a real change.
-			providersEdited := (len(body.Providers) > 0 || body.Provider != nil) && !providerConfigsEqual(savedProviders, providers)
-			if providersEdited || enabled != savedEnabled {
+			if !providerConfigsEqual(savedProviders, providers) || enabled != savedEnabled {
 				a.thinker.syncChildProviders(pool)
 			}
 		}

@@ -1066,16 +1066,20 @@ func TestPutConfigRealtimeToggleReachesRunningThreads(t *testing.T) {
 func TestPutConfigComparesEveryProviderField(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "test")
 	api, thinker := newPinTestAPI(t, newPinTestProvider("fake"))
-	const limited = `{"providers":[{"name":"anthropic","default":true,"max_output_tokens":8000}]}`
-	putProviderConfig(t, api, limited)
+	putProviderConfig(t, api, `{"providers":[{"name":"anthropic","default":true,"max_output_tokens":8000}]}`)
 	worker := spawnPinWorker(t, thinker.threads, "worker", nil, SpawnOpts{})
 	before := worker.Thinker.pool
 
-	putProviderConfig(t, api, limited)
+	// A request that changes nothing returns early, so each of these also edits
+	// the directive to reach the comparison.
+	putProviderConfig(t, api, `{"directive":"One.","providers":[{"name":"anthropic","default":true,"max_output_tokens":8000}]}`)
+	if thinker.config.GetDirective() != "One." {
+		t.Fatal("the directive edit did not apply")
+	}
 	if worker.Thinker.pool != before {
 		t.Fatal("resending the same providers moved the worker")
 	}
-	putProviderConfig(t, api, `{"realtime_enabled":false}`)
+	putProviderConfig(t, api, `{"directive":"Two.","realtime_enabled":false}`)
 	if worker.Thinker.pool != before {
 		t.Fatal("repeating the realtime flag moved the worker")
 	}

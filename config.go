@@ -155,6 +155,14 @@ func (c *Config) load() error {
 		c.Providers = []ProviderConfig{*c.Provider}
 		c.Provider = nil
 	}
+	// This limit was never applied or checked before, so a saved config can hold
+	// a value that's now refused. Keep starting on the default it has always used.
+	for i := range c.Providers {
+		if err := validateProviderOutputLimit(c.Providers[i]); err != nil {
+			logMsg("BOOT", fmt.Sprintf("ignoring saved setting: %v", err))
+			c.Providers[i].MaxOutputTokens = 0
+		}
+	}
 	for _, server := range c.MCPServers {
 		if err := validateMCPToolLoading(server); err != nil {
 			return err
@@ -398,16 +406,6 @@ func (c *Config) RefreshThread(pt PersistentThread) error {
 	})
 }
 
-// providerConfigSnapshot returns the saved providers exactly as stored.
-func (c *Config) providerConfigSnapshot() []ProviderConfig {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if len(c.Providers) == 0 && c.Provider != nil {
-		return cloneProviderConfigs([]ProviderConfig{*c.Provider})
-	}
-	return cloneProviderConfigs(c.Providers)
-}
-
 func (c *Config) RemoveThread(id string) error {
 	return c.update(func() {
 		for i, t := range c.Threads {
@@ -499,19 +497,7 @@ func (c *Config) SetExecutionControl(ec ExecutionControlConfig) error {
 func (c *Config) GetProviders() []ProviderConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]ProviderConfig, len(c.Providers))
-	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice, RealtimeModels: cloneRealtimeModels(p.RealtimeModels), RealtimeExecution: *cloneRealtimeExecutionConfig(&p.RealtimeExecution)}
-		if p.Models != nil {
-			cp.Models = make(map[string]string)
-			for k, v := range p.Models {
-				cp.Models[k] = v
-			}
-		}
-		cp.ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
-		out[i] = cp
-	}
-	return out
+	return cloneProviderConfigs(c.Providers)
 }
 
 // GetDefaultProvider returns the default provider config, or nil.
@@ -667,6 +653,7 @@ func cloneProviderConfigs(in []ProviderConfig) []ProviderConfig {
 		}
 		out[i].ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
 		out[i].RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
+		out[i].RealtimeExecution = *cloneRealtimeExecutionConfig(&p.RealtimeExecution)
 	}
 	return out
 }
@@ -748,6 +735,9 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 	}
 	if update.ServiceTier != "" {
 		providers[index].ServiceTier = update.ServiceTier
+	}
+	if update.MaxOutputTokens != 0 {
+		providers[index].MaxOutputTokens = update.MaxOutputTokens
 	}
 	if update.RealtimeModels != nil {
 		providers[index].RealtimeModels = cloneRealtimeModels(update.RealtimeModels)

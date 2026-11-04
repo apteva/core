@@ -696,6 +696,13 @@ func (pp *ProviderPool) ProviderSummary(name string) string {
 	return summary
 }
 
+func validateProviderOutputLimit(pc ProviderConfig) error {
+	if pc.MaxOutputTokens < 0 || pc.MaxOutputTokens > 64000 || (pc.MaxOutputTokens > 0 && pc.Name != "anthropic") {
+		return fmt.Errorf("provider %q: max_output_tokens is supported for anthropic only and must be between 0 and 64000 (got %d)", pc.Name, pc.MaxOutputTokens)
+	}
+	return nil
+}
+
 // buildProviderPool creates a ProviderPool from config + env vars.
 // Priority: CORE_PROVIDER env → config.json providers → auto-detect from API keys.
 func buildProviderPool(cfg *Config) (*ProviderPool, error) {
@@ -713,8 +720,8 @@ func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPoo
 	// 1. Config providers array
 	configs := cfg.GetProviders()
 	for _, pc := range configs {
-		if pc.MaxOutputTokens < 0 || pc.MaxOutputTokens > 64000 || (pc.MaxOutputTokens > 0 && pc.Name != "anthropic") {
-			return nil, fmt.Errorf("max_output_tokens is supported for anthropic only and must be between 0 and 64000")
+		if err := validateProviderOutputLimit(pc); err != nil {
+			return nil, err
 		}
 		// Route realtime providers to their own map. Gated on
 		// Config.RealtimeEnabled: when off, realtime entries are
