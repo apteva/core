@@ -52,7 +52,9 @@ type PersistentThread struct {
 	InheritCapabilities bool                         `json:"inherit_capabilities,omitempty"` // recompute from the parent's ceiling on respawn
 	Model               string                       `json:"model,omitempty"`                // starting model tier: large, medium, small
 	Reasoning           string                       `json:"reasoning,omitempty"`            // starting reasoning effort: auto, low, medium, high, ...
-	Provider            string                       `json:"provider,omitempty"`             // provider selected for this thread
+	Provider            string                       `json:"provider,omitempty"`             // provider this thread last ran on (for realtime threads, its realtime provider)
+	ProviderPin         *string                      `json:"provider_pin,omitempty"`         // explicit provider choice; "" follows the parent; nil = saved before pins were stored
+	BuiltinTools        []string                     `json:"builtin_tools,omitzero"`         // provider builtin scope: nil inherits, empty allows none
 	Realtime            bool                         `json:"realtime,omitempty"`             // spawn as a realtime (voice/audio) thread
 	AllowNoSpawn        bool                         `json:"allow_no_spawn,omitempty"`       // authenticated system/API grant for explicitly attached no_spawn MCPs
 	Voice               string                       `json:"voice,omitempty"`                // realtime voice id (e.g. "marin"); empty = provider default
@@ -369,6 +371,41 @@ func (c *Config) SaveThread(pt PersistentThread) error {
 			c.Threads = append(c.Threads, pt)
 		}
 	})
+}
+
+// RefreshThread updates a thread only while it is still saved, so a late
+// runtime update can't bring back a thread that has since been removed.
+func (c *Config) RefreshThread(pt PersistentThread) error {
+	c.mu.RLock()
+	saved := false
+	for _, t := range c.Threads {
+		if t.ID == pt.ID {
+			saved = true
+			break
+		}
+	}
+	c.mu.RUnlock()
+	if !saved {
+		return nil
+	}
+	return c.update(func() {
+		for i, t := range c.Threads {
+			if t.ID == pt.ID {
+				c.Threads[i] = pt
+				break
+			}
+		}
+	})
+}
+
+// providerConfigSnapshot returns the saved providers exactly as stored.
+func (c *Config) providerConfigSnapshot() []ProviderConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.Providers) == 0 && c.Provider != nil {
+		return cloneProviderConfigs([]ProviderConfig{*c.Provider})
+	}
+	return cloneProviderConfigs(c.Providers)
 }
 
 func (c *Config) RemoveThread(id string) error {

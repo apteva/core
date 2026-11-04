@@ -813,6 +813,9 @@ type Thinker struct {
 	apiKey              string
 	pool                *ProviderPool // all available providers (shared across threads)
 	provider            LLMProvider   // current active provider for this thinker
+	providerPin         string        // provider this thread was asked to use; empty follows its parent
+	builtinScope        []string      // builtin scope from spawn: nil inherits, empty allows none
+	pinMissingReported  bool          // last pin state announced by reportProviderPinState
 	messages            []Message
 	bus                 *EventBus
 	sub                 *Subscription
@@ -1188,6 +1191,8 @@ type thinkerRuntimeStatus struct {
 	BaselineModel       ModelTier
 	BaselineReasoning   ReasoningLevel
 	Provider            string
+	ProviderPin         string
+	ProviderMissing     bool
 	ContextMsgs         int
 	ContextChars        int
 	ModelID             string
@@ -1253,6 +1258,8 @@ func (t *Thinker) publishRuntimeStatus() {
 		BaselineModel:       t.baselineModel,
 		BaselineReasoning:   normalizeReasoningLevel(t.baselineReasoning),
 		Provider:            providerName,
+		ProviderPin:         t.providerPin,
+		ProviderMissing:     t.providerPinMissing(),
 		ContextMsgs:         len(t.messages),
 		ContextChars:        contextChars(t.messages),
 		ModelID:             t.modelID(),
@@ -1503,8 +1510,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 			if pt.InheritCapabilities {
 				capabilityMode = SpawnCapabilitiesInherit
 			}
-			t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-				ProviderName:      pt.Provider,
+			err := t.threads.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
+				ProviderName:      t.threads.restoredProviderName(pt),
+				BuiltinTools:      pt.BuiltinTools,
 				ParentID:          "main",
 				Depth:             pt.Depth,
 				DeferRun:          true,
@@ -1523,6 +1531,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				WorkMode:          pt.WorkMode,
 				RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
 			})
+			if err != nil {
+				t.reportThreadRestoreFailure(pt.ID, err)
+			}
 		} else {
 			mgr := findThreadManager(t.threads, parentID)
 			if mgr != nil {
@@ -1530,8 +1541,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				if pt.InheritCapabilities {
 					capabilityMode = SpawnCapabilitiesInherit
 				}
-				mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
-					ProviderName:      pt.Provider,
+				err := mgr.SpawnWithOpts(pt.ID, pt.Directive, pt.Tools, SpawnOpts{
+					ProviderName:      mgr.restoredProviderName(pt),
+					BuiltinTools:      pt.BuiltinTools,
 					ParentID:          parentID,
 					Depth:             pt.Depth,
 					DeferRun:          true,
@@ -1550,6 +1562,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					WorkMode:          pt.WorkMode,
 					RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
 				})
+				if err != nil {
+					t.reportThreadRestoreFailure(pt.ID, err)
+				}
 			} else {
 				logMsg("RESPAWN", fmt.Sprintf("skipping thread %q: parent %q not found", pt.ID, parentID))
 			}
@@ -1972,7 +1987,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					toolNames = append(toolNames, call.Raw)
 					continue
 				}
-				providerName := call.Args["provider"]
+				providerName := strings.TrimSpace(call.Args["provider"])
 				modelName := strings.ToLower(strings.TrimSpace(call.Args["model"]))
 				if modelName != "" {
 					if _, ok := modelNames[modelName]; !ok {
@@ -2060,6 +2075,11 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						toolNames = append(toolNames, call.Raw)
 						continue
 					}
+				}
+				if err := t.threads.validateSpawnProvider(providerName, realtime); err != nil {
+					addSpawnFailure(err)
+					toolNames = append(toolNames, call.Raw)
+					continue
 				}
 				if id == "" || directive == "" {
 					logMsg("SPAWN", fmt.Sprintf("skip: missing id=%q or directive_len=%d in LLM call", id, len(directive)))

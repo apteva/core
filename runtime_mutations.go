@@ -26,13 +26,28 @@ func (t *Thinker) createRuntimeChild(fn func() error) error {
 }
 
 func (t *Thinker) enqueueRuntimeMutation(fn func() error, invalidatesRequest bool) error {
+	done, err := t.queueRuntimeMutation(fn, invalidatesRequest)
+	if done == nil {
+		return err
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-t.quit:
+		return fmt.Errorf("thread stopped during update")
+	}
+}
+
+// queueRuntimeMutation hands fn to the owning loop and returns without waiting
+// for it. A nil channel means the thinker isn't running and fn has already run.
+func (t *Thinker) queueRuntimeMutation(fn func() error, invalidatesRequest bool) (<-chan error, error) {
 	t.mutationMu.Lock()
+	defer t.mutationMu.Unlock()
 	if t.mutationWake == nil {
 		t.mutationWake = make(chan struct{}, 1)
 	}
 	if !t.runtimeRunning {
-		defer t.mutationMu.Unlock()
-		return fn()
+		return nil, fn()
 	}
 	command := runtimeMutation{apply: fn, done: make(chan error, 1), invalidatesRequest: invalidatesRequest}
 	t.mutations = append(t.mutations, command)
@@ -43,13 +58,7 @@ func (t *Thinker) enqueueRuntimeMutation(fn func() error, invalidatesRequest boo
 	case t.mutationWake <- struct{}{}:
 	default:
 	}
-	t.mutationMu.Unlock()
-	select {
-	case err := <-command.done:
-		return err
-	case <-t.quit:
-		return fmt.Errorf("thread stopped during update")
-	}
+	return command.done, nil
 }
 
 func (t *Thinker) beginRuntime() {

@@ -217,6 +217,8 @@ type threadJSON struct {
 	Ephemeral           bool            `json:"ephemeral,omitempty"`
 	Voice               string          `json:"voice,omitempty"`
 	Provider            string          `json:"provider,omitempty"`
+	ProviderPin         string          `json:"provider_pin,omitempty"`
+	ProviderMissing     bool            `json:"provider_missing,omitempty"`
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +270,8 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 				Ephemeral:           t.Ephemeral,
 				Voice:               t.Voice,
 				Provider:            t.Provider,
+				ProviderPin:         t.ProviderPin,
+				ProviderMissing:     t.ProviderMissing,
 			})
 			// Recurse into children
 			if t.SubThreads > 0 {
@@ -811,7 +815,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		TurnDetection:     body.TurnDetection,
 		RealtimeOutput:    body.RealtimeOutput,
 		RealtimeExecution: cloneRealtimeExecutionConfig(body.RealtimeExecution),
-		ProviderName:      body.ProviderName,
+		ProviderName:      strings.TrimSpace(body.ProviderName),
 		Model:             strings.ToLower(strings.TrimSpace(body.Model)),
 		DeferRun:          true,
 	}
@@ -884,7 +888,19 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		opts.AudioControl = audioControl
 	}
 
-	if err := a.thinker.createRuntimeChild(func() error { return a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts) }); err != nil {
+	// Checked on main's loop, so a config change can't slip between the check
+	// and the spawn.
+	if err := a.thinker.createRuntimeChild(func() error {
+		if err := a.thinker.threads.validateSpawnProvider(opts.ProviderName, opts.Realtime); err != nil {
+			return err
+		}
+		return a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts)
+	}); err != nil {
+		var invalidProvider *invalidProviderError
+		if errors.As(err, &invalidProvider) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		// Race: another caller spawned the same id between our
 		// findThinkerByID check and the lock inside Spawn. Treat as
 		// success — the caller's intent (a live thread by this name)
@@ -1316,9 +1332,11 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 
 		cfg := a.thinker.config
 		providers := cfg.GetProviders()
+		savedProviders := cfg.providerConfigSnapshot()
 		providerChanged := len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil
 		var pool *ProviderPool
 		enabled := cfg.RealtimeEnabledFlag()
+		savedEnabled := enabled
 		if body.RealtimeEnabled != nil {
 			enabled = *body.RealtimeEnabled
 		}
@@ -1379,6 +1397,12 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		if providerChanged {
 			a.thinker.pool = pool
 			a.thinker.provider = pool.Default()
+			// Settings saves usually resend the providers unchanged, and moving a
+			// worker cancels its in-flight LLM request, so act only on a real change.
+			providersEdited := (len(body.Providers) > 0 || body.Provider != nil) && !providerConfigsEqual(savedProviders, providers)
+			if providersEdited || enabled != savedEnabled {
+				a.thinker.syncChildProviders(pool)
+			}
 		}
 		if body.Execution != nil && a.thinker.execution != nil {
 			a.thinker.execution.ApplyConfig(*body.Execution)

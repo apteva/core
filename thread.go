@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -193,6 +194,8 @@ type ThreadInfo struct {
 	Model               ModelTier
 	Reasoning           ReasoningLevel
 	Provider            string // active provider name
+	ProviderPin         string // provider this thread was asked to use; empty follows its parent
+	ProviderMissing     bool   // the pinned provider isn't configured, so Provider is something else
 	Realtime            bool
 	Ephemeral           bool
 	BridgeConnected     bool
@@ -236,6 +239,7 @@ type Thread struct {
 	TurnDetection       RealtimeTurnDetectionConfig
 	RealtimeOutput      RealtimeOutputConfig
 	ProviderName        string
+	nativeToolDocs      *atomic.Bool // the prompt describes tools for a provider with native tool calling
 	Ephemeral           bool
 	audioIn             chan []byte
 	audioOut            chan RealtimeAudioFrame
@@ -554,6 +558,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		delete(toolSet, "spawn")
 	}
 
+	// The prompt can be rebuilt off this thread's loop, so it reads this flag
+	// rather than a pool that a config change may be replacing.
+	nativeToolDocs := &atomic.Bool{}
+	nativeToolDocs.Store(poolSupportsNativeTools(tm.parent.pool))
 	buildThreadPrompt := func(currentID, currentParentID, currentDirective string) string {
 		parentLabel := currentParentID
 		if parentLabel == "main" {
@@ -573,7 +581,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			// Same compact-vs-full trade-off as buildSystemPrompt: if the
 			// sub-thread's provider supports native tools, the schemas are
 			// already in tools[] and we skip duplicating them in prose.
-			if poolSupportsNativeTools(tm.parent.pool) {
+			if nativeToolDocs.Load() {
 				prompt += "\n" + tm.parent.registry.CoreDocsSummary(false, isSystem)
 			} else {
 				prompt += "\n" + tm.parent.registry.CoreDocs(false, isSystem)
@@ -609,6 +617,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		TurnDetection:       opts.TurnDetection,
 		RealtimeOutput:      opts.RealtimeOutput,
 		ProviderName:        opts.ProviderName,
+		nativeToolDocs:      nativeToolDocs,
 		Ephemeral:           opts.Ephemeral,
 		audioIn:             opts.AudioIn,
 		audioOut:            opts.AudioOut,
@@ -626,17 +635,17 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 
 	// Create a Thinker — same struct as main, shares the bus and provider pool
-	// Default: inherit parent's provider. Override via opts.ProviderName.
-	threadProvider := tm.parent.provider
-	if opts.ProviderName != "" && tm.parent.pool != nil {
-		if p := tm.parent.pool.Get(opts.ProviderName); p != nil {
-			threadProvider = p
-		}
-	}
-
-	// Scope provider builtins if overridden (nil = inherit all, empty = none)
-	if opts.BuiltinTools != nil && threadProvider != nil {
-		threadProvider = threadProvider.WithBuiltins(opts.BuiltinTools)
+	// Default: inherit parent's provider. Override via opts.ProviderName, and
+	// scope provider builtins if overridden (nil = inherit all, empty = none).
+	// New spawns were validated at their entry point, so a name missing from the
+	// pool here is a saved thread whose provider has since been removed.
+	requestedProvider := strings.TrimSpace(opts.ProviderName)
+	threadProvider := selectThreadProvider(tm.parent.pool, requestedProvider, tm.parent.provider, opts.BuiltinTools)
+	// A realtime thread's ProviderName chooses its realtime provider, and a voice
+	// worker's provider comes from its call, so neither is a pin.
+	providerPin := requestedProvider
+	if opts.Realtime || opts.WorkMode {
+		providerPin = ""
 	}
 	initialModel := ModelLarge
 	if opts.Model != "" {
@@ -750,6 +759,10 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		apiKey:   tm.parent.apiKey,
 		pool:     tm.parent.pool,
 		provider: threadProvider,
+
+		providerPin:  providerPin,
+		builtinScope: cloneBuiltinScope(opts.BuiltinTools),
+
 		messages: []Message{
 			{Role: "system", Content: threadSystemPrompt},
 		},
@@ -883,6 +896,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if thread.hasPendingInboxEvents() {
 		thread.reconcileInboxEventIDs(thinker.session.EventIDs())
 	}
+	thinker.reportProviderPinState("spawn")
 	thinker.publishRuntimeStatus()
 	thinker.publishContextStatus()
 
@@ -1364,7 +1378,12 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 				if toolsStr != "" {
 					spawnTools = strings.Split(toolsStr, ",")
 				}
-				providerName := call.Args["provider"]
+				providerName := strings.TrimSpace(call.Args["provider"])
+				if err := thread.Children.validateSpawnProvider(providerName, false); err != nil {
+					emitResult(call, fmt.Sprintf("error: %v", err))
+					toolNames = append(toolNames, call.Raw)
+					continue
+				}
 				modelName := strings.ToLower(strings.TrimSpace(call.Args["model"]))
 				if modelName != "" {
 					if _, ok := modelNames[modelName]; !ok {
@@ -1828,6 +1847,8 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			Model:               status.Model,
 			Reasoning:           status.Reasoning,
 			Provider:            providerName,
+			ProviderPin:         status.ProviderPin,
+			ProviderMissing:     status.ProviderMissing,
 			Realtime:            t.IsRealtime,
 			RealtimeExecution:   cloneRealtimeExecutionConfig(t.RealtimeExecution),
 			Ephemeral:           t.Ephemeral,
@@ -2016,6 +2037,11 @@ func persistentThreadStateBase(thread *Thread) PersistentThread {
 		if !thread.IsRealtime && status.Provider != "" {
 			state.Provider = status.Provider
 		}
+		if !thread.IsRealtime {
+			pin := status.ProviderPin
+			state.ProviderPin = &pin
+		}
+		state.BuiltinTools = cloneBuiltinScope(thread.Thinker.builtinScope)
 	}
 	// A realtime thread uses a companion provider that is intentionally not
 	// the ordinary Thinker provider. When it inherited the realtime default,
