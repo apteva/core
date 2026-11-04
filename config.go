@@ -52,7 +52,9 @@ type PersistentThread struct {
 	InheritCapabilities bool                         `json:"inherit_capabilities,omitempty"` // recompute from the parent's ceiling on respawn
 	Model               string                       `json:"model,omitempty"`                // starting model tier: large, medium, small
 	Reasoning           string                       `json:"reasoning,omitempty"`            // starting reasoning effort: auto, low, medium, high, ...
-	Provider            string                       `json:"provider,omitempty"`             // provider selected for this thread
+	Provider            string                       `json:"provider,omitempty"`             // provider this thread last ran on (for realtime threads, its realtime provider)
+	ProviderPin         *string                      `json:"provider_pin,omitempty"`         // explicit provider choice; "" follows the parent; nil = saved before pins were stored
+	BuiltinTools        []string                     `json:"builtin_tools,omitzero"`         // provider builtin scope: nil inherits, empty allows none
 	Realtime            bool                         `json:"realtime,omitempty"`             // spawn as a realtime (voice/audio) thread
 	AllowNoSpawn        bool                         `json:"allow_no_spawn,omitempty"`       // authenticated system/API grant for explicitly attached no_spawn MCPs
 	Voice               string                       `json:"voice,omitempty"`                // realtime voice id (e.g. "marin"); empty = provider default
@@ -152,6 +154,14 @@ func (c *Config) load() error {
 		c.Provider.Default = true
 		c.Providers = []ProviderConfig{*c.Provider}
 		c.Provider = nil
+	}
+	// This limit was never applied or checked before, so a saved config can hold
+	// a value that's now refused. Keep starting on the default it has always used.
+	for i := range c.Providers {
+		if err := validateProviderOutputLimit(c.Providers[i]); err != nil {
+			logMsg("BOOT", fmt.Sprintf("ignoring saved setting: %v", err))
+			c.Providers[i].MaxOutputTokens = 0
+		}
 	}
 	for _, server := range c.MCPServers {
 		if err := validateMCPToolLoading(server); err != nil {
@@ -371,6 +381,31 @@ func (c *Config) SaveThread(pt PersistentThread) error {
 	})
 }
 
+// RefreshThread updates a thread only while it is still saved, so a late
+// runtime update can't bring back a thread that has since been removed.
+func (c *Config) RefreshThread(pt PersistentThread) error {
+	c.mu.RLock()
+	saved := false
+	for _, t := range c.Threads {
+		if t.ID == pt.ID {
+			saved = true
+			break
+		}
+	}
+	c.mu.RUnlock()
+	if !saved {
+		return nil
+	}
+	return c.update(func() {
+		for i, t := range c.Threads {
+			if t.ID == pt.ID {
+				c.Threads[i] = pt
+				break
+			}
+		}
+	})
+}
+
 func (c *Config) RemoveThread(id string) error {
 	return c.update(func() {
 		for i, t := range c.Threads {
@@ -462,19 +497,7 @@ func (c *Config) SetExecutionControl(ec ExecutionControlConfig) error {
 func (c *Config) GetProviders() []ProviderConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]ProviderConfig, len(c.Providers))
-	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice, RealtimeModels: cloneRealtimeModels(p.RealtimeModels), RealtimeExecution: *cloneRealtimeExecutionConfig(&p.RealtimeExecution)}
-		if p.Models != nil {
-			cp.Models = make(map[string]string)
-			for k, v := range p.Models {
-				cp.Models[k] = v
-			}
-		}
-		cp.ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
-		out[i] = cp
-	}
-	return out
+	return cloneProviderConfigs(c.Providers)
 }
 
 // GetDefaultProvider returns the default provider config, or nil.
@@ -630,6 +653,7 @@ func cloneProviderConfigs(in []ProviderConfig) []ProviderConfig {
 		}
 		out[i].ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
 		out[i].RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
+		out[i].RealtimeExecution = *cloneRealtimeExecutionConfig(&p.RealtimeExecution)
 	}
 	return out
 }
@@ -711,6 +735,9 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 	}
 	if update.ServiceTier != "" {
 		providers[index].ServiceTier = update.ServiceTier
+	}
+	if update.MaxOutputTokens != 0 {
+		providers[index].MaxOutputTokens = update.MaxOutputTokens
 	}
 	if update.RealtimeModels != nil {
 		providers[index].RealtimeModels = cloneRealtimeModels(update.RealtimeModels)

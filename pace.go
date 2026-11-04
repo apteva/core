@@ -156,6 +156,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 	previousModel := t.agentModel
 	previousReasoning := t.agentReasoning
 	previousProvider := t.provider
+	previousPin := t.providerPin
 	previousWake := t.nextWakeAt
 	previousDurable := t.paceDurable
 	previousRevision := t.paceRevision
@@ -167,6 +168,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 	nextModel := t.agentModel
 	nextReasoning := t.agentReasoning
 	nextProvider := t.provider
+	nextPin := t.providerPin
 	nextWake := t.nextWakeAt
 	nextRevision := t.paceRevision
 	nextFired := t.wakeDeadlineFired
@@ -238,14 +240,27 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 		nextReasoning = r
 		parts = append(parts, "reasoning="+r.String())
 	}
-	if name := args["provider"]; name != "" && managesInferenceLifecycle(t.provider) && name != t.provider.Name() {
-		return "", fmt.Errorf("provider-managed inference cannot switch executor through pace; configure the realtime execution mode instead")
-	}
-	if name := args["provider"]; name != "" && t.pool != nil {
-		if p := t.pool.Get(name); p != nil {
-			nextProvider = p
-			parts = append(parts, "provider="+name)
+	if name := strings.TrimSpace(args["provider"]); name != "" {
+		if managesInferenceLifecycle(t.provider) && name != t.provider.Name() {
+			return "", fmt.Errorf("provider-managed inference cannot switch executor through pace; configure the realtime execution mode instead")
 		}
+		alreadyRunning := t.provider != nil && t.provider.Name() == name
+		if !alreadyRunning {
+			selected, err := selectableProvider(t.pool, t.provider, name)
+			if err != nil {
+				return "", err
+			}
+			if t.builtinScope != nil {
+				selected = selected.WithBuiltins(t.builtinScope)
+			}
+			nextProvider = selected
+		}
+		// A worker that chooses another provider keeps it across restarts and
+		// config changes. Naming the provider it already follows isn't a pin.
+		if t.threadID != "main" && (!alreadyRunning || t.providerPin != "") {
+			nextPin = name
+		}
+		parts = append(parts, "provider="+name)
 	}
 
 	t.waitForEvents = nextWaitForEvents
@@ -254,6 +269,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 	t.agentModel = nextModel
 	t.agentReasoning = nextReasoning
 	t.provider = nextProvider
+	t.providerPin = nextPin
 	t.nextWakeAt = nextWake
 	t.paceDurable = true
 	t.paceRevision = nextRevision
@@ -269,6 +285,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 			t.agentModel = previousModel
 			t.agentReasoning = previousReasoning
 			t.provider = previousProvider
+			t.providerPin = previousPin
 			t.nextWakeAt = previousWake
 			t.paceDurable = previousDurable
 			t.paceRevision = previousRevision
@@ -277,6 +294,7 @@ func applyPaceArgs(t *Thinker, args map[string]string) (string, error) {
 			return "", fmt.Errorf("persist pace: %w", err)
 		}
 	}
+	t.reportProviderPinState("pace")
 	if clearWake {
 		return strings.Join(parts, " "), nil
 	}
