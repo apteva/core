@@ -134,8 +134,9 @@ func (p *OpenAICompatProvider) WithBuiltins(builtins []string) LLMProvider {
 // openaiMessage serializes a Message for the OpenAI API.
 // When Parts is set, content becomes the array (native format).
 type openaiMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"` // string or []ContentPart
+	Role             string `json:"role"`
+	Content          any    `json:"content"` // string or []ContentPart
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // convertAudioURLParts converts audio_url parts to input_audio (OpenAI format).
@@ -292,11 +293,16 @@ func toOpenAIMessages(messages []Message) []any {
 		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 && !m.HasParts() {
 			continue
 		}
+		msg := openaiMessage{Role: m.Role, Content: m.Content}
 		if m.HasParts() {
-			out = append(out, openaiMessage{Role: m.Role, Content: convertAudioURLParts(m.Parts)})
-		} else {
-			out = append(out, openaiMessage{Role: m.Role, Content: m.Content})
+			msg.Content = convertAudioURLParts(m.Parts)
 		}
+		// DeepSeek requires reasoning from every previous assistant turn when
+		// tools are supplied, including final replies without tool calls.
+		if m.Role == "assistant" {
+			msg.ReasoningContent = m.Reasoning
+		}
+		out = append(out, msg)
 	}
 	return out
 }
