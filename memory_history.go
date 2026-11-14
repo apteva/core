@@ -635,7 +635,18 @@ func (h *memoryHistory) readArchivedToolResult(ctx context.Context, thread, call
 			}
 		}
 		if !found {
-			return memoryToolError(fmt.Errorf("no original tool result for call_id %q in this thread", callID))
+			// A checkpoint may have indexed the original and replaced the
+			// journal after this reader loaded its call ledger. Refresh once
+			// before reporting a miss; the writer commits the index first.
+			archive = NewToolResultArchive(filepath.Dir(h.dir), thread)
+			ref, ok = archive.RefForCall(callID)
+			if !ok {
+				return memoryToolError(fmt.Errorf("no original tool result for call_id %q in this thread", callID))
+			}
+			object, err = archive.Read(ref)
+			if err != nil {
+				return memoryToolError(err)
+			}
 		}
 	}
 	var err error

@@ -677,10 +677,51 @@ func (s *Session) rewriteEntriesLocked(entries []SessionEntry) error {
 			return err
 		}
 	}
+	// Compaction can displace results below the normal archival threshold.
+	// Preserve the original payload AND its call-ID index before replacing the
+	// journal. A request/journal snapshot alone cannot satisfy history_search.
+	old, err := s.readEntriesLocked()
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := s.archiveOriginalToolResults(old); err != nil {
+		return err
+	}
 	if err := atomicWriteFile(s.path, buf.Bytes(), 0600); err != nil {
 		return err
 	}
 	s.revision++
+	return nil
+}
+
+func (s *Session) archiveOriginalToolResults(entries []SessionEntry) error {
+	for _, entry := range entries {
+		for _, result := range entry.ToolResults {
+			if result.CallID == "" {
+				continue
+			}
+			if result.SHA256 != "" || result.ArchiveRef != "" || result.ContentIsPreview {
+				// Metadata/previews must resolve to the full object; never index
+				// an excerpt or empty metadata as the original observation.
+				ref := result.SHA256
+				if ref == "" {
+					ref = result.ArchiveRef
+				}
+				if ref == "" {
+					ref, _ = s.archive.RefForCall(result.CallID)
+				}
+				original, err := s.archive.Read(ref)
+				if err != nil {
+					return fmt.Errorf("preserve original tool result %q: %w", result.CallID, err)
+				}
+				result.SHA256 = original.SHA256
+				result.ArchiveRef = toolResultArchiveRef(original.SHA256)
+			}
+			if _, err := s.archive.Archive(result); err != nil {
+				return fmt.Errorf("preserve original tool result %q: %w", result.CallID, err)
+			}
+		}
+	}
 	return nil
 }
 

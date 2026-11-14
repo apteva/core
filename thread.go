@@ -2363,7 +2363,7 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 			return ThreadUpdateResult{}, fmt.Errorf("persist thread update: %w", err)
 		}
 	}
-	thread.inboxEvents = nextEvents
+	thread.commitInboxEvents(nextEvents, acceptedEvents)
 	thread.inboxMu.Unlock()
 	result.Events = receipt
 

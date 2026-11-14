@@ -108,19 +108,7 @@ func (tm *ThreadManager) QueueWork(id string, w ThreadWork, text string, parts [
 		return fmt.Errorf("invalid thread assignment")
 	}
 	event := newThreadWorkEvent(w, text, parts)
-	thread.inboxMu.Lock()
-	for _, prior := range thread.inboxEvents {
-		if prior.ID == event.ID {
-			thread.inboxMu.Unlock()
-			if prior.Hash != event.Hash {
-				return &ThreadEventConflictError{ID: event.ID}
-			}
-			return nil
-		}
-	}
-	thread.inboxMu.Unlock()
-	// Invalidate stale decisions before the queued input can race admission.
-	thread.Thinker.work.advance(w)
+	// QueueEvents commits admission after persistence and before delivery.
 	_, err := owner.QueueEvents(id, []PersistentThreadEvent{event})
 	return err
 }
