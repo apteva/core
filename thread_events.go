@@ -181,6 +181,36 @@ func publishThreadInboxEvents(bus *EventBus, threadID string, events []Persisten
 	}
 }
 
+// Idempotency covers both content and lifecycle policy, whether the prior
+// occurrence is durable or appears earlier in this incoming batch.
+func validateThreadEventIdentities(existing, incoming []PersistentThreadEvent) error {
+	known := make(map[string]PersistentThreadEvent, len(existing)+len(incoming))
+	for _, event := range existing {
+		known[event.ID] = event
+	}
+	for _, event := range incoming {
+		if prior, ok := known[event.ID]; ok && (prior.Hash != event.Hash || prior.TrackLifecycle != event.TrackLifecycle) {
+			return &ThreadEventConflictError{ID: event.ID}
+		}
+		known[event.ID] = event
+	}
+	return nil
+}
+
+// The caller holds inboxMu and has crossed the durability boundary. Admit only
+// newly accepted assignments before publishing their wake-up events. Failed
+// enqueues and duplicate deliveries must not supersede currently accepted work.
+func (thread *Thread) commitInboxEvents(next, accepted []PersistentThreadEvent) {
+	if thread.Thinker != nil && thread.Thinker.work != nil {
+		for _, event := range accepted {
+			if event.Work != nil && event.Work.Kind == "request" {
+				thread.Thinker.work.advance(*event.Work)
+			}
+		}
+	}
+	thread.inboxEvents = next
+}
+
 // QueueEvents atomically deduplicates and durably records inbox events before
 // publishing them. Existing IDs with identical payloads are harmless retries;
 // reusing an ID for different content rejects the complete batch.
@@ -216,7 +246,7 @@ func (tm *ThreadManager) QueueEvents(id string, incoming []PersistentThreadEvent
 			return ThreadEventQueueResult{}, fmt.Errorf("persist thread events: %w", err)
 		}
 	}
-	thread.inboxEvents = next
+	thread.commitInboxEvents(next, acceptedEvents)
 	thread.inboxMu.Unlock()
 	owner.mu.RUnlock()
 
@@ -244,24 +274,12 @@ func stageThreadEvents(thread *Thread, incoming []PersistentThreadEvent) ([]Pers
 		}
 	}
 
+	if err := validateThreadEventIdentities(thread.inboxEvents, incoming); err != nil {
+		return nil, nil, result, err
+	}
 	existing := make(map[string]string, len(thread.inboxEvents)+len(incoming))
-	existingEvents := make(map[string]PersistentThreadEvent, len(thread.inboxEvents))
 	for _, event := range thread.inboxEvents {
 		existing[event.ID] = event.Hash
-		existingEvents[event.ID] = event
-	}
-	batch := map[string]string{}
-	for _, event := range incoming {
-		if hash, ok := existing[event.ID]; ok && hash != event.Hash {
-			return nil, nil, result, &ThreadEventConflictError{ID: event.ID}
-		}
-		if persisted, ok := existingEvents[event.ID]; ok && persisted.TrackLifecycle != event.TrackLifecycle {
-			return nil, nil, result, &ThreadEventConflictError{ID: event.ID}
-		}
-		if hash, ok := batch[event.ID]; ok && hash != event.Hash {
-			return nil, nil, result, &ThreadEventConflictError{ID: event.ID}
-		}
-		batch[event.ID] = event.Hash
 	}
 
 	next := clonePersistentThreadEvents(thread.inboxEvents)
@@ -312,24 +330,14 @@ func (t *Thinker) QueueMainEvents(incoming []PersistentThreadEvent) (ThreadEvent
 	if err := validateInboxCapacity(t.mainInboxEvents, incoming); err != nil {
 		return result, err
 	}
+	if err := validateThreadEventIdentities(t.mainInboxEvents, incoming); err != nil {
+		return result, err
+	}
 
 	existing := make(map[string]PersistentThreadEvent, len(t.mainInboxEvents))
 	for _, event := range t.mainInboxEvents {
 		existing[event.ID] = event
 	}
-	batch := map[string]PersistentThreadEvent{}
-	for _, event := range incoming {
-		if persisted, ok := existing[event.ID]; ok {
-			if persisted.Hash != event.Hash || persisted.TrackLifecycle != event.TrackLifecycle {
-				return result, &ThreadEventConflictError{ID: event.ID}
-			}
-		}
-		if prior, ok := batch[event.ID]; ok && (prior.Hash != event.Hash || prior.TrackLifecycle != event.TrackLifecycle) {
-			return result, &ThreadEventConflictError{ID: event.ID}
-		}
-		batch[event.ID] = event
-	}
-
 	prepareTrackedEventExecutions(incoming)
 	before := clonePersistentThreadEvents(t.mainInboxEvents)
 	acceptedEvents := make([]PersistentThreadEvent, 0, len(incoming))
