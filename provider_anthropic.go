@@ -77,10 +77,12 @@ func sanitizeToolID(id string) string {
 }
 
 type AnthropicProvider struct {
-	apiKey       string
-	url          string
-	models       map[ModelTier]string
-	builtinTools []string // enabled built-in tools: "code_execution", "web_search"
+	apiKey          string
+	url             string
+	models          map[ModelTier]string
+	builtinTools    []string // enabled built-in tools: "code_execution", "web_search"
+	builtinConfigs  map[string]BuiltinToolConfig
+	maxOutputTokens int
 }
 
 func NewAnthropicProvider(apiKey string) LLMProvider {
@@ -113,6 +115,14 @@ func anthropicMaxTokens(model string) int {
 	return 4096
 }
 
+func (p *AnthropicProvider) outputTokenLimit(model string) int {
+	limit := p.maxOutputTokens
+	if limit == 0 {
+		limit = 16384
+	}
+	return min(limit, anthropicMaxTokens(model))
+}
+
 func (p *AnthropicProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
 		{Type: "code_execution_20250825", Name: "code_execution"},
@@ -129,7 +139,8 @@ func (p *AnthropicProvider) WithBuiltins(builtins []string) LLMProvider {
 		return p // nil = inherit all
 	}
 	clone := *p // shallow copy — shares apiKey, models, httpClient
-	clone.builtinTools = builtins
+	clone.builtinTools = append([]string(nil), builtins...)
+	clone.builtinConfigs = narrowBuiltinConfigs(p.builtinConfigs, builtins)
 	return &clone
 }
 
@@ -330,18 +341,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 		})
 	}
 
-	// Add enabled built-in tools
-	for _, btName := range p.builtinTools {
-		for _, available := range p.AvailableBuiltinTools() {
-			if available.Name == btName {
-				anthropicTools = append(anthropicTools, map[string]string{
-					"type": available.Type,
-					"name": available.Name,
-				})
-				break
-			}
-		}
-	}
+	anthropicTools = append(anthropicTools, p.configuredAnthropicBuiltins()...)
 
 	// System prompt as cacheable block
 	var systemContent any
@@ -380,7 +380,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 
 	reqBody := anthropicRequest{
 		Model:     model,
-		MaxTokens: anthropicMaxTokens(model),
+		MaxTokens: p.outputTokenLimit(model),
 		Stream:    true,
 		System:    systemContent,
 		Messages:  anthropicMsgs,
@@ -617,6 +617,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 
 // toAnthropicBlocks converts our ContentParts to Anthropic content blocks.
 func toAnthropicBlocks(parts []ContentPart) []anthropicContentBlock {
+	parts = fileRefsForModel(parts)
 	var blocks []anthropicContentBlock
 	for _, p := range parts {
 		switch p.Type {

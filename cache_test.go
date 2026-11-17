@@ -157,6 +157,12 @@ func TestBuildSystemPrompt_CodexVisibleActivity(t *testing.T) {
 	if !strings.Contains(codexPrompt, "[CODEX VISIBLE ACTIVITY]") {
 		t.Fatal("Codex prompt missing visible activity guidance")
 	}
+	if !strings.Contains(codexPrompt, "Status text is only progress, not a substitute for the requested answer.") {
+		t.Fatal("Codex status guidance must distinguish progress from the answer")
+	}
+	if strings.Contains(codexPrompt, "I’ll report the result to the user.") || strings.Contains(codexPrompt, "I’ll wait quietly and check again later.") {
+		t.Fatal("Codex status examples should not encourage promises followed by idling")
+	}
 	if !strings.Contains(codexPrompt, "ALL their tools are already in your tool list") {
 		t.Fatal("Codex prompt should use eager MCP wording for small tool surfaces")
 	}
@@ -350,10 +356,16 @@ func TestIntegration_CacheHitRatio_OpenAICodex(t *testing.T) {
 		Out    int
 	}
 	var stats []turnStat
+	var nextCodexCacheRequest time.Time
 	for i, turn := range turns {
 		messages = append(messages, Message{Role: "user", Content: turn})
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		resp, err := provider.Chat(ctx, messages, "gpt-5.5", nil, nil, nil, nil)
+		if err := waitSolCacheUntil(ctx, nextCodexCacheRequest); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		nextCodexCacheRequest = time.Now().Add(5 * time.Second)
+		resp, err := provider.Chat(ctx, messages, "gpt-6.1-sol", nil, nil, nil, nil)
 		cancel()
 		if err != nil {
 			if isExpiredCodexCredentialError(err) {
@@ -381,8 +393,8 @@ func TestIntegration_CacheHitRatio_OpenAICodex(t *testing.T) {
 	}
 	fmt.Fprintf(os.Stdout, "[CACHE-RATIO] openai-codex turns=%d ratio=%.1f%% prompt=%d cached=%d\n",
 		len(stats), ratio, promptSum, cachedSum)
-	if cachedSum == 0 {
-		t.Fatalf("Codex live cache test reported zero cached tokens across steady-state turns")
+	if ratio < 100*solCacheAcceptanceRate {
+		t.Fatalf("Sol Codex steady-state cache rate %.2f%% is below %.0f%%", ratio, 100*solCacheAcceptanceRate)
 	}
 }
 

@@ -262,7 +262,7 @@ func TestRealtimeVisibilityImmutableScopeUpdateRejectsBeforeCommit(t *testing.T)
 	defs := []mcpToolDef{{Name: "lookup", InputSchema: map[string]any{"type": "object"}}}
 	registerTestMCPTools(parent.registry, "booking", defs)
 	parent.toolIndex.Add("booking", defs, false, &MCPToolLoadingConfig{Default: ToolLoadAlways})
-	if err := parent.threads.SpawnWithOpts("voice", "Idle.", nil, SpawnOpts{Realtime: true, Ephemeral: true, ProviderName: provider.Name(), DeferRun: true}); err != nil {
+	if err := parent.threads.SpawnWithOpts("voice", "Idle.", nil, SpawnOpts{Realtime: true, Ephemeral: true, ProviderName: provider.Name(), DeferRun: true, CapabilityMode: SpawnCapabilitiesExplicit}); err != nil {
 		t.Fatal(err)
 	}
 	thread := parent.threads.threads["voice"]

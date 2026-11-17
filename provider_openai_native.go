@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,22 +20,28 @@ import (
 // code_interpreter, and other OpenAI-specific features.
 // For OpenAI-compatible endpoints (Fireworks, Ollama, etc.), use OpenAICompatProvider.
 type OpenAINativeProvider struct {
-	name              string
-	apiKey            string
-	responsesURL      string
-	forceStoreFalse   bool
-	runtimeTokenURL   string
-	serverAPIKey      string
-	accountID         string
-	models            map[ModelTier]string
-	modelCapabilities map[string]ModelCapabilities
-	builtinTools      []string
-	reasoning         ReasoningSettings
-	tokenMu           sync.RWMutex
-	refreshMu         sync.Mutex
-	lastTokenRefresh  time.Time
-	cacheStateMu      sync.Mutex
-	cacheState        *openAIPromptCacheState
+	name                   string
+	apiKey                 string
+	responsesURL           string
+	forceStoreFalse        bool
+	sessionProfile         *responsesSessionProviderProfile
+	sessionState           *responsesSessionState
+	runtimeTokenURL        string
+	serverAPIKey           string
+	accountID              string
+	serviceTier            string
+	serviceTierUnsupported *atomic.Bool
+	models                 map[ModelTier]string
+	modelCapabilities      map[string]ModelCapabilities
+	builtinTools           []string
+	builtinConfigs         map[string]BuiltinToolConfig
+	imageGeneration        *ImageGenerationConfig
+	reasoning              ReasoningSettings
+	tokenMu                sync.RWMutex
+	refreshMu              sync.Mutex
+	lastTokenRefresh       time.Time
+	cacheStateMu           sync.Mutex
+	cacheState             *openAIPromptCacheState
 }
 
 func NewOpenAINativeProvider(apiKey string) LLMProvider {
@@ -51,24 +58,22 @@ func NewOpenAINativeProvider(apiKey string) LLMProvider {
 }
 
 func NewOpenAICodexProvider(accessToken string) LLMProvider {
-	serverURL := strings.TrimRight(os.Getenv("SERVER_URL"), "/")
-	providerID := strings.TrimSpace(os.Getenv("OPENAI_CODEX_PROVIDER_ID"))
-	runtimeTokenURL := ""
-	if serverURL != "" && providerID != "" {
-		runtimeTokenURL = serverURL + "/api/providers/" + providerID + "/auth/runtime-token"
-	}
+	responsesURL := "https://chatgpt.com/backend-api/codex/responses"
+	accountID := strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCOUNT_ID"))
 	return &OpenAINativeProvider{
-		name:            "openai-codex",
-		apiKey:          accessToken,
-		responsesURL:    "https://chatgpt.com/backend-api/codex/responses",
-		forceStoreFalse: true,
-		runtimeTokenURL: runtimeTokenURL,
-		serverAPIKey:    os.Getenv("APTEVA_API_KEY"),
-		accountID:       strings.TrimSpace(os.Getenv("OPENAI_CODEX_ACCOUNT_ID")),
+		name:                   "openai-codex",
+		apiKey:                 accessToken,
+		responsesURL:           responsesURL,
+		forceStoreFalse:        true,
+		sessionProfile:         &openAICodexSessionProviderProfile,
+		runtimeTokenURL:        sessionRuntimeTokenURL("OPENAI_CODEX_PROVIDER_ID"),
+		serverAPIKey:           os.Getenv("APTEVA_API_KEY"),
+		accountID:              accountID,
+		serviceTierUnsupported: &atomic.Bool{},
 		models: map[ModelTier]string{
-			ModelLarge:  "gpt-5.5",
-			ModelMedium: "gpt-5.5",
-			ModelSmall:  "gpt-5.5",
+			ModelLarge:  "gpt-6.1-sol",
+			ModelMedium: "gpt-6.1-sol",
+			ModelSmall:  "gpt-6.1-sol",
 		},
 	}
 }
@@ -82,7 +87,7 @@ func (p *OpenAINativeProvider) Name() string {
 func (p *OpenAINativeProvider) Models() map[ModelTier]string { return p.models }
 func (p *OpenAINativeProvider) SupportsNativeTools() bool    { return true }
 func (p *OpenAINativeProvider) CostPer1M() (float64, float64, float64) {
-	if p.Name() == "openai-codex" {
+	if p.sessionProfile != nil && p.sessionProfile.subscriptionBacked || p.Name() == "openai-codex" {
 		return 0, 0, 0
 	}
 	// Default to gpt-5.4-mini pricing
@@ -90,23 +95,67 @@ func (p *OpenAINativeProvider) CostPer1M() (float64, float64, float64) {
 }
 
 func (p *OpenAINativeProvider) AvailableBuiltinTools() []BuiltinTool {
-	if p.Name() == "openai-codex" {
-		return nil
+	var imageTools []BuiltinTool
+	if p.imageGenerationEnabled() {
+		imageTools = []BuiltinTool{{Type: "image_generation", Name: "image_generation"}}
 	}
-	return []BuiltinTool{
+	if p.sessionProfile != nil && !p.sessionProfile.advertiseBuiltinTools || p.Name() == "openai-codex" {
+		return imageTools
+	}
+	return append([]BuiltinTool{
 		{Type: "code_interpreter", Name: "code_interpreter"},
 		{Type: "web_search_preview", Name: "web_search"},
-	}
+	}, imageTools...)
 }
 
 func (p *OpenAINativeProvider) SetBuiltinTools(tools []string) {
+	if p.sessionProfile != nil && !p.sessionProfile.allowConfiguredBuiltinTools {
+		return
+	}
 	p.builtinTools = tools
 }
 
 func (p *OpenAINativeProvider) WithBuiltins(builtins []string) LLMProvider {
+	if builtins == nil {
+		return p
+	}
 	clone := p.clone()
-	clone.builtinTools = builtins
+	clone.SetBuiltinTools(builtins)
+	clone.builtinConfigs = narrowBuiltinConfigs(clone.builtinConfigs, builtins)
+	includeImages := false
+	for _, name := range builtins {
+		if name == "image_generation" {
+			includeImages = true
+		}
+	}
+	if !includeImages && clone.imageGeneration != nil {
+		clone.imageGeneration.Enabled = false
+	}
 	return clone
+}
+
+// WithServiceTier returns a provider clone configured with a provider-specific
+// request tier. At present only the subscription-backed Codex endpoint accepts
+// the priority tier; other providers intentionally keep the field unset.
+func (p *OpenAINativeProvider) WithServiceTier(tier string) *OpenAINativeProvider {
+	clone := p.clone()
+	clone.serviceTier = strings.TrimSpace(strings.ToLower(tier))
+	if clone.serviceTierUnsupported == nil {
+		clone.serviceTierUnsupported = &atomic.Bool{}
+	}
+	return clone
+}
+
+func normalizeCodexServiceTier(raw string) (string, error) {
+	tier := strings.TrimSpace(strings.ToLower(raw))
+	switch tier {
+	case "":
+		return "", nil
+	case "priority":
+		return tier, nil
+	default:
+		return "", fmt.Errorf("unsupported service_tier %q for openai-codex (supported: priority)", raw)
+	}
 }
 
 func (p *OpenAINativeProvider) WithReasoning(settings ReasoningSettings) LLMProvider {
@@ -124,10 +173,14 @@ func (p *OpenAINativeProvider) clone() *OpenAINativeProvider {
 	p.tokenMu.RUnlock()
 	return &OpenAINativeProvider{
 		name: p.name, apiKey: apiKey, responsesURL: p.responsesURL,
-		forceStoreFalse: p.forceStoreFalse, runtimeTokenURL: p.runtimeTokenURL,
-		serverAPIKey: p.serverAPIKey, accountID: accountID, models: p.models,
+		forceStoreFalse: p.forceStoreFalse, sessionProfile: p.sessionProfile,
+		sessionState: p.sessionState, runtimeTokenURL: p.runtimeTokenURL,
+		serverAPIKey: p.serverAPIKey, accountID: accountID, serviceTier: p.serviceTier,
+		serviceTierUnsupported: p.serviceTierUnsupported, models: p.models,
 		modelCapabilities: cloneModelCapabilitiesMap(p.modelCapabilities),
 		builtinTools:      append([]string(nil), p.builtinTools...), reasoning: p.reasoning,
+		imageGeneration:  cloneImageGenerationConfig(p.imageGeneration),
+		builtinConfigs:   cloneBuiltinConfigs(p.builtinConfigs),
 		lastTokenRefresh: lastRefresh, cacheState: cacheState,
 	}
 }
@@ -142,12 +195,18 @@ func (p *OpenAINativeProvider) promptCacheState() *openAIPromptCacheState {
 }
 
 func (p *OpenAINativeProvider) token() string {
+	if p.sessionState != nil {
+		return p.sessionState.snapshot().AccessToken
+	}
 	p.tokenMu.RLock()
 	defer p.tokenMu.RUnlock()
 	return p.apiKey
 }
 
 func (p *OpenAINativeProvider) account() string {
+	if p.sessionState != nil {
+		return p.sessionState.snapshot().AccountID
+	}
 	p.tokenMu.RLock()
 	defer p.tokenMu.RUnlock()
 	return p.accountID
@@ -165,10 +224,24 @@ func (p *OpenAINativeProvider) requestReasoning(model string) *oaiReasoning {
 		}
 		return nil
 	}
+	if p.sessionProfile != nil && level == ReasoningAuto && p.sessionProfile.defaultReasoningEffort != "" {
+		effort := p.sessionProfile.defaultReasoningEffort
+		if caps, ok := p.modelCapabilities[model]; ok {
+			if strings.TrimSpace(caps.DefaultReasoningLevel) != "" {
+				effort = caps.DefaultReasoningLevel
+			}
+			effort = reasoningEffortForCapabilities(caps, effort)
+		}
+		out := &oaiReasoning{Effort: effort}
+		if summariesSupported {
+			out.Summary = p.reasoningSummaryMode()
+		}
+		return out
+	}
 	if level == ReasoningAuto {
 		return nil
 	}
-	effort := openAIReasoningEffort(level, p.Name(), model)
+	effort := p.requestedReasoningEffort(level, model)
 	if caps, ok := p.modelCapabilities[model]; ok {
 		effort = reasoningEffortForCapabilities(caps, effort)
 	} else {
@@ -176,9 +249,23 @@ func (p *OpenAINativeProvider) requestReasoning(model string) *oaiReasoning {
 	}
 	out := &oaiReasoning{Effort: effort}
 	if level != ReasoningNone && summariesSupported {
-		out.Summary = "auto"
+		out.Summary = p.reasoningSummaryMode()
 	}
 	return out
+}
+
+func (p *OpenAINativeProvider) reasoningSummaryMode() string {
+	if p.sessionProfile != nil && p.sessionProfile.defaultReasoningSummary != "" {
+		return p.sessionProfile.defaultReasoningSummary
+	}
+	return "auto"
+}
+
+func (p *OpenAINativeProvider) requestedReasoningEffort(level ReasoningLevel, model string) string {
+	if normalizeReasoningLevel(level) == ReasoningXHigh && p.sessionProfile != nil && p.sessionProfile.allowXHighReasoning {
+		return "xhigh"
+	}
+	return openAIReasoningEffort(level, p.Name(), model)
 }
 
 func openAIReasoningEffort(level ReasoningLevel, providerName, model string) string {
@@ -207,13 +294,15 @@ func openAIReasoningEffort(level ReasoningLevel, providerName, model string) str
 }
 
 func openAIModelSupportsXHigh(model string) bool {
-	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "gpt-5.5")
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(model, "gpt-5.5") || strings.Contains(model, "gpt-6.1-sol")
 }
 
 // --- Responses API types ---
 
 type oaiResponsesRequest struct {
 	Model                string         `json:"model"`
+	ServiceTier          string         `json:"service_tier,omitempty"`
 	Instructions         string         `json:"instructions,omitempty"`
 	Input                []oaiInputItem `json:"input"`
 	Tools                []any          `json:"tools,omitempty"`
@@ -284,10 +373,11 @@ type oaiStreamEvent struct {
 }
 
 type oaiOutputItem struct {
-	Type    string `json:"type"` // "message", "function_call"
-	ID      string `json:"id,omitempty"`
-	Status  string `json:"status,omitempty"`
-	Role    string `json:"role,omitempty"`
+	Type    string   `json:"type"` // "message", "function_call"
+	ID      string   `json:"id,omitempty"`
+	Status  string   `json:"status,omitempty"`
+	FileRef *FileRef `json:"file_ref,omitempty"` // gateway replaces hosted image bytes with this handle
+	Role    string   `json:"role,omitempty"`
 	Content []struct {
 		Type string `json:"type"`
 		Text string `json:"text,omitempty"`
@@ -309,7 +399,7 @@ type oaiOutputItem struct {
 const openAIResponsesStateProvider = "openai-responses"
 
 func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, model string, tools []NativeTool, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
-	if p.Name() == "openai-codex" {
+	if p.refreshesBeforeRequest() {
 		_ = p.refreshRuntimeToken(ctx, false)
 	}
 	// Convert messages to Responses API input items
@@ -318,16 +408,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	// Convert tools
 	apiTools := p.buildAPITools(model, tools)
 
-	// Add builtin tools (only those supported by Responses API)
-	supportedBuiltins := map[string]bool{
-		"code_interpreter": true, "web_search_preview": true,
-		"file_search": true, "image_generation": true,
-	}
-	for _, bt := range p.builtinTools {
-		if supportedBuiltins[bt] {
-			apiTools = append(apiTools, map[string]string{"type": bt})
-		}
-	}
+	apiTools = append(apiTools, p.configuredOpenAIBuiltins()...)
 
 	reqBody := oaiResponsesRequest{
 		Model:  model,
@@ -335,6 +416,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		Tools:  apiTools,
 		Stream: true,
 	}
+	reqBody.ServiceTier = p.requestServiceTier()
 	reqBody.Reasoning = p.requestReasoning(model)
 	if caps, ok := p.modelCapabilities[model]; ok && caps.SupportsParallelToolCalls != nil {
 		value := *caps.SupportsParallelToolCalls
@@ -345,15 +427,22 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		reqBody.Store = &store
 		reqBody.Instructions = p.instructionsFromMessages(messages)
 		// Stateless Responses calls must carry opaque reasoning forward
-		// themselves. Request it on every Codex call so completed output
-		// items can be replayed exactly with later function outputs.
+		// themselves. Request it so completed output items can be replayed
+		// exactly with later function outputs.
 		reqBody.Include = []string{"reasoning.encrypted_content"}
 	}
 	stablePrefix := reqBody.Instructions
 	if stablePrefix == "" {
 		stablePrefix = p.instructionsFromMessages(messages)
 	}
-	cacheHints := openAIPromptCacheHintsForScope(p.Name(), model, stablePrefix, apiTools, openAIPromptCacheScopeFromContext(ctx))
+	cacheHints := openAIPromptCacheHints{}
+	if p.sessionProfile == nil || p.sessionProfile.sendPromptCacheHints {
+		scope := openAIPromptCacheScopeFromContext(ctx)
+		if scope.Account == "" {
+			scope.Account = p.account()
+		}
+		cacheHints = openAIPromptCacheHintsForScope(p.Name(), model, stablePrefix, apiTools, scope)
+	}
 	cacheState := p.promptCacheState()
 	if !cacheState.enabled() {
 		cacheHints = openAIPromptCacheHints{}
@@ -374,22 +463,40 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		logMsg("OPENAI-NATIVE", fmt.Sprintf("model=%s input_items=%d tools=0", model, len(input)))
 	}
 
-	responsesURL := p.responsesURL
-	if responsesURL == "" {
-		responsesURL = "https://api.openai.com/v1/responses"
-	}
 	doRequest := func(payload []byte) (*http.Response, error) {
 		if err := observeProviderRequest(ctx, p.Name(), model, payload); err != nil {
 			return nil, err
 		}
-		req, err := http.NewRequestWithContext(ctx, "POST", responsesURL, bytes.NewReader(payload))
+		endpoint, err := p.imageResponsesEndpoint(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.token())
-		if accountID := p.account(); p.Name() == "openai-codex" && accountID != "" {
+		if p.imageGenerationEnabled() {
+			req.Header.Set("X-Agent-Secret", imageGatewayAgentSecret())
+			req.Header.Set("X-Apteva-Caller-Agent", os.Getenv("AGENT_ID"))
+			thread, _ := ctx.Value(blobCallerThreadKey{}).(string)
+			req.Header.Set("X-Apteva-File-Thread", thread)
+			req.Header.Set("X-Apteva-Image-Provider", p.Name())
+		}
+		if p.sessionProfile != nil && p.sessionProfile.applyRequestHeaders != nil {
+			p.sessionProfile.applyRequestHeaders(req.Header, p.currentSessionSnapshot(), model)
+		} else if accountID := p.account(); p.Name() == "openai-codex" && accountID != "" {
 			req.Header.Set("ChatGPT-Account-ID", accountID)
+		}
+		if p.sessionProfile != nil && p.sessionProfile.sessionHeader != "" && requestStabilityEnabled("APTEVA_PROVIDER_SESSION_ROUTING") {
+			id := providerSessionFromContext(ctx)
+			if id == "" {
+				id = reqBody.PromptCacheKey
+			}
+			if id != "" {
+				req.Header.Set(p.sessionProfile.sessionHeader, id)
+			}
 		}
 		return tracedProviderHTTP(req)
 	}
@@ -398,7 +505,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	if err != nil {
 		return ChatResponse{}, err
 	}
-	if p.Name() == "openai-codex" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
+	if p.retriesAfterAuthError() && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
 		_ = resp.Body.Close()
 		resp, err = doRequest(body)
 		if err != nil {
@@ -409,6 +516,35 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		if reqBody.ServiceTier != "" && unsupportedResponsesServiceTier(resp.StatusCode, string(respBody)) {
+			p.disableServiceTier()
+			reqBody.ServiceTier = ""
+			retryBody, marshalErr := json.Marshal(reqBody)
+			if marshalErr != nil {
+				return ChatResponse{}, marshalErr
+			}
+			logMsg("OPENAI-NATIVE", fmt.Sprintf("service tier %q unsupported, retrying without it: %d %s", p.serviceTier, resp.StatusCode, string(respBody)))
+			resp, err = doRequest(retryBody)
+			if err != nil {
+				return ChatResponse{}, err
+			}
+			if p.retriesAfterAuthError() && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
+				_ = resp.Body.Close()
+				resp, err = doRequest(retryBody)
+				if err != nil {
+					return ChatResponse{}, err
+				}
+			}
+			if resp.StatusCode == http.StatusOK {
+				idleBody := newIdleReader(resp.Body, streamIdleTimeout(), func() {
+					logMsg("OPENAI-NATIVE", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
+				})
+				defer idleBody.Close()
+				return p.streamResponse(idleBody, onChunk, onThinking, onToolChunk)
+			}
+			respBody, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+		}
 		if cacheHints.Key != "" && openAICacheHintsUnsupported(resp.StatusCode, string(respBody)) {
 			cacheState.disable()
 			reqBody.PromptCacheKey = ""
@@ -422,7 +558,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 			if err != nil {
 				return ChatResponse{}, err
 			}
-			if p.Name() == "openai-codex" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
+			if p.retriesAfterAuthError() && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && p.refreshRuntimeToken(ctx, true) == nil {
 				_ = resp.Body.Close()
 				resp, err = doRequest(retryBody)
 				if err != nil {
@@ -453,11 +589,15 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 func (p *OpenAINativeProvider) buildAPITools(_ string, tools []NativeTool) []any {
 	var apiTools []any
 	for _, t := range tools {
+		parameters := t.Parameters
+		if p.sessionProfile != nil && p.sessionProfile.normalizeToolParameters != nil {
+			parameters = p.sessionProfile.normalizeToolParameters(parameters)
+		}
 		apiTools = append(apiTools, oaiFunctionTool{
 			Type:        "function",
 			Name:        t.Name,
 			Description: t.Description,
-			Parameters:  t.Parameters,
+			Parameters:  parameters,
 			Strict:      false,
 		})
 	}
@@ -468,15 +608,20 @@ func (p *OpenAINativeProvider) refreshRuntimeToken(ctx context.Context, force bo
 	if p.runtimeTokenURL == "" || p.serverAPIKey == "" {
 		return nil
 	}
-	before := p.token()
-	p.refreshMu.Lock()
-	defer p.refreshMu.Unlock()
+	before := p.currentSessionSnapshot()
+	if p.sessionState != nil {
+		p.sessionState.refreshMu.Lock()
+		defer p.sessionState.refreshMu.Unlock()
+	} else {
+		p.refreshMu.Lock()
+		defer p.refreshMu.Unlock()
+	}
 	if force {
-		p.tokenMu.RLock()
-		changed := p.apiKey != before
-		recent := !p.lastTokenRefresh.IsZero() && time.Since(p.lastTokenRefresh) < time.Second
-		p.tokenMu.RUnlock()
-		if changed || recent {
+		current := p.currentSessionSnapshot()
+		changed := current.AccessToken != before.AccessToken
+		generationChanged := p.sessionState != nil && current.RefreshGeneration != before.RefreshGeneration
+		recent := p.sessionState == nil && !current.LastTokenRefresh.IsZero() && time.Since(current.LastTokenRefresh) < time.Second
+		if changed || generationChanged || recent {
 			return nil
 		}
 	}
@@ -498,14 +643,32 @@ func (p *OpenAINativeProvider) refreshRuntimeToken(ctx context.Context, force bo
 		return fmt.Errorf("runtime token refresh failed: HTTP %d", resp.StatusCode)
 	}
 	var payload struct {
-		AccessToken string `json:"access_token"`
-		AccountID   string `json:"account_id"`
+		Provider      string `json:"provider"`
+		AccessToken   string `json:"access_token"`
+		AccountID     string `json:"account_id"`
+		AccountEmail  string `json:"account_email"`
+		UserID        string `json:"user_id"`
+		PrincipalType string `json:"principal_type"`
+		PrincipalID   string `json:"principal_id"`
+		BaseURL       string `json:"base_url"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
 		return err
 	}
 	if strings.TrimSpace(payload.AccessToken) == "" {
 		return fmt.Errorf("runtime token refresh returned empty access_token")
+	}
+	if p.sessionProfile != nil && p.sessionProfile.validateRuntimeProvider && payload.Provider != "" && payload.Provider != p.Name() {
+		return fmt.Errorf("runtime token refresh returned provider %q, want %q", payload.Provider, p.Name())
+	}
+	if p.sessionState != nil {
+		p.sessionState.updateFromRuntimeToken(responsesRuntimeToken{
+			AccessToken: payload.AccessToken, AccountID: payload.AccountID,
+			AccountEmail: payload.AccountEmail, UserID: payload.UserID,
+			PrincipalType: payload.PrincipalType, PrincipalID: payload.PrincipalID,
+			BaseURL: payload.BaseURL,
+		}, p.sessionProfile != nil && p.sessionProfile.replaceIdentityOnRefresh)
+		return nil
 	}
 	p.tokenMu.Lock()
 	p.apiKey = payload.AccessToken
@@ -532,6 +695,7 @@ func (p *OpenAINativeProvider) instructionsFromMessages(messages []Message) stri
 
 // buildInput converts our Message slice to Responses API input items.
 func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
+	messages = fileRefMessagesForModel(messages)
 	var items []oaiInputItem
 
 	for _, m := range messages {
@@ -555,7 +719,7 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 		// the exact provider payload (reasoning, message, function calls,
 		// IDs and status) over the lossy legacy reconstruction below.
 		if m.ProviderState != nil &&
-			m.ProviderState.Provider == openAIResponsesStateProvider &&
+			m.ProviderState.Provider == p.responseStateProvider() &&
 			len(m.ProviderState.Items) > 0 {
 			valid := true
 			for _, raw := range m.ProviderState.Items {
@@ -568,6 +732,13 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 				for _, raw := range m.ProviderState.Items {
 					items = append(items, oaiInputItem{Raw: append(json.RawMessage(nil), raw...)})
 				}
+				// Hosted images have no byte-bearing replay item. Keep their
+				// shared handles visible even when other provider state exists.
+				for _, part := range m.Parts {
+					if part.Type == "text" && strings.HasPrefix(part.Text, "[FILE HANDLE]") {
+						items = append(items, oaiInputItem{Type: "message", Role: "assistant", Content: part.Text})
+					}
+				}
 				continue
 			}
 		}
@@ -577,13 +748,15 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 			for _, tr := range m.ToolResults {
 				if tr.Image != nil {
 					imageURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tr.Image)
+					var blocks []oaiContentBlock
+					if tr.Content != "" {
+						blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: tr.Content})
+					}
+					blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: imageURL, Detail: "high"})
 					items = append(items, oaiInputItem{
 						Type:   "function_call_output",
 						CallID: tr.CallID,
-						Output: []oaiContentBlock{
-							{Type: "input_text", Text: tr.Content},
-							{Type: "input_image", ImageURL: imageURL, Detail: "high"},
-						},
+						Output: blocks,
 					})
 				} else {
 					// Function call output
@@ -629,11 +802,18 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 		if m.HasParts() {
 			logMsg("OPENAI-NATIVE", fmt.Sprintf("message with %d parts (role=%s)", len(m.Parts), m.Role))
 			var blocks []oaiContentBlock
+			if m.Content != "" {
+				blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: m.Content})
+			}
 			for _, part := range m.Parts {
 				logMsg("OPENAI-NATIVE", fmt.Sprintf("  part type=%s", part.Type))
 				switch part.Type {
 				case "text":
-					blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: part.Text})
+					// Empty text uses omitempty on the wire, leaving an invalid
+					// input_text block without its required text property.
+					if part.Text != "" {
+						blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: part.Text})
+					}
 				case "image_url":
 					if part.ImageURL != nil {
 						blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: part.ImageURL.URL, Detail: "high"})
@@ -642,7 +822,9 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 					// OpenAI Responses API does not support audio input — skip silently
 				}
 			}
-			items = append(items, oaiInputItem{Type: "message", Role: role, Content: blocks})
+			if len(blocks) > 0 {
+				items = append(items, oaiInputItem{Type: "message", Role: role, Content: blocks})
+			}
 		} else if m.Content != "" {
 			items = append(items, oaiInputItem{Type: "message", Role: role, Content: m.Content})
 		}
@@ -657,6 +839,33 @@ func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(strin
 	var fullReasoning strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
+	var generatedFiles []FileRef
+	seenImages := map[string]bool{}
+	collectImage := func(item oaiOutputItem) error {
+		if item.Type != "image_generation_call" {
+			return nil
+		}
+		if !p.imageGenerationEnabled() {
+			return fmt.Errorf("unexpected image generation while feature is disabled")
+		}
+		if item.FileRef == nil {
+			return fmt.Errorf("image generation did not return a gateway file handle")
+		}
+		if item.Status != "" && item.Status != "completed" {
+			return fmt.Errorf("image generation ended with status %q", item.Status)
+		}
+		if err := validateFileRef(item.FileRef); err != nil {
+			return err
+		}
+		if !strings.HasPrefix(item.FileRef.MimeType, "image/") {
+			return fmt.Errorf("image generation returned a non-image file")
+		}
+		if !seenImages[item.FileRef.Ref] {
+			generatedFiles = append(generatedFiles, *item.FileRef)
+			seenImages[item.FileRef.Ref] = true
+		}
+		return nil
+	}
 	var providerItems []json.RawMessage
 	completedStream := false
 
@@ -784,7 +993,10 @@ streamLoop:
 		case "response.output_item.done":
 			var item oaiOutputItem
 			json.Unmarshal(event.Item, &item)
-			if len(event.Item) > 0 && json.Valid(event.Item) {
+			if err := collectImage(item); err != nil {
+				return ChatResponse{}, err
+			}
+			if item.Type != "image_generation_call" && len(event.Item) > 0 && json.Valid(event.Item) {
 				providerItems = append(providerItems, append(json.RawMessage(nil), event.Item...))
 			}
 
@@ -869,7 +1081,8 @@ streamLoop:
 
 			var completed struct {
 				Response struct {
-					Usage struct {
+					Output []oaiOutputItem `json:"output"`
+					Usage  struct {
 						InputTokens  int `json:"input_tokens"`
 						OutputTokens int `json:"output_tokens"`
 						InputDetails struct {
@@ -880,6 +1093,11 @@ streamLoop:
 				} `json:"response"`
 			}
 			json.Unmarshal([]byte(data), &completed)
+			for _, item := range completed.Response.Output {
+				if err := collectImage(item); err != nil {
+					return ChatResponse{}, err
+				}
+			}
 			usage.PromptTokens = completed.Response.Usage.InputTokens
 			usage.CompletionTokens = completed.Response.Usage.OutputTokens
 			usage.CachedTokens = completed.Response.Usage.InputDetails.CachedTokens
@@ -922,16 +1140,17 @@ streamLoop:
 	var providerState *ProviderResponseState
 	if len(providerItems) > 0 {
 		providerState = &ProviderResponseState{
-			Provider: openAIResponsesStateProvider,
+			Provider: p.responseStateProvider(),
 			Items:    providerItems,
 		}
 	}
 	return validateProviderToolOutput(ChatResponse{
-		Text:          response,
-		ToolCalls:     toolCalls,
-		Reasoning:     fullReasoning.String(),
-		ProviderState: providerState,
-		Usage:         usage,
+		Text:           response,
+		ToolCalls:      toolCalls,
+		GeneratedFiles: generatedFiles,
+		Reasoning:      fullReasoning.String(),
+		ProviderState:  providerState,
+		Usage:          usage,
 	})
 }
 
@@ -972,4 +1191,11 @@ func logOpenAINativeStreamItemMeta(eventType string, raw json.RawMessage) {
 		summaryTextChars,
 		len(item.Arguments),
 	))
+}
+
+// WithExecutionModel isolates the voice worker's exact model from other threads.
+func (p *OpenAINativeProvider) WithExecutionModel(model string) LLMProvider {
+	clone := p.clone()
+	clone.models = map[ModelTier]string{ModelLarge: model, ModelMedium: model, ModelSmall: model}
+	return clone
 }

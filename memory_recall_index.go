@@ -38,7 +38,7 @@ func (h *recallHeap) Pop() any {
 	return item
 }
 
-func (ms *MemoryStore) recallIndexed(queries []string, n int) []MemoryRecallMatch {
+func (ms *MemoryStore) recallIndexed(queries []string, n int, thread ...string) []MemoryRecallMatch {
 	if n <= 0 {
 		n = 5
 	}
@@ -96,6 +96,9 @@ func (ms *MemoryStore) recallIndexed(queries []string, n int) []MemoryRecallMatc
 	now := time.Now().UTC()
 	score := func(id string) {
 		r := ms.active[id]
+		if len(thread) > 0 && !memoryVisible(r, thread[0]) {
+			return
+		}
 		signal := 0.0
 		for _, plan := range plans {
 			var s float64

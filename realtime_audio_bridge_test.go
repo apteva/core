@@ -191,6 +191,7 @@ func TestRealtimeAudioBridgeCloseHandshakeAndTelemetry(t *testing.T) {
 }
 
 type realtimeAudioBridgeFixture struct {
+	control   chan string
 	thread    string
 	audioOut  chan RealtimeAudioFrame
 	conn      net.Conn
@@ -229,7 +230,7 @@ func newRealtimeAudioBridgeFixture(t *testing.T, thread string) *realtimeAudioBr
 	t.Cleanup(func() { _ = conn.Close() })
 	waitForRealtimeBridgeEvent(t, telemetry, thread, "realtime.bridge_connected")
 	return &realtimeAudioBridgeFixture{
-		thread: thread, audioOut: audioOut, conn: conn, telemetry: telemetry,
+		thread: thread, audioOut: audioOut, conn: conn, telemetry: telemetry, control: control,
 	}
 }
 
@@ -342,4 +343,26 @@ func TestRealtimeAudioBridgeErrorClassification(t *testing.T) {
 		pongTimeout.data.ErrorClass != "timeout" {
 		t.Fatalf("pong timeout classification = %#v", pongTimeout.data)
 	}
+}
+
+func TestRealtimeBridgeScopedClearPrecedesNextPlayback(t *testing.T) {
+	fixture := newRealtimeAudioBridgeFixture(t, "continuous-scoped-clear")
+	fixture.audioOut <- RealtimeAudioFrame{ItemID: "cancelled", Audio: []byte{1, 2}, cancelled: func() bool { return true }}
+	fixture.control <- `{"type":"interrupt","item_id":"cancelled","requested_at_ms":1}`
+	fixture.audioOut <- RealtimeAudioFrame{ItemID: "next", Audio: []byte{3, 4}, AudioEndMS: 1}
+	header, data := readRealtimeBridgeTestFrame(t, fixture.conn)
+	var control map[string]any
+	if header.OpCode != ws.OpText || json.Unmarshal(data, &control) != nil || control["type"] != "interrupt" || control["item_id"] != "cancelled" {
+		t.Fatalf("clear did not precede next playback: %s", data)
+	}
+	header, data = readRealtimeBridgeTestFrame(t, fixture.conn)
+	var metadata map[string]any
+	if header.OpCode != ws.OpText || json.Unmarshal(data, &metadata) != nil || metadata["item_id"] != "next" {
+		t.Fatalf("cancelled frame escaped: %s", data)
+	}
+	header, data = readRealtimeBridgeTestFrame(t, fixture.conn)
+	if header.OpCode != ws.OpBinary || !bytes.Equal(data, []byte{3, 4}) {
+		t.Fatalf("next audio changed: %v %v", header.OpCode, data)
+	}
+	waitForRealtimeBridgeEvent(t, fixture.telemetry, fixture.thread, "realtime.playback_clear_sent")
 }

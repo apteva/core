@@ -259,17 +259,18 @@ type NativeToolCall struct {
 
 // ToolResult is sent back to the provider after executing a tool.
 type ToolResult struct {
-	CallID             string `json:"call_id"`
-	ToolName           string `json:"tool_name,omitempty"`
-	Content            string `json:"content"`         // full text for first consumption; bounded archive preview thereafter
-	Image              []byte `json:"image,omitempty"` // optional image (screenshot etc.)
-	IsError            bool   `json:"is_error,omitempty"`
-	OriginalChars      int    `json:"original_chars,omitempty"`
-	OriginalBytes      int    `json:"original_bytes,omitempty"`
-	OriginalImageBytes int    `json:"original_image_bytes,omitempty"`
-	SHA256             string `json:"sha256,omitempty"`
-	ArchiveRef         string `json:"archive_ref,omitempty"`
-	ContentIsPreview   bool   `json:"content_is_preview,omitempty"`
+	DirectReceipt      *ThreadWorkReceipt `json:"direct_receipt,omitempty"` // Core-authored, not tool-controlled
+	CallID             string             `json:"call_id"`
+	ToolName           string             `json:"tool_name,omitempty"`
+	Content            string             `json:"content"`         // full text for first consumption; bounded archive preview thereafter
+	Image              []byte             `json:"image,omitempty"` // optional image (screenshot etc.)
+	IsError            bool               `json:"is_error,omitempty"`
+	OriginalChars      int                `json:"original_chars,omitempty"`
+	OriginalBytes      int                `json:"original_bytes,omitempty"`
+	OriginalImageBytes int                `json:"original_image_bytes,omitempty"`
+	SHA256             string             `json:"sha256,omitempty"`
+	ArchiveRef         string             `json:"archive_ref,omitempty"`
+	ContentIsPreview   bool               `json:"content_is_preview,omitempty"`
 }
 
 // BuiltinTool defines a provider-side tool (executed by the LLM provider, not by us).
@@ -297,6 +298,7 @@ type ChatResponse struct {
 	ProviderTiming           ProviderTiming         // transport phase timings, when reported by the provider
 	ToolCalls                []NativeToolCall       // structured tool calls WE need to execute
 	ServerResults            []ServerToolResult     // tools the PROVIDER already executed
+	GeneratedFiles           []FileRef              // hosted artifacts; metadata only, bytes remain in the gateway
 	ProviderState            *ProviderResponseState // opaque provider output items needed for stateless continuation
 	Usage                    TokenUsage
 }
@@ -418,6 +420,10 @@ func createProviderByName(name string) LLMProvider {
 	case "openai-codex":
 		if token := os.Getenv("OPENAI_CODEX_ACCESS_TOKEN"); token != "" {
 			return NewOpenAICodexProvider(token)
+		}
+	case "grok-build":
+		if token := os.Getenv("GROK_BUILD_ACCESS_TOKEN"); token != "" {
+			return NewGrokBuildProvider(token)
 		}
 	case "anthropic":
 		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
@@ -645,7 +651,11 @@ func (pp *ProviderPool) RealtimeByName(name string) RealtimeProvider {
 	if pp == nil {
 		return nil
 	}
-	return pp.realtimeProviders[name]
+	if p := pp.realtimeProviders[name]; p != nil {
+		return p
+	}
+	// API integrations expose one vendor; transport companions are internal.
+	return pp.realtimeProviders[name+"-realtime"]
 }
 
 // RealtimeNames returns all registered realtime provider names.
@@ -689,20 +699,31 @@ func (pp *ProviderPool) ProviderSummary(name string) string {
 // buildProviderPool creates a ProviderPool from config + env vars.
 // Priority: CORE_PROVIDER env → config.json providers → auto-detect from API keys.
 func buildProviderPool(cfg *Config) (*ProviderPool, error) {
+	return buildProviderPoolWithCapabilities(cfg, true)
+}
+
+// Configuration validation must not replace the live capability table.
+func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPool, error) {
 	pool := &ProviderPool{
 		providers:         map[string]LLMProvider{},
 		realtimeProviders: map[string]RealtimeProvider{},
 	}
-	resetRuntimeModelCapabilities()
+	capabilities := map[string]ModelCapabilities{}
 
 	// 1. Config providers array
 	configs := cfg.GetProviders()
 	for _, pc := range configs {
+		if pc.MaxOutputTokens < 0 || pc.MaxOutputTokens > 64000 || (pc.MaxOutputTokens > 0 && pc.Name != "anthropic") {
+			return nil, fmt.Errorf("max_output_tokens is supported for anthropic only and must be between 0 and 64000")
+		}
 		// Route realtime providers to their own map. Gated on
 		// Config.RealtimeEnabled: when off, realtime entries are
 		// silently skipped so HasRealtimeProvider() returns false and
 		// the feature is completely invisible to main.
 		if isRealtimeProviderName(pc.Name) {
+			if len(pc.Builtins) > 0 {
+				return nil, fmt.Errorf("provider %q does not support configurable hosted builtins", pc.Name)
+			}
 			if !cfg.RealtimeEnabledFlag() {
 				continue
 			}
@@ -724,13 +745,29 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		if p == nil {
 			continue
 		}
+		if pc.ServiceTier != "" {
+			native, ok := p.(*OpenAINativeProvider)
+			if !ok || native.Name() != "openai-codex" {
+				return nil, fmt.Errorf("provider %q does not support service_tier", pc.Name)
+			}
+			tier, err := normalizeCodexServiceTier(pc.ServiceTier)
+			if err != nil {
+				return nil, err
+			}
+			p = native.WithServiceTier(tier)
+		}
 		applyModelOverrides(p, pc.Models)
-		registerModelCapabilities(pc.ModelCapabilities)
+		for id, caps := range pc.ModelCapabilities {
+			capabilities[id] = caps
+		}
+		if anthropic, ok := p.(*AnthropicProvider); ok {
+			anthropic.maxOutputTokens = pc.MaxOutputTokens
+		}
 		if native, ok := p.(*OpenAINativeProvider); ok {
 			native.modelCapabilities = cloneModelCapabilitiesMap(pc.ModelCapabilities)
 		}
-		if len(pc.BuiltinTools) > 0 {
-			p.SetBuiltinTools(pc.BuiltinTools)
+		if err := configureProviderBuiltins(p, pc); err != nil {
+			return nil, err
 		}
 		pool.providers[pc.Name] = p
 		pool.order = append(pool.order, pc.Name)
@@ -773,6 +810,33 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 	if len(pool.providers) == 0 {
 		return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, or OLLAMA_HOST")
 	}
+	// One configured API integration supplies text and voice credentials.
+	// Explicit legacy companion entries retain priority and defaults.
+	if cfg.RealtimeEnabledFlag() {
+		for _, pc := range configs {
+			name := pc.Name + "-realtime"
+			if pool.Get(pc.Name) == nil || !isRealtimeProviderName(name) {
+				continue
+			}
+			if existing := pool.realtimeProviders[name]; existing != nil {
+				// New voice fields on the primary integration are explicit user
+				// overrides, including when an older server injects a companion.
+				if c, ok := existing.(configurableRealtimeProvider); ok {
+					c.applyRealtimeConfig(ProviderConfig{Models: pc.RealtimeModels, RealtimeVoice: pc.RealtimeVoice})
+				}
+				continue
+			}
+			rp := createRealtimeProviderByName(name)
+			if rp == nil {
+				continue
+			}
+			if c, ok := rp.(configurableRealtimeProvider); ok {
+				c.applyRealtimeConfig(ProviderConfig{Models: pc.RealtimeModels, RealtimeVoice: pc.RealtimeVoice})
+			}
+			pool.realtimeProviders[name] = rp
+			pool.realtimeOrder = append(pool.realtimeOrder, name)
+		}
+	}
 
 	// Default = first with Default flag, or first in order
 	if pool.default_ == "" && len(pool.order) > 0 {
@@ -796,6 +860,10 @@ func buildProviderPool(cfg *Config) (*ProviderPool, error) {
 		}
 	}
 
+	if activate {
+		resetRuntimeModelCapabilities()
+		registerModelCapabilities(capabilities)
+	}
 	return pool, nil
 }
 
@@ -862,5 +930,6 @@ func calculateCostForRealtimeProvider(provider RealtimeProvider, model string, u
 		float64(usage.AudioOutputTokens)*pricing.AudioOutput)/1_000_000 +
 		usage.AudioInputSeconds/60*pricing.AudioInputPerMinute +
 		usage.AudioOutputSeconds/60*pricing.AudioOutputPerMinute +
-		float64(usage.TextInputMessages)*pricing.TextInputPerMessage
+		float64(usage.TextInputMessages)*pricing.TextInputPerMessage +
+		usage.SessionSeconds/60*pricing.SessionPerMinute
 }

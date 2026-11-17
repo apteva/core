@@ -64,10 +64,12 @@ var GeminiModelOrder = []string{
 }
 
 type GoogleProvider struct {
-	mu          sync.RWMutex
-	apiKey      string
-	models      map[ModelTier]string
-	activeModel string // current model ID for cost tracking
+	mu             sync.RWMutex
+	apiKey         string
+	models         map[ModelTier]string
+	activeModel    string // current model ID for cost tracking
+	builtinTools   []string
+	builtinConfigs map[string]BuiltinToolConfig
 }
 
 func NewGoogleProvider(apiKey string) LLMProvider {
@@ -97,15 +99,29 @@ func (p *GoogleProvider) SupportsNativeTools() bool { return true }
 func (p *GoogleProvider) AvailableBuiltinTools() []BuiltinTool {
 	return []BuiltinTool{
 		{Type: "code_execution", Name: "code_execution"},
+		{Type: "googleSearch", Name: "web_search"},
 	}
 }
 
 func (p *GoogleProvider) SetBuiltinTools(tools []string) {
-	// Google built-in tools handled via API config
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.builtinTools = append([]string(nil), tools...)
 }
 
 func (p *GoogleProvider) WithBuiltins(builtins []string) LLMProvider {
-	return &GoogleProvider{apiKey: p.apiKey, models: p.Models(), activeModel: p.ActiveModel()}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	models := map[ModelTier]string{}
+	for tier, model := range p.models {
+		models[tier] = model
+	}
+	clone := &GoogleProvider{apiKey: p.apiKey, models: models, activeModel: p.activeModel, builtinTools: append([]string(nil), p.builtinTools...), builtinConfigs: cloneBuiltinConfigs(p.builtinConfigs)}
+	if builtins != nil {
+		clone.builtinTools = append([]string(nil), builtins...)
+		clone.builtinConfigs = narrowBuiltinConfigs(clone.builtinConfigs, builtins)
+	}
+	return clone
 }
 
 func (p *GoogleProvider) CostPer1M() (float64, float64, float64) {
@@ -148,12 +164,30 @@ type geminiRequest struct {
 
 type geminiToolDecl struct {
 	FunctionDeclarations []geminiFunctionDecl `json:"functionDeclarations,omitempty"`
+	GoogleSearch         map[string]any       `json:"googleSearch,omitempty"`
+	CodeExecution        map[string]any       `json:"codeExecution,omitempty"`
+}
+
+// Empty option objects are meaningful for Gemini builtins; omitempty on a map
+// would otherwise erase the enabled tool from the request.
+func (t geminiToolDecl) MarshalJSON() ([]byte, error) {
+	out := map[string]any{}
+	if len(t.FunctionDeclarations) > 0 {
+		out["functionDeclarations"] = t.FunctionDeclarations
+	}
+	if t.GoogleSearch != nil {
+		out["googleSearch"] = t.GoogleSearch
+	}
+	if t.CodeExecution != nil {
+		out["codeExecution"] = t.CodeExecution
+	}
+	return json.Marshal(out)
 }
 
 type geminiFunctionDecl struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Name                 string         `json:"name"`
+	Description          string         `json:"description"`
+	ParametersJSONSchema map[string]any `json:"parametersJsonSchema"`
 }
 
 type geminiContent struct {
@@ -167,6 +201,14 @@ type geminiPart struct {
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
 	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
+	ExecutableCode   *struct {
+		Language string `json:"language"`
+		Code     string `json:"code"`
+	} `json:"executableCode,omitempty"`
+	CodeExecutionResult *struct {
+		Outcome string `json:"outcome"`
+		Output  string `json:"output"`
+	} `json:"codeExecutionResult,omitempty"`
 }
 
 type geminiFunctionCall struct {
@@ -187,100 +229,18 @@ type geminiInline struct {
 }
 
 func geminiToolParameters(schema map[string]any) map[string]any {
-	normalized, ok := normalizeGeminiSchema("", schema).(map[string]any)
-	if !ok || len(normalized) == 0 {
-		return map[string]any{"type": "object"}
+	// FunctionDeclaration.parameters is Google's restricted OpenAPI Schema
+	// proto, not JSON Schema. In particular, it rejects required-only anyOf
+	// branches whose properties are declared at the parent. Both GenerateContent
+	// and Live support parametersJsonSchema instead. Keep compositions, refs,
+	// nullable unions and additionalProperties intact through that field rather
+	// than weakening constraints or inventing types while lowering to the proto.
+	// https://ai.google.dev/api/caching#FunctionDeclaration
+	out := cloneJSONValue(schema).(map[string]any)
+	if _, ok := out["type"]; !ok {
+		out["type"] = "object"
 	}
-	if _, ok := normalized["type"]; !ok {
-		normalized["type"] = "object"
-	}
-	return normalized
-}
-
-func normalizeGeminiSchema(name string, v any) any {
-	switch x := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(x)+1)
-		for k, val := range x {
-			// Gemini's Schema proto rejects JSON-Schema keywords that are
-			// valid for OpenAI/MCP schemas. Drop them at every nesting
-			// level rather than sending a request that Gemini rejects with
-			// INVALID_ARGUMENT (notably additionalProperties).
-			switch k {
-			case "additionalProperties", "$schema", "$defs", "definitions", "unevaluatedProperties", "dependentSchemas":
-				continue
-			}
-			if k == "properties" {
-				props, ok := val.(map[string]any)
-				if !ok {
-					out[k] = normalizeGeminiSchema(k, val)
-					continue
-				}
-				normalizedProps := make(map[string]any, len(props))
-				for propName, propSchema := range props {
-					normalizedProps[propName] = normalizeGeminiSchema(propName, propSchema)
-				}
-				out[k] = normalizedProps
-				continue
-			}
-			out[k] = normalizeGeminiSchema(k, val)
-		}
-		if schemaTypeIncludes(out["type"], "array") {
-			if items, ok := out["items"]; !ok || isEmptyGeminiSchema(items) {
-				out["items"] = defaultGeminiArrayItems(name)
-			}
-		}
-		return out
-	case []any:
-		out := make([]any, len(x))
-		for i, val := range x {
-			out[i] = normalizeGeminiSchema(name, val)
-		}
-		return out
-	default:
-		return v
-	}
-}
-
-func defaultGeminiArrayItems(name string) map[string]any {
-	switch name {
-	case "attributes", "channels", "definition", "filters":
-		return map[string]any{"type": "object"}
-	case "enum_values", "list_ids", "tags":
-		return map[string]any{"type": "string"}
-	default:
-		return map[string]any{"type": "object"}
-	}
-}
-
-func schemaTypeIncludes(raw any, want string) bool {
-	switch x := raw.(type) {
-	case string:
-		return strings.EqualFold(x, want)
-	case []any:
-		for _, val := range x {
-			if s, ok := val.(string); ok && strings.EqualFold(s, want) {
-				return true
-			}
-		}
-	case []string:
-		for _, s := range x {
-			if strings.EqualFold(s, want) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isEmptyGeminiSchema(v any) bool {
-	if v == nil {
-		return true
-	}
-	if m, ok := v.(map[string]any); ok {
-		return len(m) == 0
-	}
-	return false
+	return out
 }
 
 // Gemini streaming response
@@ -465,9 +425,9 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		var funcs []geminiFunctionDecl
 		for _, t := range tools {
 			funcs = append(funcs, geminiFunctionDecl{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  geminiToolParameters(t.Parameters),
+				Name:                 t.Name,
+				Description:          t.Description,
+				ParametersJSONSchema: geminiToolParameters(t.Parameters),
 			})
 		}
 		if len(funcs) > 0 {
@@ -475,6 +435,7 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		}
 	}
 
+	geminiTools = append(geminiTools, p.configuredGoogleBuiltins()...)
 	reqBody := geminiRequest{
 		Contents:          contents,
 		SystemInstruction: systemContent,
@@ -523,6 +484,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
+	var serverResults []ServerToolResult
 	callPrefix := "gemini_" + newULID()
 	toolCallSeq := 0
 	completedStream := false
@@ -550,6 +512,19 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 				completedStream = true
 			}
 			for _, part := range candidate.Content.Parts {
+				if part.ExecutableCode != nil {
+					serverResults = append(serverResults, ServerToolResult{ToolName: "code_execution", Code: part.ExecutableCode.Code})
+				}
+				if part.CodeExecutionResult != nil {
+					if len(serverResults) == 0 || serverResults[len(serverResults)-1].Output != "" {
+						serverResults = append(serverResults, ServerToolResult{ToolName: "code_execution"})
+					}
+					result := &serverResults[len(serverResults)-1]
+					result.Output = part.CodeExecutionResult.Output
+					if part.CodeExecutionResult.Outcome != "OUTCOME_OK" {
+						result.Error = part.CodeExecutionResult.Outcome
+					}
+				}
 				if part.Text != "" {
 					full.WriteString(part.Text)
 					if onChunk != nil {
@@ -611,7 +586,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 		preview = preview[:200] + "..."
 	}
 	logMsg("GEMINI", fmt.Sprintf("done tokens_in=%d tokens_out=%d len=%d tools=%d response=%q", usage.PromptTokens, usage.CompletionTokens, len(response), len(toolCalls), preview))
-	return validateProviderToolOutput(ChatResponse{Text: response, ToolCalls: toolCalls, Usage: usage})
+	return validateProviderToolOutput(ChatResponse{Text: response, ToolCalls: toolCalls, ServerResults: serverResults, Usage: usage})
 }
 
 // audioMimeTypes maps file extensions to MIME types for audio.
@@ -693,6 +668,7 @@ func parseDataURI(uri string) (string, string) {
 
 // toGeminiParts converts our ContentParts to Gemini parts.
 func toGeminiParts(parts []ContentPart) []geminiPart {
+	parts = fileRefsForModel(parts)
 	var out []geminiPart
 	for _, p := range parts {
 		switch p.Type {

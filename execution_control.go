@@ -29,33 +29,41 @@ const (
 )
 
 type ExecutionControlConfig struct {
-	Mode        ExecutionControlMode `json:"mode,omitempty"`
-	Scope       string               `json:"scope,omitempty"`
-	Breakpoints []string             `json:"breakpoints,omitempty"`
-	Follow      string               `json:"follow,omitempty"`
+	Threads     map[string]ExecutionThreadControl `json:"threads,omitempty"`
+	Mode        ExecutionControlMode              `json:"mode,omitempty"`
+	Scope       string                            `json:"scope,omitempty"`
+	Breakpoints []string                          `json:"breakpoints,omitempty"`
+	Follow      string                            `json:"follow,omitempty"`
 }
 
 type ExecutionControlStatus struct {
-	Mode                ExecutionControlMode `json:"mode"`
-	Scope               string               `json:"scope"`
-	Breakpoints         []string             `json:"breakpoints"`
-	Follow              string               `json:"follow"`
-	Waiting             bool                 `json:"waiting"`
-	Phase               string               `json:"phase,omitempty"`
-	ActiveThreadID      string               `json:"active_thread_id,omitempty"`
-	Iteration           int                  `json:"iteration,omitempty"`
-	Tool                string               `json:"tool,omitempty"`
-	CallID              string               `json:"call_id,omitempty"`
-	Summary             string               `json:"summary,omitempty"`
-	Args                map[string]string    `json:"args,omitempty"`
-	WaitingCount        int                  `json:"waiting_count,omitempty"`
-	CanRestore          bool                 `json:"can_restore,omitempty"`
-	RestoreCheckpointID string               `json:"restore_checkpoint_id,omitempty"`
-	RestoreSummary      string               `json:"restore_summary,omitempty"`
-	RestorePhase        string               `json:"restore_phase,omitempty"`
+	Threads             map[string]ExecutionThreadControl `json:"threads,omitempty"`
+	Waiters             []ExecutionWaitingStatus          `json:"waiters,omitempty"`
+	Mode                ExecutionControlMode              `json:"mode"`
+	Scope               string                            `json:"scope"`
+	Breakpoints         []string                          `json:"breakpoints"`
+	Follow              string                            `json:"follow"`
+	Waiting             bool                              `json:"waiting"`
+	Phase               string                            `json:"phase,omitempty"`
+	ActiveThreadID      string                            `json:"active_thread_id,omitempty"`
+	Iteration           int                               `json:"iteration,omitempty"`
+	Tool                string                            `json:"tool,omitempty"`
+	CallID              string                            `json:"call_id,omitempty"`
+	Summary             string                            `json:"summary,omitempty"`
+	Args                map[string]string                 `json:"args,omitempty"`
+	WaitingCount        int                               `json:"waiting_count,omitempty"`
+	CanRestore          bool                              `json:"can_restore,omitempty"`
+	RestoreCheckpointID string                            `json:"restore_checkpoint_id,omitempty"`
+	RestoreSummary      string                            `json:"restore_summary,omitempty"`
+	RestorePhase        string                            `json:"restore_phase,omitempty"`
 }
 
 type ExecutionPhaseData struct {
+	Scope          string            `json:"scope,omitempty"`
+	State          string            `json:"state,omitempty"`
+	RequestID      string            `json:"request_id,omitempty"`
+	Revision       uint64            `json:"revision,omitempty"`
+	DelegationID   string            `json:"delegation_id,omitempty"`
 	ThreadID       string            `json:"thread_id"`
 	Iteration      int               `json:"iteration"`
 	Phase          string            `json:"phase"`
@@ -68,18 +76,24 @@ type ExecutionPhaseData struct {
 }
 
 type ExecutionGate struct {
-	ThreadID  string
-	Phase     ExecutionPhase
-	Iteration int
-	Tool      string
-	CallID    string
-	Summary   string
-	Args      map[string]string
-	Result    string
-	ParentID  string
+	Scope        string
+	RequestID    string
+	Revision     uint64
+	DelegationID string
+	ThreadID     string
+	Phase        ExecutionPhase
+	Iteration    int
+	Tool         string
+	CallID       string
+	Summary      string
+	Args         map[string]string
+	Result       string
+	ParentID     string
 }
 
 type ExecutionControlAction struct {
+	Scope        string               `json:"scope,omitempty"`
+	Breakpoints  []string             `json:"breakpoints,omitempty"`
 	Action       string               `json:"action"`
 	ThreadID     string               `json:"thread_id,omitempty"`
 	CheckpointID string               `json:"checkpoint_id,omitempty"`
@@ -93,6 +107,9 @@ type executionWaiter struct {
 }
 
 type ExecutionController struct {
+	threads      map[string]ExecutionThreadControl
+	threadSteps  map[string]int
+	targetSteps  map[string]int
 	mu           sync.Mutex
 	mode         ExecutionControlMode
 	scope        string
@@ -110,7 +127,10 @@ func NewExecutionController(cfg ExecutionControlConfig) *ExecutionController {
 	c := &ExecutionController{
 		waiters: map[string]*executionWaiter{},
 	}
-	c.ApplyConfig(cfg)
+	if err := c.ApplyConfig(cfg); err != nil {
+		// Invalid startup configuration must never silently enable execution.
+		_ = c.ApplyConfig(ExecutionControlConfig{Mode: ExecutionPaused, Breakpoints: []string{string(ExecutionPhaseIterationStart)}})
+	}
 	return c
 }
 
@@ -132,9 +152,16 @@ func normalizeExecutionMode(mode ExecutionControlMode) ExecutionControlMode {
 	}
 }
 
-func (c *ExecutionController) ApplyConfig(cfg ExecutionControlConfig) {
+func (c *ExecutionController) ApplyConfig(cfg ExecutionControlConfig) error {
+	if err := validateExecutionControl(cfg); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.threads = cloneExecutionThreads(cfg.Threads)
+	c.threadSteps = map[string]int{}
+	c.targetSteps = map[string]int{}
+	c.pendingSteps = 0
 	c.mode = normalizeExecutionMode(cfg.Mode)
 	c.scope = cfg.Scope
 	if c.scope == "" {
@@ -153,15 +180,15 @@ func (c *ExecutionController) ApplyConfig(cfg ExecutionControlConfig) {
 	for _, bp := range bps {
 		c.breakpoints[ExecutionPhase(bp)] = true
 	}
-	if c.mode == ExecutionAuto {
-		c.releaseAllLocked()
-	}
+	c.releaseUngatedLocked()
+	return nil
 }
 
 func (c *ExecutionController) Config() ExecutionControlConfig {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return ExecutionControlConfig{
+		Threads:     cloneExecutionThreads(c.threads),
 		Mode:        c.mode,
 		Scope:       c.scope,
 		Follow:      c.follow,
@@ -172,45 +199,48 @@ func (c *ExecutionController) Config() ExecutionControlConfig {
 func (c *ExecutionController) Status() ExecutionControlStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st := ExecutionControlStatus{
-		Mode:         c.mode,
-		Scope:        c.scope,
-		Follow:       c.follow,
-		Breakpoints:  append([]string(nil), c.breakOrder...),
-		WaitingCount: len(c.waiters),
-	}
-	if c.activeWaitID != "" {
-		if w := c.waiters[c.activeWaitID]; w != nil {
-			st.Waiting = true
-			st.ActiveThreadID = w.gate.ThreadID
-			st.Phase = string(w.gate.Phase)
-			st.Iteration = w.gate.Iteration
-			st.Tool = w.gate.Tool
-			st.CallID = w.gate.CallID
-			st.Summary = w.gate.Summary
-			if len(w.gate.Args) > 0 {
-				st.Args = copyStringMap(w.gate.Args)
-			}
-		}
-	}
-	return st
+	return c.statusLocked()
 }
 
 func (c *ExecutionController) Control(action ExecutionControlAction) (ExecutionControlStatus, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	switch strings.ToLower(strings.TrimSpace(action.Action)) {
+	action.Action = strings.ToLower(strings.TrimSpace(action.Action))
+	if action.Scope == "thread" {
+		err := c.controlThreadLocked(action)
+		return c.statusLocked(), err
+	}
+	if action.Scope != "" && action.Scope != "instance" {
+		return c.statusLocked(), fmt.Errorf("scope must be instance or thread")
+	}
+	if action.ThreadID != "" {
+		if err := validateThreadID(action.ThreadID); err != nil {
+			return c.statusLocked(), err
+		}
+	}
+	if action.Breakpoints != nil {
+		return c.statusLocked(), fmt.Errorf("instance breakpoints must be configured via execution_control")
+	}
+	switch action.Action {
 	case "run":
 		c.mode = ExecutionAuto
 		c.pendingSteps = 0
-		c.releaseAllLocked()
+		c.targetSteps = map[string]int{}
+		c.releaseUngatedLocked()
 	case "pause":
 		c.mode = ExecutionPaused
+		c.pendingSteps = 0
+		c.targetSteps = map[string]int{}
+		c.threadSteps = map[string]int{}
 	case "step":
 		c.mode = ExecutionStep
 		if !c.releaseOneLocked(action.ThreadID) {
-			c.pendingSteps++
+			if action.ThreadID != "" {
+				c.targetSteps[action.ThreadID]++
+			} else {
+				c.pendingSteps++
+			}
 		}
 	default:
 		return c.statusLocked(), fmt.Errorf("action must be run, pause, or step")
@@ -231,13 +261,19 @@ func (c *ExecutionController) Wait(gate ExecutionGate, quit <-chan struct{}, emi
 // A paused loop must still service configuration mutations on its owning
 // goroutine. Servicing a mutation does not release or consume the pause gate.
 func (c *ExecutionController) waitWithRuntimeMutations(gate ExecutionGate, quit <-chan struct{}, emit func(string, ExecutionPhaseData), wake <-chan struct{}, apply func()) bool {
+	select {
+	case <-quit:
+		return false
+	default:
+	}
 	c.mu.Lock()
-	if !c.shouldGateLocked(gate.Phase) {
+	scope := c.blockingScopeLocked(gate)
+	gate.Scope = scope
+	if scope == "" {
 		c.mu.Unlock()
 		return true
 	}
-	if c.pendingSteps > 0 {
-		c.pendingSteps--
+	if c.consumeStepLocked(gate, scope) {
 		c.mu.Unlock()
 		if emit != nil {
 			emit("execution.released", gate.phaseData())
@@ -254,7 +290,9 @@ func (c *ExecutionController) waitWithRuntimeMutations(gate ExecutionGate, quit 
 	c.mu.Unlock()
 
 	if emit != nil {
-		emit("execution.waiting", gate.phaseData())
+		data := gate.phaseData()
+		data.State = "blocked"
+		emit("execution.waiting", data)
 	}
 
 	for {
@@ -264,6 +302,11 @@ func (c *ExecutionController) waitWithRuntimeMutations(gate ExecutionGate, quit 
 				apply()
 			}
 		case proceed := <-w.release:
+			select {
+			case <-quit:
+				proceed = false
+			default:
+			}
 			if proceed {
 				if emit != nil {
 					emit("execution.released", gate.phaseData())
@@ -324,6 +367,8 @@ func (c *ExecutionController) CancelThread(threadID string) bool {
 	if threadID == "" {
 		threadID = "main"
 	}
+	delete(c.threadSteps, threadID)
+	delete(c.targetSteps, threadID)
 	for _, id := range c.order {
 		w := c.waiters[id]
 		if w != nil && w.gate.ThreadID == threadID {
@@ -411,6 +456,7 @@ func (c *ExecutionController) compactOrderLocked() {
 
 func (c *ExecutionController) statusLocked() ExecutionControlStatus {
 	st := ExecutionControlStatus{
+		Threads: cloneExecutionThreads(c.threads), Waiters: c.waitingStatusLocked(),
 		Mode:         c.mode,
 		Scope:        c.scope,
 		Follow:       c.follow,
@@ -436,6 +482,7 @@ func (c *ExecutionController) statusLocked() ExecutionControlStatus {
 
 func (g ExecutionGate) phaseData() ExecutionPhaseData {
 	data := ExecutionPhaseData{
+		Scope: g.Scope, RequestID: g.RequestID, Revision: g.Revision, DelegationID: g.DelegationID,
 		ThreadID:       g.ThreadID,
 		Iteration:      g.Iteration,
 		Phase:          string(g.Phase),

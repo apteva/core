@@ -2,11 +2,13 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"sort"
@@ -40,6 +42,7 @@ type mcpToolDef struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	Annotations map[string]any `json:"annotations,omitempty"`
 	Meta        map[string]any `json:"_meta,omitempty"`
 }
 
@@ -317,8 +320,11 @@ func (s *MCPServer) call(method string, params any) (json.RawMessage, error) {
 	return s.callContext(context.Background(), method, params)
 }
 func (s *MCPServer) callContext(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
-	defer cancel()
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mcpCallTimeout)
+		defer cancel()
+	}
 	id := s.nextID.Add(1)
 
 	ch := make(chan jsonRPCResponse, 1)
@@ -375,15 +381,12 @@ func (s *MCPServer) callContext(ctx context.Context, method string, params any) 
 		s.pendMu.Lock()
 		delete(s.pending, id)
 		s.pendMu.Unlock()
-		return nil, fmt.Errorf("MCP call timed out after %s", mcpCallTimeout)
+		return nil, fmt.Errorf("MCP call timed out: %w", ctx.Err())
 	}
 }
 
-// mcpCallTimeout is the deadline for a single tool invocation. Bumped
-// from 30s because legitimate long-running tools (audio transcription,
-// large-file downloads, OCR) can legitimately take a minute or two.
-// Short enough that a hung MCP still surfaces as a timeout error within
-// a reasonable window for retry.
+// mcpCallTimeout bounds calls without a caller deadline, including MCP
+// initialization. Tool calls use their caller's per-tool deadline.
 const mcpCallTimeout = 3 * time.Minute
 
 func (s *MCPServer) notify(method string, params any) {
@@ -487,12 +490,30 @@ func mcpProxyHandlerContext(server MCPConn, toolName string, opts ...any) func(c
 		if err != nil {
 			return ToolResponse{Text: fmt.Sprintf("error: %v", err), IsError: true}
 		}
-		var image []byte
 		result, image := extractMCPResultImage(resp.Text)
 		if blobs != nil {
 			result = blobs.RewriteBinaryToHandle(result)
 		}
-		return ToolResponse{Text: result, Image: image, IsError: resp.IsError}
+		// The transport already decoded standard MCP images/audio into Image
+		// and Parts. Only transform the text; rebuilding the response here
+		// silently discarded those native content blocks.
+		resp.Text = result
+		if len(image) > 0 {
+			if len(resp.Image) == 0 {
+				resp.Image = image
+			} else if !bytes.Equal(resp.Image, image) {
+				// A legacy JSON screenshot may coexist with native content.
+				// Retain both, without mutating the original Parts backing array.
+				mime := http.DetectContentType(image)
+				if !strings.HasPrefix(mime, "image/") {
+					mime = "image/png"
+				}
+				resp.Parts = append(append([]ContentPart(nil), resp.Parts...), ContentPart{
+					Type: "image_url", ImageURL: &ImageURL{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)},
+				})
+			}
+		}
+		return resp
 	}
 }
 

@@ -32,6 +32,10 @@ func NewXAIRealtimeProvider(apiKey string) *XAIRealtimeProvider {
 
 func (p *XAIRealtimeProvider) Name() string { return "xai-realtime" }
 
+func (p *XAIRealtimeProvider) RealtimeCapabilities(string) RealtimeCapabilities {
+	return RealtimeCapabilities{AudioTruncation: true, InputSpeechEvents: true}
+}
+
 func (p *XAIRealtimeProvider) Models() map[ModelTier]string {
 	out := make(map[ModelTier]string, len(p.models))
 	for tier, model := range p.models {
@@ -81,6 +85,9 @@ func (p *XAIRealtimeProvider) Open(ctx context.Context, opts RealtimeSessionOpts
 }
 
 func buildXAISessionUpdate(opts RealtimeSessionOpts, defaultVoice string) ([]byte, error) {
+	if err := validateCompatibleRealtimeOutput(opts); err != nil {
+		return nil, err
+	}
 	normalizedTurnDetection, err := opts.TurnDetection.normalized()
 	if err != nil {
 		return nil, fmt.Errorf("xai-realtime turn detection: %w", err)

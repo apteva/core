@@ -25,6 +25,57 @@ func newGoogleRealtimeTestSession() *googleRealtimeSession {
 	}
 }
 
+func TestGoogleLiveSetupPreservesRegisteredSearchToolsJSONSchema(t *testing.T) {
+	registry := NewToolRegistry("google-schema-regression")
+	tool := registry.Get("search_tools").native
+	original := string(mustJSON(t, tool.Parameters))
+	payload, err := buildGoogleLiveSetup(RealtimeSessionOpts{
+		Model: "gemini-3.1-flash-live-preview", Tools: []NativeTool{tool},
+	}, "Kore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope struct {
+		Setup struct {
+			Tools []geminiToolDecl `json:"tools"`
+		} `json:"setup"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Setup.Tools) != 1 || len(envelope.Setup.Tools[0].FunctionDeclarations) != 1 {
+		t.Fatalf("unexpected setup tools: %s", payload)
+	}
+	declaration := envelope.Setup.Tools[0].FunctionDeclarations[0]
+	if declaration.Name != "search_tools" {
+		t.Fatalf("tool name = %q", declaration.Name)
+	}
+	branches := declaration.ParametersJSONSchema["anyOf"].([]any)
+	if len(branches) != 2 {
+		t.Fatalf("query-or-queries constraint changed: %#v", branches)
+	}
+	for i, field := range []string{"query", "queries"} {
+		branch := branches[i].(map[string]any)
+		required := branch["required"].([]any)
+		if len(required) != 1 || required[0] != field {
+			t.Fatalf("branch required fields changed: %#v", branch)
+		}
+	}
+	if strings.Contains(string(payload), `"parameters":`) {
+		t.Fatal("Live must use parametersJsonSchema, not the restricted Schema proto")
+	}
+	if string(mustJSON(t, declaration.ParametersJSONSchema)) != original {
+		t.Fatalf("search_tools JSON Schema constraints changed: %s", payload)
+	}
+	if string(mustJSON(t, tool.Parameters)) != original {
+		t.Fatal("realtime setup mutated the registry schema used by other providers")
+	}
+	// Ordinary Gemini uses the same conversion and must produce the same wire schema.
+	if string(mustJSON(t, declaration.ParametersJSONSchema)) != string(mustJSON(t, geminiToolParameters(tool.Parameters))) {
+		t.Fatal("realtime and ordinary Gemini schema conversion diverged")
+	}
+}
+
 func TestGoogleLiveSetupUsesNativeProtocol(t *testing.T) {
 	payload, err := buildGoogleLiveSetup(RealtimeSessionOpts{
 		Model: "gemini-3.1-flash-live-preview", Voice: "Aoede", Instructions: "full core prompt",
@@ -65,10 +116,10 @@ func TestGoogleLiveSetupUsesNativeProtocol(t *testing.T) {
 	}
 	tools := setup["tools"].([]any)
 	declarations := tools[0].(map[string]any)["functionDeclarations"].([]any)
-	parameters := declarations[0].(map[string]any)["parameters"].(map[string]any)
+	parameters := declarations[0].(map[string]any)["parametersJsonSchema"].(map[string]any)
 	slots := parameters["properties"].(map[string]any)["slots"].(map[string]any)
-	if slots["items"] == nil {
-		t.Fatalf("Gemini array schema was not normalized: %#v", slots)
+	if slots["type"] != "array" || slots["items"] != nil {
+		t.Fatalf("JSON Schema arrays must not receive invented item constraints: %#v", slots)
 	}
 }
 
@@ -277,7 +328,7 @@ func TestGoogleRealtimeProviderRegistrationOverridesAndPricing(t *testing.T) {
 	if !ok {
 		t.Fatalf("provider = %T", pool.RealtimeDefault())
 	}
-	if provider.Models()[ModelLarge] != "gemini-live-pinned" || provider.Models()[ModelSmall] != "gemini-live-small" || provider.DefaultVoice() != "Aoede" {
+	if provider.Models()[ModelLarge] != "gemini-live-pinned" || provider.Models()[ModelMedium] != "gemini-3.8-live" || provider.Models()[ModelSmall] != "gemini-live-small" || provider.DefaultVoice() != "Aoede" {
 		t.Fatalf("models=%#v voice=%q", provider.Models(), provider.DefaultVoice())
 	}
 	cost := calculateCostForRealtimeProvider(provider, "gemini-live-pinned", RealtimeUsage{

@@ -3,6 +3,16 @@ package core
 import "fmt"
 
 func (thread *Thread) queueCompletion(callID, message string) error {
+	if thread.IsRealtime {
+		thread.completionMu.Lock()
+		thread.completionMessage = message
+		thread.completionExecutionIDs = thread.Thinker.currentEventExecutions()
+		thread.completionMu.Unlock()
+		return nil // The common terminal path reports the actual shutdown outcome.
+	}
+	if thread.WorkMode && thread.Thinker.work != nil {
+		return thread.Thinker.publishThreadWork(thread.Thinker.work.snapshot(), message, "completed", nil)
+	}
 	parent := thread.Parent
 	if parent == nil {
 		return fmt.Errorf("missing completion recipient")

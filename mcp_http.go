@@ -46,7 +46,9 @@ func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 		Name: name,
 		url:  url,
 		client: &http.Client{
-			Timeout: 3 * time.Minute,
+			// Tool execution has its own deadline. Allow a connector's
+			// declared longer timeout without this transport cutting it short.
+			Timeout: 10 * time.Minute,
 			// Disable auto-redirects so we can re-issue POSTs with the body
 			// preserved. http.Client would otherwise follow 307/308 but drop
 			// the body for non-idempotent methods.
@@ -57,7 +59,9 @@ func connectMCPHTTP(name, url string) (*MCPHTTPServer, error) {
 	}
 
 	// Initialize
-	result, headers, err := srv.callWithHeaders("initialize", map[string]any{
+	initCtx, cancelInit := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancelInit()
+	result, headers, err := srv.callWithHeadersContext(initCtx, "initialize", map[string]any{
 		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
 		"clientInfo": map[string]string{
@@ -141,6 +145,11 @@ func (s *MCPHTTPServer) doPOSTContext(ctx context.Context, body []byte, includeA
 		if agentID := os.Getenv("AGENT_ID"); agentID != "" && isAptevaAppMCPURL(currentURL) {
 			httpReq.Header.Set("X-Apteva-Caller-Agent", agentID)
 		}
+		if isAptevaBlobMCPURL(currentURL) {
+			if thread, _ := ctx.Value(blobCallerThreadKey{}).(string); thread != "" {
+				httpReq.Header.Set("X-Apteva-File-Thread", thread)
+			}
+		}
 		if sessionID != "" {
 			httpReq.Header.Set("Mcp-Session-Id", sessionID)
 		}
@@ -201,6 +210,17 @@ func isAptevaAppMCPURL(raw string) bool {
 	}
 	return (strings.HasPrefix(u.Path, "/api/apps/") || strings.HasPrefix(u.Path, "/api/environment-app-gateway/")) &&
 		strings.HasSuffix(u.Path, "/mcp")
+}
+
+// Identity is supplied only to server-authorized local gateway endpoints,
+// never to external MCP services or from model-generated tool arguments.
+func isAptevaBlobMCPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" && u.Hostname() != "::1") {
+		return false
+	}
+	return u.Query().Get("file_agent") != "" && u.Query().Get("file_auth") != "" &&
+		(isAptevaAppMCPURL(raw) || strings.HasPrefix(u.Path, "/mcp/"))
 }
 
 func (s *MCPHTTPServer) callWithHeaders(method string, params any) (json.RawMessage, http.Header, error) {

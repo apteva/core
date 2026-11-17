@@ -120,11 +120,13 @@ func (c *Config) saveThreadAndRegisterEventExecutions(pt PersistentThread, accep
 				}
 			}
 			registerEventExecutionsLocked(c, pt.ID, accepted)
+			ackParentReportsLocked(c, pt.ID, accepted)
 		})
 	}
 	return c.update(func() {
 		upsertPersistentThreadLocked(c, pt)
 		registerEventExecutionsLocked(c, pt.ID, accepted)
+		ackParentReportsLocked(c, pt.ID, accepted)
 	})
 }
 
@@ -132,6 +134,7 @@ func (c *Config) saveMainEventsAndRegisterExecutions(events, accepted []Persiste
 	return c.updateRuntime(func() {
 		c.MainEvents = clonePersistentThreadEvents(events)
 		registerEventExecutionsLocked(c, "main", accepted)
+		ackParentReportsLocked(c, "main", accepted)
 	})
 }
 

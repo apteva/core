@@ -20,7 +20,8 @@ const (
 
 // Event is the single message type flowing through the system.
 type Event struct {
-	ToolGeneration *uint64 // identifies tool results from a particular conversation generation
+	Work           *ThreadWork // structured assignment/result correlation
+	ToolGeneration *uint64     // identifies tool results from a particular conversation generation
 	// ID is an optional caller-supplied durable inbox identifier. It is used
 	// only for idempotent API delivery and is never interpreted as an internal
 	// event type or exposed to the model.
@@ -31,7 +32,7 @@ type Event struct {
 
 	Text       string        // message payload
 	ToolName   string        // tool name (for EventToolChunk)
-	Parts      []ContentPart // optional media (images, audio) attached to this event
+	Parts      []ContentPart // optional media or durable server file references attached to this event
 	ToolResult *ToolResult   // optional: structured tool result
 	// ExecutionIDs correlate opt-in durable inbox work across continuations,
 	// tools, sends, and spawned workers. They are runtime metadata only and are

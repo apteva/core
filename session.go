@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,9 @@ const (
 
 // SessionEntry is one line in the JSONL history file.
 type SessionEntry struct {
+	Work               *ThreadWork                 `json:"work,omitempty"`
+	RealtimeTranscript *RealtimeTranscriptMetadata `json:"realtime_transcript,omitempty"`
+	RealtimeBackend    bool                        `json:"realtime_backend,omitempty"`
 	// Sequence is a per-session, monotonically increasing cursor. It makes the
 	// durable history safe for consumers that need to observe a running thread:
 	// unlike the in-memory context window, this cursor does not move when old
@@ -182,7 +186,11 @@ func (s *Session) prepareEntryForDurability(entry SessionEntry) (SessionEntry, e
 // projectEntriesForModelLoad migrates legacy full-payload entries into the
 // archive and always returns bounded projections. If an archive write fails,
 // the in-memory fallback is still bounded and contains no image bytes.
-func (s *Session) projectEntriesForModelLoad(entries []SessionEntry) []SessionEntry {
+func (s *Session) projectEntriesForModelLoad(entries []SessionEntry, toolResultBudget ...int) []SessionEntry {
+	limit := historicalToolResultPerResultChars
+	if len(toolResultBudget) > 0 {
+		limit = max(0, min(toolResultBudget[0], 64_000))
+	}
 	projected := make([]SessionEntry, len(entries))
 	for i, entry := range entries {
 		projected[i] = entry
@@ -218,10 +226,10 @@ func (s *Session) projectEntriesForModelLoad(entries []SessionEntry) []SessionEn
 			if err != nil {
 				archived = original
 				archived.Image = nil
-				archived.Content = deterministicToolResultExcerpt(original.Content, historicalToolResultPerResultChars)
+				archived.Content = deterministicToolResultExcerpt(original.Content, limit)
 				archived.ContentIsPreview = true
 			}
-			projected[i].ToolResults[j] = projectArchivedToolResult(archived, historicalToolResultPerResultChars)
+			projected[i].ToolResults[j] = projectArchivedToolResult(archived, limit)
 		}
 	}
 	return projected
@@ -260,18 +268,21 @@ func (s *Session) AppendMessage(msg Message, iteration int, usage TokenUsage) er
 		return err
 	}
 	entry := SessionEntry{
-		Timestamp:     time.Now(),
-		Role:          msg.Role,
-		Content:       msg.Content,
-		Parts:         msg.Parts,
-		ToolCalls:     msg.ToolCalls,
-		ToolResults:   msg.ToolResults,
-		Reasoning:     msg.Reasoning,
-		ProviderState: msg.ProviderState,
-		EventIDs:      append([]string(nil), msg.EventIDs...),
-		TokensIn:      usage.PromptTokens,
-		TokensOut:     usage.CompletionTokens,
-		Iteration:     iteration,
+		RealtimeTranscript: msg.RealtimeTranscript,
+		RealtimeBackend:    msg.RealtimeBackend,
+		Work:               cloneThreadWork(msg.Work),
+		Timestamp:          time.Now(),
+		Role:               msg.Role,
+		Content:            msg.Content,
+		Parts:              msg.Parts,
+		ToolCalls:          msg.ToolCalls,
+		ToolResults:        msg.ToolResults,
+		Reasoning:          msg.Reasoning,
+		ProviderState:      msg.ProviderState,
+		EventIDs:           append([]string(nil), msg.EventIDs...),
+		TokensIn:           usage.PromptTokens,
+		TokensOut:          usage.CompletionTokens,
+		Iteration:          iteration,
 	}
 	return s.Append(entry)
 }
@@ -307,7 +318,7 @@ func (s *Session) EventIDs() map[string]bool {
 
 // LoadTail reads the last n messages from the history file and converts them to Messages.
 // Skips system messages and _compacted entries (compacted summaries are prepended as context).
-func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []string) {
+func (s *Session) LoadTail(n int, toolResultBudget ...int) (messages []Message, compactedSummaries []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -344,12 +355,12 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 			}
 		}
 	}
-	entries = s.projectEntriesForModelLoad(entries)
+	entries = s.projectEntriesForModelLoad(entries, toolResultBudget...)
 
 	// Collect compacted summaries
 	for _, e := range entries {
 		if e.Role == "_compacted" && e.Summary != "" {
-			compactedSummaries = append(compactedSummaries, e.Summary)
+			compactedSummaries = append(compactedSummaries, appendFileRefText(e.Summary, e.Parts))
 		}
 	}
 
@@ -370,14 +381,17 @@ func (s *Session) LoadTail(n int) (messages []Message, compactedSummaries []stri
 	// Convert to Messages
 	for _, e := range real {
 		msg := Message{
-			Role:          e.Role,
-			Content:       e.Content,
-			Parts:         e.Parts,
-			ToolCalls:     e.ToolCalls,
-			ToolResults:   e.ToolResults,
-			Reasoning:     e.Reasoning,
-			ProviderState: e.ProviderState,
-			EventIDs:      append([]string(nil), e.EventIDs...),
+			RealtimeTranscript: e.RealtimeTranscript,
+			RealtimeBackend:    e.RealtimeBackend,
+			Work:               cloneThreadWork(e.Work),
+			Role:               e.Role,
+			Content:            e.Content,
+			Parts:              e.Parts,
+			ToolCalls:          e.ToolCalls,
+			ToolResults:        e.ToolResults,
+			Reasoning:          e.Reasoning,
+			ProviderState:      e.ProviderState,
+			EventIDs:           append([]string(nil), e.EventIDs...),
 		}
 		// Normalize role: "tool_result" → "user" with ToolResults
 		if e.Role == "tool_result" {
@@ -415,6 +429,9 @@ func (s *Session) LoadAfter(after int64, limit int) (entries []SessionEntry, nex
 	if limit <= 0 {
 		limit = 500
 	}
+	// Transcript revisions retain their chronological position but have a new
+	// cursor so live consumers can update the same turn without missing edits.
+	sort.SliceStable(all, func(i, j int) bool { return all[i].Sequence < all[j].Sequence })
 	capacity := limit
 	if len(all) < capacity {
 		capacity = len(all)
@@ -633,6 +650,17 @@ func (s *Session) compact(keepRecent int, force bool, summarize func(text string
 		Summary:   summaryText,
 		OrigCount: realCount,
 	}
+	// Keep reference metadata independently of the model-written summary, so
+	// summarization cannot drop or rewrite opaque handles. No bytes are retained.
+	seenRefs := map[FileRef]bool{}
+	for _, entry := range entries[:compactPrefix] {
+		for _, part := range entry.Parts {
+			if part.Type == "file_ref" && part.FileRef != nil && !seenRefs[*part.FileRef] {
+				seenRefs[*part.FileRef] = true
+				compactedEntry.Parts = append(compactedEntry.Parts, cloneContentParts([]ContentPart{part})...)
+			}
+		}
+	}
 
 	// Rewrite file
 	newEntries := append([]SessionEntry{compactedEntry}, recent...)
@@ -649,10 +677,51 @@ func (s *Session) rewriteEntriesLocked(entries []SessionEntry) error {
 			return err
 		}
 	}
+	// Compaction can displace results below the normal archival threshold.
+	// Preserve the original payload AND its call-ID index before replacing the
+	// journal. A request/journal snapshot alone cannot satisfy history_search.
+	old, err := s.readEntriesLocked()
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := s.archiveOriginalToolResults(old); err != nil {
+		return err
+	}
 	if err := atomicWriteFile(s.path, buf.Bytes(), 0600); err != nil {
 		return err
 	}
 	s.revision++
+	return nil
+}
+
+func (s *Session) archiveOriginalToolResults(entries []SessionEntry) error {
+	for _, entry := range entries {
+		for _, result := range entry.ToolResults {
+			if result.CallID == "" {
+				continue
+			}
+			if result.SHA256 != "" || result.ArchiveRef != "" || result.ContentIsPreview {
+				// Metadata/previews must resolve to the full object; never index
+				// an excerpt or empty metadata as the original observation.
+				ref := result.SHA256
+				if ref == "" {
+					ref = result.ArchiveRef
+				}
+				if ref == "" {
+					ref, _ = s.archive.RefForCall(result.CallID)
+				}
+				original, err := s.archive.Read(ref)
+				if err != nil {
+					return fmt.Errorf("preserve original tool result %q: %w", result.CallID, err)
+				}
+				result.SHA256 = original.SHA256
+				result.ArchiveRef = toolResultArchiveRef(original.SHA256)
+			}
+			if _, err := s.archive.Archive(result); err != nil {
+				return fmt.Errorf("preserve original tool result %q: %w", result.CallID, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -689,10 +758,10 @@ func buildCompactionParts(entries []SessionEntry, keepRecent int) (combined stri
 
 	for _, e := range old {
 		if e.Role == "_compacted" {
-			combined += "[previous summary]\n" + excerptForCompaction(e.Summary, compactionInputMessagePreviewChars) + "\n"
+			combined += "[previous summary]\n" + excerptForCompaction(appendFileRefText(e.Summary, e.Parts), compactionInputMessagePreviewChars) + "\n"
 		} else if e.Role != "system" {
 			realCount++
-			combined += fmt.Sprintf("[%s]\n%s\n", e.Role, excerptForCompaction(e.Content, compactionInputMessagePreviewChars))
+			combined += fmt.Sprintf("[%s]\n%s\n", e.Role, excerptForCompaction(appendFileRefText(e.Content, e.Parts), compactionInputMessagePreviewChars))
 			if len(e.ToolCalls) > 0 {
 				combined += "Tool calls:\n"
 				for _, call := range e.ToolCalls {

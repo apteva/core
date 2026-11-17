@@ -2,11 +2,14 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 )
 
@@ -48,10 +51,107 @@ func decodeMCPResult(result mcpCallResult) (ToolResponse, error) {
 		}
 	}
 	if len(result.StructuredContent) > 0 {
-		texts = append(texts, string(result.StructuredContent))
+		out.StructuredContent = append(json.RawMessage(nil), result.StructuredContent...)
+		// MCP recommends mirroring structured output in a text block. Show the
+		// model one copy; anything distinct from the mirror is kept.
+		if !mirrorsStructuredContent(texts, result.StructuredContent) {
+			texts = append(texts, string(result.StructuredContent))
+		}
 	}
 	out.Text = strings.Join(texts, "\n")
 	return out, nil
+}
+
+func mirrorsStructuredContent(texts []string, structured json.RawMessage) bool {
+	for _, text := range texts {
+		if equivalentJSON([]byte(text), structured) {
+			return true
+		}
+	}
+	return false
+}
+
+// equivalentJSON reports whether a and b each hold exactly one JSON value and
+// those values are equal, ignoring whitespace and object key order.
+func equivalentJSON(a, b []byte) bool {
+	va, err := decodeSingleJSON(a)
+	if err != nil {
+		return false
+	}
+	vb, err := decodeSingleJSON(b)
+	return err == nil && reflect.DeepEqual(va, vb)
+}
+
+// decodeSingleJSON rejects trailing documents and duplicate object keys. The
+// latter must be checked before decoding into maps: encoding/json otherwise
+// silently replaces earlier values, potentially hiding a conflicting status.
+func decodeSingleJSON(data []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	v, err := decodeUniqueJSONValue(dec, 0)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("unexpected data after JSON value")
+	}
+	return v, nil
+}
+
+func decodeUniqueJSONValue(dec *json.Decoder, depth int) (any, error) {
+	// This parser is an eligibility check, not a general tool-result limit.
+	// Excessively nested results retain their normal model-facing path.
+	if depth > 1000 {
+		return nil, errors.New("JSON nesting exceeds eligibility limit")
+	}
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	switch token {
+	case json.Delim('{'):
+		object := make(map[string]any)
+		for dec.More() {
+			keyToken, err := dec.Token()
+			if err != nil {
+				return nil, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return nil, errors.New("expected JSON object key")
+			}
+			if _, exists := object[key]; exists {
+				return nil, errors.New("duplicate JSON object key")
+			}
+			value, err := decodeUniqueJSONValue(dec, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = value
+		}
+		if end, err := dec.Token(); err != nil || end != json.Delim('}') {
+			return nil, errors.New("unterminated JSON object")
+		}
+		return object, nil
+	case json.Delim('['):
+		array := make([]any, 0)
+		for dec.More() {
+			value, err := decodeUniqueJSONValue(dec, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, value)
+		}
+		if end, err := dec.Token(); err != nil || end != json.Delim(']') {
+			return nil, errors.New("unterminated JSON array")
+		}
+		return array, nil
+	default:
+		if _, delimiter := token.(json.Delim); delimiter {
+			return nil, errors.New("unexpected JSON delimiter")
+		}
+		return token, nil
+	}
 }
 
 func listAllMCPTools(call func(string, any) (json.RawMessage, error)) ([]mcpToolDef, error) {

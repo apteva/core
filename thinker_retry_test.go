@@ -74,6 +74,29 @@ func (p *scriptedRetryProvider) AvailableBuiltinTools() []BuiltinTool   { return
 func (p *scriptedRetryProvider) SetBuiltinTools([]string)               {}
 func (p *scriptedRetryProvider) WithBuiltins([]string) LLMProvider      { return p }
 
+type tierRetryProvider struct {
+	models    map[ModelTier]string
+	responses map[string]ChatResponse
+	errors    map[string]error
+	calls     []string
+}
+
+func (p *tierRetryProvider) Chat(_ context.Context, _ []Message, model string, _ []NativeTool, _ func(string), _ func(string), _ func(string, string, string)) (ChatResponse, error) {
+	p.calls = append(p.calls, model)
+	if err := p.errors[model]; err != nil {
+		return ChatResponse{}, err
+	}
+	return p.responses[model], nil
+}
+
+func (p *tierRetryProvider) Models() map[ModelTier]string           { return p.models }
+func (p *tierRetryProvider) Name() string                           { return "tiered" }
+func (p *tierRetryProvider) CostPer1M() (float64, float64, float64) { return 0, 0, 0 }
+func (p *tierRetryProvider) SupportsNativeTools() bool              { return false }
+func (p *tierRetryProvider) AvailableBuiltinTools() []BuiltinTool   { return nil }
+func (p *tierRetryProvider) SetBuiltinTools([]string)               {}
+func (p *tierRetryProvider) WithBuiltins([]string) LLMProvider      { return p }
+
 func retryTestThinker(provider LLMProvider) *Thinker {
 	bus := NewEventBus()
 	return &Thinker{
@@ -105,6 +128,53 @@ func TestCallLLMWithRetryPreservesPreparedTurn(t *testing.T) {
 		if len(seen) != 2 || seen[1].Content != "original work" {
 			t.Fatalf("attempt %d saw changed context: %#v", i+1, seen)
 		}
+	}
+}
+
+func TestCallLLMWithRetryUsesAlternateTierWhenModelIsOverloaded(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selected ModelTier
+		want     []string
+	}{
+		{name: "lighter model", selected: ModelMedium, want: []string{"medium-model", "small-model"}},
+		{name: "stronger model", selected: ModelSmall, want: []string{"small-model", "medium-model"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &tierRetryProvider{
+				models: map[ModelTier]string{
+					ModelLarge:  "large-model",
+					ModelMedium: "medium-model",
+					ModelSmall:  "small-model",
+				},
+				responses: map[string]ChatResponse{
+					"medium-model": {Text: "medium recovered"},
+					"small-model":  {Text: "small recovered"},
+				},
+				errors: map[string]error{tc.want[0]: errors.New("provider API error 429: model overloaded")},
+			}
+			thinker := retryTestThinker(provider)
+			thinker.model = tc.selected
+
+			resp, err := thinker.callLLMWithRetry(context.Background())
+			if err != nil {
+				t.Fatalf("callLLMWithRetry: %v", err)
+			}
+			if len(provider.calls) != len(tc.want) {
+				t.Fatalf("model calls = %v, want %v", provider.calls, tc.want)
+			}
+			for i := range tc.want {
+				if provider.calls[i] != tc.want[i] {
+					t.Fatalf("model calls = %v, want %v", provider.calls, tc.want)
+				}
+			}
+			if resp.Model != tc.want[1] {
+				t.Fatalf("response model = %q, want %q", resp.Model, tc.want[1])
+			}
+			if thinker.model != tc.selected {
+				t.Fatalf("configured tier changed to %s, want %s", thinker.model, tc.selected)
+			}
+		})
 	}
 }
 

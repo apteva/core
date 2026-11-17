@@ -696,7 +696,9 @@ func TestRealtimePlaybackAcknowledgementDoesNotLeakAcrossItems(t *testing.T) {
 	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventSpeechStarted})
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if len(session.truncations) != 1 || session.truncations[0].itemID != "item-new" || session.truncations[0].endMS != 250 {
+	// Both outstanding segments are cleared. Each retains its own playback
+	// evidence; the old item's 200ms receipt must not shorten the new item.
+	if len(session.truncations) != 2 || session.truncations[0].itemID != "item-old" || session.truncations[0].endMS != 200 || session.truncations[1].itemID != "item-new" || session.truncations[1].endMS != 250 {
 		t.Fatalf("truncations = %#v", session.truncations)
 	}
 }
@@ -723,30 +725,30 @@ func TestRealtimeInterruptionDrainsQueueAndDropsCanceledAudioTail(t *testing.T) 
 	}
 }
 
-func TestRealtimeOutputOverflowAbortsInsteadOfDroppingMiddleAudio(t *testing.T) {
+func TestRealtimeOutputBurstPreservedWithoutCancellingSpeech(t *testing.T) {
 	session := newFakeRealtimeSession()
 	audioOut := make(chan RealtimeAudioFrame, 1)
 	control := make(chan string, 1)
 	rt := newRealtimeThinker(context.Background(), newTestThinker(), &fakeRealtimeProvider{}, "", nil, audioOut, control)
 	rt.replaceSession(session)
-
-	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-overflow", Audio: make([]byte, realtimePCMBytesPerSecond)})
-	rt.acknowledgePlayback("item-overflow", 220)
-	rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "item-overflow", Audio: make([]byte, realtimePCMBytesPerSecond)})
-
-	if len(audioOut) != 0 {
-		t.Fatalf("overflow left %d stale frame(s) queued", len(audioOut))
+	for i := 0; i < 2; i++ {
+		rt.handleSessionEvent(RealtimeEvent{Type: RealtimeEventAudioOut, ItemID: "burst", Audio: make([]byte, realtimePCMBytesPerSecond)})
 	}
-	if got := <-control; got != "interrupt" {
-		t.Fatalf("overflow control=%q", got)
+	if len(audioOut) != 1 || len(rt.outputPending) != 1 {
+		t.Fatal("burst was lost")
+	}
+	first := <-audioOut
+	first.written(true)
+	rt.pumpRealtimeOutput()
+	second := <-audioOut
+	second.written(true)
+	if second.AudioEndMS != 2000 || len(control) != 0 {
+		t.Fatal("burst reordered or cleared")
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if session.interrupts != 1 {
-		t.Fatalf("provider interrupts=%d, want 1", session.interrupts)
-	}
-	if len(session.truncations) != 1 || session.truncations[0].itemID != "item-overflow" || session.truncations[0].endMS != 220 {
-		t.Fatalf("overflow truncations=%#v", session.truncations)
+	if session.interrupts != 0 {
+		t.Fatal("ordinary burst cancelled speech")
 	}
 }
 

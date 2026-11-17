@@ -288,6 +288,9 @@ func messageBytes(m Message) int {
 	n := len(m.Content)
 	for _, p := range m.Parts {
 		n += len(p.Text)
+		if p.Type == "file_ref" {
+			n += len(fileRefText(p.FileRef))
+		}
 	}
 	// Tool calls + tool results ride in structured fields that travel
 	// as JSON on the wire; approximate via the string content only

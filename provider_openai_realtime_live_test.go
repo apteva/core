@@ -45,6 +45,9 @@ Call probe exactly once, then say the returned value exactly and nothing else. K
 	if err := session.SendText("user", "Run the probe now."); err != nil {
 		t.Fatal(err)
 	}
+	if err := session.RequestResponse(); err != nil {
+		t.Fatal(err)
+	}
 	toolSeen := false
 	for {
 		select {

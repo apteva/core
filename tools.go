@@ -9,6 +9,8 @@ import (
 )
 
 type toolCall struct {
+	work              *ThreadWork     // immutable assignment revision at inference/queue admission
+	context           context.Context // optional call-owned cancellation, used by realtime
 	trace             *toolTrace
 	prerequisites     map[string]RequiredFirstAction
 	prerequisiteNames map[string]string
@@ -74,9 +76,10 @@ func executeTool(t *Thinker, call toolCall) {
 			call.trace.finish("cancelled")
 		}
 	}()
-	// Extract _reason before dispatch (observability field, not passed to handler)
-	reason := call.Args["_reason"]
-	delete(call.Args, "_reason")
+	if call.context != nil && call.context.Err() != nil {
+		t.pendingTools.Delete(call.NativeID)
+		return
+	}
 	executionIDs := call.executionIDs
 	if executionIDs == nil {
 		executionIDs = t.currentEventExecutions()
@@ -85,6 +88,7 @@ func executeTool(t *Thinker, call toolCall) {
 	if call.definition == nil && call.resolutionError == "" {
 		t.resolveToolCall(&call)
 	}
+	callData := t.prepareToolCallData(&call, executionIDs)
 	generation := call.generation
 	if !call.admitted {
 		generation = t.toolGeneration.Load()
@@ -93,21 +97,22 @@ func executeTool(t *Thinker, call toolCall) {
 	if generation != t.toolGeneration.Load() {
 		return
 	}
-	if !t.acquireToolSlot() {
+	if !t.acquireToolSlotForContext(call.context) {
 		t.pendingTools.Delete(call.NativeID)
 		return
 	}
-	if generation != t.toolGeneration.Load() {
+	if generation != t.toolGeneration.Load() || call.context != nil && call.context.Err() != nil {
 		t.releaseToolSlot()
+		if call.context != nil && call.context.Err() != nil {
+			t.pendingTools.Delete(call.NativeID)
+		}
 		return
 	}
 	t.asyncToolsActive.Add(1)
 
 	// Telemetry: tool.call
 	if t.telemetry != nil {
-		t.telemetry.Emit("tool.call", t.threadID, call.trace.data(ToolCallData{
-			ID: call.NativeID, Name: call.Name, Args: call.Args, Reason: reason, ExecutionIDs: executionIDs,
-		}))
+		t.telemetry.Emit("tool.call", t.threadID, call.trace.data(callData))
 	}
 
 	// Track pending async tool call. Value carries the tool name so the
@@ -123,11 +128,24 @@ func executeTool(t *Thinker, call toolCall) {
 		defer call.trace.finish("cancelled")
 		defer t.releaseToolSlot()
 		defer t.asyncToolsActive.Add(-1)
-		ctx, cancel := context.WithTimeout(t.toolContext(), 3*time.Minute)
+		ctx, cancel := context.WithTimeout(t.toolContext(), toolCallTimeout(call))
+		if call.context != nil {
+			// Retain owner shutdown/reset semantics while adding cancellation
+			// of this individual provider call, including queued-call races.
+			stopCallCancellation := context.AfterFunc(call.context, cancel)
+			defer stopCallCancellation()
+			if call.context.Err() != nil {
+				cancel()
+			}
+		}
+		ctx = withBlobCallerThread(ctx, t.threadID)
 		t.toolLifecycleMu.Lock()
-		if generation != t.toolGeneration.Load() {
+		if generation != t.toolGeneration.Load() || ctx.Err() != nil {
 			t.toolLifecycleMu.Unlock()
 			cancel()
+			if call.context != nil && call.context.Err() != nil {
+				t.pendingTools.Delete(call.NativeID)
+			}
 			return
 		}
 		t.toolCancels.Store(call.NativeID, context.CancelFunc(cancel))
@@ -180,7 +198,9 @@ func executeTool(t *Thinker, call toolCall) {
 		}
 		var resp ToolResponse
 		def := call.definition
-		if call.resolutionError != "" {
+		if call.work != nil && !t.work.current(*call.work) {
+			resp = ToolResponse{Text: "Skipped: assignment changed before this operation started. Reassess the latest input.", IsError: true}
+		} else if call.resolutionError != "" {
 			resp = ToolResponse{Text: call.resolutionError, IsError: true}
 		} else if def == nil || (def.Handler == nil && def.HandlerContext == nil) {
 			resp = ToolResponse{Text: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
@@ -204,7 +224,7 @@ func executeTool(t *Thinker, call toolCall) {
 					t.telemetry.Emit("tool.arguments", t.threadID, call.trace.data(newToolArgumentsData(call.NativeID, call.Name, "mcp_typed", typedArgs)))
 					t.telemetry.Emit("tool.dispatch", t.threadID, call.trace.data(map[string]any{"id": call.NativeID, "manifest_hash": call.manifestHash, "resolved": toolIdentity(def), "arguments": newToolArgumentsData(call.NativeID, call.Name, "dispatched", typedArgs)}))
 				}
-				resp = t.registry.dispatchDefinition(ctx, def, dispatchArgs)
+				resp = t.registry.dispatchDefinition(withMemoryCaller(ctx, t.threadID), def, dispatchArgs)
 				if def.MCP && generation == t.toolGeneration.Load() {
 					t.recordMCPProgress(call, resp)
 					if !resp.IsError {
@@ -261,6 +281,10 @@ func executeTool(t *Thinker, call toolCall) {
 			IsError:  resp.IsError,
 		}
 
+		if outcome == "success" {
+			toolResult.DirectReceipt = t.directToolReceipt(call, resp)
+		}
+
 		if !t.executionGate(ExecutionPhaseToolAfter, ExecutionGate{
 			Tool:    call.Name,
 			CallID:  call.NativeID,
@@ -313,6 +337,16 @@ func executeTool(t *Thinker, call toolCall) {
 }
 
 func toolDispatchArgs(t *Thinker, call toolCall) map[string]string {
+	// Core's completion hint never reaches app/tool arguments.
+	if _, ok := call.Args[completeAssignmentArg]; ok && t != nil && t.directResultPolicy(call.Name) != nil {
+		args := make(map[string]string, len(call.Args))
+		for k, v := range call.Args {
+			if k != completeAssignmentArg {
+				args[k] = v
+			}
+		}
+		call.Args = args
+	}
 	if t == nil || t.registry == nil {
 		return call.Args
 	}

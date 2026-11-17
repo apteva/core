@@ -624,6 +624,7 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 // --- Convenience emitters with typed data ---
 
 type LLMDoneData struct {
+	Purpose            string `json:"purpose,omitempty"`
 	Provider           string `json:"provider,omitempty"`
 	Model              string `json:"model"`
 	Reasoning          string `json:"reasoning,omitempty"` // legacy alias for requested effort
@@ -724,6 +725,7 @@ type ToolCallData struct {
 	Name         string            `json:"name"`
 	Args         map[string]string `json:"args,omitempty"`
 	Reason       string            `json:"reason,omitempty"`
+	ReasonSource string            `json:"reason_source,omitempty"` // model, tool_description, or tool_name
 	ExecutionIDs []string          `json:"execution_ids,omitempty"`
 }
 
@@ -813,17 +815,18 @@ func topLevelArgumentTypes(value any) map[string]string {
 }
 
 type ToolResultData struct {
-	ID                  string   `json:"id,omitempty"`
-	Name                string   `json:"name"`
-	DurationMs          int64    `json:"duration_ms"`
-	Success             bool     `json:"success"`
-	Result              string   `json:"result,omitempty"`
-	ResultOriginalBytes int      `json:"result_original_bytes"`
-	ResultContextBytes  int      `json:"result_context_bytes"`
-	ResultPreviewBytes  int      `json:"result_preview_bytes"`
-	ResultImageBytes    int      `json:"result_image_bytes,omitempty"`
-	ResultTruncated     bool     `json:"result_truncated"`
-	ExecutionIDs        []string `json:"execution_ids,omitempty"`
+	ID                     string   `json:"id,omitempty"`
+	Name                   string   `json:"name"`
+	DurationMs             int64    `json:"duration_ms"`
+	Success                bool     `json:"success"`
+	Result                 string   `json:"result,omitempty"`
+	ResultOriginalBytes    int      `json:"result_original_bytes"`
+	ResultContextBytes     int      `json:"result_context_bytes"`
+	ResultPreviewBytes     int      `json:"result_preview_bytes"`
+	ResultImageBytes       int      `json:"result_image_bytes,omitempty"`
+	ResultTruncated        bool     `json:"result_truncated"`
+	ResultPreviewTruncated bool     `json:"result_preview_truncated"`
+	ExecutionIDs           []string `json:"execution_ids,omitempty"`
 }
 
 const toolResultTelemetryPreviewBytes = 1000
@@ -843,16 +846,17 @@ func newToolResultData(id, name string, durationMs int64, success bool, original
 		preview = preview[:end] + "..."
 	}
 	return ToolResultData{
-		ID:                  id,
-		Name:                name,
-		DurationMs:          durationMs,
-		Success:             success,
-		Result:              preview,
-		ResultOriginalBytes: len(originalText) + imageBytes,
-		ResultContextBytes:  len(contextText) + imageBytes,
-		ResultPreviewBytes:  len(preview),
-		ResultImageBytes:    imageBytes,
-		ResultTruncated:     truncated,
+		ID:                     id,
+		Name:                   name,
+		DurationMs:             durationMs,
+		Success:                success,
+		Result:                 preview,
+		ResultOriginalBytes:    len(originalText) + imageBytes,
+		ResultContextBytes:     len(contextText) + imageBytes,
+		ResultPreviewBytes:     len(preview),
+		ResultImageBytes:       imageBytes,
+		ResultTruncated:        truncated,
+		ResultPreviewTruncated: truncated,
 	}
 }
 
@@ -902,6 +906,9 @@ func ModelContextWindow(modelID string) int {
 		{"claude-3-opus", 200_000},
 		{"claude-3-sonnet", 200_000},
 		{"claude-3-haiku", 200_000},
+
+		// --- OpenAI ---
+		{"gpt-6.1-sol", 1_050_000},
 
 		// --- Fireworks + OpenCode Go (Kimi / MiniMax) ---
 		// Both providers expose the same Kimi K2.x and MiniMax M2.x

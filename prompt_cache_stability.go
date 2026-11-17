@@ -95,15 +95,18 @@ func (t *Thinker) advancePromptCacheEpoch(reason string, resetRequestContext boo
 	}
 	t.promptCacheEpoch++
 	t.promptCacheResetReason = reason
-	t.promptCachePreviousRequest = nil
+	if !requestStabilityEnabled("APTEVA_STABLE_CACHE_IDENTITY") {
+		t.promptCachePreviousRequest = nil
+	}
 	t.promptCacheStableHash = ""
 
 	if t.telemetry != nil {
 		data := map[string]any{
-			"iteration":     t.iteration,
-			"cache_epoch":   t.promptCacheEpoch,
-			"reset_reason":  reason,
-			"identity_hash": promptCacheShortHash([]byte(t.promptCacheIdentity())),
+			"iteration":                 t.iteration,
+			"cache_epoch":               t.promptCacheEpoch,
+			"reset_reason":              reason,
+			"identity_hash":             promptCacheShortHash([]byte(t.promptCacheIdentity())),
+			"provider_identity_rotated": !requestStabilityEnabled("APTEVA_STABLE_CACHE_IDENTITY"),
 		}
 		for key, value := range details {
 			data[key] = value
@@ -135,8 +138,9 @@ func (t *Thinker) preparePromptCacheContext(ctx context.Context, messages []Mess
 	t.promptCachePreviousRequest = append(t.promptCachePreviousRequest[:0], request...)
 
 	scope := openAIPromptCacheScope{
-		Identity: t.promptCacheIdentity(),
-		Epoch:    t.promptCacheEpoch,
+		Identity:  t.promptCacheIdentity(),
+		Epoch:     t.promptCacheEpoch,
+		Namespace: providerSessionFromContext(t.providerSessionContext(ctx, "cache")),
 	}
 	return withOpenAIPromptCacheScope(ctx, scope)
 }

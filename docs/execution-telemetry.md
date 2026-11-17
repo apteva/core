@@ -32,6 +32,13 @@ a fabricated workflow execution ID.
 
 ## Events and timing
 
+Creating a child through `POST /threads/{id}` or lazy `POST /event` delivery
+does not cancel main's inference or discard its response. Construction is
+serialized by the owning loop while inference runs; the existing parent inbox
+notification is consumed on the next turn. Concurrent duplicate creation
+remains idempotent. Edits to the active thread's configuration, permissions,
+or history still invalidate its request before the changed state is applied.
+
 | Event | Meaning |
 | --- | --- |
 | `llm.request.queued` | Provider attempt entered preparation. |
@@ -67,7 +74,41 @@ Realtime sessions retain their existing `realtime.*` session/usage events;
 the request events cover request/response inference, while shared worker and
 tool instrumentation also applies to realtime workers.
 
+## Tool activity labels
+
+Registered tools expose a required nonempty `_reason` string to the model.
+Core strips that operator-only field before dispatch and emits it as
+`tool.call.data.reason`. Omitting it, or sending only whitespace, does not
+block execution: Core uses the first sentence/line of the captured tool
+description, capped at 160 characters. Without a usable description, Core
+uses the tool name as a readable operation label. Fallbacks never include
+argument values or claim that an operation succeeded.
+
+`reason_source` identifies `model`, `tool_description`, or `tool_name`, so a
+nonempty activity label does not conceal an upstream omission. The same
+preparation applies to asynchronous tools, main-thread inline tools, and
+worker inline or unavailable-tool calls. Consumers such as Conversations
+can keep reading `reason` without changes. Existing persisted empty labels
+are not backfilled.
+
+`tool.arguments` at the `provider_raw` stage retains the original model JSON;
+fallback labels are never injected into replay arguments. Use that event to
+distinguish a model omission from an argument-conversion or telemetry bug.
+
 ## Compatibility and aggregation
+
+Tool result preview truncation and model-context projection are separate.
+`tool.result.result_preview_truncated` is the explicit preview flag;
+`result_truncated` remains its compatibility alias. Neither means the model
+received a shortened result. `tool.result.context` reports original and
+projected tool-result bytes and `results_shortened` for the prepared request.
+Provider request budgets still report the final serialized request estimate.
+
+`llm.fallback.skipped` identifies candidates whose input cannot fit, including
+the candidate's complete budget. `context_window_source` distinguishes live
+model capabilities, the static table, and `unknown_model_default`; an unknown
+default is not an advertised provider limit. Input-size rejection does not
+trigger fallback compaction or rewrite the primary's durable history.
 
 Continue calculating existing usage/cost/call totals from `llm.done` and
 existing realtime usage events. Do not count detailed request or HTTP records
@@ -92,3 +133,73 @@ tool receipts retain their previous durability behavior.
 - `RUN_CODEX_EXECUTION_TELEMETRY=1 go test -run '^TestCodexExecutionTelemetry$' -v .`
 - Server: `go test -short -run 'TestExecutionTelemetryAdditiveCompatibility|TestTelemetry' .`
 - Dashboard: `bun test src/components/AgentView.executionTelemetry.test.ts`
+
+## Scoped execution control
+
+Execution pauses are cooperative breakpoints, controlled independently of the
+realtime transport. Existing configurations and unscoped `POST /control` actions
+retain instance-wide behavior. To pause only the root before it does background
+work, configure Core before startup:
+
+```json
+{
+  "execution_control": {
+    "mode": "auto",
+    "scope": "instance",
+    "threads": {
+      "main": {"mode": "paused", "breakpoints": ["iteration.start"]}
+    }
+  }
+}
+```
+
+Thread rules target exact IDs, are persisted with configuration, and are not
+inherited by children. All threads still share the instance controller. An
+instance breakpoint takes precedence: a thread-scoped run or step cannot release
+it. Instance `run` resumes the instance gate while retaining explicit thread
+pauses. An explicit instance `step` can release one selected gate, as before.
+Step credits are temporary and are not restored after a restart.
+
+The existing Core `POST /control` endpoint accepts:
+
+```json
+{"action":"pause","scope":"thread","thread_id":"main","breakpoints":["iteration.start"]}
+{"action":"step","scope":"thread","thread_id":"main"}
+{"action":"run","scope":"thread","thread_id":"main"}
+```
+
+Omitting breakpoints on a new rule uses the existing default execution
+breakpoints; use `iteration.start` explicitly to stop before inference. Thread
+`run` removes the exact rule. Unknown scopes, invalid IDs and unknown breakpoints
+are rejected. Checkpoint restoration remains instance-scoped. Cancellation still
+exits a blocked worker; permissions, approvals and tool checks remain in the
+ordinary worker path.
+
+For Server runtime spawning, the equivalent opt-in startup request is:
+
+```json
+{"start_paused":true,"start_paused_scope":"thread","start_paused_thread_id":"main"}
+```
+
+Omitted startup scope retains the existing instance-wide pause. Voice Evals and
+simulated voice callers explicitly use the root-only scope. Text Evals retain
+instance-wide pause and stepping. These fields require coordinated SDK, Server,
+Environments and Evals releases; older servers do not implement their semantics.
+
+Execution state is observable separately from provider latency:
+
+- `realtime.execution_queued`: an assignment is ready for worker dispatch, with
+  request, revision, delegation and worker IDs.
+- `execution.waiting`: a worker is blocked, with `state: blocked`, its exact
+  `phase` and the blocking `scope` (`instance` or `thread`). `/status` includes
+  every waiter and its current blocking scope, even after controls change.
+- `execution.running`: the worker passed its execution gates and entered request
+  preparation/inference, with assignment correlation. Provider HTTP admission is
+  still measured by `llm.request.started` and `llm.http.started`.
+- Legacy `realtime.execution_started` remains a dispatch event, explicitly marked
+  `state: queued` and `measurement_stage: assignment_dispatched`. It does not
+  prove that the worker passed a pause gate.
+
+This control does not alter audio buffering, provider turn-taking, playback or
+forced response/commit behavior. It does not resolve the independent realtime
+finalization timeout.

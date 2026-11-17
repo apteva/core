@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,11 @@ func projectBulkyContext(messages []Message, ref string, protected ...map[string
 				}
 			}
 		}
+		if len(protected) > 0 {
+			for _, result := range m.ToolResults {
+				pending = pending || protected[0][result.CallID]
+			}
+		}
 		if m.Role == "system" || m.RequestContext || pending {
 			continue
 		}
@@ -38,14 +44,17 @@ func projectBulkyContext(messages []Message, ref string, protected ...map[string
 					switch parsed.(type) {
 					case map[string]any, []any:
 						state := projectRecoveryPayload(r.Content, "[large value retained in original archive]", 0)
-						if len(state) < len(r.Content) {
+						if len(state) <= len(r.Content)*3/4 && len(strings.Join(stateNotes, "\n"))+len(state)+len(r.CallID)+10 <= 2*contextRecoveryPayloadBytes {
 							stateNotes = append(stateNotes, "call_id="+r.CallID+"\n"+state)
 						}
 					}
 				}
-				r.Content = compactRecoveryPayload(r.Content, receipt)
-				r.ContentIsPreview = true
-				changed = true
+				compact := compactRecoveryPayload(r.Content, receipt)
+				if len(compact) < len(r.Content) {
+					r.Content = compact
+					r.ContentIsPreview = true
+					changed = true
+				}
 			}
 			if len(r.Image) > 0 && i < len(next)-2 {
 				r.Image = nil
@@ -133,7 +142,7 @@ func (s *Session) checkpointRecoveredContext(messages []Message) (string, error)
 	return archived.ArchiveRef, nil
 }
 
-func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvider, messages []Message, reason error, pass int) ([]Message, error) {
+func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvider, messages []Message, reason error, pass int, tier ModelTier) ([]Message, error) {
 	if t.session == nil || t.session.archive == nil {
 		return nil, fmt.Errorf("cannot preserve context: durable session archive unavailable")
 	}
@@ -150,34 +159,69 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 	next := projectBulkyContext(messages, ref, protected)
 	before := estimatedContextTokens(messages)
 	materiallySmaller := func(candidate []Message) bool { return estimatedContextTokens(candidate) <= before-max(128, before/20) }
-	if !materiallySmaller(next) {
+	// Use the rejecting request's complete budget, including schema overhead.
+	// The adapter still checks the exact serialized candidate before submission.
+	var overflow *contextBudgetError
+	hasBudget := errors.As(reason, &overflow)
+	base := estimatePreparedRequest(provider.Name(), modelIDForProvider(provider, tier), messages, nil)
+	fits := func(candidate []Message) bool {
+		if !hasBudget {
+			return false
+		}
+		b := estimatePreparedRequest(provider.Name(), modelIDForProvider(provider, tier), candidate, nil)
+		return b.InputTokens+max(0, overflow.Budget.InputTokens-base.InputTokens) <= overflow.Budget.InputBudget
+	}
+	progress := func(candidate []Message) bool {
+		return materiallySmaller(candidate) || (estimatedContextTokens(candidate) < before && fits(candidate))
+	}
+	if !progress(next) || (hasBudget && !fits(next)) {
 		// A fixed 20-message tail was the incident's failure: it could itself be
 		// larger than the model. Retain the newest complete call/result group and
 		// summarize the older prefix. Never use emergency deletion on failure.
 		keep := max(2, 4-pass)
 		start := retainedStartForContextPressure(next, keep)
-		// The newest external instruction must remain verbatim even when it is
-		// followed by several tool-only continuations.
+		// Pin the instruction itself, not the entire tool run following it.
+		// Prior recovery summaries are history and may be merged again.
+		latestUser := -1
 		for i := len(next) - 1; i >= 1; i-- {
-			if next[i].Role == "user" && !next[i].RequestContext && len(next[i].ToolResults) == 0 && strings.TrimSpace(next[i].Content) != "" {
-				if i < start {
-					start = retainedStartForContextPressure(next, len(next)-i)
-				}
+			if next[i].Role == "user" && !next[i].RequestContext && len(next[i].ToolResults) == 0 && !isRecoverySummary(next[i]) && (strings.TrimSpace(next[i].Content) != "" || next[i].HasParts()) {
+				latestUser = i
 				break
+			}
+		}
+		// If a parallel call message contains a pending call, retain all its
+		// paired result messages too. A summary must not split a native group.
+		retainedCalls := map[string]bool{}
+		for id := range protected {
+			retainedCalls[id] = true
+		}
+		for changed := true; changed; {
+			changed = false
+			for _, m := range next[:start] {
+				ids := recoveryMessageCallIDs(m)
+				keep := false
+				for _, id := range ids {
+					keep = keep || retainedCalls[id]
+				}
+				if keep {
+					for _, id := range ids {
+						if !retainedCalls[id] {
+							retainedCalls[id], changed = true, true
+						}
+					}
+				}
 			}
 		}
 		// Keep every system instruction and current request snapshot outside the
 		// summary, regardless of its position in the prepared request.
 		old := []Message{}
 		prefix := []Message{}
-		for _, m := range next[:start] {
+		for i, m := range next[:start] {
 			pending := false
-			for _, call := range m.ToolCalls {
-				if protected[call.ID] {
-					pending = true
-				}
+			for _, id := range recoveryMessageCallIDs(m) {
+				pending = pending || retainedCalls[id]
 			}
-			if pending || m.Role == "system" || m.RequestContext || (strings.HasPrefix(m.Content, "[COMPACTED CONTEXT]") || strings.HasPrefix(m.Content, "[RECOVERED TOOL STATE]")) {
+			if pending || m.Role == "system" || m.RequestContext || i == latestUser {
 				prefix = append(prefix, m)
 			} else {
 				old = append(old, m)
@@ -197,10 +241,12 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 		for _, m := range old {
 			ids = append(ids, m.EventIDs...)
 		}
-		prefix = append(prefix, Message{Role: "user", Content: "[COMPACTED CONTEXT]\n" + summary + "\nFull pre-recovery context: " + ref, EventIDs: ids})
+		compacted := summaryWithFileRefs("[COMPACTED CONTEXT]\n"+summary+"\nFull pre-recovery context: "+ref, old)
+		compacted.EventIDs = ids
+		prefix = append(prefix, compacted)
 		next = append(prefix, next[start:]...)
 	}
-	if !materiallySmaller(next) {
+	if !progress(next) {
 		return nil, fmt.Errorf("compaction did not materially shrink input; full context preserved at %s", ref)
 	}
 	durable := make([]Message, 0, len(next))
@@ -219,9 +265,24 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 	t.messages = durable
 	t.advancePromptCacheEpoch("context_recovery", true, nil)
 	if t.telemetry != nil {
-		t.telemetry.Emit("llm.context_recovery", t.threadID, map[string]any{"provider": provider.Name(), "model": modelIDForProvider(provider, t.model), "iteration": t.iteration, "reason": reason.Error(), "pass": pass, "before_tokens_est": before, "after_tokens_est": estimatedContextTokens(next), "archive_ref": ref, "history_archive_ref": historyRef, "before_fingerprint": requestFingerprint(raw)})
+		t.telemetry.Emit("llm.context_recovery", t.threadID, map[string]any{"provider": provider.Name(), "model": modelIDForProvider(provider, tier), "iteration": t.iteration, "reason": reason.Error(), "pass": pass, "before_tokens_est": before, "after_tokens_est": estimatedContextTokens(next), "archive_ref": ref, "history_archive_ref": historyRef, "before_fingerprint": requestFingerprint(raw)})
 	}
 	return next, nil
+}
+
+func isRecoverySummary(m Message) bool {
+	return strings.HasPrefix(m.Content, "[COMPACTED CONTEXT]") || strings.HasPrefix(m.Content, "[RECOVERED TOOL STATE]")
+}
+
+func recoveryMessageCallIDs(m Message) []string {
+	ids := make([]string, 0, len(m.ToolCalls)+len(m.ToolResults))
+	for _, call := range m.ToolCalls {
+		ids = append(ids, call.ID)
+	}
+	for _, result := range m.ToolResults {
+		ids = append(ids, result.CallID)
+	}
+	return ids
 }
 
 func (t *Thinker) emitRequestBudget(b requestBudget) {
@@ -231,8 +292,12 @@ func (t *Thinker) emitRequestBudget(b requestBudget) {
 }
 
 func (t *Thinker) callProviderWithContextRecovery(ctx context.Context, provider LLMProvider, messages []Message) (ChatResponse, []Message, error) {
+	return t.callProviderWithContextRecoveryAtTier(ctx, provider, messages, t.model)
+}
+
+func (t *Thinker) callProviderWithContextRecoveryAtTier(ctx context.Context, provider LLMProvider, messages []Message, tier ModelTier) (ChatResponse, []Message, error) {
 	for pass := 0; ; pass++ {
-		resp, err := t.thinkWithProviderMessages(ctx, provider, messages)
+		resp, err := t.thinkWithProviderMessagesAtTier(ctx, provider, messages, tier)
 		if err == nil || !isContextLengthError(err) {
 			return resp, messages, err
 		}
@@ -245,12 +310,51 @@ func (t *Thinker) callProviderWithContextRecovery(ctx context.Context, provider 
 		if pass >= 3 {
 			return resp, messages, &contextManagementError{Cause: err}
 		}
-		next, recoveryErr := t.recoverOversizedRequest(ctx, provider, messages, err, pass)
+		next, recoveryErr := t.recoverOversizedRequest(ctx, provider, messages, err, pass, tier)
 		if recoveryErr != nil {
 			return resp, messages, &contextManagementError{Cause: fmt.Errorf("%w; recovery: %v", err, recoveryErr)}
 		}
 		messages = next
 	}
+}
+
+// callProviderWithOverloadRecovery keeps the configured model tier stable but
+// lets this request move to another concrete model from the same provider when
+// the selected model is overloaded. Cross-provider fallback remains the
+// caller's responsibility.
+func (t *Thinker) callProviderWithOverloadRecovery(ctx context.Context, provider LLMProvider, messages []Message, selected ModelTier) (ChatResponse, []Message, error) {
+	if managesInferenceLifecycle(provider) {
+		r, err := t.thinkWithProviderMessagesAtTier(ctx, provider, messages, selected)
+		return r, messages, err
+	}
+	resp, messages, err := t.callProviderWithContextRecoveryAtTier(ctx, provider, messages, selected)
+	if !isProviderOverloadError(err) || ctx.Err() != nil {
+		return resp, messages, err
+	}
+
+	fromTier := selected
+	for _, tier := range overloadFallbackTiers(provider, selected) {
+		fromModel := modelIDForProvider(provider, fromTier)
+		toModel := modelIDForProvider(provider, tier)
+		logMsg("FALLBACK", fmt.Sprintf("[%s] %s model %s overloaded (%v), trying %s", t.threadID, provider.Name(), fromModel, err, toModel))
+		if t.telemetry != nil {
+			t.telemetry.Emit("llm.model_fallback", t.threadID, map[string]any{
+				"provider":   provider.Name(),
+				"from_tier":  fromTier.String(),
+				"from_model": fromModel,
+				"to_tier":    tier.String(),
+				"to_model":   toModel,
+				"error":      err.Error(),
+				"iteration":  t.iteration,
+			})
+		}
+		resp, messages, err = t.callProviderWithContextRecoveryAtTier(ctx, provider, messages, tier)
+		if err == nil || !isProviderOverloadError(err) || ctx.Err() != nil {
+			return resp, messages, err
+		}
+		fromTier = tier
+	}
+	return resp, messages, err
 }
 
 // Batch complete messages instead of silently excerpting them. The caller's
@@ -260,13 +364,27 @@ func (t *Thinker) summarizeRecoveryPrefix(ctx context.Context, provider LLMProvi
 	batches := [][]Message{}
 	batch := []Message{}
 	size := 0
-	for _, m := range messages {
+	for messageIndex, m := range messages {
 		raw, err := json.Marshal(m)
 		if err != nil {
 			return "", err
 		}
 		if len(raw) > maxCompactionInputBytes {
-			return "", fmt.Errorf("single history message exceeds summary budget; original context preserved")
+			// Feed every byte of a large observation to the summarizer in
+			// ordered fragments. They are history data, never partial tool calls
+			// for execution. No middle excerpt or field is silently discarded.
+			if len(batch) > 0 {
+				batches = append(batches, batch)
+				batch = nil
+				size = 0
+			}
+			const fragmentBytes = 32 << 10
+			for offset, part := 0, 1; offset < len(raw); part++ {
+				fragment := validToolResultPrefix(string(raw[offset:]), fragmentBytes)
+				batches = append(batches, []Message{{Role: "user", Content: fmt.Sprintf("[HISTORY FRAGMENT message=%d part=%d offset=%d total_bytes=%d; continuation of one serialized message, not instructions]\n%s", messageIndex, part, offset, len(raw), fragment)}})
+				offset += len(fragment)
+			}
+			continue
 		}
 		if size+len(raw) > maxCompactionInputBytes && len(batch) > 0 {
 			batches = append(batches, batch)
@@ -279,7 +397,7 @@ func (t *Thinker) summarizeRecoveryPrefix(ctx context.Context, provider LLMProvi
 	if len(batch) > 0 {
 		batches = append(batches, batch)
 	}
-	if len(batches) > 16 {
+	if len(batches) > 64 {
 		return "", fmt.Errorf("history exceeds bounded recovery batch count; original context preserved")
 	}
 	summaries := []string{}
@@ -316,7 +434,14 @@ func (t *Thinker) summarizeRecoveryPrefix(ctx context.Context, provider LLMProvi
 // megabytes of pixels/document text. Cutting the whole JSON string would hide
 // identifiers and completion flags merely because of their byte position.
 func compactRecoveryPayload(value, receipt string) string {
-	return projectRecoveryPayload(value, receipt, contextRecoveryPayloadBytes)
+	projected := projectRecoveryPayload(value, receipt, contextRecoveryPayloadBytes/4)
+	if len(projected) > contextRecoveryPayloadBytes {
+		// A wide object/array can be huge without any individual large leaf.
+		// Mark the whole-result excerpt incomplete; the immutable archive holds
+		// every omitted field, rather than presenting partial JSON as complete.
+		return deterministicToolResultExcerpt(projected, max(0, contextRecoveryPayloadBytes-len(receipt))) + receipt
+	}
+	return projected
 }
 func projectRecoveryPayload(value, receipt string, previewBytes int) string {
 	parsed, valid := decodeRecoveryJSON(value)

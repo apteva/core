@@ -21,8 +21,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/apteva/core"
+	"io"
 	"os"
 )
 
@@ -42,6 +44,31 @@ var (
 
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		// Keep --version first: older binaries safely return their version when
+		// Server probes this protocol instead of starting an agent.
+		if len(os.Args) > 2 && os.Args[2] == "--builtin-capabilities" {
+			_ = json.NewEncoder(os.Stdout).Encode(core.ProviderBuiltinCatalog())
+			return
+		}
+		if len(os.Args) > 2 && os.Args[2] == "--validate-builtins" {
+			var request struct {
+				Provider string                            `json:"provider"`
+				Builtins map[string]core.BuiltinToolConfig `json:"builtins"`
+			}
+			decoder := json.NewDecoder(io.LimitReader(os.Stdin, 1<<20))
+			decoder.DisallowUnknownFields()
+			err := decoder.Decode(&request)
+			var result map[string]core.BuiltinToolConfig
+			if err == nil {
+				result, err = core.ValidateProviderBuiltins(request.Provider, request.Builtins)
+			}
+			if err != nil {
+				_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"builtins": result})
+			return
+		}
 		fmt.Printf("apteva-core %s (%s)\n", Version, BuildTime)
 		return
 	}

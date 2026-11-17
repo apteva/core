@@ -239,9 +239,19 @@ type RealtimeSessionOpts struct {
 	TranscribeInput    bool
 	TranscriptionModel string // empty = provider default
 	TurnDetection      RealtimeTurnDetectionConfig
+	OutputConfig       RealtimeOutputConfig
+	timing             *realtimeTiming // internal, session-scoped observer
 	// RestoreHistory asks immutable providers to accept an initial history seed.
 	// Fresh sessions must not synthesize an empty completed conversation turn.
-	RestoreHistory bool
+	RestoreHistory           bool
+	History                  []Message // startup seed for providers whose history is immutable
+	ConversationInstructions string    // voice role; backend keeps the full Core prompt
+	ExecutionMode            string
+	ExecutionModel           string
+	ExecutionReasoning       string
+	ExecutionInstructions    string
+	ExecutionTools           []NativeTool
+	InitialMessage           string // trusted greeting instructions, seeded at startup
 }
 
 // RealtimePricing supports dollars per one million tokens plus optional
@@ -261,6 +271,7 @@ type RealtimePricing struct {
 	AudioInputPerMinute  float64
 	AudioOutputPerMinute float64
 	TextInputPerMessage  float64
+	SessionPerMinute     float64
 }
 
 // RealtimeUsage is the detailed token accounting carried by a completed
@@ -280,6 +291,7 @@ type RealtimeUsage struct {
 	AudioInputSeconds  float64
 	AudioOutputSeconds float64
 	TextInputMessages  int
+	SessionSeconds     float64 // a delta, even when the provider reports cumulative usage
 }
 
 // RealtimeAudioFrame is the provider-neutral unit sent to an external audio
@@ -287,10 +299,33 @@ type RealtimeUsage struct {
 // 24 kHz, mono). ItemID and AudioEndMS let the renderer report how much of an
 // assistant item was actually played without knowing the provider protocol.
 type RealtimeAudioFrame struct {
-	Audio      []byte
-	ResponseID string
-	ItemID     string
-	AudioEndMS int
+	providerObservedAt time.Time
+	queuedAt           time.Time
+	SessionGeneration  int64
+	Audio              []byte
+	ResponseID         string
+	ItemID             string
+	AudioEndMS         int
+	Silent             bool // PCM remains ordered; silence does not imply active speech
+	timing             *realtimeTiming
+	cancelled          func() bool // invalidated playback must never reach the renderer
+	settle             func(int)
+	delivery           func(bool) // bridge write receipt; never a playback acknowledgement
+}
+
+func (f RealtimeAudioFrame) written(success bool) {
+	written := 0
+	if success {
+		written = len(f.Audio)
+	}
+	f.writtenBytes(written)
+}
+func (f RealtimeAudioFrame) writtenBytes(written int) {
+	if f.settle != nil {
+		f.settle(written)
+	} else if f.delivery != nil {
+		f.delivery(written == len(f.Audio))
+	}
 }
 
 // RealtimeSession is the live, bidirectional handle to a single
@@ -300,6 +335,9 @@ type RealtimeSession interface {
 	// SendAudio pushes a chunk of input audio in the configured
 	// AudioInFmt to the model. Non-blocking on the model side — the
 	// session buffers and the network does its own back-pressure.
+	// nil means the entire frame was admitted locally exactly once, not that
+	// the provider received it. RealtimeErrorPressure/Closed mean no admission;
+	// callers may retry. Other failures may have uncertain remote delivery.
 	SendAudio(pcm []byte) error
 
 	// SendText injects a text message into the conversation. role is
@@ -310,7 +348,9 @@ type RealtimeSession interface {
 
 	// SendToolResult delivers one tool result without starting the next model
 	// response. This separation lets the generic thinker submit every result
-	// from a parallel tool batch before requesting one continuation.
+	// from a parallel tool batch before requesting one continuation. Sessions
+	// opting into realtimeAsyncToolSession instead deliver each result directly
+	// to an already-running interaction, without an explicit continuation.
 	SendToolResult(callID, result string, isError bool) error
 
 	// RequestResponse asks the provider to continue after text or tool items
@@ -326,9 +366,9 @@ type RealtimeSession interface {
 	// renewal so the worker can continue rather than becoming a blank agent.
 	RestoreConversation(messages []Message) error
 
-	// Interrupt cancels the model's current utterance. Used when new
-	// user audio arrives during model speech, or when main sends a
-	// course-correction the worker decides to act on immediately.
+	// Interrupt requests that the provider stop its current speech. Some
+	// protocols send a cancellation; others append a corrective instruction.
+	// Success means the command was queued, not confirmed cancellation.
 	Interrupt() error
 
 	// Truncate removes the unplayed suffix of an assistant audio item after
@@ -343,6 +383,18 @@ type RealtimeSession interface {
 	// Close terminates the session and releases resources. Safe to
 	// call multiple times.
 	Close() error
+}
+
+// Optional capability for providers that continue reasoning while tools run.
+// SendToolResult delivers immediately; no RequestResponse is needed afterwards.
+// Other providers retain the existing explicit batch/continuation contract.
+type realtimeAsyncToolSession interface {
+	SendsToolResultsImmediately() bool
+}
+
+func realtimeToolsAreAsync(session RealtimeSession) bool {
+	async, ok := session.(realtimeAsyncToolSession)
+	return ok && async.SendsToolResultsImmediately()
 }
 
 // RealtimeConfigurationDisposition describes how a live provider can apply a
@@ -382,32 +434,61 @@ var ErrRealtimeResumeUnavailable = errors.New("realtime resumption unavailable")
 // emit. Receivers should switch on Type before reading fields.
 type RealtimeEventType string
 
+// A provider may cancel a call before Core consumes its cancellation event.
+// Adapters return this sentinel instead of treating the late result as a broken
+// connection. Core normalizes the race through the same cancellation lifecycle.
+var ErrRealtimeToolCallCancelled = errors.New("realtime tool call was cancelled")
+
 const (
-	RealtimeEventAudioOut         RealtimeEventType = "audio_out"         // PCM chunk
-	RealtimeEventTranscriptInput  RealtimeEventType = "transcript_input"  // user said
-	RealtimeEventTranscriptOutput RealtimeEventType = "transcript_output" // model said
-	RealtimeEventToolCall         RealtimeEventType = "tool_call"
-	RealtimeEventResponseStarted  RealtimeEventType = "response_started"
-	RealtimeEventResponseDone     RealtimeEventType = "response_done"
-	RealtimeEventSpeechStarted    RealtimeEventType = "speech_started"
-	RealtimeEventRateLimits       RealtimeEventType = "rate_limits"
-	RealtimeEventSessionEnded     RealtimeEventType = "session_ended"
-	RealtimeEventOutputBlocked    RealtimeEventType = "output_blocked"
-	RealtimeEventError            RealtimeEventType = "error"
-	RealtimeEventSessionExpiring  RealtimeEventType = "session_expiring"
+	RealtimeEventAudioOut             RealtimeEventType = "audio_out"         // PCM chunk
+	RealtimeEventTranscriptInput      RealtimeEventType = "transcript_input"  // user said
+	RealtimeEventTranscriptOutput     RealtimeEventType = "transcript_output" // model said
+	RealtimeEventToolCall             RealtimeEventType = "tool_call"
+	RealtimeEventToolCallCancelled    RealtimeEventType = "tool_call_cancelled"
+	RealtimeEventResponseStarted      RealtimeEventType = "response_started"
+	RealtimeEventResponseDone         RealtimeEventType = "response_done"
+	RealtimeEventUtteranceDone        RealtimeEventType = "utterance_done" // speech finished, interaction still active
+	RealtimeEventSpeechStarted        RealtimeEventType = "speech_started"
+	RealtimeEventSessionReady         RealtimeEventType = "session_ready"
+	RealtimeEventSpeechStopped        RealtimeEventType = "speech_stopped"
+	RealtimeEventRateLimits           RealtimeEventType = "rate_limits"
+	RealtimeEventSessionEnded         RealtimeEventType = "session_ended"
+	RealtimeEventOutputBlocked        RealtimeEventType = "output_blocked"
+	RealtimeEventTranscriptIncomplete RealtimeEventType = "transcript_incomplete"
+	RealtimeEventError                RealtimeEventType = "error"
+	RealtimeEventSessionExpiring      RealtimeEventType = "session_expiring"
+	RealtimeEventBackendProgress      RealtimeEventType = "backend_progress"
+	RealtimeEventDelegation           RealtimeEventType = "delegation"
+	RealtimeEventSessionUsage         RealtimeEventType = "session_usage"
+	RealtimeEventContextAcknowledged  RealtimeEventType = "context_acknowledged"
 )
 
 // RealtimeEvent is a single event from a session. Only the fields
 // relevant to the Type are populated.
 type RealtimeEvent struct {
-	Type RealtimeEventType
+	audioForwarded bool           // internal audio-lane observation; payload already delivered
+	ObservedAt     time.Time      // local receipt time; never a provider wall clock
+	Settings       map[string]any // sanitized session acknowledgement
+	Type           RealtimeEventType
 
 	// Audio (RealtimeEventAudioOut)
 	Audio []byte
 
 	// Transcript (RealtimeEventTranscript*)
-	Transcript string
-	Final      bool // true = end-of-utterance, false = partial
+	Transcript        string
+	Final             bool // true = end-of-utterance, false = partial
+	TranscriptDelta   bool // partial is an increment rather than a complete snapshot
+	TranscriptStartMS int
+	TranscriptEndMS   int
+	TranscriptGrouped bool // application grouping; never provider-final evidence
+	// Optional explicit output-to-work evidence. Never derive it from timing.
+	OutputWork         *ThreadWork
+	OutputPurpose      string // answer or backchannel; empty means unknown
+	DelegationID       string
+	ApplicationOwned   bool // work originated in Core; no provider delegation ID
+	DelegationOffsetMS int
+	ClientEventID      string
+	Terminal           bool // provider says this session must not be automatically restarted
 
 	// Tool call (RealtimeEventToolCall)
 	ToolCallID string
@@ -423,6 +504,8 @@ type RealtimeEvent struct {
 	AudioEndMS        int
 	Usage             RealtimeUsage
 	DroppedAudio      uint64
+	PlaybackID        string // application audio identity; independent of transcript grouping
+	AudioSilence      bool   // provider-neutral PCM voice observation
 	OutputBlockReason string // RealtimeEventOutputBlocked; no leaked content
 
 	// Error (RealtimeEventError)

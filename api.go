@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,6 +151,7 @@ func newCoreHTTPServer(thinker *Thinker) (*http.Server, error) {
 	//   DELETE /memory/by-id/{id}  — drop by ULID (preferred for
 	//                                 platform-driven cleanup)
 	mux.HandleFunc("/memory", api.apiAuth(api.memoryRoot))
+	mux.HandleFunc("/memory/forget-source", api.apiAuth(api.memoryForgetSource))
 	mux.HandleFunc("/memory/", api.apiAuth(api.memoryItem))
 	mux.HandleFunc("/", api.apiAuth(http.FileServer(http.Dir("web")).ServeHTTP))
 	return &http.Server{
@@ -196,24 +198,25 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 }
 
 type threadJSON struct {
-	Inference  InferenceHealth `json:"inference"`
-	ID         string          `json:"id"`
-	Name       string          `json:"name,omitempty"`
-	ParentID   string          `json:"parent_id,omitempty"`
-	Depth      int             `json:"depth"`
-	Directive  string          `json:"directive,omitempty"`
-	Tools      []string        `json:"tools,omitempty"`
-	MCPNames   []string        `json:"mcp_names,omitempty"`
-	Iteration  int             `json:"iteration"`
-	Rate       string          `json:"rate"`
-	NextWakeAt string          `json:"next_wake_at,omitempty"`
-	Model      string          `json:"model"`
-	Reasoning  string          `json:"reasoning,omitempty"`
-	Age        string          `json:"age"`
-	Realtime   bool            `json:"realtime,omitempty"`
-	Ephemeral  bool            `json:"ephemeral,omitempty"`
-	Voice      string          `json:"voice,omitempty"`
-	Provider   string          `json:"provider,omitempty"`
+	Inference           InferenceHealth `json:"inference"`
+	ID                  string          `json:"id"`
+	Name                string          `json:"name,omitempty"`
+	ParentID            string          `json:"parent_id,omitempty"`
+	Depth               int             `json:"depth"`
+	Directive           string          `json:"directive,omitempty"`
+	Tools               []string        `json:"tools,omitempty"`
+	MCPNames            []string        `json:"mcp_names,omitempty"`
+	InheritCapabilities bool            `json:"inherit_capabilities,omitempty"`
+	Iteration           int             `json:"iteration"`
+	Rate                string          `json:"rate"`
+	NextWakeAt          string          `json:"next_wake_at,omitempty"`
+	Model               string          `json:"model"`
+	Reasoning           string          `json:"reasoning,omitempty"`
+	Age                 string          `json:"age"`
+	Realtime            bool            `json:"realtime,omitempty"`
+	Ephemeral           bool            `json:"ephemeral,omitempty"`
+	Voice               string          `json:"voice,omitempty"`
+	Provider            string          `json:"provider,omitempty"`
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
@@ -246,24 +249,25 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 	collectThreads = func(tm *ThreadManager) {
 		for _, t := range tm.List() {
 			out = append(out, threadJSON{
-				Inference:  t.Inference,
-				ID:         t.ID,
-				Name:       t.Name,
-				ParentID:   t.ParentID,
-				Depth:      t.Depth,
-				Directive:  t.Directive,
-				Tools:      t.Tools,
-				MCPNames:   t.MCPNames,
-				Iteration:  t.Iteration,
-				Rate:       t.Rate.String(),
-				NextWakeAt: formatNextWakeAt(t.NextWakeAt),
-				Model:      t.Model.String(),
-				Reasoning:  t.Reasoning.String(),
-				Age:        formatAge(time.Since(t.Started)),
-				Realtime:   t.Realtime,
-				Ephemeral:  t.Ephemeral,
-				Voice:      t.Voice,
-				Provider:   t.Provider,
+				Inference:           t.Inference,
+				ID:                  t.ID,
+				Name:                t.Name,
+				ParentID:            t.ParentID,
+				Depth:               t.Depth,
+				Directive:           t.Directive,
+				Tools:               t.Tools,
+				MCPNames:            t.MCPNames,
+				InheritCapabilities: t.InheritCapabilities,
+				Iteration:           t.Iteration,
+				Rate:                t.Rate.String(),
+				NextWakeAt:          formatNextWakeAt(t.NextWakeAt),
+				Model:               t.Model.String(),
+				Reasoning:           t.Reasoning.String(),
+				Age:                 formatAge(time.Since(t.Started)),
+				Realtime:            t.Realtime,
+				Ephemeral:           t.Ephemeral,
+				Voice:               t.Voice,
+				Provider:            t.Provider,
 			})
 			// Recurse into children
 			if t.SubThreads > 0 {
@@ -497,9 +501,10 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		tools = *body.Tools
 	}
 	result, err := a.thinker.threads.UpdateWithEvents(id, "", directive, tools, ThreadUpdateOptions{
-		RestartRealtime: body.RestartRealtime,
-		ReplaceTools:    body.Tools != nil,
-		MCPNames:        body.MCP,
+		RestartRealtime:         body.RestartRealtime,
+		ReplaceTools:            body.Tools != nil,
+		MCPNames:                body.MCP,
+		BypassCapabilityCeiling: true,
 	}, normalizedEvents)
 	if err != nil {
 		if errors.Is(err, ErrRealtimeConfigurationRestartRequired) {
@@ -586,6 +591,13 @@ func parseAPIEventMessage(raw json.RawMessage) (string, []ContentPart, error) {
 		case "audio_url":
 			if part.AudioURL == nil || strings.TrimSpace(part.AudioURL.URL) == "" {
 				return "", nil, fmt.Errorf("message part %d: audio_url.url required", i)
+			}
+		case "file_ref":
+			if part.Text != "" || part.ImageURL != nil || part.InputAudio != nil || part.AudioURL != nil {
+				return "", nil, fmt.Errorf("message part %d: file_ref may contain only reference metadata", i)
+			}
+			if err := validateFileRef(part.FileRef); err != nil {
+				return "", nil, fmt.Errorf("message part %d: %w", i, err)
 			}
 		default:
 			return "", nil, fmt.Errorf("message part %d: unsupported type %q", i, part.Type)
@@ -703,10 +715,10 @@ func (a *APIServer) rollbackAPICreatedThread(id string) {
 // spawnThread handles POST /threads/{id}. Idempotent: if the thread
 // already exists, returns its current state with status="exists". Otherwise it
 // spawns a new one with the given directive + tools + mcp and returns
-// status="created". Missing
-// fields fall back to inherit-from-main: directive=main's directive,
-// tools=[] (spawnInternal supplies the safe baseline: send, done,
-// pace, evolve), mcp=[].
+// status="created". Missing capability fields inherit the main thread's
+// delegable ceiling. Explicit tools or mcp arrays retain the legacy strict
+// profile behavior, including explicitly empty arrays for a minimal worker.
+// Missing directive fields continue to inherit the main directive.
 func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id string) {
 	if id == "main" {
 		http.Error(w, "cannot spawn over main", http.StatusBadRequest)
@@ -730,6 +742,8 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		InitialMessage             string                      `json:"initial_message,omitempty"`
 		Events                     []apiThreadEventRequest     `json:"events,omitempty"`
 		BridgeDisconnectTTLSeconds int                         `json:"bridge_disconnect_ttl_seconds,omitempty"`
+		RealtimeExecution          *RealtimeExecutionConfig    `json:"realtime_execution,omitempty"`
+		RealtimeOutput             RealtimeOutputConfig        `json:"realtime_output,omitempty"`
 		TurnDetection              RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`
 	}
 	if r.ContentLength > 0 {
@@ -789,19 +803,31 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 	// grabbing them. The LLM's spawn-tool path doesn't set
 	// this, so in-agent workers still can't escalate.
 	opts := SpawnOpts{
-		MCPNames:      body.MCP,
-		BypassNoSpawn: true,
-		Realtime:      body.Realtime,
-		Ephemeral:     body.Ephemeral,
-		Voice:         body.Voice,
-		TurnDetection: body.TurnDetection,
-		ProviderName:  body.ProviderName,
-		Model:         strings.ToLower(strings.TrimSpace(body.Model)),
-		DeferRun:      true,
+		MCPNames:          body.MCP,
+		BypassNoSpawn:     true,
+		Realtime:          body.Realtime,
+		Ephemeral:         body.Ephemeral,
+		Voice:             body.Voice,
+		TurnDetection:     body.TurnDetection,
+		RealtimeOutput:    body.RealtimeOutput,
+		RealtimeExecution: cloneRealtimeExecutionConfig(body.RealtimeExecution),
+		ProviderName:      body.ProviderName,
+		Model:             strings.ToLower(strings.TrimSpace(body.Model)),
+		DeferRun:          true,
 	}
 	if body.BridgeDisconnectTTLSeconds < 0 || body.BridgeDisconnectTTLSeconds > 3600 {
 		http.Error(w, "bridge_disconnect_ttl_seconds must be between 0 and 3600", http.StatusBadRequest)
 		return
+	}
+	if !body.Realtime && !body.RealtimeOutput.isZero() {
+		http.Error(w, "realtime_output requires realtime=true", http.StatusBadRequest)
+		return
+	}
+	if output, err := body.RealtimeOutput.normalized(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	} else {
+		opts.RealtimeOutput = output
 	}
 	if !body.Realtime && !body.TurnDetection.isZero() {
 		http.Error(w, "turn_detection requires realtime=true", http.StatusBadRequest)
@@ -858,7 +884,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		opts.AudioControl = audioControl
 	}
 
-	if err := a.thinker.mutateRuntime(func() error { return a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts) }); err != nil {
+	if err := a.thinker.createRuntimeChild(func() error { return a.thinker.threads.SpawnWithOpts(id, directive, body.Tools, opts) }); err != nil {
 		// Race: another caller spawned the same id between our
 		// findThinkerByID check and the lock inside Spawn. Treat as
 		// success — the caller's intent (a live thread by this name)
@@ -1012,6 +1038,10 @@ func (a *APIServer) control(w http.ResponseWriter, r *http.Request) {
 		a.thinker.execution = NewExecutionController(a.thinker.config.GetExecutionControl())
 	}
 	if strings.ToLower(strings.TrimSpace(body.Action)) == "restore_checkpoint" {
+		if body.Scope != "" && body.Scope != "instance" {
+			http.Error(w, "checkpoint restore requires instance scope", http.StatusBadRequest)
+			return
+		}
 		meta, err := a.thinker.restoreExecutionCheckpoint(body.CheckpointID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1114,7 +1144,7 @@ func (a *APIServer) postEvent(w http.ResponseWriter, r *http.Request) {
 	if threadID != "main" && findThinkerByID(a.thinker, threadID) == nil && !a.thinker.bus.HasSubscriber(threadID) {
 		directive := a.thinker.config.GetDirective()
 		created := false
-		if err := a.thinker.mutateRuntime(func() error { return a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}) }); err != nil {
+		if err := a.thinker.createRuntimeChild(func() error { return a.thinker.threads.SpawnWithOpts(threadID, directive, nil, SpawnOpts{}) }); err != nil {
 			if !strings.Contains(err.Error(), "already exists") {
 				logMsg("API", fmt.Sprintf("lazy spawn %q failed: %v", threadID, err))
 				http.Error(w, "failed to spawn thread: "+err.Error(), http.StatusInternalServerError)
@@ -1195,6 +1225,15 @@ func (a *APIServer) eventLifecycle(w http.ResponseWriter, r *http.Request) {
 
 func (a *APIServer) config(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPut {
+		body, valid := a.decodeConfigUpdate(w, r)
+		if !valid {
+			return
+		}
+		if !configUpdateChanges(a.thinker.config, body) {
+			writeJSON(w, map[string]any{"status": "updated"})
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), configUpdateKey{}, body))
 		if err := a.thinker.mutateRuntime(func() error { a.configNow(w, r); return nil }); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 		}
@@ -1252,73 +1291,25 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, map[string]any{
 			"automatic_tool_loading": a.thinker.config.GetAutomaticToolLoading(),
+			"memory_policy":          a.thinker.config.GetMemoryPolicy(),
 			"directive":              a.thinker.config.GetDirective(),
 			"provider":               providerInfo,
 			"providers":              a.thinker.config.GetProviders(),
+			"builtin_capabilities":   status.BuiltinCapabilities,
 			"mcp_servers":            mcpInfo,
 			"execution_control":      a.thinker.executionStatus(),
 			"execution_checkpoints":  a.thinker.executionCheckpointMeta(),
 			"realtime_enabled":       a.thinker.config.RealtimeEnabledFlag(),
+			"realtime_providers":     status.RealtimeProviders,
 			"realtime_voice":         a.thinker.config.GetRealtimeVoice(),
 			"realtime_voice_mcp":     a.thinker.config.GetRealtimeVoiceMCP(),
 		})
 	case http.MethodPut:
-		var body struct {
-			AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
-			Directive            string                      `json:"directive,omitempty"`
-			Provider             *ProviderConfig             `json:"provider,omitempty"`
-			Providers            []ProviderConfig            `json:"providers,omitempty"`
-			Computer             json.RawMessage             `json:"computer,omitempty"`
-			MCPServers           []MCPServerConfig           `json:"mcp_servers,omitempty"`
-			Execution            *ExecutionControlConfig     `json:"execution_control,omitempty"`
-			RealtimeEnabled      *bool                       `json:"realtime_enabled,omitempty"`
-			RealtimeVoice        *string                     `json:"realtime_voice,omitempty"`
-			RealtimeVoiceMCP     *[]string                   `json:"realtime_voice_mcp,omitempty"`
-			Reset                *struct {
-				History bool `json:"history,omitempty"`
-				Memory  bool `json:"memory,omitempty"`
-				Threads bool `json:"threads,omitempty"`
-			} `json:"reset,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := validateAutomaticToolLoading(body.AutomaticToolLoading); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if len(body.Computer) > 0 {
-			http.Error(w, "core computer config has been removed; use the Computer app MCP tools instead", http.StatusGone)
-			return
-		}
-		for _, server := range body.MCPServers {
-			if err := validateMCPToolLoading(server); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if body.RealtimeVoice != nil {
-			candidate := &Config{}
-			if err := candidate.SetRealtimeVoice(*body.RealtimeVoice); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil {
-			providers := a.thinker.config.GetProviders()
-			if len(body.Providers) > 0 {
-				providers = cloneProviderConfigs(body.Providers)
-			}
-			if body.Provider != nil {
-				providers = mergeProviderConfig(providers, *body.Provider)
-			}
-			enabled := a.thinker.config.RealtimeEnabledFlag()
-			if body.RealtimeEnabled != nil {
-				enabled = *body.RealtimeEnabled
-			}
-			if _, err := buildProviderPool(&Config{Providers: providers, RealtimeEnabled: enabled}); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+		body, prevalidated := r.Context().Value(configUpdateKey{}).(configUpdate)
+		if !prevalidated {
+			var valid bool
+			body, valid = a.decodeConfigUpdate(w, r)
+			if !valid {
 				return
 			}
 		}
@@ -1347,6 +1338,9 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 		commit := func(mcp []MCPServerConfig) error {
 			return cfg.update(func() {
+				if body.MemoryPolicy != nil {
+					cfg.MemoryPolicy = MemoryPolicy{ExcludeThreads: append([]string(nil), body.MemoryPolicy.ExcludeThreads...)}
+				}
 				if body.AutomaticToolLoading != nil {
 					cfg.AutomaticToolLoading = body.AutomaticToolLoading
 				}
@@ -1478,12 +1472,14 @@ func writeJSON(w http.ResponseWriter, v any) {
 // continues to work; ID is also exposed for callers that want to
 // address by id directly.
 type memoryListItem struct {
-	Index  int       `json:"index"`
-	ID     string    `json:"id"`
-	Text   string    `json:"text"` // = MemoryRecord.Content (kept as `text` for backward UI compat)
-	Tags   []string  `json:"tags,omitempty"`
-	Weight float64   `json:"weight,omitempty"`
-	Time   time.Time `json:"time"` // = MemoryRecord.TS
+	Scope   string         `json:"scope,omitempty"`
+	Sources []MemorySource `json:"sources,omitempty"`
+	Index   int            `json:"index"`
+	ID      string         `json:"id"`
+	Text    string         `json:"text"` // = MemoryRecord.Content (kept as `text` for backward UI compat)
+	Tags    []string       `json:"tags,omitempty"`
+	Weight  float64        `json:"weight,omitempty"`
+	Time    time.Time      `json:"time"` // = MemoryRecord.TS
 }
 
 // memoryRoot dispatches /memory by method:
@@ -1515,12 +1511,14 @@ func (a *APIServer) memoryList(w http.ResponseWriter, r *http.Request) {
 	out := make([]memoryListItem, len(active))
 	for i, r := range active {
 		out[i] = memoryListItem{
-			Index:  i,
-			ID:     r.ID,
-			Text:   r.Content,
-			Tags:   r.Tags,
-			Weight: r.Weight,
-			Time:   r.TS,
+			Scope:   r.Scope,
+			Sources: r.Sources,
+			Index:   i,
+			ID:      r.ID,
+			Text:    r.Content,
+			Tags:    r.Tags,
+			Weight:  r.Weight,
+			Time:    r.TS,
 		}
 	}
 	writeJSON(w, out)
@@ -1548,6 +1546,7 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		Tags    []string `json:"tags"`
 		Weight  float64  `json:"weight"`
 		Reason  string   `json:"reason"` // optional supersede reason
+		Scope   *string  `json:"scope"`  // omitted preserves existing scope; empty explicitly shares
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -1558,8 +1557,16 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimSpace(body.ID)
+	var metadata []MemoryMetadata
+	if body.Scope != nil {
+		if *body.Scope != "" && !validMemoryThreadID(*body.Scope) {
+			http.Error(w, "invalid memory scope", http.StatusBadRequest)
+			return
+		}
+		metadata = []MemoryMetadata{{Scope: *body.Scope}}
+	}
 	if id == "" {
-		newID, err := a.thinker.memory.Remember(body.Content, body.Tags, body.Weight)
+		newID, err := a.thinker.memory.Remember(body.Content, body.Tags, body.Weight, metadata...)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -1572,7 +1579,7 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		if reason == "" {
 			reason = "upsert via POST /memory"
 		}
-		newID, err := a.thinker.memory.Supersede(targetID, body.Content, body.Tags, body.Weight, reason)
+		newID, err := a.thinker.memory.Supersede(targetID, body.Content, body.Tags, body.Weight, reason, metadata...)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -1580,7 +1587,7 @@ func (a *APIServer) memoryUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"id": newID, "supersedes": targetID, "source_id": id, "action": "upserted"})
 		return
 	}
-	newID, err := a.thinker.memory.RememberWithID(id, body.Content, body.Tags, body.Weight)
+	newID, err := a.thinker.memory.RememberWithID(id, body.Content, body.Tags, body.Weight, metadata...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

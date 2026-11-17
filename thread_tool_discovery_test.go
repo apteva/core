@@ -458,6 +458,7 @@ func TestWorkerNoSpawnToolCannotBeDiscoveredOrExecuted(t *testing.T) {
 		[]string{toolName},
 		SpawnOpts{
 			DeferRun: true, MCPNames: []string{"channels"},
+			CapabilityMode: SpawnCapabilitiesExplicit,
 		},
 	); err != nil {
 		t.Fatalf("spawn explicit no_spawn worker: %v", err)

@@ -27,6 +27,7 @@ type PersistentPaceState struct {
 // entries retain their payload so they can be replayed after a crash;
 // consumed entries retain only ID+hash as the bounded deduplication ledger.
 type PersistentThreadEvent struct {
+	Work           *ThreadWork   `json:"work,omitempty"`
 	ExecutionIDs   []string      `json:"execution_ids,omitempty"`
 	ID             string        `json:"id"`
 	Hash           string        `json:"hash"`
@@ -38,23 +39,27 @@ type PersistentThreadEvent struct {
 }
 
 type PersistentThread struct {
-	ID            string                       `json:"id"`
-	Name          string                       `json:"name,omitempty"`      // human-readable label; empty = display as ID
-	ParentID      string                       `json:"parent_id,omitempty"` // empty = child of main
-	Depth         int                          `json:"depth,omitempty"`     // 0 = main's direct child
-	System        bool                         `json:"system,omitempty"`    // system thread (can't be killed by LLM)
-	Directive     string                       `json:"directive"`
-	Tools         []string                     `json:"tools"`
-	MCPNames      []string                     `json:"mcp_names,omitempty"`      // MCP servers to connect on respawn
-	Model         string                       `json:"model,omitempty"`          // starting model tier: large, medium, small
-	Reasoning     string                       `json:"reasoning,omitempty"`      // starting reasoning effort: auto, low, medium, high, ...
-	Provider      string                       `json:"provider,omitempty"`       // provider selected for this thread
-	Realtime      bool                         `json:"realtime,omitempty"`       // spawn as a realtime (voice/audio) thread
-	AllowNoSpawn  bool                         `json:"allow_no_spawn,omitempty"` // authenticated system/API grant for explicitly attached no_spawn MCPs
-	Voice         string                       `json:"voice,omitempty"`          // realtime voice id (e.g. "marin"); empty = provider default
-	TurnDetection *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"` // realtime VAD/turn-taking profile and overrides
-	Pace          *PersistentPaceState         `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
-	Events        []PersistentThreadEvent      `json:"events,omitempty"`         // pending inbox payloads + bounded consumed-ID ledger
+	RealtimeExecution   *RealtimeExecutionConfig     `json:"realtime_execution,omitempty"`
+	WorkMode            bool                         `json:"work_mode,omitempty"`
+	ID                  string                       `json:"id"`
+	Name                string                       `json:"name,omitempty"`      // human-readable label; empty = display as ID
+	ParentID            string                       `json:"parent_id,omitempty"` // empty = child of main
+	Depth               int                          `json:"depth,omitempty"`     // 0 = main's direct child
+	System              bool                         `json:"system,omitempty"`    // system thread (can't be killed by LLM)
+	Directive           string                       `json:"directive"`
+	Tools               []string                     `json:"tools"`
+	MCPNames            []string                     `json:"mcp_names,omitempty"`            // effective MCP server scopes captured for audit/restart
+	InheritCapabilities bool                         `json:"inherit_capabilities,omitempty"` // recompute from the parent's ceiling on respawn
+	Model               string                       `json:"model,omitempty"`                // starting model tier: large, medium, small
+	Reasoning           string                       `json:"reasoning,omitempty"`            // starting reasoning effort: auto, low, medium, high, ...
+	Provider            string                       `json:"provider,omitempty"`             // provider selected for this thread
+	Realtime            bool                         `json:"realtime,omitempty"`             // spawn as a realtime (voice/audio) thread
+	AllowNoSpawn        bool                         `json:"allow_no_spawn,omitempty"`       // authenticated system/API grant for explicitly attached no_spawn MCPs
+	Voice               string                       `json:"voice,omitempty"`                // realtime voice id (e.g. "marin"); empty = provider default
+	RealtimeOutput      *RealtimeOutputConfig        `json:"realtime_output,omitempty"`
+	TurnDetection       *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"` // realtime VAD/turn-taking profile and overrides
+	Pace                *PersistentPaceState         `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
+	Events              []PersistentThreadEvent      `json:"events,omitempty"`         // pending inbox payloads + bounded consumed-ID ledger
 }
 
 // ProviderConfig persists a provider and its model selections.
@@ -82,10 +87,18 @@ type ProviderConfig struct {
 	Models            map[string]string            `json:"models,omitempty"`             // "large" → model ID, "medium" → ..., "small" → ...
 	ModelCapabilities map[string]ModelCapabilities `json:"model_capabilities,omitempty"` // selected model metadata keyed by model ID
 	BuiltinTools      []string                     `json:"builtin_tools,omitempty"`      // e.g. ["code_execution"]
+	Builtins          map[string]BuiltinToolConfig `json:"builtins,omitempty"`           // provider-hosted capability flags and options
+	ImageGeneration   *ImageGenerationConfig       `json:"image_generation,omitempty"`   // experimental hosted image generation; disabled by default
+	ServiceTier       string                       `json:"service_tier,omitempty"`       // provider request tier, e.g. "priority"
+	MaxOutputTokens   int                          `json:"max_output_tokens,omitempty"`  // Anthropic turn output limit; 0 uses 16K, bounded by model maximum
 	RealtimeVoice     string                       `json:"realtime_voice,omitempty"`     // default voice for realtime providers (e.g. "marin")
+	RealtimeModels    map[string]string            `json:"realtime_models,omitempty"`    // voice models on this same API integration
+	RealtimeExecution RealtimeExecutionConfig      `json:"realtime_execution,omitempty,omitzero"`
 }
 
 type Config struct {
+	ParentReports        []PendingParentReport       `json:"parent_reports,omitempty"`
+	MemoryPolicy         MemoryPolicy                `json:"memory_policy,omitempty"`
 	AutomaticToolLoading *AutomaticToolLoadingConfig `json:"automatic_tool_loading,omitempty"`
 	RuntimeSequence      uint64                      `json:"runtime_sequence,omitempty"`
 	mu                   sync.RWMutex
@@ -146,6 +159,12 @@ func (c *Config) load() error {
 		}
 	}
 	if err := validateAutomaticToolLoading(c.AutomaticToolLoading); err != nil {
+		return err
+	}
+	if err := validateMemoryPolicy(&c.MemoryPolicy); err != nil {
+		return err
+	}
+	if err := validateExecutionControl(c.Execution); err != nil {
 		return err
 	}
 	return c.loadRuntimeJournalLocked()
@@ -220,6 +239,7 @@ func (c *Config) restore(data []byte) {
 	c.RuntimeSequence = restored.RuntimeSequence
 	c.Directive = restored.Directive
 	c.Unconscious = restored.Unconscious
+	c.MemoryPolicy = restored.MemoryPolicy
 	c.RealtimeEnabled = restored.RealtimeEnabled
 	c.RealtimeVoice = restored.RealtimeVoice
 	c.RealtimeVoiceMCP = restored.RealtimeVoiceMCP
@@ -407,7 +427,9 @@ func (c *Config) GetThreads() []PersistentThread {
 	out := make([]PersistentThread, len(c.Threads))
 	copy(out, c.Threads)
 	for i := range out {
+		out[i].RealtimeExecution = cloneRealtimeExecutionConfig(out[i].RealtimeExecution)
 		out[i].Pace = clonePersistentPaceState(out[i].Pace)
+		out[i].RealtimeOutput = cloneRealtimeOutputConfig(out[i].RealtimeOutput)
 		out[i].TurnDetection = cloneRealtimeTurnDetectionConfig(out[i].TurnDetection)
 		out[i].Events = clonePersistentThreadEvents(out[i].Events)
 	}
@@ -425,17 +447,14 @@ func (c *Config) GetMCPServers() []MCPServerConfig {
 func (c *Config) GetExecutionControl() ExecutionControlConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := c.Execution
-	if len(c.Execution.Breakpoints) > 0 {
-		out.Breakpoints = append([]string(nil), c.Execution.Breakpoints...)
-	}
-	return out
+	return cloneExecutionControl(c.Execution)
 }
 
 func (c *Config) SetExecutionControl(ec ExecutionControlConfig) error {
-	if len(ec.Breakpoints) > 0 {
-		ec.Breakpoints = append([]string(nil), ec.Breakpoints...)
+	if err := validateExecutionControl(ec); err != nil {
+		return err
 	}
+	ec = cloneExecutionControl(ec)
 	return c.update(func() { c.Execution = ec })
 }
 
@@ -445,7 +464,7 @@ func (c *Config) GetProviders() []ProviderConfig {
 	defer c.mu.RUnlock()
 	out := make([]ProviderConfig, len(c.Providers))
 	for i, p := range c.Providers {
-		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: p.BuiltinTools, RealtimeVoice: p.RealtimeVoice}
+		cp := ProviderConfig{Name: p.Name, Default: p.Default, BuiltinTools: append([]string(nil), p.BuiltinTools...), Builtins: cloneBuiltinConfigs(p.Builtins), ImageGeneration: cloneImageGenerationConfig(p.ImageGeneration), ServiceTier: p.ServiceTier, RealtimeVoice: p.RealtimeVoice, RealtimeModels: cloneRealtimeModels(p.RealtimeModels), RealtimeExecution: *cloneRealtimeExecutionConfig(&p.RealtimeExecution)}
 		if p.Models != nil {
 			cp.Models = make(map[string]string)
 			for k, v := range p.Models {
@@ -465,11 +484,17 @@ func (c *Config) GetDefaultProvider() *ProviderConfig {
 	for _, p := range c.Providers {
 		if p.Default {
 			cp := p
+			cp.RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
+			cp.ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
+			cp.Builtins = cloneBuiltinConfigs(p.Builtins)
 			return &cp
 		}
 	}
 	if len(c.Providers) > 0 {
 		cp := c.Providers[0]
+		cp.RealtimeModels = cloneRealtimeModels(cp.RealtimeModels)
+		cp.ImageGeneration = cloneImageGenerationConfig(cp.ImageGeneration)
+		cp.Builtins = cloneBuiltinConfigs(cp.Builtins)
 		return &cp
 	}
 	return nil
@@ -488,6 +513,9 @@ func (c *Config) GetProviderByName(name string) *ProviderConfig {
 	for _, p := range c.Providers {
 		if p.Name == name {
 			cp := p
+			cp.RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
+			cp.ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
+			cp.Builtins = cloneBuiltinConfigs(p.Builtins)
 			return &cp
 		}
 	}
@@ -496,17 +524,20 @@ func (c *Config) GetProviderByName(name string) *ProviderConfig {
 
 // SetProvider adds or updates a provider in the list. If it's the only one, marks it default.
 func (c *Config) SetProvider(pc *ProviderConfig) error {
+	copy := *pc
+	copy.ImageGeneration = cloneImageGenerationConfig(pc.ImageGeneration)
+	copy.Builtins = cloneBuiltinConfigs(pc.Builtins)
 	return c.update(func() {
 		found := false
 		for i, p := range c.Providers {
 			if p.Name == pc.Name {
-				c.Providers[i] = *pc
+				c.Providers[i] = copy
 				found = true
 				break
 			}
 		}
 		if !found {
-			c.Providers = append(c.Providers, *pc)
+			c.Providers = append(c.Providers, copy)
 		}
 		if len(c.Providers) == 1 {
 			c.Providers[0].Default = true
@@ -589,6 +620,8 @@ func cloneProviderConfigs(in []ProviderConfig) []ProviderConfig {
 	for i, p := range in {
 		out[i] = p
 		out[i].BuiltinTools = append([]string(nil), p.BuiltinTools...)
+		out[i].ImageGeneration = cloneImageGenerationConfig(p.ImageGeneration)
+		out[i].Builtins = cloneBuiltinConfigs(p.Builtins)
 		if p.Models != nil {
 			out[i].Models = make(map[string]string, len(p.Models))
 			for tier, model := range p.Models {
@@ -596,6 +629,7 @@ func cloneProviderConfigs(in []ProviderConfig) []ProviderConfig {
 			}
 		}
 		out[i].ModelCapabilities = cloneModelCapabilitiesMap(p.ModelCapabilities)
+		out[i].RealtimeModels = cloneRealtimeModels(p.RealtimeModels)
 	}
 	return out
 }
@@ -657,6 +691,33 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 	if update.BuiltinTools != nil {
 		providers[index].BuiltinTools = append([]string(nil), update.BuiltinTools...)
 	}
+	if update.ImageGeneration != nil {
+		providers[index].ImageGeneration = cloneImageGenerationConfig(update.ImageGeneration)
+	}
+	if update.Builtins != nil {
+		if providers[index].Builtins == nil {
+			providers[index].Builtins = map[string]BuiltinToolConfig{}
+		}
+		for name := range update.Builtins {
+			for existing := range providers[index].Builtins {
+				if canonicalBuiltinName(existing) == canonicalBuiltinName(name) {
+					delete(providers[index].Builtins, existing)
+				}
+			}
+		}
+		for name, cfg := range cloneBuiltinConfigs(update.Builtins) {
+			providers[index].Builtins[name] = cfg
+		}
+	}
+	if update.ServiceTier != "" {
+		providers[index].ServiceTier = update.ServiceTier
+	}
+	if update.RealtimeModels != nil {
+		providers[index].RealtimeModels = cloneRealtimeModels(update.RealtimeModels)
+	}
+	if !update.RealtimeExecution.isZero() {
+		providers[index].RealtimeExecution = update.RealtimeExecution
+	}
 	if update.RealtimeVoice != "" {
 		providers[index].RealtimeVoice = update.RealtimeVoice
 	}
@@ -666,4 +727,15 @@ func mergeProviderConfig(providers []ProviderConfig, update ProviderConfig) []Pr
 		}
 	}
 	return providers
+}
+
+func cloneRealtimeModels(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

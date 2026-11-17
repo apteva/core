@@ -19,8 +19,10 @@ type openAIPromptCacheHints struct {
 }
 
 type openAIPromptCacheScope struct {
-	Identity string
-	Epoch    uint64
+	Identity  string
+	Epoch     uint64
+	Namespace string
+	Account   string
 }
 
 type openAIPromptCacheScopeContextKey struct{}
@@ -83,25 +85,43 @@ func openAIPromptCacheHintsForScope(providerName, model, stablePrefix string, to
 	}
 
 	h := sha256.New()
-	h.Write([]byte("apteva-openai-cache-v2\n"))
+	stableIdentity := requestStabilityEnabled("APTEVA_STABLE_CACHE_IDENTITY")
+	version := "v2"
+	if stableIdentity {
+		version = "v3"
+	}
+	h.Write([]byte("apteva-openai-cache-" + version + "\n"))
 	h.Write([]byte(providerName))
 	h.Write([]byte{'\n'})
 	h.Write([]byte(model))
 	h.Write([]byte{'\n'})
 	h.Write([]byte(scope.Identity))
 	h.Write([]byte{'\n'})
-	h.Write([]byte(strconv.FormatUint(scope.Epoch, 10)))
-	h.Write([]byte{'\n'})
-	h.Write([]byte(stablePrefix))
-	h.Write([]byte{'\n'})
-	if tools != nil {
-		if b, err := json.Marshal(tools); err == nil {
-			h.Write(b)
+	if stableIdentity {
+		h.Write([]byte(scope.Namespace))
+		h.Write([]byte{'\n'})
+		h.Write([]byte(scope.Account))
+		h.Write([]byte{'\n'})
+	}
+	// A key partitions reuse; exact prompt matching decides what can be reused.
+	// Diagnostic epochs and changing schemas must not partition one conversation.
+	// Unscoped direct provider callers retain content-based isolation.
+	if !stableIdentity || scope.Identity == "" {
+		if !stableIdentity {
+			h.Write([]byte(strconv.FormatUint(scope.Epoch, 10)))
+			h.Write([]byte{'\n'})
+		}
+		h.Write([]byte(stablePrefix))
+		h.Write([]byte{'\n'})
+		if tools != nil {
+			if b, err := json.Marshal(tools); err == nil {
+				h.Write(b)
+			}
 		}
 	}
 	sum := h.Sum(nil)
 	return openAIPromptCacheHints{
-		Key:       "apteva-v2-" + hex.EncodeToString(sum[:16]),
+		Key:       "apteva-" + version + "-" + hex.EncodeToString(sum[:16]),
 		Retention: retention,
 	}
 }

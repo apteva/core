@@ -29,7 +29,7 @@ func TestIntegration_CodexPromptCacheSmoke(t *testing.T) {
 	provider := NewOpenAICodexProvider(token).(*OpenAINativeProvider)
 	model := strings.TrimSpace(os.Getenv("CODEX_CACHE_SMOKE_MODEL"))
 	if model == "" {
-		model = "gpt-5.6-terra"
+		model = "gpt-6.1-sol"
 	}
 	stablePrefix := strings.Repeat(
 		"This is stable prompt-cache test context. Preserve it exactly and answer only with the requested token. ",

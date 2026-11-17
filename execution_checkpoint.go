@@ -233,6 +233,11 @@ func cloneMessages(in []Message) []Message {
 	out := make([]Message, len(in))
 	for i, m := range in {
 		out[i] = m
+		out[i].Work = cloneThreadWork(m.Work)
+		if m.RealtimeTranscript != nil {
+			meta := *m.RealtimeTranscript
+			out[i].RealtimeTranscript = &meta
+		}
 		out[i].Parts = cloneContentParts(m.Parts)
 		out[i].ToolCalls = cloneToolCalls(m.ToolCalls)
 		out[i].ToolResults = cloneToolResults(m.ToolResults)
@@ -247,6 +252,12 @@ func cloneContentParts(in []ContentPart) []ContentPart {
 	}
 	out := make([]ContentPart, len(in))
 	copy(out, in)
+	for i := range out {
+		if in[i].FileRef != nil {
+			ref := *in[i].FileRef
+			out[i].FileRef = &ref
+		}
+	}
 	return out
 }
 

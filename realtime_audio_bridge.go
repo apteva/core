@@ -99,28 +99,47 @@ func (e *realtimeBridgeControlError) Unwrap() error { return e.err }
 // separate header and payload. Without this lock a reader-generated pong can
 // land between an outbound audio frame's header and payload.
 type realtimeBridgeSocket struct {
-	conn net.Conn
+	window realtimePlaybackWindow
+	conn   net.Conn
 
-	writeMu   sync.Mutex
-	closeSent bool
+	writeMu      sync.Mutex
+	closeSent    bool
+	writeTimeout time.Duration
+	readyOnce    sync.Once
+}
+
+func (s *realtimeBridgeSocket) writeBudget() time.Duration {
+	if s.writeTimeout > 0 {
+		return s.writeTimeout
+	}
+	return realtimeBridgeWriteTimeout
 }
 
 func (s *realtimeBridgeSocket) writeAudio(metadata, audio []byte) error {
+	_, err := s.writePlaybackAudio(metadata, audio, nil)
+	return err
+}
+
+func (s *realtimeBridgeSocket) writePlaybackAudio(metadata, audio []byte, cancelled func() bool) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closeSent {
-		return net.ErrClosed
+	if cancelled != nil && cancelled() {
+		return false, nil
 	}
-	if err := s.conn.SetWriteDeadline(time.Now().Add(realtimeBridgeWriteTimeout)); err != nil {
-		return err
+	if s.closeSent {
+		return false, net.ErrClosed
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
+		return false, err
 	}
 	// Keep metadata and its audio frame adjacent. Control frames may legally
 	// occur between data frames, but the bridge's application protocol treats
 	// this pair as one unit.
 	if err := wsutil.WriteServerMessage(s.conn, ws.OpText, metadata); err != nil {
-		return err
+		return false, err
 	}
-	return wsutil.WriteServerBinary(s.conn, audio)
+	err := wsutil.WriteServerBinary(s.conn, audio)
+	return err == nil, err
 }
 
 func (s *realtimeBridgeSocket) writeText(payload []byte) error {
@@ -129,7 +148,7 @@ func (s *realtimeBridgeSocket) writeText(payload []byte) error {
 	if s.closeSent {
 		return net.ErrClosed
 	}
-	if err := s.conn.SetWriteDeadline(time.Now().Add(realtimeBridgeWriteTimeout)); err != nil {
+	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
 		return err
 	}
 	return wsutil.WriteServerMessage(s.conn, ws.OpText, payload)
@@ -141,7 +160,7 @@ func (s *realtimeBridgeSocket) writeClose(code ws.StatusCode, reason string) err
 	if s.closeSent {
 		return nil
 	}
-	if err := s.conn.SetWriteDeadline(time.Now().Add(realtimeBridgeWriteTimeout)); err != nil {
+	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
 		return err
 	}
 	if err := wsutil.WriteServerMessage(s.conn, ws.OpClose, ws.NewCloseFrameBody(code, reason)); err != nil {
@@ -177,7 +196,7 @@ func (s *realtimeBridgeSocket) handleControl(header ws.Header, reader io.Reader)
 		}
 		return nil
 	}
-	if err := s.conn.SetWriteDeadline(time.Now().Add(realtimeBridgeWriteTimeout)); err != nil {
+	if err := s.conn.SetWriteDeadline(time.Now().Add(s.writeBudget())); err != nil {
 		return &realtimeBridgeControlError{op: header.OpCode, err: err}
 	}
 	err := wsutil.ControlFrameHandler(s.conn, ws.StateServerSide)(header, reader)
@@ -251,7 +270,11 @@ func renewAudioBridge(threadID string, audioIn chan []byte, audioOut chan Realti
 // unregisterAudioBridge removes any registrations bound to threadID.
 // Used when a realtime spawn fails post-token-issuance, or when the
 // thread is killed before a bridge connected.
-func unregisterAudioBridge(threadID string) {
+func unregisterAudioBridge(threadID string, completionReason ...string) {
+	reason := "audio bridge unregistered"
+	if len(completionReason) > 0 && (completionReason[0] == "realtime conversation completed" || completionReason[0] == "realtime completion timed out") {
+		reason = completionReason[0]
+	}
 	audioBridgeMu.Lock()
 	for tok, reg := range audioBridgeByTok {
 		if reg.threadID == threadID {
@@ -264,7 +287,7 @@ func unregisterAudioBridge(threadID string) {
 	if live != nil {
 		live.cancel(newRealtimeBridgeEnd(
 			"core", "close", ws.StatusNormalClosure,
-			"audio bridge unregistered", "", true,
+			reason, "", true,
 		))
 	}
 }
@@ -446,7 +469,22 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	conn, _, _, err := ws.UpgradeHTTP(r, w)
+	if r.URL.Query().Get("audio_protocol") != "1" && a.thinker != nil && a.thinker.threads != nil {
+		_, managed := a.thinker.threads.findManagedThread(thread)
+		if managed != nil && managed.Realtime != nil && managed.Realtime.opts.OutputConfig.Media.format() != AudioPCM16 {
+			http.Error(w, "negotiated audio protocol required", http.StatusBadRequest)
+			return
+		}
+	}
+	contract := a.realtimeRendererContract(thread, r)
+	if contract != "" {
+		w.Header().Set(realtimeAudioSessionHeader, contract)
+	}
+	upgrader := ws.HTTPUpgrader{}
+	if contract != "" {
+		upgrader.Header = http.Header{realtimeAudioSessionHeader: {contract}}
+	}
+	conn, _, _, err := upgrader.Upgrade(r, w)
 	if err != nil {
 		logMsg("REALTIME-AUDIO", fmt.Sprintf("upgrade failed for thread=%s: %v", thread, err))
 		return
@@ -456,15 +494,36 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		_ = conn.Close()
 		return
 	}
+	var providerStates <-chan struct{}
+	var providerStateSource *RealtimeThinker
+	if contract != "" && a.thinker != nil && a.thinker.threads != nil {
+		_, t := a.thinker.threads.findManagedThread(thread)
+		if t != nil && t.Realtime != nil {
+			providerStateSource = t.Realtime
+			providerStates = t.Realtime.providerStateWake
+			t.Realtime.wakeProviderState()
+		}
+	}
 	connectedAt := time.Now()
 	socket := &realtimeBridgeSocket{conn: conn}
+	socket.window.bytesPerSecond = realtimePCMBytesPerSecond
+	if providerStateSource != nil {
+		socket.window.bytesPerSecond = providerStateSource.outputRate()
+	}
+	if contract != "" {
+		socket.writeTimeout = realtimeLiveBridgeWriteTimeout
+	}
 	logMsg("REALTIME-AUDIO", fmt.Sprintf("bridge connected for thread=%s", thread))
-	if a.thinker != nil && a.thinker.threads != nil {
+	if contract == "" && a.thinker != nil && a.thinker.threads != nil {
 		a.thinker.threads.realtimeBridgeConnected(thread)
+	}
+	bridgeMedia := RealtimeMediaConfig{}
+	if providerStateSource != nil {
+		bridgeMedia = providerStateSource.opts.OutputConfig.Media
 	}
 	if a.thinker != nil && a.thinker.telemetry != nil {
 		a.thinker.telemetry.Emit("realtime.bridge_connected", thread, map[string]any{
-			"encoding": "pcm16", "sample_rate": 24000, "channels": 1,
+			"encoding": bridgeMedia.format(), "sample_rate": bridgeMedia.rate(), "channels": 1,
 		})
 	}
 
@@ -490,10 +549,53 @@ func (a *APIServer) realtimeAudioHandler(w http.ResponseWriter, r *http.Request)
 		}
 	}()
 
+	writeControl := func(control string) error {
+		payload := realtimePlaybackControlPayload(control)
+		if err := socket.writeText(payload); err != nil {
+			return err
+		}
+		var message struct {
+			Type        string `json:"type"`
+			ItemID      string `json:"item_id"`
+			RequestedAt int64  `json:"requested_at_ms"`
+		}
+		if json.Unmarshal(payload, &message) == nil && message.Type == "interrupt" && a.thinker != nil && a.thinker.telemetry != nil {
+			var delay any
+			if message.RequestedAt > 0 {
+				elapsed := time.Now().UnixMilli() - message.RequestedAt
+				if elapsed < 0 {
+					elapsed = 0
+				}
+				delay = elapsed
+			}
+			a.thinker.telemetry.Emit("realtime.playback_clear_sent", thread, map[string]any{"item_id": message.ItemID, "interrupt_to_bridge_clear_ms": delay, "playback_clear_confirmed": false})
+		}
+		return nil
+	}
 	var termination *realtimeBridgeEnd
 bridgeLoop:
 	for {
 		select {
+		case control, ok := <-reg.control:
+			if !ok {
+				reg.control = nil
+				continue
+			}
+			if err := writeControl(control); err != nil {
+				termination = classifyRealtimeBridgeError("core", "write", err)
+				cancel(termination)
+				break bridgeLoop
+			}
+			continue
+		default:
+		}
+		select {
+		case <-providerStates:
+			if err := writeControl(providerStateSource.providerStateControl()); err != nil {
+				termination = classifyRealtimeBridgeError("core", "write", err)
+				cancel(termination)
+				break bridgeLoop
+			}
 		case <-ctx.Done():
 			termination = classifyRealtimeBridgeError("context", "close", context.Cause(ctx))
 			break bridgeLoop
@@ -506,23 +608,63 @@ bridgeLoop:
 				cancel(termination)
 				break bridgeLoop
 			}
-			metadata, _ := json.Marshal(map[string]any{
-				"type": "audio.frame", "response_id": frame.ResponseID,
-				"item_id": frame.ItemID, "audio_end_ms": frame.AudioEndMS,
+			// A new playback may win select while an older clear is already queued.
+			// Flush those controls before writing this frame, including for legacy players.
+		flushControls:
+			for {
+				select {
+				case control, ok := <-reg.control:
+					if !ok {
+						reg.control = nil
+						break flushControls
+					}
+					if err := writeControl(control); err != nil {
+						frame.written(false)
+						termination = classifyRealtimeBridgeError("core", "write", err)
+						cancel(termination)
+						break bridgeLoop
+					}
+				default:
+					break flushControls
+				}
+			}
+			frame.timing.outputWait(frame.ResponseID, frame.ItemID, frame.queuedAt)
+			written, err := socket.writeFlowControlledAudio(ctx, frame, func() error {
+				for {
+					select {
+					case control, ok := <-reg.control:
+						if !ok {
+							reg.control = nil
+							return nil
+						}
+						if err := writeControl(control); err != nil {
+							return err
+						}
+					case <-providerStates:
+						if err := writeControl(providerStateSource.providerStateControl()); err != nil {
+							return err
+						}
+					default:
+						return nil
+					}
+				}
 			})
-			if err := socket.writeAudio(metadata, frame.Audio); err != nil {
+			if err != nil {
+				frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
+				frame.writtenBytes(written)
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("write end for thread=%s: %v", thread, err))
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
 				break bridgeLoop
 			}
+			frame.timing.writtenBytes(frame.ResponseID, frame.ItemID, time.Now(), len(frame.Audio), written)
+			frame.writtenBytes(written)
 		case control, ok := <-reg.control:
 			if !ok {
 				reg.control = nil
 				continue
 			}
-			payload := []byte(fmt.Sprintf(`{"type":%q}`, control))
-			if err := socket.writeText(payload); err != nil {
+			if err := writeControl(control); err != nil {
 				logMsg("REALTIME-AUDIO", fmt.Sprintf("control write end for thread=%s: %v", thread, err))
 				termination = classifyRealtimeBridgeError("core", "write", err)
 				cancel(termination)
@@ -626,20 +768,61 @@ func runRealtimeAudioBridgeReader(
 		}
 		if header.OpCode == ws.OpText {
 			var control struct {
-				Type       string `json:"type"`
-				ItemID     string `json:"item_id"`
-				AudioEndMS int    `json:"audio_end_ms"`
+				Type        string `json:"type"`
+				ItemID      string `json:"item_id"`
+				AudioEndMS  int    `json:"audio_end_ms"`
+				Evidence    string `json:"evidence"`
+				Scope       string `json:"scope"`
+				Generation  int64  `json:"session_generation"`
+				CapacityMS  int    `json:"capacity_ms"`
+				TimingTrace bool   `json:"timing_trace"`
 			}
 			if json.Unmarshal(data, &control) == nil && a.thinker != nil && a.thinker.threads != nil {
 				switch control.Type {
+				case "playback.ready":
+					socket.window.configureTrace(control.TimingTrace)
+					if socket.writeTimeout > 0 && control.CapacityMS > 0 {
+						socket.window.configure(control.CapacityMS)
+					}
+					if control.Evidence == "" || validPlaybackEvidence(control.Evidence) {
+						_, t := a.thinker.threads.findManagedThread(thread)
+						if t != nil && t.Realtime != nil {
+							t.Realtime.delivery.setEvidence(control.Evidence)
+						}
+						a.thinker.threads.realtimePlaybackReady(thread)
+						socket.readyOnce.Do(func() { a.thinker.threads.realtimeBridgeConnected(thread) })
+					}
+				case "playback.cleared":
+					if control.Scope != "" && control.Scope != "local" && control.Scope != "stream" {
+						continue
+					}
+					socket.window.clear(control.Generation, control.ItemID)
+					_, t := a.thinker.threads.findManagedThread(thread)
+					if t != nil && t.Realtime != nil {
+						t.Realtime.emit("realtime.renderer_clear", map[string]any{"item_id": control.ItemID, "session_generation": control.Generation, "scope": control.Scope, "remote_playback_confirmed": false})
+						if control.Generation == 0 || generationForAudioFrame(t.Realtime) == control.Generation {
+							a.thinker.threads.realtimePlaybackCleared(thread, control.ItemID)
+						}
+					}
 				case "playback.progress":
 					if control.ItemID != "" && control.AudioEndMS >= 0 {
-						a.thinker.threads.realtimePlaybackProgress(thread, control.ItemID, control.AudioEndMS)
+						if control.Evidence == "" || validPlaybackEvidence(control.Evidence) {
+							_, t := a.thinker.threads.findManagedThread(thread)
+							if t != nil && t.Realtime != nil {
+								socket.window.progress(control.Generation, control.ItemID, control.AudioEndMS)
+								t.Realtime.acknowledgePlaybackEvidence(control.ItemID, control.AudioEndMS, control.Generation, control.Evidence)
+							}
+						}
 					}
 				case "playback.overflow":
 					if control.ItemID != "" {
-						a.thinker.threads.realtimePlaybackOverflow(thread, control.ItemID)
+						_, t := a.thinker.threads.findManagedThread(thread)
+						if t != nil && t.Realtime != nil {
+							t.Realtime.rendererPlaybackOverflowForGeneration(control.ItemID, control.Generation)
+						}
 					}
+				case "input.speech_stopped":
+					a.thinker.threads.realtimeInputSpeechStopped(thread)
 				case "input.speech_started":
 					a.thinker.threads.realtimeInputSpeechStarted(thread)
 				}
@@ -649,6 +832,25 @@ func runRealtimeAudioBridgeReader(
 		if header.OpCode != ws.OpBinary || len(data) == 0 {
 			continue
 		}
+		if defaultMediaRate(socket.window.bytesPerSecond) == realtimePCMBytesPerSecond && len(data)%2 != 0 {
+			return newRealtimeBridgeEnd("client", "read", ws.StatusInvalidFramePayloadData, "unaligned PCM16 audio", "protocol", false)
+		}
+		// Managed input goes straight to the duration-budgeted queue; never wait
+		// behind provider recovery or stop reading interruption/lifecycle controls.
+		if a.thinker != nil && a.thinker.threads != nil {
+			_, t := a.thinker.threads.findManagedThread(thread)
+			if t != nil && t.Realtime != nil {
+				t.Realtime.admitRealtimeAudio(data, time.Now())
+				continue
+			}
+		}
+		if socket.writeTimeout > 0 {
+			if err := enqueueLiveRendererInput(ctx, reg.audioIn, data); err != nil {
+				return err
+			}
+			continue
+		}
+
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case reg.audioIn <- data:
@@ -678,4 +880,12 @@ func runRealtimeAudioBridgeReader(
 			)
 		}
 	}
+}
+
+func realtimePlaybackControlPayload(control string) []byte {
+	if json.Valid([]byte(control)) {
+		return []byte(control)
+	}
+	payload, _ := json.Marshal(map[string]string{"type": control})
+	return payload
 }

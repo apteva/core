@@ -4,14 +4,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
 
-// TestIntegration_CodexSubThreadToolSearchDiscoverAndCall is the worker
-// equivalent of TestIntegration_ToolSearch_DiscoverAndCall. It uses a real
-// Codex model and an opaque MCP tool name so the only successful path is:
+// TestIntegration_CodexSubThreadToolSearchDiscoverAndCall uses real Codex
+// Terra with an inherited (no tools/MCP arguments) worker and an opaque MCP
+// tool name, so the only successful path is:
 //
 //	worker search_tools -> worker activeTools -> next-turn schema ->
 //	worker dispatch -> MCP result back to that same worker.
@@ -47,7 +48,8 @@ func TestIntegration_CodexSubThreadToolSearchDiscoverAndCall(t *testing.T) {
 			ToolLoading: &MCPToolLoadingConfig{Default: ToolLoadDeferred},
 		}},
 	}
-	parent := NewThinker(token, NewOpenAICodexProvider(token), cfg)
+	provider := &fixedModelProvider{LLMProvider: NewOpenAICodexProvider(token), model: "gpt-5.6-terra"}
+	parent := NewThinker(token, provider, cfg)
 	defer parent.Stop()
 	defer parent.threads.KillAll()
 	defer func() {
@@ -72,13 +74,16 @@ Do not guess a tool name, spawn, send, evolve, or call done. After the external
 tool succeeds, call pace with rate normal.`
 	if err := parent.threads.SpawnWithOpts(
 		threadID, directive, nil,
-		SpawnOpts{DeferRun: true, ParentID: "main", MCPNames: []string{"catalog"}},
+		SpawnOpts{DeferRun: true, ParentID: "main"},
 	); err != nil {
 		t.Fatalf("spawn Codex discovery worker: %v", err)
 	}
 	thread := parent.threads.threads[threadID]
 	if thread == nil {
 		t.Fatal("Codex discovery worker missing")
+	}
+	if !thread.InheritCapabilities || !slices.Contains(thread.MCPNames, "catalog") {
+		t.Fatalf("worker did not inherit the catalog scope: inherited=%v mcp=%v", thread.InheritCapabilities, thread.MCPNames)
 	}
 	// Keep the directive in the already-built system prompt, but suppress
 	// directive BM25 preloading so this test proves explicit search_tools.
@@ -141,7 +146,7 @@ tool succeeds, call pace with rate normal.`
 	if !sawSuccessfulResult {
 		t.Fatalf("successful worker tool.result telemetry missing\n%s", strings.Join(trace, "\n"))
 	}
-	t.Logf("CODEX SUB-THREAD TOOL DISCOVERY TRACE\n%s", strings.Join(trace, "\n"))
+	t.Logf("CODEX TERRA INHERITED SUB-THREAD TOOL DISCOVERY TRACE\n%s", strings.Join(trace, "\n"))
 }
 
 // TestIntegration_CodexSubThreadExactToolScopeSmoke proves with a real model

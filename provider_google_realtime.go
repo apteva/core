@@ -37,14 +37,18 @@ func NewGoogleRealtimeProvider(apiKey string) *GoogleRealtimeProvider {
 		endpoint:     googleRealtimeEndpoint,
 		defaultVoice: "Kore",
 		models: map[ModelTier]string{
-			ModelLarge:  "gemini-3.1-flash-live-preview",
-			ModelMedium: "gemini-3.1-flash-live-preview",
-			ModelSmall:  "gemini-3.1-flash-live-preview",
+			ModelLarge:  "gemini-3.8-live",
+			ModelMedium: "gemini-3.8-live",
+			ModelSmall:  "gemini-3.8-live",
 		},
 	}
 }
 
 func (p *GoogleRealtimeProvider) Name() string { return "google-realtime" }
+
+func (p *GoogleRealtimeProvider) RealtimeCapabilities(string) RealtimeCapabilities {
+	return RealtimeCapabilities{AudioTruncation: true, InputSpeechEvents: true}
+}
 
 func (p *GoogleRealtimeProvider) Models() map[ModelTier]string {
 	out := make(map[ModelTier]string, len(p.models))
@@ -54,11 +58,12 @@ func (p *GoogleRealtimeProvider) Models() map[ModelTier]string {
 	return out
 }
 
-func (p *GoogleRealtimeProvider) Pricing(string) RealtimePricing {
-	return RealtimePricing{
-		TextInput: 0.75, TextOutput: 4.50,
-		AudioInput: 3.00, AudioOutput: 12.00,
+func (p *GoogleRealtimeProvider) Pricing(model string) RealtimePricing {
+	if pricing, ok := googleLiveModelPricing[strings.TrimPrefix(strings.TrimSpace(model), "models/")]; ok {
+		return pricing
 	}
+	// Preserve the historical fallback for configured/pinned model aliases.
+	return googleLiveModelPricing["gemini-3.1-flash-live-preview"]
 }
 
 func (p *GoogleRealtimeProvider) DefaultVoice() string {
@@ -102,8 +107,8 @@ func googleLiveTools(tools []NativeTool) []map[string]any {
 	declarations := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
 		declaration := map[string]any{
-			"name":       tool.Name,
-			"parameters": geminiToolParameters(tool.Parameters),
+			"name":                 tool.Name,
+			"parametersJsonSchema": geminiToolParameters(tool.Parameters),
 		}
 		if strings.TrimSpace(tool.Description) != "" {
 			declaration["description"] = tool.Description
@@ -139,11 +144,17 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 			},
 		},
 	}
-	thinking := map[string]any{"includeThoughts": false}
-	if level := googleLiveThinkingLevel(opts.Reasoning); level != "" {
-		thinking["thinkingLevel"] = level
+	profile, err := googleLiveProfileWithOptions(opts)
+	if err != nil {
+		return nil, err
 	}
-	generation["thinkingConfig"] = thinking
+	thinking, err := profile.thinkingConfig(opts.Reasoning)
+	if err != nil {
+		return nil, err
+	}
+	if thinking != nil {
+		generation["thinkingConfig"] = thinking
+	}
 	normalizedTurnDetection, err := opts.TurnDetection.normalized()
 	if err != nil {
 		return nil, fmt.Errorf("google-realtime turn detection: %w", err)
@@ -175,7 +186,7 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 	setup := map[string]any{
 		"model":             "models/" + strings.TrimPrefix(model, "models/"),
 		"generationConfig":  generation,
-		"systemInstruction": map[string]any{"parts": []map[string]any{{"text": opts.Instructions}}},
+		"systemInstruction": map[string]any{"parts": []map[string]any{{"text": realtimeToolInstructions(opts.Instructions, profile.asyncTools)}}},
 		"realtimeInputConfig": map[string]any{
 			"automaticActivityDetection": automaticActivityDetection,
 			"activityHandling":           activityHandling,
@@ -183,10 +194,15 @@ func buildGoogleLiveSetup(opts RealtimeSessionOpts, defaultVoice string) ([]byte
 		},
 		"contextWindowCompression": map[string]any{"slidingWindow": map[string]any{}},
 	}
-	if opts.RestoreHistory {
+	if opts.RestoreHistory && !profile.alpha {
 		setup["historyConfig"] = map[string]any{"initialHistoryInClientContent": true}
 	}
 	if tools := googleLiveTools(opts.Tools); len(tools) > 0 {
+		if profile.toolBehavior != "" {
+			for _, declaration := range tools[0]["functionDeclarations"].([]map[string]any) {
+				declaration["behavior"] = profile.toolBehavior
+			}
+		}
 		setup["tools"] = tools
 	}
 	if opts.TranscribeInput {
@@ -212,7 +228,8 @@ type googleLiveTranscription struct {
 }
 
 type googleLiveServerContent struct {
-	ModelTurn *struct {
+	InteractionStatus string `json:"interactionStatus,omitempty"`
+	ModelTurn         *struct {
 		Parts []googleLivePart `json:"parts"`
 	} `json:"modelTurn,omitempty"`
 	GenerationComplete  bool                     `json:"generationComplete,omitempty"`
@@ -245,9 +262,10 @@ type googleLiveUsage struct {
 }
 
 type googleLiveServerMessage struct {
-	SetupComplete json.RawMessage          `json:"setupComplete,omitempty"`
-	ServerContent *googleLiveServerContent `json:"serverContent,omitempty"`
-	ToolCall      *struct {
+	InteractionStatus string                   `json:"interactionStatus,omitempty"`
+	SetupComplete     json.RawMessage          `json:"setupComplete,omitempty"`
+	ServerContent     *googleLiveServerContent `json:"serverContent,omitempty"`
+	ToolCall          *struct {
 		FunctionCalls []googleLiveFunctionCall `json:"functionCalls"`
 	} `json:"toolCall,omitempty"`
 	ToolCallCancellation *struct {
@@ -269,17 +287,19 @@ type googleLiveServerMessage struct {
 }
 
 type googleLiveFunctionResponse struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Response map[string]any `json:"response"`
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Response   map[string]any `json:"response"`
+	Scheduling string         `json:"scheduling,omitempty"`
 }
 
 type googleRealtimeSession struct {
-	conn   net.Conn
-	events chan RealtimeEvent
-	outbox chan realtimeOutboundFrame
-	done   chan struct{}
-	ready  chan error
+	inputReservations realtimeInputReservations
+	conn              net.Conn
+	events            chan RealtimeEvent
+	outbox            chan realtimeOutboundFrame
+	done              chan struct{}
+	ready             chan error
 
 	closeOnce sync.Once
 	readyOnce sync.Once
@@ -287,15 +307,25 @@ type googleRealtimeSession struct {
 	seq       atomic.Uint64
 	dropped   atomic.Uint64
 
-	inputRate int
-	speech    googleSpeechGate // owned by translate/readLoop
+	inputRate   int
+	profile     googleLiveProfile
+	timing      *realtimeTiming
+	guardConfig RealtimeSpeechGuardConfig
+	settings    map[string]any
+	receivedAt  time.Time        // readLoop owned
+	readyAt     time.Time        // published before the setup acknowledgement channel
+	speech      googleSpeechGate // owned by translate/readLoop
 
 	mu                  sync.Mutex
 	currentResponseID   string
+	currentItemID       string
 	inputTranscript     string
 	outputTranscript    string
 	lastUsage           RealtimeUsage
+	interactionUsage    RealtimeUsage
 	callNames           map[string]string
+	cancelledCalls      map[string]bool
+	cancelledCallOrder  []string
 	pendingResponses    []googleLiveFunctionResponse
 	configFingerprint   string
 	restartAfterTurn    bool
@@ -311,7 +341,7 @@ func openGoogleRealtimeSession(ctx context.Context, provider *GoogleRealtimeProv
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := url.Parse(provider.endpoint)
+	endpoint, err := url.Parse(googleLiveEndpoint(provider.endpoint, opts.Model))
 	if err != nil {
 		return nil, fmt.Errorf("google-realtime endpoint: %w", err)
 	}
@@ -329,10 +359,13 @@ func openGoogleRealtimeSession(ctx context.Context, provider *GoogleRealtimeProv
 	if inputRate == 0 {
 		inputRate = 16000
 	}
+	profile, _ := googleLiveProfileWithOptions(opts)
 	s := &googleRealtimeSession{
 		conn: conn, events: make(chan RealtimeEvent, realtimeEventBuffer),
 		outbox: make(chan realtimeOutboundFrame, realtimeOutboxBuffer), done: make(chan struct{}), ready: make(chan error, 1),
 		inputRate: inputRate, callNames: map[string]string{},
+		profile: profile, timing: opts.timing, guardConfig: opts.OutputConfig.SpeechGuard.resolved(),
+		settings:          googleRealtimeSettings(opts, setup),
 		configFingerprint: googleRealtimeConfigFingerprint(opts.Instructions, opts.Tools),
 		historySeeding:    opts.RestoreHistory,
 		sessionID:         googleRealtimeSessionSequence.Add(1),
@@ -382,11 +415,34 @@ func (s *googleRealtimeSession) nextResponseID() string {
 
 func (s *googleRealtimeSession) currentOrNextResponseID() string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	started := s.currentResponseID == ""
 	if s.currentResponseID == "" {
 		s.currentResponseID = s.nextResponseID()
 	}
-	return s.currentResponseID
+	id := s.currentResponseID
+	s.mu.Unlock()
+	if started && s.profile.interactionStatus {
+		s.emitControl(RealtimeEvent{Type: RealtimeEventResponseStarted, ResponseID: id})
+	}
+	return id
+}
+
+func (s *googleRealtimeSession) activeResponse() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentResponseID != ""
+}
+
+func (s *googleRealtimeSession) utteranceID(responseID string) string {
+	if !s.profile.interactionStatus {
+		return responseID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.currentItemID == "" {
+		s.currentItemID = s.nextResponseID() + "_utterance"
+	}
+	return s.currentItemID
 }
 
 func (s *googleRealtimeSession) finishResponseID() string {
@@ -467,7 +523,7 @@ func (s *googleRealtimeSession) readLoop() {
 				return
 			default:
 			}
-			signalErr := fmt.Errorf("google-realtime read: %w", err)
+			signalErr := realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("google-realtime read: %w", err))
 			s.signalReady(signalErr)
 			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: signalErr})
 			ended := RealtimeEvent{Type: RealtimeEventSessionEnded, DroppedAudio: s.dropped.Load()}
@@ -485,8 +541,9 @@ func (s *googleRealtimeSession) readLoop() {
 			continue
 		}
 		var message googleLiveServerMessage
+		s.receivedAt = time.Now()
 		if err := json.Unmarshal(data, &message); err != nil {
-			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime decode: %w", err)})
+			s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorProtocol, fmt.Errorf("google-realtime decode: %w", err))})
 			continue
 		}
 		s.translate(&message)
@@ -494,6 +551,18 @@ func (s *googleRealtimeSession) readLoop() {
 }
 
 func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
+	if s.receivedAt.IsZero() {
+		s.receivedAt = time.Now()
+	}
+	receivedAt := s.receivedAt
+	s.receivedAt = time.Time{}
+	status := message.InteractionStatus
+	if status == "" && message.ServerContent != nil {
+		status = message.ServerContent.InteractionStatus
+	}
+	if s.profile.interactionStatus && status == "IN_PROGRESS" {
+		s.currentOrNextResponseID()
+	}
 	if message.GoAway != nil {
 		left, err := time.ParseDuration(message.GoAway.TimeLeft)
 		if err == nil && left >= 0 {
@@ -509,6 +578,11 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 		return
 	}
 	if message.SetupComplete != nil {
+		s.mu.Lock()
+		if s.readyAt.IsZero() {
+			s.readyAt = receivedAt
+		}
+		s.mu.Unlock()
 		s.signalReady(nil)
 	}
 	if message.UsageMetadata != nil {
@@ -518,45 +592,72 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 	}
 	if message.ToolCallCancellation != nil {
 		s.mu.Lock()
+		responseID := s.currentResponseID
 		for _, id := range message.ToolCallCancellation.IDs {
 			delete(s.callNames, id)
-		}
-		s.mu.Unlock()
-	}
-	if message.ServerContent != nil {
-		content := message.ServerContent
-		if content.Interrupted {
-			s.speech = googleSpeechGate{}
-			s.emitControl(RealtimeEvent{Type: RealtimeEventSpeechStarted})
-		}
-		responseID := s.currentOrNextResponseID()
-
-		if content.InputTranscription != nil && content.InputTranscription.Text != "" {
-			s.mu.Lock()
-			s.inputTranscript = appendGoogleTranscript(s.inputTranscript, content.InputTranscription.Text)
-			partial := s.inputTranscript
-			s.mu.Unlock()
-			s.emitAudio(RealtimeEvent{
-				Type: RealtimeEventTranscriptInput, Transcript: partial,
-				ResponseID: responseID, ItemID: responseID,
-			})
-		}
-		if content.OutputTranscription != nil && content.OutputTranscription.Text != "" {
-			s.mu.Lock()
-			s.outputTranscript = appendGoogleTranscript(s.outputTranscript, content.OutputTranscription.Text)
-			partial := s.outputTranscript
-			s.turnOutputSinceTool = true
-			s.mu.Unlock()
-			if pattern := detectRealtimeInternalNarration(partial); pattern != "" {
-				s.rejectSpeech(responseID, pattern)
-			} else if !s.speech.rejected {
-				// Guard-bearing transcripts cannot be dropped under audio backpressure.
-				s.emitControl(RealtimeEvent{Type: RealtimeEventTranscriptOutput, Transcript: partial, ResponseID: responseID, ItemID: responseID})
-				if len(strings.TrimSpace(partial)) >= 32 || strings.ContainsAny(partial, ".?!") {
-					s.releaseSpeechAudio()
+			if s.cancelledCalls == nil {
+				s.cancelledCalls = make(map[string]bool)
+			}
+			if !s.cancelledCalls[id] {
+				s.cancelledCalls[id] = true
+				s.cancelledCallOrder = append(s.cancelledCallOrder, id)
+				if len(s.cancelledCallOrder) > realtimeTerminalToolLimit {
+					delete(s.cancelledCalls, s.cancelledCallOrder[0])
+					copy(s.cancelledCallOrder, s.cancelledCallOrder[1:])
+					s.cancelledCallOrder = s.cancelledCallOrder[:realtimeTerminalToolLimit]
 				}
 			}
 		}
+		kept := s.pendingResponses[:0]
+		for _, response := range s.pendingResponses {
+			cancelled := false
+			for _, id := range message.ToolCallCancellation.IDs {
+				cancelled = cancelled || response.ID == id
+			}
+			if !cancelled {
+				kept = append(kept, response)
+			}
+		}
+		s.pendingResponses = kept
+		s.mu.Unlock()
+		for _, id := range message.ToolCallCancellation.IDs {
+			s.emitControl(RealtimeEvent{Type: RealtimeEventToolCallCancelled, ToolCallID: id, ResponseID: responseID})
+		}
+	}
+	// A status-only IDLE update must not create a phantom interaction, but
+	// other fields in the same envelope (e.g. tool calls) still need handling.
+	if content := message.ServerContent; content != nil && (!s.profile.interactionStatus || s.activeResponse() || content.ModelTurn != nil || content.InputTranscription != nil || content.OutputTranscription != nil) {
+		if content.Interrupted {
+			s.mu.Lock()
+			interruptedResponse, interruptedItem := s.currentResponseID, s.currentItemID
+			s.mu.Unlock()
+			if !s.profile.interactionStatus {
+				interruptedItem = interruptedResponse
+			}
+			for _, event := range s.speech.pending {
+				s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+			}
+			s.speech = googleSpeechGate{}
+			if s.profile.interactionStatus {
+				s.mu.Lock()
+				s.outputTranscript, s.currentItemID = "", ""
+				s.mu.Unlock()
+			}
+			s.emitControl(RealtimeEvent{Type: RealtimeEventSpeechStarted, ResponseID: interruptedResponse, ItemID: interruptedItem})
+		}
+		responseID := s.currentOrNextResponseID()
+		itemID := responseID
+		if s.profile.interactionStatus {
+			s.mu.Lock()
+			itemID = s.currentItemID
+			s.mu.Unlock()
+			// Status-only and generation-complete frames are not utterances.
+			if content.ModelTurn != nil || content.InputTranscription != nil || content.OutputTranscription != nil {
+				itemID = s.utteranceID(responseID)
+			}
+		}
+
+		var audioEvents []RealtimeEvent
 		if content.ModelTurn != nil {
 			for _, part := range content.ModelTurn.Parts {
 				if part.Thought {
@@ -571,15 +672,53 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 					s.mu.Lock()
 					s.turnOutputSinceTool = true
 					s.mu.Unlock()
-					s.queueSpeechAudio(RealtimeEvent{
+					s.timing.providerAudio(responseID, itemID, receivedAt, pcm, AudioPCM16, 24000)
+					audioEvents = append(audioEvents, RealtimeEvent{
 						Type: RealtimeEventAudioOut, Audio: pcm,
-						ResponseID: responseID, ItemID: responseID,
+						ResponseID: responseID, ItemID: itemID,
 					})
 				}
 			}
 		}
+		if content.InputTranscription != nil && content.InputTranscription.Text != "" {
+			s.mu.Lock()
+			s.inputTranscript = appendGoogleTranscript(s.inputTranscript, content.InputTranscription.Text)
+			partial := s.inputTranscript
+			s.mu.Unlock()
+			s.emitAudio(RealtimeEvent{
+				Type: RealtimeEventTranscriptInput, Transcript: partial,
+				ResponseID: responseID, ItemID: itemID,
+			})
+		}
+		if content.OutputTranscription != nil && content.OutputTranscription.Text != "" {
+			s.mu.Lock()
+			s.outputTranscript = appendGoogleTranscript(s.outputTranscript, content.OutputTranscription.Text)
+			partial := s.outputTranscript
+			s.turnOutputSinceTool = true
+			s.mu.Unlock()
+			if pattern := detectRealtimeInternalNarration(partial); pattern != "" {
+				for _, event := range audioEvents {
+					s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+				}
+				audioEvents = nil
+				s.rejectSpeech(responseID, pattern)
+			} else if !s.speech.rejected {
+				// Guard-bearing transcripts cannot be dropped under audio backpressure.
+				s.emitControl(RealtimeEvent{Type: RealtimeEventTranscriptOutput, Transcript: partial, ResponseID: responseID, ItemID: itemID})
+				if len(strings.TrimSpace(partial)) >= s.guardConfig.resolved().PrefixBytes || strings.ContainsAny(partial, ".?!") {
+					s.releaseSpeechAudio()
+				}
+			}
+		}
+		for _, event := range audioEvents {
+			s.queueSpeechAudio(event)
+		}
 		if content.TurnComplete {
-			s.finishTurn()
+			if s.profile.interactionStatus {
+				s.finishUtterance(responseID)
+			} else {
+				s.finishTurn()
+			}
 		}
 	}
 	if message.ToolCall != nil && len(message.ToolCall.FunctionCalls) > 0 {
@@ -599,25 +738,37 @@ func (s *googleRealtimeSession) translate(message *googleLiveServerMessage) {
 		// Gemini's dedicated toolCall message ends the function-selection
 		// response. The queued tool responses themselves trigger continuation;
 		// RequestResponse only flushes them as one atomic batch.
+		if !s.profile.interactionStatus {
+			s.finishTurn()
+		} else {
+			s.commitInteractionUsage()
+		}
+	}
+	if s.profile.interactionStatus && status == "IDLE" && s.activeResponse() {
 		s.finishTurn()
 	}
 }
 
-func (s *googleRealtimeSession) finishTurn() {
+func (s *googleRealtimeSession) finishUtterance(responseID string) {
+	if s.profile.interactionStatus {
+		s.commitInteractionUsage()
+	}
 	s.mu.Lock()
 	input, output := strings.TrimSpace(s.inputTranscript), strings.TrimSpace(s.outputTranscript)
 	s.inputTranscript, s.outputTranscript = "", ""
-	usage := s.lastUsage
-	s.lastUsage = RealtimeUsage{}
-	restart := s.restartAfterTurn
-	s.restartAfterTurn = false
 	s.turnOutputSinceTool = false
+	itemID := s.currentItemID
 	s.mu.Unlock()
-	responseID := s.finishResponseID()
+	if !s.profile.interactionStatus {
+		itemID = responseID
+	}
+	if s.profile.interactionStatus && itemID == "" && input == "" && output == "" && s.speech.bytes == 0 {
+		return
+	}
 	if input != "" {
 		s.emitControl(RealtimeEvent{
 			Type: RealtimeEventTranscriptInput, Transcript: input, Final: true,
-			ResponseID: responseID, ItemID: responseID,
+			ResponseID: responseID, ItemID: itemID,
 		})
 	}
 	if !s.speech.rejected {
@@ -630,14 +781,56 @@ func (s *googleRealtimeSession) finishTurn() {
 	if output != "" && !s.speech.rejected {
 		s.emitControl(RealtimeEvent{
 			Type: RealtimeEventTranscriptOutput, Transcript: output, Final: true,
-			ResponseID: responseID, ItemID: responseID,
+			ResponseID: responseID, ItemID: itemID,
 		})
 	}
 	s.speech = googleSpeechGate{}
+	s.mu.Lock()
+	s.currentItemID = ""
+	s.mu.Unlock()
+	if s.profile.interactionStatus {
+		s.emitControl(RealtimeEvent{Type: RealtimeEventUtteranceDone, ResponseID: responseID, ItemID: itemID})
+	}
+}
+
+func (s *googleRealtimeSession) finishTurn() {
+	responseID := s.currentOrNextResponseID()
+	s.finishUtterance(responseID)
+	s.finishResponseID()
+	s.mu.Lock()
+	usage := s.lastUsage
+	s.lastUsage = RealtimeUsage{}
+	if s.profile.interactionStatus {
+		usage = s.interactionUsage
+		s.interactionUsage = RealtimeUsage{}
+	}
+	restart := s.restartAfterTurn
+	s.restartAfterTurn = false
+	s.mu.Unlock()
 	s.emitControl(RealtimeEvent{Type: RealtimeEventResponseDone, ResponseID: responseID, Usage: usage})
 	if restart {
 		_ = s.Close()
 	}
+}
+
+// Usage snapshots describe a generation, not the whole extended interaction.
+// Commit the latest snapshot at utterance/tool boundaries, so progress speech
+// and tool-selection reasoning are billed once alongside the final answer.
+// Intermediate updates within a generation continue to replace lastUsage.
+func (s *googleRealtimeSession) commitInteractionUsage() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, total := s.lastUsage, &s.interactionUsage
+	total.TotalTokens += u.TotalTokens
+	total.InputTokens += u.InputTokens
+	total.OutputTokens += u.OutputTokens
+	total.TextInputTokens += u.TextInputTokens
+	total.TextCachedTokens += u.TextCachedTokens
+	total.TextOutputTokens += u.TextOutputTokens
+	total.AudioInputTokens += u.AudioInputTokens
+	total.AudioCachedTokens += u.AudioCachedTokens
+	total.AudioOutputTokens += u.AudioOutputTokens
+	s.lastUsage = RealtimeUsage{}
 }
 
 func (s *googleRealtimeSession) writeLoop() {
@@ -646,11 +839,28 @@ func (s *googleRealtimeSession) writeLoop() {
 		case <-s.done:
 			return
 		case frame := <-s.outbox:
-			if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
-				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: fmt.Errorf("google-realtime write: %w", err)})
+			started := time.Now()
+			if frame.input.stale() {
+				frame.input.settle(false, 0)
+				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("input audio expired before transport write"))})
 				_ = s.Close()
 				return
 			}
+			budget := 5 * time.Second
+			if frame.input != nil && frame.input.frame.MaxAge > 0 {
+				remaining := frame.input.frame.MaxAge - time.Since(frame.input.frame.ReceivedAt)
+				if remaining < budget {
+					budget = remaining
+				}
+			}
+			_ = s.conn.SetWriteDeadline(time.Now().Add(budget))
+			if err := wsutil.WriteClientMessage(s.conn, frame.op, frame.data); err != nil {
+				frame.input.settle(false, time.Since(started))
+				s.emitControl(RealtimeEvent{Type: RealtimeEventError, Err: realtimeAdapterError(RealtimeErrorTransport, fmt.Errorf("google-realtime write: %w", err))})
+				_ = s.Close()
+				return
+			}
+			frame.input.settle(true, time.Since(started))
 		}
 	}
 }
@@ -671,16 +881,16 @@ func (s *googleRealtimeSession) pingLoop() {
 func (s *googleRealtimeSession) enqueueFrame(frame realtimeOutboundFrame) error {
 	select {
 	case <-s.done:
-		return fmt.Errorf("google-realtime session closed")
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("google-realtime session closed"))
 	default:
 	}
 	select {
 	case s.outbox <- frame:
 		return nil
 	case <-s.done:
-		return fmt.Errorf("google-realtime session closed")
+		return realtimeAdapterError(RealtimeErrorClosed, fmt.Errorf("google-realtime session closed"))
 	default:
-		return fmt.Errorf("google-realtime outbox full")
+		return realtimeAdapterError(RealtimeErrorPressure, fmt.Errorf("google-realtime outbox full"))
 	}
 }
 
@@ -696,6 +906,9 @@ func (s *googleRealtimeSession) emitAudio(event RealtimeEvent) {
 	select {
 	case s.events <- event:
 	default:
+		if event.Type == RealtimeEventAudioOut {
+			s.timing.dropped(event.ResponseID, event.ItemID, len(event.Audio))
+		}
 		s.dropped.Add(1)
 	}
 }
@@ -742,6 +955,9 @@ func googleLiveResultValue(result string) any {
 func (s *googleRealtimeSession) SendToolResult(callID, result string, isError bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.cancelledCalls[callID] {
+		return ErrRealtimeToolCallCancelled
+	}
 	name := s.callNames[callID]
 	if name == "" {
 		return fmt.Errorf("google-realtime: unknown tool call %q", callID)
@@ -750,11 +966,31 @@ func (s *googleRealtimeSession) SendToolResult(callID, result string, isError bo
 	if isError {
 		response = map[string]any{"error": result}
 	}
+	if s.profile.asyncTools {
+		// An async session accepts each result as it becomes ready. Do
+		// not queue it behind RequestResponse/IDLE or other parallel calls.
+		functionResponse := googleLiveFunctionResponse{ID: callID, Name: name, Response: response}
+		if !s.profile.interactionStatus {
+			// Match the Google SDK's FunctionResponse wire shape. Scheduling is
+			// a protocol field, separate from the tool's response data. Extended
+			// Thinking retains its existing model-managed result delivery.
+			functionResponse.Scheduling = "WHEN_IDLE"
+		}
+		err := s.enqueue(map[string]any{"toolResponse": map[string]any{
+			"functionResponses": []googleLiveFunctionResponse{functionResponse},
+		}})
+		if err == nil {
+			delete(s.callNames, callID)
+		}
+		return err
+	}
 	s.pendingResponses = append(s.pendingResponses, googleLiveFunctionResponse{
 		ID: callID, Name: name, Response: response,
 	})
 	return nil
 }
+
+func (s *googleRealtimeSession) SendsToolResultsImmediately() bool { return s.profile.asyncTools }
 
 func (s *googleRealtimeSession) RequestResponse() error {
 	s.mu.Lock()
@@ -847,6 +1083,7 @@ func (s *googleRealtimeSession) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.done)
+		s.inputReservations.close()
 		if s.conn != nil {
 			err = s.conn.Close()
 		}
@@ -857,3 +1094,21 @@ func (s *googleRealtimeSession) Close() error {
 var _ RealtimeProvider = (*GoogleRealtimeProvider)(nil)
 var _ configurableRealtimeProvider = (*GoogleRealtimeProvider)(nil)
 var _ RealtimeSession = (*googleRealtimeSession)(nil)
+
+func (s *googleRealtimeSession) RealtimeSettings() map[string]any { return s.settings }
+
+func (s *googleRealtimeSession) RealtimeReadyAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyAt
+}
+
+func (s *googleRealtimeSession) SendAudioFrame(f RealtimeInputAudio) error {
+	data, err := json.Marshal(map[string]any{"realtimeInput": map[string]any{"audio": map[string]any{"mimeType": fmt.Sprintf("audio/pcm;rate=%d", s.inputRate), "data": base64.StdEncoding.EncodeToString(f.Audio)}}})
+	if err != nil {
+		return err
+	}
+	return s.inputReservations.admit(f, func(p *realtimeInputReservation) error {
+		return s.enqueueFrame(realtimeOutboundFrame{op: ws.OpText, data: data, input: p})
+	})
+}
