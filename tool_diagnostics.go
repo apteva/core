@@ -52,30 +52,119 @@ func manifestDigest(tools []ToolIdentity) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
-// Emit the catalog once per mount/policy revision, shared across the main
-// thinker and its workers. Per-request manifests reference its schema hashes.
-func (t *Thinker) recordToolCatalog() {
-	if t.telemetry == nil || t.toolIndex == nil || t.registry == nil {
-		return
+// A semantic content identity is independent of transport/activation revisions.
+func (t *Thinker) semanticToolCatalog() (string, json.RawMessage, int, int, uint64, error) {
+	if t.toolIndex == nil || t.registry == nil {
+		return "", nil, 0, 0, 0, nil
 	}
 	ix := t.toolIndex
-	ix.mu.Lock()
-	if ix.revision == ix.diagnosedRevision {
-		ix.mu.Unlock()
-		return
-	}
+	ix.mu.RLock()
 	revision := ix.revision
-	ix.diagnosedRevision = revision
 	entries := append([]IndexEntry(nil), ix.entries...)
 	aliases := copyStringMap(ix.aliases)
-	ix.mu.Unlock()
+	ix.mu.RUnlock()
 	catalog := make([]map[string]any, 0, len(entries))
 	for _, e := range entries {
 		def := t.registry.Get(e.Name)
 		if def == nil {
 			continue
 		}
-		catalog = append(catalog, map[string]any{"identity": toolIdentity(def), "description": e.Description, "parameters": def.native.Parameters, "loading": e.LoadMode, "no_spawn": e.NoSpawn})
+		catalog = append(catalog, map[string]any{"identity": toolIdentity(def), "description": e.Description, "parameters": def.native.Parameters, "loading": normalizeToolLoadMode(e.LoadMode), "no_spawn": e.NoSpawn, "access": e.Access})
 	}
-	t.telemetry.Emit("tool.catalog", t.threadID, map[string]any{"revision": revision, "tools": catalog, "aliases": aliases})
+	raw, err := json.Marshal(map[string]any{"tools": catalog, "aliases": aliases})
+	if err != nil {
+		return "", nil, 0, 0, revision, err
+	}
+	hash, body, tools, aliasCount, err := canonicalToolCatalog(raw)
+	return hash, body, tools, aliasCount, revision, err
+}
+
+func (t *Thinker) recordToolCatalog() {
+	if t.telemetry == nil || t.toolIndex == nil || t.registry == nil {
+		return
+	}
+	t.catalogSnapshotMu.Lock()
+	defer t.catalogSnapshotMu.Unlock()
+	ix := t.toolIndex
+	ix.mu.RLock()
+	revision := ix.revision
+	ix.mu.RUnlock()
+	if t.catalogSnapshotRecorded && t.catalogSnapshotRevision == revision {
+		return
+	}
+	hash, body, tools, aliases, revision, err := t.semanticToolCatalog()
+	if err != nil {
+		return
+	}
+	ix.mu.RLock()
+	stable := ix.revision == revision
+	ix.mu.RUnlock()
+	if !stable {
+		return
+	}
+	t.telemetry.recordCatalog(t.threadID, hash, body, revision, tools, aliases)
+	t.catalogSnapshotRecorded = true
+	t.catalogSnapshotRevision = revision
+	t.catalogSnapshotHash = hash
+}
+func (t *Thinker) currentToolCatalogHash() string {
+	t.catalogSnapshotMu.Lock()
+	defer t.catalogSnapshotMu.Unlock()
+	return t.catalogSnapshotHash
+}
+
+func (t *Telemetry) recordCatalog(thread, hash string, body json.RawMessage, revision uint64, tools, aliases int) {
+	t.catalogMu.Lock()
+	defer t.catalogMu.Unlock()
+	if t.catalogSnapshots == nil {
+		t.catalogSnapshots = map[string]catalogDiagnosticSnapshot{}
+	}
+	fields := map[string]any{"catalog_hash": hash, "catalog_format": toolCatalogFormat, "revision": revision, "tool_count": tools, "alias_count": aliases}
+	if _, seen := t.catalogSnapshots[hash]; !seen {
+		var full map[string]json.RawMessage
+		if json.Unmarshal(body, &full) != nil {
+			return
+		}
+		fields["tools"] = full["tools"]
+		fields["aliases"] = full["aliases"]
+	} else {
+		fields["catalog_reference"] = true
+	}
+	// Serialize the initial snapshot before its references in the telemetry log.
+	t.Emit("tool.catalog", thread, fields)
+	t.catalogSnapshots[hash] = catalogDiagnosticSnapshot{Thread: thread, Body: body, Revision: revision, Tools: tools, Aliases: aliases}
+}
+
+// Keep one in-memory payload per content hash so Server can recover a catalog
+// after retention, a restore, or a lost first snapshot, without logging it again
+// on ordinary requests. Recovery is requested by the authenticated ingest peer.
+type catalogDiagnosticSnapshot struct {
+	Thread         string
+	Body           json.RawMessage
+	Revision       uint64
+	Tools, Aliases int
+}
+
+func (t *Telemetry) replayMissingCatalogs(hashes []string) {
+	t.catalogMu.Lock()
+	defer t.catalogMu.Unlock()
+	if len(hashes) > 64 {
+		hashes = hashes[:64]
+	}
+	seen := map[string]bool{}
+	for _, hash := range hashes {
+		if seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		snapshot, ok := t.catalogSnapshots[hash]
+		if !ok {
+			continue
+		}
+		var full map[string]json.RawMessage
+		if json.Unmarshal(snapshot.Body, &full) != nil {
+			continue
+		}
+		t.Emit("tool.catalog", snapshot.Thread, map[string]any{"catalog_hash": hash, "catalog_format": toolCatalogFormat, "revision": snapshot.Revision, "tool_count": snapshot.Tools, "alias_count": snapshot.Aliases, "tools": full["tools"], "aliases": full["aliases"], "catalog_recovery": true})
+	}
 }

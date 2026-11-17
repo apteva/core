@@ -320,7 +320,7 @@ func (t *Thinker) recordPresentedTools(tools []NativeTool, snapshots ...map[stri
 	t.toolManifestHash = digest
 	t.presentedToolsMu.Unlock()
 	if t.telemetry != nil && len(tools) > 0 {
-		t.telemetry.Emit("tool.manifest", t.threadID, map[string]any{"iteration": t.iteration, "hash": digest, "tools": manifest})
+		t.telemetry.Emit("tool.manifest", t.threadID, map[string]any{"iteration": t.iteration, "hash": digest, "catalog_hash": t.currentToolCatalogHash(), "tools": manifest})
 	}
 }
 
