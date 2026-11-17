@@ -7,8 +7,12 @@ import (
 
 // Prepare replacement transports and their schemas privately. Nothing live is
 // removed until every replacement is ready and the configuration commit succeeds.
-func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit func([]MCPServerConfig) error) error {
+func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit func([]MCPServerConfig) error, finalize ...func(bool, string)) error {
 	t := a.thinker
+	beforeCatalog, _, _, _, _, err := t.semanticToolCatalog()
+	if err != nil {
+		return err
+	}
 	current := map[string]MCPServerConfig{}
 	for _, c := range t.config.GetMCPServers() {
 		current[c.Name] = c
@@ -114,6 +118,14 @@ func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit fu
 			break
 		}
 	}
-	t.resetPromptCache(reason)
+	afterCatalog, _, _, _, _, err := t.semanticToolCatalog()
+	if err != nil {
+		return err
+	}
+	if len(finalize) > 0 {
+		finalize[0](beforeCatalog != afterCatalog, reason)
+	} else {
+		t.refreshRuntimePrompt(reason, beforeCatalog != afterCatalog)
+	}
 	return nil
 }

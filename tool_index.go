@@ -27,15 +27,14 @@ import (
 //   - The registry will eventually want to evict tools (uninstall an
 //     app); a separate index keeps that bookkeeping local.
 type ToolIndex struct {
-	mu                sync.RWMutex
-	entries           []IndexEntry
-	byName            map[string]int
-	serverPrefixes    map[string]bool
-	localNames        map[string][]int
-	aliases           map[string]string
-	revision          uint64
-	diagnosedRevision uint64
-	changed           chan struct{}
+	mu             sync.RWMutex
+	entries        []IndexEntry
+	byName         map[string]int
+	serverPrefixes map[string]bool
+	localNames     map[string][]int
+	aliases        map[string]string
+	revision       uint64
+	changed        chan struct{}
 }
 
 // IndexEntry is one tool's worth of searchable metadata.

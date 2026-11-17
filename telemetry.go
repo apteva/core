@@ -29,6 +29,8 @@ type TelemetryEvent struct {
 
 // Telemetry collects events and forwards them to the server.
 type Telemetry struct {
+	catalogMu        sync.Mutex
+	catalogSnapshots map[string]catalogDiagnosticSnapshot
 	traces           sync.Map // thread id -> current executionTrace; payloads may override with an origin snapshot
 	logBase          int
 	liveBase         int
@@ -617,6 +619,12 @@ func (t *Telemetry) postBatch(client *http.Client, body []byte) bool {
 		logMsg("TELEMETRY", fmt.Sprintf("forwardLoop: POST %s status=%d body=%s",
 			t.telemetryURL, resp.StatusCode, string(respBody)))
 		return false
+	}
+	var ack struct {
+		MissingCatalogs []string `json:"missing_catalogs"`
+	}
+	if json.Unmarshal(respBody, &ack) == nil && len(ack.MissingCatalogs) > 0 {
+		t.replayMissingCatalogs(ack.MissingCatalogs)
 	}
 	return true
 }
