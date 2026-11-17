@@ -1385,8 +1385,15 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		var commitErr error
+		toolsChanged := false
+		refreshReason := "directive_reloaded"
 		if body.MCPServers != nil {
-			commitErr = a.reconcileMCPTransaction(body.MCPServers, commit)
+			commitErr = a.reconcileMCPTransaction(body.MCPServers, commit, func(changed bool, reason string) {
+				toolsChanged = changed
+				if changed {
+					refreshReason = reason
+				}
+			})
 		} else {
 			commitErr = commit(nil)
 		}
@@ -1407,7 +1414,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			a.thinker.execution.ApplyConfig(*body.Execution)
 		}
 		if body.Directive != "" || providerChanged || body.MCPServers != nil {
-			a.thinker.reloadDirectiveNow()
+			a.thinker.refreshRuntimePrompt(refreshReason, toolsChanged)
 		}
 		a.thinker.publishRuntimeStatus()
 		a.thinker.publishContextStatus()

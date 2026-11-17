@@ -73,6 +73,12 @@ history, and results return through the parent's durable inbox. An assignment
 completion keeps the worker available for the next assignment; `done` still
 terminates that worker and does not itself stop its parent conversation.
 
+Assignment admission advances the revision only after the inbox transaction
+is durable and before the event is delivered. Failed or duplicate admissions
+leave the current assignment valid. Main, child, and profile-update queues
+share event-ID conflict validation: retries must match both payload and
+lifecycle-tracking policy, including duplicates within one batch.
+
 Plain final assistant text completes the assignment. `send(id="parent", ... )`
 can deliver progress; `status="completed"` explicitly returns an assignment
 result. `status="completion_requested"` requests graceful completion of the

@@ -793,52 +793,56 @@ type APIEvent struct {
 type ToolHandler func(t *Thinker, calls []toolCall, consumed []string) (replies []string, toolNames []string, results []ToolResult)
 
 type Thinker struct {
-	parentReportMu      sync.Mutex
-	parentReportOnce    sync.Once
-	parentReportDone    chan struct{} // guarded by parentReportMu; closed after retry writes stop
-	parentReportPending map[string]PendingParentReport
-	traceOnce           sync.Once
-	trace               *executionTrace
-	inferenceMu         sync.Mutex
-	inferenceHealth     InferenceHealth
-	shuttingDown        atomic.Bool
-	compactionActive    atomic.Bool
-	mutationMu          sync.Mutex
-	mutationWake        chan struct{}
-	mutations           []runtimeMutation
-	runtimeRunning      bool
-	requestCancel       context.CancelFunc
-	snapshotMu          sync.Mutex
-	owner               *ThreadManager
-	apiKey              string
-	pool                *ProviderPool // all available providers (shared across threads)
-	provider            LLMProvider   // current active provider for this thinker
-	providerPin         string        // provider this thread was asked to use; empty follows its parent
-	builtinScope        []string      // builtin scope from spawn: nil inherits, empty allows none
-	pinMissingReported  bool          // last pin state announced by reportProviderPinState
-	messages            []Message
-	bus                 *EventBus
-	sub                 *Subscription
-	pause               chan bool
-	quit                chan struct{}
-	runMu               sync.Mutex
-	runLaunchMu         sync.Mutex
-	runScheduled        sync.WaitGroup
-	runContextMu        sync.Mutex
-	runCancel           context.CancelFunc
-	stopOnce            sync.Once
-	iteration           int
-	paused              bool
-	llmActive           atomic.Bool
-	rate                ThinkRate
-	agentRate           ThinkRate
-	agentSleep          time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
-	nextWakeAt          time.Time     // one pending agent-owned timer persisted by pace
-	resumeWakeAt        time.Time     // one-shot startup gate restored from config
-	waitForEvents       bool          // explicit pace(clear_wake) decision, renewed after the next input
-	paceDurable         bool          // true after an explicit or restored pace
-	paceRevision        uint64        // increments only when the agent replaces or clears its pending wake
-	wakeReason          string        // reason supplied to the next request-context snapshot
+	catalogSnapshotMu       sync.Mutex
+	catalogSnapshotRevision uint64
+	catalogSnapshotHash     string
+	catalogSnapshotRecorded bool
+	parentReportMu          sync.Mutex
+	parentReportOnce        sync.Once
+	parentReportDone        chan struct{} // guarded by parentReportMu; closed after retry writes stop
+	parentReportPending     map[string]PendingParentReport
+	traceOnce               sync.Once
+	trace                   *executionTrace
+	inferenceMu             sync.Mutex
+	inferenceHealth         InferenceHealth
+	shuttingDown            atomic.Bool
+	compactionActive        atomic.Bool
+	mutationMu              sync.Mutex
+	mutationWake            chan struct{}
+	mutations               []runtimeMutation
+	runtimeRunning          bool
+	requestCancel           context.CancelFunc
+	snapshotMu              sync.Mutex
+	owner                   *ThreadManager
+	apiKey                  string
+	pool                    *ProviderPool // all available providers (shared across threads)
+	provider                LLMProvider   // current active provider for this thinker
+	providerPin             string        // provider this thread was asked to use; empty follows its parent
+	builtinScope            []string      // builtin scope from spawn: nil inherits, empty allows none
+	pinMissingReported      bool          // last pin state announced by reportProviderPinState
+	messages                []Message
+	bus                     *EventBus
+	sub                     *Subscription
+	pause                   chan bool
+	quit                    chan struct{}
+	runMu                   sync.Mutex
+	runLaunchMu             sync.Mutex
+	runScheduled            sync.WaitGroup
+	runContextMu            sync.Mutex
+	runCancel               context.CancelFunc
+	stopOnce                sync.Once
+	iteration               int
+	paused                  bool
+	llmActive               atomic.Bool
+	rate                    ThinkRate
+	agentRate               ThinkRate
+	agentSleep              time.Duration // freeform sleep duration (takes priority over agentRate when > 0)
+	nextWakeAt              time.Time     // one pending agent-owned timer persisted by pace
+	resumeWakeAt            time.Time     // one-shot startup gate restored from config
+	waitForEvents           bool          // explicit pace(clear_wake) decision, renewed after the next input
+	paceDurable             bool          // true after an explicit or restored pace
+	paceRevision            uint64        // increments only when the agent replaces or clears its pending wake
+	wakeReason              string        // reason supplied to the next request-context snapshot
 	// wakeDeadlineFired remains true while the model processes a timer wake.
 	// The expired deadline stays persisted until that turn completes so a
 	// crash re-delivers rather than silently loses scheduled work.
@@ -4206,26 +4210,45 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 
 func (t *Thinker) ReloadDirective() {
 	_ = t.mutateRuntime(func() error {
-		t.reloadDirectiveNow()
-		t.InjectConsole("Directive updated to: " + t.directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
+		if t.reloadDirectiveNow() {
+			t.InjectConsole("Directive updated to: " + t.directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
+		}
 		return nil
 	})
 }
 func (t *Thinker) ReloadDirectiveQuiet() {
 	_ = t.mutateRuntime(func() error { t.reloadDirectiveNow(); return nil })
 }
-func (t *Thinker) reloadDirectiveNow() {
+func (t *Thinker) reloadDirectiveNow() bool {
+	return t.refreshRuntimePrompt("directive_reloaded", false)
+}
+
+func (t *Thinker) refreshRuntimePrompt(reason string, toolsChanged bool) bool {
 	directive := t.config.GetDirective()
+	prompt := buildSystemPrompt(directive, t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)
+	oldPrompt := ""
+	if len(t.messages) > 0 {
+		oldPrompt = t.messages[0].Content
+	}
+	if directive == t.directive && prompt == oldPrompt && !toolsChanged {
+		return false
+	}
 	if directive != t.directive {
 		if err := t.consumeEventOnlyWait(); err != nil {
 			t.recordPersistenceFailure(err)
-			return
+			return false
 		}
 	}
 	t.directive = directive
-	t.messages[0] = Message{Role: "system", Content: buildSystemPrompt(directive, t.registry, "", t.mcpServers, nil, t.pool, t.mcpCatalog)}
-	t.resetPromptCache("directive_reloaded")
+	system := Message{Role: "system", Content: prompt}
+	if len(t.messages) == 0 {
+		t.messages = []Message{system}
+	} else {
+		t.messages[0] = system
+	}
+	t.resetPromptCache(reason)
 	t.publishContextStatus()
+	return true
 }
 
 // Inject sends a message event to this thinker's bus subscription.
