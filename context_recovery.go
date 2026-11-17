@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,11 @@ func projectBulkyContext(messages []Message, ref string, protected ...map[string
 				}
 			}
 		}
+		if len(protected) > 0 {
+			for _, result := range m.ToolResults {
+				pending = pending || protected[0][result.CallID]
+			}
+		}
 		if m.Role == "system" || m.RequestContext || pending {
 			continue
 		}
@@ -38,7 +44,7 @@ func projectBulkyContext(messages []Message, ref string, protected ...map[string
 					switch parsed.(type) {
 					case map[string]any, []any:
 						state := projectRecoveryPayload(r.Content, "[large value retained in original archive]", 0)
-						if len(state) <= len(r.Content)*3/4 {
+						if len(state) <= len(r.Content)*3/4 && len(strings.Join(stateNotes, "\n"))+len(state)+len(r.CallID)+10 <= 2*contextRecoveryPayloadBytes {
 							stateNotes = append(stateNotes, "call_id="+r.CallID+"\n"+state)
 						}
 					}
@@ -153,34 +159,69 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 	next := projectBulkyContext(messages, ref, protected)
 	before := estimatedContextTokens(messages)
 	materiallySmaller := func(candidate []Message) bool { return estimatedContextTokens(candidate) <= before-max(128, before/20) }
-	if !materiallySmaller(next) {
+	// Use the rejecting request's complete budget, including schema overhead.
+	// The adapter still checks the exact serialized candidate before submission.
+	var overflow *contextBudgetError
+	hasBudget := errors.As(reason, &overflow)
+	base := estimatePreparedRequest(provider.Name(), modelIDForProvider(provider, tier), messages, nil)
+	fits := func(candidate []Message) bool {
+		if !hasBudget {
+			return false
+		}
+		b := estimatePreparedRequest(provider.Name(), modelIDForProvider(provider, tier), candidate, nil)
+		return b.InputTokens+max(0, overflow.Budget.InputTokens-base.InputTokens) <= overflow.Budget.InputBudget
+	}
+	progress := func(candidate []Message) bool {
+		return materiallySmaller(candidate) || (estimatedContextTokens(candidate) < before && fits(candidate))
+	}
+	if !progress(next) || (hasBudget && !fits(next)) {
 		// A fixed 20-message tail was the incident's failure: it could itself be
 		// larger than the model. Retain the newest complete call/result group and
 		// summarize the older prefix. Never use emergency deletion on failure.
 		keep := max(2, 4-pass)
 		start := retainedStartForContextPressure(next, keep)
-		// The newest external instruction must remain verbatim even when it is
-		// followed by several tool-only continuations.
+		// Pin the instruction itself, not the entire tool run following it.
+		// Prior recovery summaries are history and may be merged again.
+		latestUser := -1
 		for i := len(next) - 1; i >= 1; i-- {
-			if next[i].Role == "user" && !next[i].RequestContext && len(next[i].ToolResults) == 0 && strings.TrimSpace(next[i].Content) != "" {
-				if i < start {
-					start = retainedStartForContextPressure(next, len(next)-i)
-				}
+			if next[i].Role == "user" && !next[i].RequestContext && len(next[i].ToolResults) == 0 && !isRecoverySummary(next[i]) && (strings.TrimSpace(next[i].Content) != "" || next[i].HasParts()) {
+				latestUser = i
 				break
+			}
+		}
+		// If a parallel call message contains a pending call, retain all its
+		// paired result messages too. A summary must not split a native group.
+		retainedCalls := map[string]bool{}
+		for id := range protected {
+			retainedCalls[id] = true
+		}
+		for changed := true; changed; {
+			changed = false
+			for _, m := range next[:start] {
+				ids := recoveryMessageCallIDs(m)
+				keep := false
+				for _, id := range ids {
+					keep = keep || retainedCalls[id]
+				}
+				if keep {
+					for _, id := range ids {
+						if !retainedCalls[id] {
+							retainedCalls[id], changed = true, true
+						}
+					}
+				}
 			}
 		}
 		// Keep every system instruction and current request snapshot outside the
 		// summary, regardless of its position in the prepared request.
 		old := []Message{}
 		prefix := []Message{}
-		for _, m := range next[:start] {
+		for i, m := range next[:start] {
 			pending := false
-			for _, call := range m.ToolCalls {
-				if protected[call.ID] {
-					pending = true
-				}
+			for _, id := range recoveryMessageCallIDs(m) {
+				pending = pending || retainedCalls[id]
 			}
-			if pending || m.Role == "system" || m.RequestContext || (strings.HasPrefix(m.Content, "[COMPACTED CONTEXT]") || strings.HasPrefix(m.Content, "[RECOVERED TOOL STATE]")) {
+			if pending || m.Role == "system" || m.RequestContext || i == latestUser {
 				prefix = append(prefix, m)
 			} else {
 				old = append(old, m)
@@ -205,7 +246,7 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 		prefix = append(prefix, compacted)
 		next = append(prefix, next[start:]...)
 	}
-	if !materiallySmaller(next) {
+	if !progress(next) {
 		return nil, fmt.Errorf("compaction did not materially shrink input; full context preserved at %s", ref)
 	}
 	durable := make([]Message, 0, len(next))
@@ -227,6 +268,21 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 		t.telemetry.Emit("llm.context_recovery", t.threadID, map[string]any{"provider": provider.Name(), "model": modelIDForProvider(provider, tier), "iteration": t.iteration, "reason": reason.Error(), "pass": pass, "before_tokens_est": before, "after_tokens_est": estimatedContextTokens(next), "archive_ref": ref, "history_archive_ref": historyRef, "before_fingerprint": requestFingerprint(raw)})
 	}
 	return next, nil
+}
+
+func isRecoverySummary(m Message) bool {
+	return strings.HasPrefix(m.Content, "[COMPACTED CONTEXT]") || strings.HasPrefix(m.Content, "[RECOVERED TOOL STATE]")
+}
+
+func recoveryMessageCallIDs(m Message) []string {
+	ids := make([]string, 0, len(m.ToolCalls)+len(m.ToolResults))
+	for _, call := range m.ToolCalls {
+		ids = append(ids, call.ID)
+	}
+	for _, result := range m.ToolResults {
+		ids = append(ids, result.CallID)
+	}
+	return ids
 }
 
 func (t *Thinker) emitRequestBudget(b requestBudget) {
@@ -378,7 +434,14 @@ func (t *Thinker) summarizeRecoveryPrefix(ctx context.Context, provider LLMProvi
 // megabytes of pixels/document text. Cutting the whole JSON string would hide
 // identifiers and completion flags merely because of their byte position.
 func compactRecoveryPayload(value, receipt string) string {
-	return projectRecoveryPayload(value, receipt, contextRecoveryPayloadBytes)
+	projected := projectRecoveryPayload(value, receipt, contextRecoveryPayloadBytes/4)
+	if len(projected) > contextRecoveryPayloadBytes {
+		// A wide object/array can be huge without any individual large leaf.
+		// Mark the whole-result excerpt incomplete; the immutable archive holds
+		// every omitted field, rather than presenting partial JSON as complete.
+		return deterministicToolResultExcerpt(projected, max(0, contextRecoveryPayloadBytes-len(receipt))) + receipt
+	}
+	return projected
 }
 func projectRecoveryPayload(value, receipt string, previewBytes int) string {
 	parsed, valid := decodeRecoveryJSON(value)

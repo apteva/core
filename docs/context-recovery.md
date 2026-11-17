@@ -31,22 +31,43 @@ recovery instead of an unchanged transient retry or immediate fallback:
 1. Archive the complete rejected request before reducing it.
 2. Project oversized machine payloads and older opaque response state while
    preserving ordinary messages, instructions, and in-flight native calls.
-   Structured JSON keeps small fields and exact numeric identifiers. Compact
-   structured state notes survive subsequent tool-result aging and restart.
+   Structured JSON keeps small fields and exact numeric identifiers when it
+   fits. Wide objects/arrays also receive a whole-result cap, with an explicit
+   incomplete excerpt and archive receipt instead of unmarked partial JSON.
+   Structured state notes have an aggregate budget and survive subsequent
+   tool-result aging and restart.
 3. If necessary, summarize older history in bounded batches. An oversized
    single message is fed as ordered UTF-8-safe fragments, including every byte
-   of its serialized content. Preserve current instructions, the latest external request,
-   existing continuation summaries, request-only context, pending calls, and
-   tool call/result boundaries. Empty/failed summaries never trigger blind
-   deletion.
-4. Require at least a 5% reduction (and at least 128 estimated tokens) before
-   retrying. Every candidate is budget-checked again before submission. At
+   of its serialized content. Preserve current instructions and the latest
+   external request verbatim while allowing completed tool exchanges after
+   that request to be summarized. Previous continuation summaries may be
+   merged again. Request-only context, pending calls, and their parallel
+   call/result groups remain outside the summary. Empty/failed summaries
+   never trigger blind deletion.
+4. Use the rejecting request's complete input budget, including schema
+   overhead. A smaller projection that fits is accepted even below a 5%
+   reduction; one that remains over budget proceeds to summarization. For
+   provider errors without a measured budget, require at least a 5% reduction
+   and at least 128 estimated tokens. Every candidate is budget-checked again
+   before submission. At
    most three recovery passes run within the existing five-minute request
    deadline.
 5. Archive the complete previous session journal, including history outside
    the live tail, and atomically checkpoint the reduced durable context.
+   Before any journal rewrite, archive each original tool result under its
+   original call ID, including small results previously stored only inline.
+   Archive/index failures abort the rewrite. `history_search` can resolve
+   those IDs after compaction and restart; a full-journal snapshot alone is
+   insufficient for call-ID lookup.
    Consumed event IDs survive the checkpoint. Session revisions invalidate
    obsolete background summaries without waiting for their model calls.
+
+Live Venice coverage (uses synthetic history and a deliberately smaller Core
+budget to force both recovery paths against the real model):
+
+```sh
+RUN_LLM_INTEGRATION_TESTS=1 VENICE_API_KEY=... GOWORK=off go test -run '^TestIntegration_VeniceLongToolRunRecovery$' -count=1 -timeout 6m -v .
+```
 
 Archives use the existing private, content-addressed tool-result archive and
 its size/quota limits. Request and journal references are recorded in recovery
