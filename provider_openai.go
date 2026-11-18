@@ -693,6 +693,19 @@ func NewManagedProvider(endpoint, token string) LLMProvider {
 	}
 }
 
+// NewClaudeSubscriptionProvider talks to the local Apteva Server's Claude
+// subscription route. Like the managed provider, the token is this core's
+// own credential; usage counts against the owner's Claude plan, so there
+// is no per-token cost. Model ids are the Claude CLI's family aliases.
+func NewClaudeSubscriptionProvider(endpoint, token string) LLMProvider {
+	return &OpenAICompatProvider{
+		name: "claude-subscription", apiKey: token, url: endpoint, authHeader: "Bearer",
+		models: map[ModelTier]string{
+			ModelLarge: "opus", ModelMedium: "sonnet", ModelSmall: "haiku",
+		},
+	}
+}
+
 func NewFireworksProvider(apiKey string) LLMProvider {
 	return &OpenAICompatProvider{
 		name:       "fireworks",

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -424,6 +425,15 @@ func createProviderByName(name string) LLMProvider {
 	case "grok-build":
 		if token := os.Getenv("GROK_BUILD_ACCESS_TOKEN"); token != "" {
 			return NewGrokBuildProvider(token)
+		}
+	case "claude-subscription":
+		// Served by the local Apteva Server, which runs the model through
+		// the owner's signed-in Claude CLI. Core only sees an
+		// OpenAI-compatible endpoint authenticated with its own core key.
+		serverURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SERVER_URL")), "/")
+		token := os.Getenv("APTEVA_API_KEY")
+		if os.Getenv("CLAUDE_SUBSCRIPTION_CONNECTION_ID") != "" && serverURL != "" && token != "" {
+			return NewClaudeSubscriptionProvider(serverURL+"/api/llm/claude-subscription/chat/completions", token)
 		}
 	case "anthropic":
 		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
