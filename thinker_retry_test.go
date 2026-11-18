@@ -350,8 +350,64 @@ func TestStopCancelsInFlightProviderCall(t *testing.T) {
 		if !cancelled {
 			t.Fatalf("stored telemetry = %#v, want llm.cancelled", events)
 		}
+		// The provider did not fail: nothing reads as an error.
+		for _, kind := range []string{"llm.provider_error", "llm.error"} {
+			if got := traceEvents(t, thinker.telemetry, kind); len(got) != 0 {
+				t.Fatalf("%s after a cancel = %#v", kind, got)
+			}
+		}
 	case <-time.After(time.Second):
 		t.Fatal("Stop did not cancel provider call")
+	}
+}
+
+// A request that runs out of time did not get an answer from the provider,
+// so unlike a cancel it is still reported as a provider error.
+func TestTimedOutProviderCallIsAProviderError(t *testing.T) {
+	provider := &scriptedRetryProvider{name: "slow", block: true}
+	thinker := retryTestThinker(provider)
+	thinker.telemetry = &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := thinker.callLLMWithRetry(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v", err)
+	}
+	if got := traceEvents(t, thinker.telemetry, "llm.provider_error"); len(got) != 1 || got[0]["provider"] != "slow" {
+		t.Fatalf("llm.provider_error = %#v", got)
+	}
+}
+
+// Cancelled while trying the fallback: the primary's real failure is still
+// reported, the fallback's cancel is not.
+func TestCancelDuringFallbackReportsOnlyThePrimaryError(t *testing.T) {
+	primary := &scriptedRetryProvider{name: "primary", failures: 100}
+	fallback := &scriptedRetryProvider{name: "fallback", block: true, started: make(chan struct{})}
+	thinker := retryTestThinker(primary)
+	thinker.telemetry = &Telemetry{notify: make(chan struct{}, 1), quit: make(chan struct{})}
+	thinker.pool = &ProviderPool{
+		providers: map[string]LLMProvider{"primary": primary, "fallback": fallback},
+		order:     []string{"primary", "fallback"},
+		default_:  "primary",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := thinker.callLLMWithRetry(ctx)
+		done <- err
+	}()
+	<-fallback.started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not stop the fallback call")
+	}
+	got := traceEvents(t, thinker.telemetry, "llm.provider_error")
+	if len(got) != 1 || got[0]["role"] != "primary" {
+		t.Fatalf("llm.provider_error = %#v", got)
 	}
 }
 
