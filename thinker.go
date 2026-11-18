@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -3732,6 +3733,14 @@ func isProviderOverloadError(err error) bool {
 	return false
 }
 
+// cancelledByCaller reports whether the request was called off on this side:
+// newer configuration, superseded work, or Stop. The provider did not fail,
+// so this is recorded as llm.cancelled, not as a provider error. A timeout
+// is not a cancellation and still counts against the provider.
+func cancelledByCaller(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
+}
+
 func (t *Thinker) callLLMWithRetry(ctx context.Context) (ChatResponse, error) {
 	t.sanitizeConversationMessages()
 	return t.callLLMWithRetryMessages(ctx, t.messages)
@@ -3760,7 +3769,7 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 		if isInvalidToolHistory(err) {
 			return resp, err
 		}
-		if err != nil && t.telemetry != nil {
+		if err != nil && t.telemetry != nil && !cancelledByCaller(ctx) {
 			t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": resp.Provider, "model": resp.Model, "error": err.Error(), "role": "primary", "iteration": t.iteration})
 		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
@@ -3787,7 +3796,7 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 						if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
 							permanentFallbacks[fallback.Name()] = fallbackErr
 						}
-						if t.telemetry != nil {
+						if t.telemetry != nil && !cancelledByCaller(ctx) {
 							model := fallbackResp.Model
 							if model == "" {
 								model = modelIDForProvider(fallback, t.model)
