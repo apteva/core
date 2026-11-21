@@ -177,7 +177,7 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(a.startTime)
 	status := a.thinker.status()
 
-	writeJSON(w, map[string]any{
+	body := map[string]any{
 		"uptime_seconds":        int(elapsed.Seconds()),
 		"inference":             a.thinker.inferenceSnapshot(),
 		"workflow_healthy":      a.thinker.workflowHealthy(),
@@ -194,7 +194,13 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 		"llm_active":            status.LLMActive,
 		"execution_control":     a.thinker.executionStatus(),
 		"execution_checkpoints": a.thinker.executionCheckpointMeta(),
-	})
+	}
+	// The agent's chosen provider can't run in this process (its credentials
+	// arrive only at start). Nothing else runs in its place.
+	if status.ProviderUnavailable != nil {
+		body["provider_unavailable"] = status.ProviderUnavailable
+	}
+	writeJSON(w, body)
 }
 
 type threadJSON struct {
@@ -1305,7 +1311,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			mcpInfo = append(mcpInfo, entry)
 		}
 
-		writeJSON(w, map[string]any{
+		response := map[string]any{
 			"automatic_tool_loading": a.thinker.config.GetAutomaticToolLoading(),
 			"memory_policy":          a.thinker.config.GetMemoryPolicy(),
 			"directive":              a.thinker.config.GetDirective(),
@@ -1319,7 +1325,11 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			"realtime_providers":     status.RealtimeProviders,
 			"realtime_voice":         a.thinker.config.GetRealtimeVoice(),
 			"realtime_voice_mcp":     a.thinker.config.GetRealtimeVoiceMCP(),
-		})
+		}
+		if status.ProviderUnavailable != nil {
+			response["provider_unavailable"] = status.ProviderUnavailable
+		}
+		writeJSON(w, response)
 	case http.MethodPut:
 		body, prevalidated := r.Context().Value(configUpdateKey{}).(configUpdate)
 		if !prevalidated {
@@ -1404,6 +1414,9 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		if providerChanged {
 			a.thinker.pool = pool
 			a.thinker.provider = pool.Default()
+			if info := pool.Unavailable(); info != nil {
+				logMsg("PROVIDER", fmt.Sprintf("default provider %q cannot run: %s; not using another provider in its place", info.Name, info.Reason))
+			}
 			// Settings saves usually resend the providers unchanged, and moving a
 			// worker cancels its in-flight LLM request, so act only on a real change.
 			if !providerConfigsEqual(savedProviders, providers) || enabled != savedEnabled {
@@ -1467,6 +1480,9 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		response := map[string]any{"status": "updated"}
 		if resetResult != nil {
 			response["reset"] = resetResult
+		}
+		if info := providerUnavailableInfo(a.thinker.provider); info != nil {
+			response["provider_unavailable"] = info
 		}
 		writeJSON(w, response)
 	default:

@@ -52,7 +52,7 @@ func permanentProviderError(err error) bool {
 		return false
 	}
 	var invalid *toolNameError
-	if errors.As(err, &invalid) {
+	if errors.As(err, &invalid) || errors.Is(err, ErrProviderUnavailable) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
