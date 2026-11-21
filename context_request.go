@@ -69,6 +69,9 @@ func providerExecutionFailureReason(err error) string {
 	if errors.As(err, &management) || isContextLengthError(err) {
 		return "context_management_failed: " + err.Error()
 	}
+	if errors.Is(err, ErrProviderUnavailable) {
+		return "provider_unavailable: " + err.Error()
+	}
 	return "provider_retry_budget_exhausted: " + err.Error()
 }
 

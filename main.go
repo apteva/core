@@ -175,8 +175,12 @@ func runCore() error {
 	if err != nil {
 		return err
 	}
-	models := provider.Models()
-	fmt.Fprintf(os.Stderr, "LLM provider: %s (large=%s, medium=%s, small=%s)\n", provider.Name(), models[ModelLarge], models[ModelMedium], models[ModelSmall])
+	if info := providerUnavailableInfo(provider); info != nil {
+		fmt.Fprintf(os.Stderr, "LLM provider: %s cannot run: %s; not using another provider in its place\n", info.Name, info.Reason)
+	} else {
+		models := provider.Models()
+		fmt.Fprintf(os.Stderr, "LLM provider: %s (large=%s, medium=%s, small=%s)\n", provider.Name(), models[ModelLarge], models[ModelMedium], models[ModelSmall])
+	}
 
 	// Keep apiKey for backward compat (memory embeddings use it)
 	apiKey := os.Getenv("FIREWORKS_API_KEY")

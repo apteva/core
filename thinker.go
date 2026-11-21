@@ -1198,6 +1198,7 @@ type thinkerRuntimeStatus struct {
 	Provider            string
 	ProviderPin         string
 	ProviderMissing     bool
+	ProviderUnavailable *ProviderUnavailable
 	ContextMsgs         int
 	ContextChars        int
 	ModelID             string
@@ -1265,6 +1266,7 @@ func (t *Thinker) publishRuntimeStatus() {
 		Provider:            providerName,
 		ProviderPin:         t.providerPin,
 		ProviderMissing:     t.providerPinMissing(),
+		ProviderUnavailable: providerUnavailableInfo(t.provider),
 		ContextMsgs:         len(t.messages),
 		ContextChars:        contextChars(t.messages),
 		ModelID:             t.modelID(),
@@ -1336,7 +1338,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	// override the test's intent. Production callers pass the result
 	// of selectProvider(), so the explicit value is the env-detected
 	// default anyway — no behavior change there.
-	if provider != nil {
+	if provider != nil && providerUnavailableInfo(provider) == nil {
 		name := provider.Name()
 		if pool.Get(name) == nil {
 			pool.providers[name] = provider
@@ -3785,7 +3787,9 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 			logMsg("ATTACHMENT", fmt.Sprintf("[%s] quarantined %d rejected attachments; retrying prepared turn without them", t.threadID, count))
 			continue
 		}
-		if err != nil && !isContextLengthError(err) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
+		// A provider that can't run here is the agent's choice, not an outage:
+		// moving the request to another provider is left to the user.
+		if err != nil && !isContextLengthError(err) && !errors.Is(err, ErrProviderUnavailable) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
 			if fallback := t.compatibleFallback(primary.Name(), messages); fallback != nil {
 				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), err, fallback.Name()))
 				fallbackErr := permanentFallbacks[fallback.Name()]

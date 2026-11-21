@@ -568,6 +568,7 @@ type ProviderPool struct {
 	realtimeProviders map[string]RealtimeProvider // "openai-realtime" → instance
 	realtimeOrder     []string                    // realtime names in registration order
 	realtimeDefault   string                      // default realtime provider name
+	unavailable       *unavailableProvider        // chosen default this core cannot run; never replaced by another provider
 }
 
 // Get returns a provider by name, or nil if not found.
@@ -585,6 +586,9 @@ func (pp *ProviderPool) Default() LLMProvider {
 	}
 	if p, ok := pp.providers[pp.default_]; ok {
 		return p
+	}
+	if pp.unavailable != nil {
+		return pp.unavailable
 	}
 	// Fallback: first available
 	if len(pp.order) > 0 {
@@ -760,6 +764,11 @@ func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPoo
 		}
 		p := createProviderByName(pc.Name)
 		if p == nil {
+			// Keep an explicit default even when it can't run here, so the
+			// agent reports it rather than running on another provider.
+			if pc.Default {
+				pool.markDefaultUnavailable(pc.Name)
+			}
 			continue
 		}
 		if pc.ServiceTier != "" {
@@ -790,6 +799,7 @@ func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPoo
 		pool.order = append(pool.order, pc.Name)
 		if pc.Default {
 			pool.default_ = pc.Name
+			pool.unavailable = nil
 		}
 	}
 
@@ -804,6 +814,7 @@ func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPoo
 			pool.order = append([]string{explicit}, pool.order...)
 		}
 		pool.default_ = explicit
+		pool.unavailable = nil
 	}
 
 	// 3. Auto-detect from API keys if nothing configured.
@@ -815,7 +826,7 @@ func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPoo
 	// will silently win and burn budget). Ollama is last because it
 	// requires OLLAMA_HOST set explicitly and only returns non-nil
 	// when the user has it running.
-	if len(pool.providers) == 0 {
+	if len(pool.providers) == 0 && pool.unavailable == nil {
 		for _, name := range []string{"opencode-go", "fireworks", "anthropic", "google", "openai", "xai", "venice", "nvidia", "ollama"} {
 			if p := createProviderByName(name); p != nil {
 				pool.providers[name] = p
@@ -824,7 +835,7 @@ func buildProviderPoolWithCapabilities(cfg *Config, activate bool) (*ProviderPoo
 		}
 	}
 
-	if len(pool.providers) == 0 {
+	if len(pool.providers) == 0 && pool.unavailable == nil {
 		return nil, fmt.Errorf("no LLM provider configured — set FIREWORKS_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, or OLLAMA_HOST")
 	}
 	// One configured API integration supplies text and voice credentials.
