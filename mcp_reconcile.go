@@ -3,7 +3,36 @@ package core
 import (
 	"fmt"
 	"reflect"
+	"strings"
 )
+
+// MCPReplacementError reports the connections a configuration change needed
+// that could not be made. The previous configuration stays in place.
+type MCPReplacementError struct {
+	Connected, Attempted int
+	Failed               []string
+}
+
+func (e *MCPReplacementError) Error() string {
+	return fmt.Sprintf("MCP replacement failed: connected %d of %d (failed: %s); previous configuration retained",
+		e.Connected, e.Attempted, strings.Join(e.Failed, ", "))
+}
+
+// failedMCPNames returns the names in attempted that have no connection in
+// connected, in attempted order.
+func failedMCPNames(attempted []MCPServerConfig, connected []MCPConn) []string {
+	ok := map[string]bool{}
+	for _, srv := range connected {
+		ok[srv.GetName()] = true
+	}
+	var failed []string
+	for _, c := range attempted {
+		if !ok[c.Name] {
+			failed = append(failed, c.Name)
+		}
+	}
+	return failed
+}
 
 // Prepare replacement transports and their schemas privately. Nothing live is
 // removed until every replacement is ready and the configuration commit succeeds.
@@ -44,7 +73,7 @@ func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit fu
 		live[srv.GetName()] = srv
 	}
 	replacement := map[string]bool{}
-	var connect []MCPServerConfig
+	var connect, retry []MCPServerConfig
 	for _, c := range desired {
 		old, known := current[c.Name]
 		unchanged := old.URL == c.URL && old.Command == c.Command && old.Transport == c.Transport && reflect.DeepEqual(old.Args, c.Args) && reflect.DeepEqual(old.Env, c.Env)
@@ -52,6 +81,14 @@ func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit fu
 			continue
 		}
 		replacement[c.Name] = true
+		// A saved connection that is unchanged but not live already failed
+		// before this update. Try it once more, but its failure belongs to
+		// whatever broke it, not to the change being applied, so it must not
+		// block that change.
+		if live[c.Name] == nil && known && unchanged {
+			retry = append(retry, c)
+			continue
+		}
 		connect = append(connect, c)
 	}
 	stagedRegistry := &ToolRegistry{tools: map[string]*ToolDef{}}
@@ -64,7 +101,14 @@ func (a *APIServer) reconcileMCPTransaction(desired []MCPServerConfig, commit fu
 	}
 	if len(staged) != len(connect) {
 		cleanup()
-		return fmt.Errorf("MCP replacement failed: connected %d of %d; previous configuration retained", len(staged), len(connect))
+		return &MCPReplacementError{Connected: len(staged), Attempted: len(connect), Failed: failedMCPNames(connect, staged)}
+	}
+	if len(retry) > 0 {
+		retried := connectAndRegisterMCPWith(retry, stagedRegistry, stagedIndex, t.blobs, connectAnyMCP)
+		if failed := failedMCPNames(retry, retried); len(failed) > 0 {
+			logMsg("MCP", fmt.Sprintf("still unavailable, kept in configuration: %s", strings.Join(failed, ", ")))
+		}
+		staged = append(staged, retried...)
 	}
 	for _, def := range stagedRegistry.tools {
 		old := t.registry.Get(def.Name)
