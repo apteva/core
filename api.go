@@ -1408,6 +1408,18 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			commitErr = commit(nil)
 		}
 		if commitErr != nil {
+			// Name the connections that failed so the caller can tell whose
+			// failure it is before it restarts anything.
+			var replacementErr *MCPReplacementError
+			if errors.As(commitErr, &replacementErr) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{
+					"error":              "apply configuration: " + commitErr.Error(),
+					"failed_mcp_servers": replacementErr.Failed,
+				})
+				return
+			}
 			http.Error(w, "apply configuration: "+commitErr.Error(), http.StatusInternalServerError)
 			return
 		}

@@ -631,9 +631,16 @@ func connectAnyMCPWithRetry(cfg MCPServerConfig) (MCPConn, error) {
 // arguments and results flow through the blob store (see
 // mcpProxyHandler). Pass nil for blobs to register plain proxies.
 func connectAndRegisterMCP(configs []MCPServerConfig, registry *ToolRegistry, index *ToolIndex, blobs *BlobStore) []MCPConn {
+	return connectAndRegisterMCPWith(configs, registry, index, blobs, connectAnyMCPWithRetry)
+}
+
+// connectAndRegisterMCPWith is connectAndRegisterMCP with the connect step
+// supplied, so a caller can choose a single attempt instead of the retry
+// budget.
+func connectAndRegisterMCPWith(configs []MCPServerConfig, registry *ToolRegistry, index *ToolIndex, blobs *BlobStore, connect func(MCPServerConfig) (MCPConn, error)) []MCPConn {
 	var servers []MCPConn
 	for _, cfg := range configs {
-		srv, err := connectAnyMCPWithRetry(cfg)
+		srv, err := connect(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "MCP %s: %v\n", cfg.Name, err)
 			continue
