@@ -893,6 +893,14 @@ func ModelContextWindow(modelID string) int {
 	if caps, ok := capabilitiesForModel(modelID); ok && caps.ContextWindow > 0 {
 		return caps.ContextWindow
 	}
+	// Claude Code model aliases, as the claude-subscription provider sends
+	// them. Matched exactly: as substrings they would catch unrelated ids.
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "opus", "sonnet", "haiku":
+		return 200_000
+	case "opus[1m]", "sonnet[1m]", "haiku[1m]":
+		return 1_000_000
+	}
 	// Order longest-prefix first to win over shorter substrings.
 	table := []struct {
 		match  string
@@ -900,11 +908,20 @@ func ModelContextWindow(modelID string) int {
 	}{
 		// --- Anthropic (Claude) ---
 		// 1M-context variants are explicitly tagged.
+		{"claude-opus-4-8[1m]", 1_000_000},
 		{"claude-opus-4-7[1m]", 1_000_000},
 		{"claude-opus-4-6[1m]", 1_000_000},
 		{"claude-opus-4-5[1m]", 1_000_000},
 		{"claude-sonnet-4-6[1m]", 1_000_000},
 		{"claude-sonnet-4-5[1m]", 1_000_000},
+		// Claude 5 family: every documented id has a 1M window (default
+		// and maximum): fable-5, -5-1, -5-2; mythos-5, -5-1, -5-2;
+		// opus-5, -5-5; sonnet-5, -5-5; haiku-5-5.
+		{"claude-fable-5", 1_000_000},
+		{"claude-mythos-5", 1_000_000},
+		{"claude-opus-5", 1_000_000},
+		{"claude-sonnet-5", 1_000_000},
+		{"claude-haiku-5", 1_000_000},
 		// Standard 200K Claude family.
 		{"claude-opus-4", 200_000},
 		{"claude-sonnet-4", 200_000},
