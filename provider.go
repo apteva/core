@@ -569,6 +569,7 @@ type ProviderPool struct {
 	realtimeOrder     []string                    // realtime names in registration order
 	realtimeDefault   string                      // default realtime provider name
 	unavailable       *unavailableProvider        // chosen default this core cannot run; never replaced by another provider
+	health            *providerHealth             // providers skipped after credential failures; shared with the pool this one replaced when providers are unchanged
 }
 
 // Get returns a provider by name, or nil if not found.

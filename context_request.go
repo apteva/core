@@ -237,12 +237,29 @@ func observeProviderRequest(ctx context.Context, provider, model string, body []
 }
 
 // Preserve both causal identities; errors.As/Is must see primary AND fallback.
-type providerChainError struct {
-	PrimaryName, FallbackName string
-	Primary, Fallback         error
+// providerAttempt is one provider's part in a request that no provider
+// answered: the error it returned, or why it was not called.
+type providerAttempt struct {
+	Provider string
+	Role     string // "primary" or "fallback"
+	Err      error
 }
 
+// providerChainError names every provider a request went through, in order,
+// so one error says why each of them did not answer.
+type providerChainError struct{ Attempts []providerAttempt }
+
 func (e *providerChainError) Error() string {
-	return fmt.Sprintf("primary %s: %v; fallback %s: %v", e.PrimaryName, e.Primary, e.FallbackName, e.Fallback)
+	parts := make([]string, 0, len(e.Attempts))
+	for _, attempt := range e.Attempts {
+		parts = append(parts, fmt.Sprintf("%s %s: %v", attempt.Role, attempt.Provider, attempt.Err))
+	}
+	return fmt.Sprintf("no provider answered (%d tried or skipped): %s", len(e.Attempts), strings.Join(parts, "; "))
 }
-func (e *providerChainError) Unwrap() []error { return []error{e.Primary, e.Fallback} }
+func (e *providerChainError) Unwrap() []error {
+	out := make([]error, 0, len(e.Attempts))
+	for _, attempt := range e.Attempts {
+		out = append(out, attempt.Err)
+	}
+	return out
+}

@@ -200,6 +200,10 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	if status.ProviderUnavailable != nil {
 		body["provider_unavailable"] = status.ProviderUnavailable
 	}
+	// Providers skipped because their credentials or account were rejected.
+	if health := a.thinker.pool.ProviderHealth(); len(health) > 0 {
+		body["provider_health"] = health
+	}
 	writeJSON(w, body)
 }
 
@@ -1424,6 +1428,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if providerChanged {
+			pool.inheritHealth(a.thinker.pool, savedProviders, providers, enabled != savedEnabled)
 			a.thinker.pool = pool
 			a.thinker.provider = pool.Default()
 			if info := pool.Unavailable(); info != nil {
