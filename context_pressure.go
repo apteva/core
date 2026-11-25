@@ -20,7 +20,6 @@ const (
 	semanticCompactionTokenRatio       = 0.65
 	contextPressureCharFallback        = 512 * 1024
 	semanticCompactionCharFallback     = 384 * 1024
-	contextPressureEmptyStreak         = 2
 	toolResultContextPreviewChars      = 2000
 	compactionInputMessagePreviewChars = 6000
 	semanticCompactionTimeout          = 90 * time.Second
@@ -353,19 +352,19 @@ func shouldCompactBeforeLLM(modelID string, messages []Message) bool {
 	return after < semanticCompactionCharFallback || before-after >= before/10
 }
 
-func shouldRecoverFromEmptyResponse(usage TokenUsage, modelID string, messages []Message, emptyStreak int) bool {
+// shouldRecoverFromEmptyResponse reports whether an empty answer came with a
+// context near the model's limit, where compacting and asking again can help.
+// On a smaller context compaction gains nothing, however many answers came
+// back empty.
+func shouldRecoverFromEmptyResponse(usage TokenUsage, modelID string, messages []Message) bool {
 	maxTokens := ModelEffectiveContextWindow(modelID)
 	if usage.PromptTokens > 0 && maxTokens > 0 && float64(usage.PromptTokens) >= float64(maxTokens)*contextPressureTokenRatio {
 		return true
 	}
 	if maxTokens > 0 {
-		if estimatedContextTokens(messages) >= int(float64(maxTokens)*contextPressureTokenRatio) {
-			return true
-		}
-	} else if contextChars(messages) >= contextPressureCharFallback {
-		return true
+		return estimatedContextTokens(messages) >= int(float64(maxTokens)*contextPressureTokenRatio)
 	}
-	return emptyStreak >= contextPressureEmptyStreak
+	return contextChars(messages) >= contextPressureCharFallback
 }
 
 func trimMessagesForContextPressure(messages []Message, keepRecent int) []Message {
