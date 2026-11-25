@@ -376,6 +376,50 @@ func TestAPI_Threads_WithSubThreads(t *testing.T) {
 	if body[1]["id"] != "test-thread" {
 		t.Errorf("expected second thread 'test-thread', got %v", body[1]["id"])
 	}
+	for _, thread := range body {
+		raw, _ := thread["started_at"].(string)
+		started, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil || time.Since(started) < 0 || time.Since(started) > time.Minute {
+			t.Errorf("thread %v started_at = %q (%v)", thread["id"], raw, err)
+		}
+	}
+}
+
+func TestThreadDoneTelemetryReportsKilledThreadAsCancelled(t *testing.T) {
+	_, thinker := newTestAPI()
+	if err := thinker.threads.Spawn("killed-thread", "test prompt", []string{"web"}); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	thinker.threads.Kill("killed-thread")
+
+	events, _ := thinker.telemetry.Events(0)
+	for _, event := range events {
+		if event.ThreadID != "killed-thread" || event.Type != "thread.done" {
+			continue
+		}
+		var done ThreadDoneData
+		if err := json.Unmarshal(event.Data, &done); err != nil {
+			t.Fatalf("decode thread.done: %v", err)
+		}
+		if done.Outcome != "cancelled" || done.Result != "" || done.ParentID != "main" {
+			t.Fatalf("thread.done data = %+v", done)
+		}
+		return
+	}
+	t.Fatalf("no thread.done event for killed-thread: %+v", events)
+}
+
+func TestTelemetryPreviewCutsOnRuneBoundary(t *testing.T) {
+	if got, cut := telemetryPreview("short", 10); got != "short" || cut {
+		t.Fatalf("short preview = %q, %v", got, cut)
+	}
+	// "é" is two bytes; a 4-byte cap must not split the second one.
+	if got, cut := telemetryPreview("ééé", 4); got != "éé..." || !cut {
+		t.Fatalf("cut preview = %q, %v", got, cut)
+	}
+	if got, cut := telemetryPreview("éé", 3); got != "é..." || !cut {
+		t.Fatalf("mid-rune preview = %q, %v", got, cut)
+	}
 }
 
 func TestAPI_PostEvent(t *testing.T) {

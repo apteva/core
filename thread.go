@@ -1561,6 +1561,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							emitResult(call, "error: persist parent completion: "+err.Error())
 						} else {
 							doneMsg = &msg
+							thread.recordCompletionResult(msg)
 						}
 					}
 				}
@@ -2645,9 +2646,16 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 	}
 	// Telemetry: thread.done
 	if tm.parent.telemetry != nil {
-		data := any(ThreadDoneData{ParentID: parentID})
+		done := ThreadDoneData{ParentID: parentID}
+		var trace *executionTrace
 		if thread != nil {
-			data = withTrace(data, thread.Thinker.tracing().snapshot())
+			trace = thread.Thinker.tracing()
+			done.Outcome = trace.finishedOutcome()
+			done.Result, done.ResultTruncated = telemetryPreview(thread.completionResult(), toolResultTelemetryPreviewBytes)
+		}
+		data := any(done)
+		if trace != nil {
+			data = withTrace(data, trace.snapshot())
 		}
 		tm.parent.telemetry.Emit("thread.done", id, data)
 		if thread != nil {
