@@ -2389,7 +2389,11 @@ func (tm *ThreadManager) UpdateWithEvents(id, name, directive string, tools []st
 		return ThreadUpdateResult{}, validationErr
 	}
 	var result ThreadUpdateResult
-	err := thread.Thinker.mutateRuntime(func() error {
+	mutate := thread.Thinker.mutateRuntime
+	if opts.Quiet && len(incoming) == 0 {
+		mutate = thread.Thinker.mutateRuntimeQuietly
+	}
+	err := mutate(func() error {
 		var err error
 		result, err = owner.updateWithOptsNow(id, name, directive, tools, opts, incoming)
 		return err

@@ -9,6 +9,9 @@ type runtimeMutation struct {
 	apply              func() error
 	done               chan error
 	invalidatesRequest bool
+	// quiet commands do not start a turn by themselves: a thread waiting
+	// for its next wake applies them and keeps waiting.
+	quiet bool
 }
 
 // The loop owns mutable conversation/provider state. External mutations cancel
@@ -25,8 +28,21 @@ func (t *Thinker) createRuntimeChild(fn func() error) error {
 	return t.enqueueRuntimeMutation(fn, false)
 }
 
+// mutateRuntimeQuietly is mutateRuntime for a change that must not wake the
+// thread, such as a directive refreshed because main's changed. A request in
+// flight still restarts with the new profile; a waiting thread applies the
+// change and keeps waiting, so it takes effect on the thread's next real wake.
+func (t *Thinker) mutateRuntimeQuietly(fn func() error) error {
+	done, err := t.queueRuntimeMutationCommand(runtimeMutation{apply: fn, invalidatesRequest: true, quiet: true})
+	return t.awaitRuntimeMutation(done, err)
+}
+
 func (t *Thinker) enqueueRuntimeMutation(fn func() error, invalidatesRequest bool) error {
 	done, err := t.queueRuntimeMutation(fn, invalidatesRequest)
+	return t.awaitRuntimeMutation(done, err)
+}
+
+func (t *Thinker) awaitRuntimeMutation(done <-chan error, err error) error {
 	if done == nil {
 		return err
 	}
@@ -41,17 +57,21 @@ func (t *Thinker) enqueueRuntimeMutation(fn func() error, invalidatesRequest boo
 // queueRuntimeMutation hands fn to the owning loop and returns without waiting
 // for it. A nil channel means the thinker isn't running and fn has already run.
 func (t *Thinker) queueRuntimeMutation(fn func() error, invalidatesRequest bool) (<-chan error, error) {
+	return t.queueRuntimeMutationCommand(runtimeMutation{apply: fn, invalidatesRequest: invalidatesRequest})
+}
+
+func (t *Thinker) queueRuntimeMutationCommand(command runtimeMutation) (<-chan error, error) {
 	t.mutationMu.Lock()
 	defer t.mutationMu.Unlock()
 	if t.mutationWake == nil {
 		t.mutationWake = make(chan struct{}, 1)
 	}
 	if !t.runtimeRunning {
-		return nil, fn()
+		return nil, command.apply()
 	}
-	command := runtimeMutation{apply: fn, done: make(chan error, 1), invalidatesRequest: invalidatesRequest}
+	command.done = make(chan error, 1)
 	t.mutations = append(t.mutations, command)
-	if invalidatesRequest && t.requestCancel != nil {
+	if command.invalidatesRequest && t.requestCancel != nil {
 		t.requestCancel()
 	}
 	select {
@@ -91,6 +111,19 @@ func (t *Thinker) applyRuntimeMutations() bool {
 // The result says whether the model response became stale, not whether any
 // command ran: child creation must not discard a completed response.
 func (t *Thinker) applyQueuedRuntimeMutations(inferenceRunning bool) bool {
+	invalidated, _ := t.applyRuntimeMutationBatch(inferenceRunning)
+	return invalidated
+}
+
+// applyRuntimeMutationsWhileWaiting runs at the wait boundary and says whether
+// the wake should start a turn. Only quiet commands keep the thread waiting; a
+// wake with nothing queued starts a turn as it always has.
+func (t *Thinker) applyRuntimeMutationsWhileWaiting() bool {
+	_, wake := t.applyRuntimeMutationBatch(false)
+	return wake
+}
+
+func (t *Thinker) applyRuntimeMutationBatch(inferenceRunning bool) (invalidated, wake bool) {
 	t.mutationMu.Lock()
 	count := len(t.mutations)
 	if inferenceRunning {
@@ -110,12 +143,13 @@ func (t *Thinker) applyQueuedRuntimeMutations(inferenceRunning bool) bool {
 	default:
 	}
 	t.mutationMu.Unlock()
-	invalidated := false
+	wake = len(batch) == 0
 	for _, cmd := range batch {
 		invalidated = invalidated || cmd.invalidatesRequest
+		wake = wake || !cmd.quiet
 		cmd.done <- cmd.apply()
 	}
-	return invalidated
+	return invalidated, wake
 }
 func (t *Thinker) runtimeRequest(ctx context.Context) (context.Context, func()) {
 	request, cancel := context.WithCancel(ctx)

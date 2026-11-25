@@ -3468,13 +3468,18 @@ func (t *Thinker) Run() {
 			timer = time.NewTimer(delay)
 			timerC = timer.C
 		}
+	wait:
 		select {
 		case <-timerC:
 			t.wakeDeadlineFired = true
 			t.wakeReason = "timer"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
 		case <-t.mutationWake:
-			t.applyRuntimeMutations()
+			if !t.applyRuntimeMutationsWhileWaiting() {
+				// A quiet change (an inherited directive refresh) takes
+				// effect on the next real wake.
+				goto wait
+			}
 		case <-t.sub.Wake:
 			t.wakeReason = "event"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: event received", t.threadID))

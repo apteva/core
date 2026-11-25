@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -414,4 +415,54 @@ func TestRestoreKeepsFlagsAndRecomputesFromCurrentMain(t *testing.T) {
 	if !strings.Contains(reporter.Directive, "New rule.") || strings.Contains(reporter.Directive, "Old rule.") || !strings.HasPrefix(reporter.Directive, "## Role\nReport.") {
 		t.Fatalf("restored worker policy = %q", reporter.Directive)
 	}
+}
+
+// A sleeping thread that follows main takes main's new text without running a
+// turn; the change applies on its next real event.
+func TestInheritedRefreshDoesNotWakeSleepingThread(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		cfg := &Config{path: "config.json", Directive: "## Mission\nSign off with ALPHA."}
+		provider := newPacingTestProvider(2)
+		provider.responses = []ChatResponse{{Text: "Waiting.", ToolCalls: []NativeToolCall{{ID: "wait", Name: "pace", Args: map[string]string{"clear_wake": "true"}}}}}
+		parent := NewThinker("", provider, cfg)
+		defer parent.blobs.Close()
+		if err := parent.threads.SpawnWithOpts("chat", "", nil, SpawnOpts{InheritMain: true, DirectiveSuffix: "\n\n## Channel\nReply briefly.", APIManaged: true}); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { parent.threads.KillAll(); provider.release(1); provider.release(2); synctest.Wait() }()
+		synctest.Wait()
+		if got := <-provider.started; got != 1 {
+			t.Fatalf("first call = %d", got)
+		}
+		provider.release(1)
+		synctest.Wait()
+
+		if err := cfg.SetDirective("## Mission\nSign off with BRAVO."); err != nil {
+			t.Fatal(err)
+		}
+		sync := parent.syncThreadDirectives()
+		if strings.Join(sync.Inherited, ",") != "chat" || len(sync.Failed) != 0 {
+			t.Fatalf("sync = %+v", sync)
+		}
+		if got := liveDirective(t, parent, "chat"); got != "## Mission\nSign off with BRAVO.\n\n## Channel\nReply briefly." {
+			t.Fatalf("directive = %q", got)
+		}
+		time.Sleep(2 * idleWakeFallback)
+		synctest.Wait()
+		select {
+		case got := <-provider.started:
+			t.Fatalf("quiet refresh started call %d", got)
+		default:
+		}
+
+		parent.threads.Send("chat", "Status?")
+		synctest.Wait()
+		if got := <-provider.started; got != 2 {
+			t.Fatalf("event call = %d", got)
+		}
+		if prompt := messagesText(provider.request(2)); !strings.Contains(prompt, "BRAVO") || strings.Contains(prompt, "ALPHA") {
+			t.Fatal("next turn did not use main's new text")
+		}
+	})
 }
