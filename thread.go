@@ -181,6 +181,9 @@ type ThreadInfo struct {
 	ID                  string
 	Name                string // human-readable display label; empty = render id
 	System              bool   // platform-managed; hidden from and immutable by agent tools
+	APIManaged          bool   // created through the API; agent tools may only message it
+	InheritMain         bool   // directive is main's directive plus DirectiveSuffix
+	DirectiveSuffix     string
 	ParentID            string // "main" or parent thread ID
 	Depth               int
 	Directive           string
@@ -223,10 +226,17 @@ type Thread struct {
 	System                 bool   // platform-managed thread, not an agent-addressable worker
 	// Name can be edited via update without touching parent_id
 	// references or session storage. Empty means "use ID for display".
-	ParentID  string   // "main" or parent thread ID
-	Depth     int      // 0 = child of main, 1 = grandchild, etc.
-	Directive string   // original directive before tool docs
-	MCPNames  []string // MCP server names this thread connected to
+	ParentID  string // "main" or parent thread ID
+	Depth     int    // 0 = child of main, 1 = grandchild, etc.
+	Directive string // original directive before tool docs
+	// APIManaged threads were created through the API (apps, channels, the
+	// dashboard). Agent tools may message them but not update or kill them.
+	APIManaged bool
+	// InheritMain threads run main's directive plus DirectiveSuffix and are
+	// recomputed whenever main's directive changes.
+	InheritMain     bool
+	DirectiveSuffix string
+	MCPNames        []string // MCP server names this thread connected to
 	// InheritCapabilities records whether this thread was created from its
 	// parent's effective delegation ceiling rather than a legacy explicit
 	// tools/MCP profile. The effective snapshot is still persisted for audit.
@@ -373,6 +383,13 @@ type SpawnOpts struct {
 	// Pace restores the agent-owned pending wake of a persistent thread. It is
 	// not exposed through spawn and never enters the thread directive.
 	Pace *PersistentPaceState
+	// APIManaged marks a thread created through the authenticated API. Never
+	// set by the agent spawn tool.
+	APIManaged bool
+	// InheritMain builds the directive from main's current directive plus
+	// DirectiveSuffix, and keeps it that way as main's directive changes.
+	InheritMain     bool
+	DirectiveSuffix string
 	// InitialMessage is sent to the realtime provider after the first audio
 	// bridge connects, then immediately requests a response.
 	InitialMessage string
@@ -533,6 +550,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 			break
 		}
 	}
+	directive = tm.composeThreadDirective(directive, isSystem, opts.Realtime, opts.InheritMain, opts.DirectiveSuffix)
 
 	// Build tool set
 	toolSet := make(map[string]bool)
@@ -609,6 +627,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		ParentID:            parentID,
 		Depth:               depth,
 		Directive:           directive,
+		APIManaged:          opts.APIManaged,
+		InheritMain:         opts.InheritMain && !isSystem && !opts.Realtime,
+		DirectiveSuffix:     opts.DirectiveSuffix,
 		MCPNames:            opts.MCPNames,
 		InheritCapabilities: inheritedCapabilities,
 		IsRealtime:          opts.Realtime,
@@ -1478,7 +1499,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, "error: kill requires id")
 				} else if thread.Children == nil {
 					emitResult(call, "error: cannot kill (not a leader thread)")
-				} else if err := thread.Children.ValidateAgentTarget(sid); err != nil {
+				} else if err := thread.Children.ValidateManagedTarget(sid); err != nil {
 					emitResult(call, "error: "+err.Error())
 				} else {
 					if err := t.config.RemoveThread(sid); err != nil {
@@ -1499,7 +1520,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, "error: update requires id")
 				} else if thread.Children == nil {
 					emitResult(call, "error: cannot update (not a leader thread)")
-				} else if err := thread.Children.ValidateAgentTarget(sid); err != nil {
+				} else if err := thread.Children.ValidateManagedTarget(sid); err != nil {
 					emitResult(call, "error: "+err.Error())
 				} else if newID == "" && name == "" && !directiveEditRequested && toolsStr == "" {
 					emitResult(call, "error: update requires at least one of new_id, name, directive, tools")
@@ -1519,6 +1540,9 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							applyErr = err
 						} else {
 							directive, directiveSummary, applyErr = applyDirectiveEdit(currentDirective, call.Args)
+							if applyErr == nil {
+								directive, _ = protectManagedBlocks(currentDirective, directive)
+							}
 							directiveChanged = applyErr == nil && directive != currentDirective
 						}
 					}
@@ -1527,7 +1551,7 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 							RestartRealtime: parseTruthy(call.Args["restart_realtime"]),
 						})
 						if applyErr == nil && directiveChanged {
-							thread.Children.SendWithPartsExecution(sid, fmt.Sprintf("[directive updated] %s", directive), nil, t.currentEventExecutions())
+							thread.Children.SendWithPartsExecution(sid, fmt.Sprintf("[directive updated] %s", directive)+leaderDirectiveNotice(thread.Children.ChildrenOf(sid)), nil, t.currentEventExecutions())
 						}
 					}
 					if applyErr != nil {
@@ -1584,24 +1608,39 @@ func threadToolHandler(thread *Thread, tm *ThreadManager) ToolHandler {
 					emitResult(call, directiveEditCorrectionResult(err))
 				} else {
 					d, summary, err := applyDirectiveEdit(thread.Directive, call.Args)
+					inheritMain, suffix := thread.InheritMain, thread.DirectiveSuffix
+					if err == nil {
+						inheritMain, suffix = evolvedInheritance(tm.parent.config.GetDirective(), inheritMain, suffix, d)
+						if !inheritMain {
+							var kept bool
+							if d, kept = protectManagedBlocks(thread.Directive, d); !kept {
+								summary = directiveEditSummaryWithWarnings(summary, []string{"platform-maintained sections were kept unchanged; only the operator can change them"})
+							}
+						}
+					}
 					if err != nil {
 						emitResult(call, directiveEditCorrectionResult(err))
 					} else if d == thread.Directive {
-						emitResult(call, evolveCompletionToolResult("directive already current; no update was needed", ""))
+						emitResult(call, evolveCompletionToolResult("directive already current; no update was needed", summary))
 					} else {
 						var persistErr error
 						if !thread.Ephemeral {
 							persisted := persistentThreadState(thread)
 							persisted.Directive = d
+							persisted.InheritMain, persisted.DirectiveSuffix = inheritMain, suffix
 							persistErr = tm.parent.config.SaveThread(persisted)
 						}
 						if persistErr != nil {
 							emitResult(call, fmt.Sprintf("error: persist directive: %v", persistErr))
 						} else {
+							// Same lock order as updateWithOptsNow: manager, then transcript.
+							tm.mu.Lock()
 							if thread.Realtime != nil {
 								thread.Realtime.transcriptMu.Lock()
 							}
 							thread.Directive = d
+							thread.InheritMain, thread.DirectiveSuffix = inheritMain, suffix
+							tm.mu.Unlock()
 							t.directive = d
 							if t.rebuildPrompt != nil {
 								t.messages[0] = Message{Role: "system", Content: t.rebuildPrompt("")}
@@ -1777,6 +1816,83 @@ func validateRootSendTarget(id string) error {
 
 // ValidateAgentTarget rejects platform-managed threads while leaving public
 // manager operations privileged for server and runtime callers.
+// ValidateManagedTarget is the check for agent tools that change or end a
+// thread (update, kill). Threads created through the API accept messages from
+// agent tools but are changed and stopped only by whoever created them.
+func (tm *ThreadManager) ValidateManagedTarget(id string) error {
+	if err := tm.ValidateAgentTarget(id); err != nil {
+		return err
+	}
+	owner, thread := tm.findManagedThread(id)
+	if thread == nil {
+		return nil
+	}
+	owner.mu.RLock()
+	apiManaged := thread.APIManaged
+	owner.mu.RUnlock()
+	if apiManaged {
+		return fmt.Errorf("thread %q was created by the platform (an app, channels or the operator) and only it can change or stop the thread; message it with send instead", id)
+	}
+	return nil
+}
+
+// composeThreadDirective applies the agent-wide directive policy to a new or
+// restored thread. Threads that inherit main run main's current directive plus
+// their suffix; other workers carry main's managed blocks. System threads and
+// caller-configured realtime sessions keep their directive as given.
+func (tm *ThreadManager) composeThreadDirective(directive string, isSystem, realtime, inheritMain bool, suffix string) string {
+	if isSystem || tm.parent == nil || tm.parent.config == nil {
+		return directive
+	}
+	mainDirective := tm.parent.config.GetDirective()
+	if inheritMain {
+		return mainDirective + suffix
+	}
+	if realtime {
+		return directive
+	}
+	return withManagedBlocks(directive, managedBlocks(mainDirective))
+}
+
+// threadKind reports whether a direct child is a system or realtime thread.
+func (tm *ThreadManager) threadKind(id string) (system, realtime, ok bool) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	thread := tm.threads[id]
+	if thread == nil {
+		return false, false, false
+	}
+	return thread.System, thread.IsRealtime, true
+}
+
+// backfillAPIThread marks a thread re-posted through the API as API-managed,
+// and as inheriting main when its directive is still exactly main's directive
+// plus the suffix, for threads created before Core recorded either. The
+// runtime is left alone so an in-flight request is not interrupted; the
+// caller persists the thread afterwards.
+func (tm *ThreadManager) backfillAPIThread(id string, inheritMain bool, suffix string) bool {
+	if tm == nil || tm.parent == nil || tm.parent.config == nil {
+		return false
+	}
+	mainDirective := tm.parent.config.GetDirective()
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	thread := tm.threads[id]
+	if thread == nil || thread.System {
+		return false
+	}
+	changed := false
+	if !thread.APIManaged {
+		thread.APIManaged = true
+		changed = true
+	}
+	if inheritMain && !thread.InheritMain && !thread.IsRealtime && thread.Directive == mainDirective+suffix {
+		thread.InheritMain, thread.DirectiveSuffix = true, suffix
+		changed = true
+	}
+	return changed
+}
+
 func (tm *ThreadManager) ValidateAgentTarget(id string) error {
 	tm.mu.RLock()
 	thread, exists := tm.threads[id]
@@ -1836,6 +1952,9 @@ func (tm *ThreadManager) List() []ThreadInfo {
 			ID:                  t.ID,
 			Name:                t.Name,
 			System:              t.System,
+			APIManaged:          t.APIManaged,
+			InheritMain:         t.InheritMain,
+			DirectiveSuffix:     t.DirectiveSuffix,
 			ParentID:            t.ParentID,
 			Depth:               t.Depth,
 			Directive:           t.Directive,
@@ -1928,6 +2047,17 @@ func (tm *ThreadManager) Count() int {
 	return len(tm.threads)
 }
 
+// ChildrenOf returns the child manager of a leader thread, or nil.
+func (tm *ThreadManager) ChildrenOf(id string) *ThreadManager {
+	owner, thread := tm.findManagedThread(id)
+	if thread == nil {
+		return nil
+	}
+	owner.mu.RLock()
+	defer owner.mu.RUnlock()
+	return thread.Children
+}
+
 func (tm *ThreadManager) Directive(id string) (string, error) {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
@@ -2013,6 +2143,10 @@ func persistentThreadStateBase(thread *Thread) PersistentThread {
 		InheritCapabilities: thread.InheritCapabilities,
 		Provider:            thread.ProviderName, Realtime: thread.IsRealtime,
 		AllowNoSpawn: thread.AllowNoSpawn, Voice: thread.Voice,
+		APIManaged: thread.APIManaged, InheritMain: thread.InheritMain,
+	}
+	if thread.InheritMain {
+		state.DirectiveSuffix = thread.DirectiveSuffix
 	}
 	if thread.IsRealtime && !thread.RealtimeOutput.isZero() {
 		state.RealtimeOutput = cloneRealtimeOutputConfig(&thread.RealtimeOutput)
@@ -2125,6 +2259,17 @@ type ThreadUpdateOptions struct {
 	// BypassCapabilityCeiling is reserved for authenticated API callers. Agent
 	// updates must remain a subset of the updating parent's authority.
 	BypassCapabilityCeiling bool
+	// Quiet applies a directive without waking the thread: an event-only wait
+	// stays in place and the new prompt takes effect on the next event.
+	Quiet bool
+	// Inheritance, when non-nil, replaces whether the directive follows main.
+	Inheritance *ThreadInheritance
+}
+
+// ThreadInheritance describes a directive built as main's directive + Suffix.
+type ThreadInheritance struct {
+	InheritMain bool
+	Suffix      string
 }
 
 type ThreadUpdateResult struct {
@@ -2135,6 +2280,7 @@ type ThreadUpdateResult struct {
 	ToolsChanged          bool
 	MCPChanged            bool
 	CapabilityModeChanged bool
+	InheritanceChanged    bool
 	RealtimeRestarted     bool
 }
 
@@ -2257,6 +2403,8 @@ type threadProfileUpdate struct {
 	tools               map[string]bool
 	mcp                 []string
 	inheritCapabilities bool
+	inheritMain         bool
+	suffix              string
 }
 
 // planThreadProfile uses the same normalization for preflight and commit.
@@ -2300,8 +2448,17 @@ func planThreadProfile(thread *Thread, name, directive string, tools []string, o
 		nextInheritCapabilities = false
 	}
 	result.CapabilityModeChanged = nextInheritCapabilities != thread.InheritCapabilities
-	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged || result.MCPChanged || result.CapabilityModeChanged
-	return threadProfileUpdate{result: result, name: nextName, directive: nextDirective, tools: nextTools, mcp: nextMCPNames, inheritCapabilities: nextInheritCapabilities}
+	nextInheritMain, nextSuffix := thread.InheritMain, thread.DirectiveSuffix
+	if opts.Inheritance != nil {
+		nextInheritMain = opts.Inheritance.InheritMain && !thread.System && !thread.IsRealtime
+		nextSuffix = ""
+		if nextInheritMain {
+			nextSuffix = opts.Inheritance.Suffix
+		}
+	}
+	result.InheritanceChanged = nextInheritMain != thread.InheritMain || nextSuffix != thread.DirectiveSuffix
+	result.Changed = result.NameChanged || result.DirectiveChanged || result.ToolsChanged || result.MCPChanged || result.CapabilityModeChanged || result.InheritanceChanged
+	return threadProfileUpdate{result: result, name: nextName, directive: nextDirective, tools: nextTools, mcp: nextMCPNames, inheritCapabilities: nextInheritCapabilities, inheritMain: nextInheritMain, suffix: nextSuffix}
 }
 
 func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []string, opts ThreadUpdateOptions, incoming []PersistentThreadEvent) (ThreadUpdateResult, error) {
@@ -2353,8 +2510,9 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 		persisted.Name, persisted.Directive, persisted.Tools = nextName, nextDirective, toolSetToSlice(nextTools)
 		persisted.MCPNames = append([]string(nil), nextMCPNames...)
 		persisted.InheritCapabilities = plan.inheritCapabilities
+		persisted.InheritMain, persisted.DirectiveSuffix = plan.inheritMain, plan.suffix
 		persisted.Events = clonePersistentThreadEvents(nextEvents)
-		if result.DirectiveChanged && persisted.Pace != nil {
+		if result.DirectiveChanged && !opts.Quiet && persisted.Pace != nil {
 			persisted.Pace.WaitForEvents = false
 		}
 		if err := tm.parent.config.saveThreadProfileAndEvents(persisted, acceptedEvents); err != nil {
@@ -2372,7 +2530,8 @@ func (tm *ThreadManager) updateWithOptsNow(id, name, directive string, tools []s
 	}
 	thread.Name = nextName
 	thread.Directive = nextDirective
-	if result.DirectiveChanged {
+	thread.InheritMain, thread.DirectiveSuffix = plan.inheritMain, plan.suffix
+	if result.DirectiveChanged && !opts.Quiet {
 		thread.Thinker.waitForEvents = false
 		thread.Thinker.publishRuntimeStatus()
 	}
