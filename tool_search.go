@@ -171,14 +171,39 @@ type searchToolsResult struct {
 	Results          []DiscoveryIntentResult `json:"results,omitempty"`
 	SchemaTokens     int                     `json:"schema_tokens_est,omitempty"`
 	SkippedBudget    int                     `json:"skipped_budget,omitempty"`
+	// NoClearMatch: results exist, but none is an exact name and each covers
+	// under half of the query's words.
+	NoClearMatch bool `json:"no_clear_match,omitempty"`
 }
 
 type searchToolHit struct {
-	Match   string  `json:"match,omitempty"`
-	Score   float64 `json:"score,omitempty"`
-	Name    string  `json:"name"`
-	Server  string  `json:"server"`
-	Summary string  `json:"summary"`
+	Match     string  `json:"match,omitempty"`
+	Score     float64 `json:"score,omitempty"`
+	Name      string  `json:"name"`
+	Server    string  `json:"server"`
+	Summary   string  `json:"summary"`
+	WeakMatch bool    `json:"weak_match,omitempty"`
+}
+
+// readIntentWords and changeIntentWords classify a search query. A query that
+// reads or lists and asks for no change prefers read tools and ranks tools
+// that send messages lower.
+var (
+	readIntentWords   = wordSet("list", "get", "read", "find", "search", "show", "fetch", "lookup", "look", "view", "latest", "recent", "retrieve", "check", "count", "inspect", "which", "what", "status", "history")
+	changeIntentWords = wordSet("send", "reply", "forward", "notify", "publish", "broadcast", "invite", "create", "add", "update", "set", "edit", "delete", "remove", "write", "assign", "move", "post", "sms")
+)
+
+func readIntentQuery(query string) bool {
+	read := false
+	for _, word := range strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	}) {
+		if changeIntentWords[word] {
+			return false
+		}
+		read = read || readIntentWords[word]
+	}
+	return read
 }
 
 // applyPreload searches the directive and events drained this iteration, then
@@ -372,6 +397,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 		}
 		t.evictActiveToolsLRU(activeToolsCap)
 	}
+	t.publishActiveTools()
 
 	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
 	// Expiration is per-turn bookkeeping, not part of visibility resolution.
@@ -534,6 +560,14 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	if len(intents) == 0 {
 		return `{"error":"at least one non-empty query is required"}`
 	}
+	for i := range intents {
+		if readIntentQuery(intents[i].Query) {
+			intents[i].DemoteSends = true
+			if intents[i].Access == DiscoveryAccessAny {
+				intents[i].Access = DiscoveryAccessPreferRead
+			}
+		}
+	}
 	discovery := t.discoverTools(DiscoveryRequest{Intents: intents, AllowNoSpawn: allowNoSpawn, AllowSuggestions: true, MaxTools: maxTools, MaxSchemaTokens: maxSchemaTokens, Activate: true})
 	res := searchToolsResult{Query: query, Loaded: discovery.Loaded, CatalogRevision: discovery.CatalogRevision, AvailableServers: available, Results: discovery.Results, SchemaTokens: discovery.SchemaTokens, SkippedBudget: discovery.SkippedBudget}
 	if t.discoveredToolUntil == nil {
@@ -542,8 +576,10 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	for _, name := range discovery.Loaded {
 		t.discoveredToolUntil[name] = t.iteration + 1
 	}
+	t.publishActiveTools()
 	seenHits, seenSuggestions := map[string]bool{}, map[string]bool{}
 	coverageUnavailable := false
+	candidates, weak := 0, 0
 	for _, group := range discovery.Results {
 		res.Unresolved = append(res.Unresolved, group.Unresolved...)
 		if len(group.Ambiguous) > 0 {
@@ -556,7 +592,11 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 		}
 		coverageUnavailable = coverageUnavailable || group.Coverage == "unavailable_in_scope"
 		for _, candidate := range group.Candidates {
-			hit := searchToolHit{Name: candidate.Name, Server: candidate.Server, Summary: candidate.Summary, Match: candidate.Match, Score: candidate.Score}
+			candidates++
+			if candidate.WeakMatch {
+				weak++
+			}
+			hit := searchToolHit{Name: candidate.Name, Server: candidate.Server, Summary: candidate.Summary, Match: candidate.Match, Score: candidate.Score, WeakMatch: candidate.WeakMatch}
 			if candidate.Suggestion {
 				if !seenSuggestions[candidate.Name] {
 					res.Suggestions = append(res.Suggestions, hit)
@@ -572,13 +612,17 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 		if coverageUnavailable {
 			res.Error = "unavailable_in_scope: no matching tool is authorized in the requested server scope; do not substitute another operation."
 		} else {
-			res.Error = "lexical_miss: no indexed terms matched. This does not prove the capability is unavailable; refine the query or inspect available_servers."
+			res.Error = "lexical_miss: no indexed terms matched. This does not prove the capability is unavailable; refine the query once or inspect available_servers. If a refined search also misses, continue with the tools you have or report that the capability is missing instead of searching again."
 		}
 		if len(available) > 0 {
 			res.Note = "no lexical matches; available_servers: " + strings.Join(available, ", ") + "; refine the query"
 		} else {
 			res.Note = "no MCP servers visible to this thread"
 		}
+	}
+	if candidates > 0 && weak == candidates {
+		res.NoClearMatch = true
+		res.Note = strings.TrimSpace(res.Note + " No clear match: each result covers less than half of the query's words, so none is known to do what was asked. If none fits, continue with the tools you have or report that the capability is missing; rewording the same search rarely finds another tool.")
 	}
 	if len(res.Unresolved) > 0 || len(res.Ambiguous) > 0 {
 		res.Note = strings.TrimSpace(res.Note + " Requested names were unresolved or ambiguous. Descriptive suggestions, if present, have schemas loaded for inspection but are not exact matches or equivalent replacements. Confirm their documented operation before use; do not infer that a capability is unsupported from a failed name lookup.")

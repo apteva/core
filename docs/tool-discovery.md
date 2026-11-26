@@ -103,3 +103,25 @@ and 82 microseconds per descriptive query on the local Apple M1 Pro.
 
 The optional `automatic_context` Kimi scenario covers the default-enabled
 [automatic loading](automatic-tool-loading.md), requiring zero searches.
+
+## Weak matches and send tools
+
+Descriptive (BM25) hits that cover less than half of the query's distinct
+terms are marked `weak_match`. When every result of a `search_tools` call is
+weak and none is an exact name, the result sets `no_clear_match` and its note
+tells the model that none of the results is known to do what was asked, and to
+continue with the tools it has or report the missing capability rather than
+rewording the same search. A lexical miss still does not claim the capability
+is unavailable, but now bounds retries to one refined search.
+
+A query that reads or lists something (words such as get, list, find, latest)
+and asks for no change (send, reply, create, update, delete and similar) is
+searched with read preference, and tools whose names say they send a message
+(send, reply, forward, notify, publish, broadcast, invite, sms) score half. This
+keeps tools such as `crm_contacts_reply` from topping a search for the latest
+inbound messages. A read-only annotation always exempts a tool.
+
+The read-preference bonus now applies only to tools that match at least one
+query term. Before, every read tool scored for any query, so a query that
+matched nothing still returned the first read tools alphabetically, and
+automatic loading could fill its budget with them.

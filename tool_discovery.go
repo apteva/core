@@ -116,6 +116,8 @@ type DiscoveryIntent struct {
 	Limit    int
 	Source   string
 	Priority int
+	// DemoteSends ranks tools that send messages lower (read or list intent).
+	DemoteSends bool
 }
 
 type DiscoveryRequest struct {
@@ -139,6 +141,7 @@ type DiscoveryToolResult struct {
 	Loaded     bool            `json:"loaded"`
 	SkipReason string          `json:"skip_reason,omitempty"`
 	Suggestion bool            `json:"suggestion,omitempty"`
+	WeakMatch  bool            `json:"weak_match,omitempty"`
 	entry      IndexEntry
 }
 
@@ -301,7 +304,7 @@ func (t *Thinker) discoverToolsOnce(request DiscoveryRequest) DiscoveryResult {
 		}
 		var found indexSearchResult
 		if len(intent.Servers) == 0 || len(serverScope) > 0 {
-			found = t.toolIndex.searchDetailedWithOptions(intent.Query, intent.Limit, request.AllowNoSpawn, authorized, indexSearchOptions{Servers: serverScope, Access: intent.Access})
+			found = t.toolIndex.searchDetailedWithOptions(intent.Query, intent.Limit, request.AllowNoSpawn, authorized, indexSearchOptions{Servers: serverScope, Access: intent.Access, DemoteSends: intent.DemoteSends})
 		}
 		group.Unresolved, group.Ambiguous = found.Unresolved, found.Ambiguous
 		for _, unresolved := range found.Unresolved {
@@ -321,7 +324,7 @@ func (t *Thinker) discoverToolsOnce(request DiscoveryRequest) DiscoveryResult {
 				if len(summary) > 240 {
 					summary = summary[:237] + "..."
 				}
-				group.Candidates = append(group.Candidates, DiscoveryToolResult{Name: entry.Name, Server: entry.Server, Access: entry.Access, Match: entry.Match, Score: entry.Score, Summary: summary, Suggestion: suggestion, entry: entry})
+				group.Candidates = append(group.Candidates, DiscoveryToolResult{Name: entry.Name, Server: entry.Server, Access: entry.Access, Match: entry.Match, Score: entry.Score, Summary: summary, Suggestion: suggestion, WeakMatch: entry.WeakMatch, entry: entry})
 			}
 		}
 		appendCandidates(found.Hits, false)

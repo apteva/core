@@ -12,8 +12,10 @@ explicit discovery can add a newly required tool. Tool ordering is sorted.
 
 Automatic tool loading is **enabled by default**, with `search_tools` retained
 as a backup. When `automatic_tool_loading` is absent, the defaults are eight
-automatically selected tools, approximately 2,000 schema tokens, and relevance
-from already-recalled memory. Existing explicit settings, including
+automatically selected tools, approximately 6,000 schema tokens, and relevance
+from already-recalled memory. (The schema default was 2,000 until November
+2026; that fit only two to four typical app tool schemas, and workers searched
+for the rest.) Existing explicit settings, including
 `enabled: false`, remain authoritative. This default applies when Core runs the
 new build; it does not mutate saved agent configuration.
 
@@ -25,7 +27,7 @@ Example partial **Core `PUT /config`** request to customize the defaults:
     "enabled": true,
     "workflow_tools": ["tickets_tickets_get"],
     "max_tools": 8,
-    "max_schema_tokens": 2000,
+    "max_schema_tokens": 6000,
     "include_memory": true
   }
 }
@@ -37,9 +39,11 @@ restore the prior setting, including when the optional field was absent.
 Disable with `{"automatic_tool_loading":{"enabled":false}}`; omission in an
 unrelated partial update preserves the setting. Each supplied settings object
 replaces the previous one. There is no dashboard control for these settings yet.
-The running-agent server config proxy forwards the setting to Core; the existing
-server stopped-agent config whitelist does not yet accept this
-field. Use a running Core or its persisted config for custom overrides.
+apteva-server forwards the setting to Core whether it arrives at the top level
+of a config update or inside the agent's saved `config` object (as Helper's
+`agents_update` sends it), for running and stopped agents, and restores the
+saved value at start when Core's own config has none. It refuses a value Core
+would not accept, including an object without `enabled`.
 
 ## Selection
 
@@ -55,14 +59,20 @@ To exercise it on a small fixture, set `APTEVA_TOOL_SEARCH=on` for that test
 process. `search_tools` remains available as a fallback.
 
 1. Prioritize configured canonical MCP names in `workflow_tools`.
-2. Search separately using the current instruction, this thread's active
+2. Load canonical MCP tool names written in the instruction, task or directive
+   at the same priority, for at most half of `max_tools`, so a task that names
+   its tools gets them without a search and relevance keeps the other half.
+3. Search separately using the current instruction, this thread's active
    execution reason/prerequisite, standing directive, and optionally the memory
    context already selected by automatic recall. Interleave ranked sources so
-   the directive cannot consume all available slots.
-3. Retain valid selections across context changes. New candidates fill remaining
+   the directive cannot consume all available slots. Memory is not used on a
+   thread other than main that is working on a tracked task (for example a
+   workflow step worker): its instruction, task and directive are the better
+   signal, and recall there tended to load tools from unrelated past work.
+4. Retain valid selections across context changes. New candidates fill remaining
    space; configured workflow tools have priority. Explicit search/use retains
    its independent activation and batch LRU budgets.
-4. Resolve every name against the live registry, reapply capabilities and
+5. Resolve every name against the live registry, reapply capabilities and
    `no_spawn`, and attach the real native schemas before the provider request.
 
 Memory is only a relevance signal. It neither grants access nor provides a
@@ -70,7 +80,7 @@ schema. This adds no model request, embedding call or separate memory lookup.
 Selection does not execute tools or append anything to conversation history.
 Unknown/ambiguous exact names never automatically activate suggested substitutes.
 
-The default automatic selection budget is 8 tools and approximately 2,000 schema
+The default automatic selection budget is 8 tools and approximately 6,000 schema
 tokens. `max_tools` accepts 1–20; `max_schema_tokens` accepts 1–16,000; zero selects
 the default. The estimate is serialized native schema bytes divided by four,
 including injected fields, not a provider tokenizer measurement. Input queries
@@ -149,3 +159,18 @@ running local agents, starting with agent 1118. Each reported automatic loading
 and memory relevance enabled with the default budgets. Stopped agents were not
 started; all prior agent processes exited. The final full short suite and focused
 race tests passed. Remote production was not changed.
+
+## Replacement threads
+
+A caller that replaces a thread, such as a workflow engine that ends an idle
+worker and later starts the next one for the same job, can pass
+`continue_tools_from: "<earlier thread id>"` to `POST /threads/{id}`. The new
+thread starts with the MCP tools the earlier one had loaded (through search or
+spawn), so it does not search for them again. The earlier thread may still be
+running or may have ended within the last 24 hours; Core keeps the loaded names
+of the last 256 ended threads in memory only, so a Core restart forgets them.
+Only names carry over: each one is checked against the new thread's own grants,
+MCP scopes and `no_spawn` rule, so continuity never widens access. An unknown
+source is not an error; the thread starts as it would without the field.
+`thread.tools_continued` telemetry records the source, the tools loaded and how
+many were offered.
