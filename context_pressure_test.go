@@ -139,7 +139,7 @@ func TestShouldCompactBeforeLLMIgnoresCompressedScreenshotByteSize(t *testing.T)
 	if shouldCompactBeforeLLM("kimi-k2.6", messages) {
 		t.Fatal("compressed screenshot bytes triggered compaction for a known large-context model")
 	}
-	if shouldRecoverFromEmptyResponse(TokenUsage{}, "kimi-k2.6", messages, 1) {
+	if shouldRecoverFromEmptyResponse(TokenUsage{}, "kimi-k2.6", messages) {
 		t.Fatal("compressed screenshot bytes triggered empty-response pressure recovery")
 	}
 }
@@ -206,18 +206,23 @@ func TestMessageForSessionDropsComputerPixelsOnly(t *testing.T) {
 
 func TestShouldRecoverFromEmptyResponseNearContextLimit(t *testing.T) {
 	messages := []Message{{Role: "system", Content: "small"}}
-	if !shouldRecoverFromEmptyResponse(TokenUsage{PromptTokens: 205_000}, "kimi-k2.6", messages, 1) {
+	if !shouldRecoverFromEmptyResponse(TokenUsage{PromptTokens: 205_000}, "kimi-k2.6", messages) {
 		t.Fatal("expected recovery near 256k context limit")
 	}
 }
 
-func TestShouldRecoverFromEmptyResponseAfterRepeatedEmptyUnknownUsage(t *testing.T) {
-	messages := []Message{{Role: "system", Content: "small"}}
-	if shouldRecoverFromEmptyResponse(TokenUsage{}, "unknown-model", messages, 1) {
-		t.Fatal("did not expect recovery on first empty response without pressure signal")
+// Compaction after empty answers needs a context near the limit. On a small
+// one it gains nothing, so it never runs there, whatever the model.
+func TestShouldRecoverFromEmptyResponseNeedsALargeContext(t *testing.T) {
+	small := []Message{{Role: "system", Content: "small"}, {Role: "user", Content: "[thread:chat-conv-1] started"}}
+	for _, model := range []string{"unknown-model", "kimi-k2.6"} {
+		if shouldRecoverFromEmptyResponse(TokenUsage{PromptTokens: 7_000}, model, small) {
+			t.Fatalf("%s: recovery on a small context", model)
+		}
 	}
-	if !shouldRecoverFromEmptyResponse(TokenUsage{}, "unknown-model", messages, contextPressureEmptyStreak) {
-		t.Fatal("expected recovery after repeated empty responses")
+	large := []Message{{Role: "system", Content: "system"}, {Role: "user", Content: strings.Repeat("x", contextPressureCharFallback)}}
+	if !shouldRecoverFromEmptyResponse(TokenUsage{}, "unknown-model", large) {
+		t.Fatal("expected recovery when an unknown model's context is large")
 	}
 }
 

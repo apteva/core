@@ -1097,6 +1097,13 @@ func inlineToolResultIsError(content string) bool {
 
 const maxRepeatedInlineToolResults = 3
 
+// maxEmptyModelResponses is how many answers in a row with no text, tool
+// calls or files one turn accepts. Then the turn ends and the thread waits for
+// its next event or wake, as after any other turn: some models answer a purely
+// informational message with reasoning alone, and asking again forever only
+// spends requests.
+const maxEmptyModelResponses = 3
+
 func (t *Thinker) resetInlineToolContinuation() {
 	t.inlineResultFingerprint = ""
 	t.inlineResultRepeats = 0
@@ -3099,53 +3106,71 @@ func (t *Thinker) Run() {
 		// alone doesn't justify keeping the turn — without text or
 		// tool calls there's nothing for the agent to act on or the
 		// provider to replay.
+		//
+		// Near the context limit an empty answer can mean the context is
+		// too large, so Core compacts and asks again. Otherwise it asks
+		// again a few times, then ends the turn without an answer and
+		// waits for the next event or wake like after any other turn.
+		emptyTurn := false
 		if reply == "" && len(chatResp.ToolCalls) == 0 && len(chatResp.GeneratedFiles) == 0 {
 			emptyLLMResponses++
-			if shouldRecoverFromEmptyResponse(usage, t.modelID(), requestMessages, emptyLLMResponses) {
-				reduced := t.compactForContextPressure("empty_response", usage, emptyLLMResponses)
-				emptyLLMResponses = 0
-				if !reduced {
-					logMsg("RUN", fmt.Sprintf("[%s] context pressure compaction made no progress after empty response; backing off before retry", t.threadID))
-					select {
-					case <-time.After(30 * time.Second):
-					case <-t.quit:
-						return
-					}
+			if shouldRecoverFromEmptyResponse(usage, t.modelID(), requestMessages) {
+				if t.compactForContextPressure("empty_response", usage, emptyLLMResponses) {
+					emptyLLMResponses = 0
+					continue
 				}
-			} else {
-				logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls — skipping assistant turn (empty_streak=%d)", t.threadID, t.iteration, emptyLLMResponses))
+				logMsg("RUN", fmt.Sprintf("[%s] iter %d: context pressure compaction made no progress after an empty response; ending the turn", t.threadID, t.iteration))
+			} else if emptyLLMResponses < maxEmptyModelResponses {
+				logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls — asking again (empty_streak=%d)", t.threadID, t.iteration, emptyLLMResponses))
 				select {
 				case <-time.After(5 * time.Second):
 				case <-t.quit:
 					return
 				}
+				continue
+			} else {
+				logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls %d times in a row; ending the turn", t.threadID, t.iteration, emptyLLMResponses))
 			}
-			continue
-		}
-		emptyLLMResponses = 0
-		assistantMsg := Message{
-			Role:          "assistant",
-			Content:       reply,
-			ToolCalls:     chatResp.ToolCalls,
-			Reasoning:     chatResp.Reasoning,
-			ProviderState: chatResp.ProviderState,
-			Parts:         generatedFileParts(chatResp.GeneratedFiles),
-		}
-		if t.work != nil {
-			w := workAtRequest
-			if len(chatResp.ToolCalls) == 0 && t.pendingToolCount() == 0 {
-				w.Kind = "result"
-				w.Status = "completed"
+			if t.telemetry != nil {
+				t.telemetry.Emit("llm.empty_response_limited", t.threadID, map[string]any{
+					"iteration": t.iteration, "empty_responses": emptyLLMResponses,
+				})
 			}
-			assistantMsg.Work = &w
-		}
-		t.messages = append(t.messages, assistantMsg)
+			t.failEventExecutions("repeated_empty_model_responses")
+			if t.work != nil {
+				if err := t.publishThreadWork(workAtRequest, "The model returned no answer.", "failed", nil); err != nil {
+					t.recordPersistenceFailure(err)
+					return
+				}
+			}
+			emptyLLMResponses = 0
+			emptyTurn = true
+		} else {
+			emptyLLMResponses = 0
+			assistantMsg := Message{
+				Role:          "assistant",
+				Content:       reply,
+				ToolCalls:     chatResp.ToolCalls,
+				Reasoning:     chatResp.Reasoning,
+				ProviderState: chatResp.ProviderState,
+				Parts:         generatedFileParts(chatResp.GeneratedFiles),
+			}
+			if t.work != nil {
+				w := workAtRequest
+				if len(chatResp.ToolCalls) == 0 && t.pendingToolCount() == 0 {
+					w.Kind = "result"
+					w.Status = "completed"
+				}
+				assistantMsg.Work = &w
+			}
+			t.messages = append(t.messages, assistantMsg)
 
-		// Persist to session history
-		if t.session != nil {
-			if err := t.session.AppendMessage(assistantMsg, t.iteration, usage); err != nil {
-				t.recordPersistenceFailure(err)
-				return
+			// Persist to session history
+			if t.session != nil {
+				if err := t.session.AppendMessage(assistantMsg, t.iteration, usage); err != nil {
+					t.recordPersistenceFailure(err)
+					return
+				}
 			}
 		}
 
@@ -3296,7 +3321,7 @@ func (t *Thinker) Run() {
 		t.applyActiveModelFloor()
 		t.publishRuntimeStatus()
 
-		if t.work != nil && len(calls) == 0 && t.pendingToolCount() == 0 {
+		if t.work != nil && !emptyTurn && len(calls) == 0 && t.pendingToolCount() == 0 {
 			if err := t.publishThreadWork(workAtRequest, reply, "completed", generatedFileParts(chatResp.GeneratedFiles)); err != nil {
 				t.recordPersistenceFailure(err)
 				return
