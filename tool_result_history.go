@@ -304,7 +304,13 @@ func (t *Thinker) prepareToolResultRequest(messages []Message) []Message {
 			})
 		}
 	}
-	projected, imagesRemoved := limitKeptToolImages(t.prepareHistoricalToolResults(messages), t.toolResultUnseen)
+	projected, imagesRemoved, imagesRetired := t.keptToolImages.apply(t.prepareHistoricalToolResults(messages), t.toolResultUnseen)
+	if imagesRetired > 0 {
+		// One deliberate prefix rewrite per batch, like mature-result projection.
+		t.advancePromptCacheEpoch("tool_images_retired", false, map[string]any{
+			"images_retired": imagesRetired, "images_removed": imagesRemoved,
+		})
+	}
 	projected = prepareLatestToolImageTail(projected)
 	if t.telemetry != nil {
 		original, sent, shortened := 0, 0, 0

@@ -9,6 +9,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"strings"
 	"testing"
 )
@@ -163,10 +166,10 @@ func TestToolImagesSurviveLaterRequestsAndNewerScreenshots(t *testing.T) {
 	}
 }
 
-func TestToolImageBudgetRemovesOldestWithSpecificNote(t *testing.T) {
+func TestToolImageBudgetKeepsANewFrameSetWhole(t *testing.T) {
 	th := &Thinker{threadID: "main", session: NewSession(t.TempDir(), "main")}
 	th.messages = []Message{{Role: "system", Content: "Compare renders."}, {Role: "user", Content: "Render each view."}}
-	frames := testFrames(t, maxKeptToolImages+3)
+	frames := testFrames(t, keptToolImagesHighCount+1)
 	appendToolTurn(th, "old", "media_frames", "Older frames.", []ToolImage{
 		{Data: frames[0], Label: "Frame at 0 s"}, {Data: frames[1], Label: "Frame at 5 s"}, {Data: frames[2], Label: "Frame at 10 s"},
 	})
@@ -178,10 +181,11 @@ func TestToolImageBudgetRemovesOldestWithSpecificNote(t *testing.T) {
 	}
 	appendToolTurn(th, "new", "media_frames", "Newer frames.", recent)
 
-	// Unseen images are always sent once, even past the budget.
+	// 17 kept images pass the high mark. Unseen images are always sent, so
+	// only the older result can retire.
 	first := th.prepareToolResultRequest(th.messages)
-	if got := len(requestImages(first, "new")); got != maxKeptToolImages {
-		t.Fatalf("new result images = %d, want %d", got, maxKeptToolImages)
+	if got := len(requestImages(first, "new")); got != len(recent) {
+		t.Fatalf("new result images = %d, want all %d", got, len(recent))
 	}
 	if got := len(requestImages(first, "old")); got != 0 {
 		t.Fatalf("old result kept %d images past the budget", got)
@@ -192,8 +196,129 @@ func TestToolImageBudgetRemovesOldestWithSpecificNote(t *testing.T) {
 			t.Fatalf("removal note %q lacks %q", note, want)
 		}
 	}
+	th.markToolResultsConsumed(first)
+
+	// Once seen, the 14 frames sit under the high mark: the set stays whole
+	// and the retired images stay out.
+	next := th.prepareToolResultRequest(th.messages)
+	if len(requestImages(next, "new")) != len(recent) || len(requestImages(next, "old")) != 0 {
+		t.Fatalf("after one request: new=%d old=%d", len(requestImages(next, "new")), len(requestImages(next, "old")))
+	}
 	if live := th.messages[3].ToolResults[0]; len(live.Images) != 3 || strings.Contains(live.Content, "removed") {
 		t.Fatal("the budget must only shape the request, not the live history")
+	}
+}
+
+// requestJSON is the request as the provider would compare its cached prefix.
+func requestJSON(t *testing.T, messages []Message) string {
+	t.Helper()
+	raw, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func TestKeptToolImagesRetireInLatchedBatches(t *testing.T) {
+	th := &Thinker{threadID: "main", session: NewSession(t.TempDir(), "main")}
+	th.messages = []Message{{Role: "system", Content: "Render views."}, {Role: "user", Content: "One view per call."}}
+	views := testFrames(t, 2*keptToolImagesHighCount)
+	id := func(i int) string { return fmt.Sprintf("view-%d", i) }
+	var previous []Message
+	active, retired, batches := 0, 0, 0
+	for i, view := range views {
+		appendToolTurn(th, id(i), "render_view", fmt.Sprintf("Rendered view %d.", i), []ToolImage{{Data: view, Label: fmt.Sprintf("View %d", i)}})
+		epoch := th.promptCacheEpoch
+		request := th.prepareToolResultRequest(th.messages)
+
+		// The first image past the high mark retires the oldest down to
+		// the low mark, in one batch with one deliberate cache reset.
+		active++
+		batch := active > keptToolImagesHighCount
+		if batch {
+			retired += active - keptToolImagesLowCount
+			active = keptToolImagesLowCount
+			batches++
+			if th.promptCacheEpoch != epoch+1 {
+				t.Fatalf("view %d: cache epoch %d -> %d, want one reset for the batch", i, epoch, th.promptCacheEpoch)
+			}
+			// A retry of the same request changes nothing and resets nothing.
+			if again := th.prepareToolResultRequest(th.messages); requestJSON(t, again) != requestJSON(t, request) || th.promptCacheEpoch != epoch+1 {
+				t.Fatal("a repeated request must be byte-identical with no new reset")
+			}
+		} else {
+			if th.promptCacheEpoch != epoch {
+				t.Fatalf("view %d: unexpected cache reset", i)
+			}
+			// Between batches every earlier message is sent unchanged.
+			if previous != nil && !strings.HasPrefix(requestJSON(t, request), strings.TrimSuffix(requestJSON(t, previous), "]")) {
+				t.Fatalf("view %d rewrote an earlier message", i)
+			}
+		}
+		// Retired images never come back; everything newer is sent.
+		for j := 0; j <= i; j++ {
+			want := 1
+			if j < retired {
+				want = 0
+			}
+			if got := len(requestImages(request, id(j))); got != want {
+				t.Fatalf("at view %d, view %d has %d images, want %d", i, j, got, want)
+			}
+		}
+		th.markToolResultsConsumed(request)
+		previous = request
+	}
+	if batches != 2 || th.promptCacheEpoch != 2 {
+		t.Fatalf("batches = %d, cache resets = %d; want 2 of each for 32 views", batches, th.promptCacheEpoch)
+	}
+	if note := requestContent(previous, id(0)); !strings.Contains(note, "1 image returned by render_view was removed to save context: View 0.") {
+		t.Fatalf("retired result note = %q", note)
+	}
+}
+
+// sizedTestJPEG returns a plain JPEG of the given size. The image budget
+// prices images by their dimensions only.
+func sizedTestJPEG(t *testing.T, width, height, shade int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	fill := color.RGBA{R: uint8(shade), G: 90, B: 160, A: 255}
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.SetRGBA(x, y, fill)
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 60}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestKeptToolImagesTokenMarkRetiresLargeImages(t *testing.T) {
+	th := &Thinker{threadID: "main", session: NewSession(t.TempDir(), "main")}
+	th.messages = []Message{{Role: "system", Content: "Inspect stills."}, {Role: "user", Content: "Grab full-HD stills."}}
+	cost := estimateImageTokens(sizedTestJPEG(t, 1920, 1080, 0))
+	under := keptToolImagesHighTokens / cost // stills that fit under the token mark
+	if under >= keptToolImagesHighCount {
+		t.Fatalf("full-HD still costs %d estimated tokens; the test needs the token mark to bind first", cost)
+	}
+	var request []Message
+	for i := 0; i <= under; i++ {
+		appendToolTurn(th, fmt.Sprintf("still-%d", i), "media_still", "Still captured.", []ToolImage{{Data: sizedTestJPEG(t, 1920, 1080, i)}})
+		request = th.prepareToolResultRequest(th.messages)
+		th.markToolResultsConsumed(request)
+	}
+	kept, tokens := 0, 0
+	for i := 0; i <= under; i++ {
+		if n := len(requestImages(request, fmt.Sprintf("still-%d", i))); n > 0 {
+			kept += n
+			tokens += n * cost
+		} else if kept > 0 {
+			t.Fatalf("still %d retired after a newer one was kept", i)
+		}
+	}
+	if tokens > keptToolImagesLowTokens || kept == 0 || (kept+1)*cost <= keptToolImagesLowTokens {
+		t.Fatalf("kept %d stills (%d estimated tokens), want the newest that fit under %d", kept, tokens, keptToolImagesLowTokens)
 	}
 }
 

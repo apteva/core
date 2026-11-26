@@ -38,11 +38,14 @@ const (
 	// A text block directly before an image labels it when it is this short.
 	maxToolImageLabelChars = 200
 
-	// Kept tool images share one budget per request. The token estimate is
-	// deliberately conservative (about twice what providers bill), so 24k
-	// estimated tokens is roughly 12k real image tokens.
-	maxKeptToolImages      = 8
-	maxKeptToolImageTokens = 24_000
+	// Kept tool images share one budget per request. Above the high mark, the
+	// oldest retire in one batch down to the low mark (see
+	// keptToolImageRetirement). Token figures are estimates, deliberately about
+	// twice what providers bill: 48k estimated is roughly 24k real tokens.
+	keptToolImagesHighCount  = 16
+	keptToolImagesHighTokens = 48_000
+	keptToolImagesLowCount   = 8
+	keptToolImagesLowTokens  = 24_000
 )
 
 // toolImageMetaString reads a string value from an MCP block's _meta.

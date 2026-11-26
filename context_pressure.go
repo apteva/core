@@ -11,6 +11,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -294,62 +295,117 @@ func prepareLatestToolImageTail(messages []Message) []Message {
 	return projected
 }
 
-// limitKeptToolImages applies the shared image budget to a provider-only
-// projection. Images from results the model has not seen yet are always
-// sent and count first; older kept images go, oldest first, once the newest
-// ones fill the budget. Each shortened result says exactly what was removed.
-func limitKeptToolImages(messages []Message, unseen func(ToolResult) bool) ([]Message, int) {
+// keptToolImageRetirement decides which kept tool images leave the request.
+// Kept images build up to a high mark; then the oldest retire in one batch,
+// down to a low mark. Retired images never come back. Between batches every
+// earlier message is sent exactly as before, so the provider's prompt cache
+// keeps matching. A sliding "newest N" window would instead rewrite an older
+// message each time a new image arrived, and miss the cache from there on.
+type keptToolImageRetirement struct {
+	mu      sync.Mutex
+	retired map[string]bool // result key + image index
+}
+
+type keptToolImageRef struct {
+	message, result, image int
+	key                    string
+	cost                   int
+	// Pinned images are sent whatever the budget: the model has not seen
+	// them yet, or their result has no stable key to remember them by.
+	pinned bool
+}
+
+// apply returns a provider-only projection without the retired images. Each
+// shortened result says exactly which images were removed. It also returns
+// how many images the request leaves out and how many retired in this call.
+func (r *keptToolImageRetirement) apply(messages []Message, unseen func(ToolResult) bool) ([]Message, int, int) {
 	names := toolNamesByCallID(messages)
-	count, tokens := 0, 0
-	var projected []Message
-	removedTotal := 0
-	for i := len(messages) - 1; i >= 0; i-- {
-		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
-			result := messages[i].ToolResults[j]
+	var refs []keptToolImageRef // oldest first
+	present := make(map[string]bool)
+	for i, message := range messages {
+		for j, result := range message.ToolResults {
 			if len(result.Images) == 0 {
 				continue
 			}
 			name := toolResultName(result, names)
-			fresh := unseen != nil && unseen(result)
-			keep := make([]bool, len(result.Images))
-			var removed []ToolImage
-			for k := len(result.Images) - 1; k >= 0; k-- {
-				img := result.Images[k]
+			resultKey := toolResultKey(result)
+			pinned := resultKey == "" || (unseen != nil && unseen(result))
+			for k, img := range result.Images {
 				if toolImageIsLatest(img, name) {
-					keep[k] = true // handled by the latest-image tail
-					continue
+					continue // handled by the latest-image tail
 				}
-				cost := estimateImageTokens(img.Data)
-				if fresh || (count < maxKeptToolImages && tokens+cost <= maxKeptToolImageTokens) {
-					keep[k] = true
-					count++
-					tokens += cost
-					continue
+				ref := keptToolImageRef{message: i, result: j, image: k, cost: estimateImageTokens(img.Data), pinned: pinned}
+				if resultKey != "" {
+					ref.key = fmt.Sprintf("%s#%d", resultKey, k)
+					present[ref.key] = true
 				}
-				removed = append([]ToolImage{img}, removed...)
+				refs = append(refs, ref)
+			}
+		}
+	}
+
+	r.mu.Lock()
+	for key := range r.retired {
+		if !present[key] {
+			delete(r.retired, key) // its message left the history
+		}
+	}
+	count, tokens := 0, 0
+	for _, ref := range refs {
+		if !r.retired[ref.key] {
+			count++
+			tokens += ref.cost
+		}
+	}
+	newlyRetired := 0
+	if count > keptToolImagesHighCount || tokens > keptToolImagesHighTokens {
+		for _, ref := range refs {
+			if count <= keptToolImagesLowCount && tokens <= keptToolImagesLowTokens {
+				break
+			}
+			if ref.pinned || r.retired[ref.key] {
+				continue
+			}
+			if r.retired == nil {
+				r.retired = make(map[string]bool)
+			}
+			r.retired[ref.key] = true
+			count--
+			tokens -= ref.cost
+			newlyRetired++
+		}
+	}
+	retired := make(map[[3]int]bool)
+	for _, ref := range refs {
+		if ref.key != "" && r.retired[ref.key] {
+			retired[[3]int{ref.message, ref.result, ref.image}] = true
+		}
+	}
+	r.mu.Unlock()
+
+	if len(retired) == 0 {
+		return messages, 0, newlyRetired
+	}
+	projected := cloneMessages(messages)
+	for i := range projected {
+		for j := range projected[i].ToolResults {
+			target := &projected[i].ToolResults[j]
+			var images, removed []ToolImage
+			for k, img := range target.Images {
+				if retired[[3]int{i, j, k}] {
+					removed = append(removed, img)
+				} else {
+					images = append(images, img)
+				}
 			}
 			if len(removed) == 0 {
 				continue
 			}
-			if projected == nil {
-				projected = cloneMessages(messages)
-			}
-			target := &projected[i].ToolResults[j]
-			var images []ToolImage
-			for k, img := range target.Images {
-				if keep[k] {
-					images = append(images, img)
-				}
-			}
 			target.Images = images
-			target.Content = appendToolResultNote(target.Content, toolImagesRemovedNote(removed, name, "to save context"))
-			removedTotal += len(removed)
+			target.Content = appendToolResultNote(target.Content, toolImagesRemovedNote(removed, toolResultName(*target, names), "to save context"))
 		}
 	}
-	if projected == nil {
-		return messages, 0
-	}
-	return projected, removedTotal
+	return projected, len(retired), newlyRetired
 }
 
 // checkpointHistoryWindow trims history in occasional blocks instead of
