@@ -223,6 +223,7 @@ type threadJSON struct {
 	Model               string          `json:"model"`
 	Reasoning           string          `json:"reasoning,omitempty"`
 	Age                 string          `json:"age"`
+	StartedAt           string          `json:"started_at,omitempty"`
 	Realtime            bool            `json:"realtime,omitempty"`
 	Ephemeral           bool            `json:"ephemeral,omitempty"`
 	Voice               string          `json:"voice,omitempty"`
@@ -254,6 +255,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 		Model:      status.Model.String(),
 		Reasoning:  status.Reasoning.String(),
 		Age:        formatAge(time.Since(a.startTime)),
+		StartedAt:  formatNextWakeAt(a.startTime),
 	}}
 
 	// Recursively collect all threads (including sub-threads of leaders)
@@ -276,6 +278,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 				Model:               t.Model.String(),
 				Reasoning:           t.Reasoning.String(),
 				Age:                 formatAge(time.Since(t.Started)),
+				StartedAt:           formatNextWakeAt(t.Started),
 				Realtime:            t.Realtime,
 				Ephemeral:           t.Ephemeral,
 				Voice:               t.Voice,

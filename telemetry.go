@@ -707,7 +707,13 @@ type ThreadSpawnData struct {
 
 type ThreadDoneData struct {
 	ParentID string `json:"parent_id"`
-	Result   string `json:"result,omitempty"`
+	// Result is the message the thread passed to done, capped like a tool
+	// result preview. Empty when the thread ended without calling done.
+	Result          string `json:"result,omitempty"`
+	ResultTruncated bool   `json:"result_truncated,omitempty"`
+	// Outcome repeats the thread's worker.finished outcome (completed,
+	// failed or cancelled) so one event says how the thread ended.
+	Outcome string `json:"outcome,omitempty"`
 }
 
 // ThreadRenamedData fires when update changes a thread's display name
@@ -844,15 +850,7 @@ const toolResultTelemetryPreviewBytes = 1000
 // available to the next model turn; it can differ from the tool's original
 // output when core wraps or transforms a result.
 func newToolResultData(id, name string, durationMs int64, success bool, originalText, contextText string, imageBytes int) ToolResultData {
-	preview := contextText
-	truncated := len(preview) > toolResultTelemetryPreviewBytes
-	if truncated {
-		end := toolResultTelemetryPreviewBytes
-		for end > 0 && !utf8.ValidString(preview[:end]) {
-			end--
-		}
-		preview = preview[:end] + "..."
-	}
+	preview, truncated := telemetryPreview(contextText, toolResultTelemetryPreviewBytes)
 	return ToolResultData{
 		ID:                     id,
 		Name:                   name,
@@ -866,6 +864,19 @@ func newToolResultData(id, name string, durationMs int64, success bool, original
 		ResultTruncated:        truncated,
 		ResultPreviewTruncated: truncated,
 	}
+}
+
+// telemetryPreview cuts text to at most max bytes on a UTF-8 boundary and
+// appends "..." when it cut anything.
+func telemetryPreview(text string, max int) (string, bool) {
+	if len(text) <= max {
+		return text, false
+	}
+	end := max
+	for end > 0 && !utf8.ValidString(text[:end]) {
+		end--
+	}
+	return text[:end] + "...", true
 }
 
 type DirectiveChangeData struct {
