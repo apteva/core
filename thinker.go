@@ -484,8 +484,16 @@ func rosterEntry(t ThreadInfo) string {
 		}
 		runtimeInfo = fmt.Sprintf(" [realtime; %s; audio bridge %s; listed configuration already applied]", ownership, bridge)
 	}
-	return fmt.Sprintf("- %s%s%s\n  directive: %s\n  tools: %s\n",
-		label, subInfo, runtimeInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
+	ownerInfo := ""
+	if t.APIManaged {
+		ownerInfo = " [created by the platform; message it with send, do not update or kill]"
+	}
+	directive := truncateStr(t.Directive, 150)
+	if t.InheritMain {
+		directive = "(your directive) + " + truncateStr(strings.TrimSpace(t.DirectiveSuffix), 120)
+	}
+	return fmt.Sprintf("- %s%s%s%s\n  directive: %s\n  tools: %s\n",
+		label, subInfo, runtimeInfo, ownerInfo, directive, strings.Join(t.Tools, ", "))
 }
 
 // rosterShouldDigest applies the two budgets plus hysteresis. entries are the
@@ -1095,6 +1103,13 @@ func inlineToolResultIsError(content string) bool {
 
 const maxRepeatedInlineToolResults = 3
 
+// maxEmptyModelResponses is how many answers in a row with no text, tool
+// calls or files one turn accepts. Then the turn ends and the thread waits for
+// its next event or wake, as after any other turn: some models answer a purely
+// informational message with reasoning alone, and asking again forever only
+// spends requests.
+const maxEmptyModelResponses = 3
+
 func (t *Thinker) resetInlineToolContinuation() {
 	t.inlineResultFingerprint = ""
 	t.inlineResultRepeats = 0
@@ -1544,6 +1559,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				Events:            pt.Events,
 				WorkMode:          pt.WorkMode,
 				RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
+				APIManaged:        pt.APIManaged,
+				InheritMain:       pt.InheritMain,
+				DirectiveSuffix:   pt.DirectiveSuffix,
 			})
 			if err != nil {
 				t.reportThreadRestoreFailure(pt.ID, err)
@@ -1575,6 +1593,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					Events:            pt.Events,
 					WorkMode:          pt.WorkMode,
 					RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
+					APIManaged:        pt.APIManaged,
+					InheritMain:       pt.InheritMain,
+					DirectiveSuffix:   pt.DirectiveSuffix,
 				})
 				if err != nil {
 					t.reportThreadRestoreFailure(pt.ID, err)
@@ -2156,7 +2177,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				id := call.Args["id"]
 				if id == "" {
 					addResult("error: kill requires id")
-				} else if err := t.threads.ValidateAgentTarget(id); err != nil {
+				} else if err := t.threads.ValidateManagedTarget(id); err != nil {
 					addResult("error: " + err.Error())
 				} else {
 					if err := t.config.RemoveThread(id); err != nil {
@@ -2185,7 +2206,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				directiveEditRequested := hasDirectiveEditArgs(call.Args)
 				if id == "" {
 					addResult("error: update requires id")
-				} else if err := t.threads.ValidateAgentTarget(id); err != nil {
+				} else if err := t.threads.ValidateManagedTarget(id); err != nil {
 					addResult("error: " + err.Error())
 				} else if newID == "" && name == "" && !directiveEditRequested && toolsStr == "" {
 					addResult("error: update requires at least one of new_id, name, directive, tools")
@@ -2209,6 +2230,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							applyErr = err
 						} else {
 							directive, directiveSummary, applyErr = applyDirectiveEdit(currentDirective, call.Args)
+							if applyErr == nil {
+								directive, _ = protectManagedBlocks(currentDirective, directive)
+							}
 							directiveChanged = applyErr == nil && directive != currentDirective
 						}
 					}
@@ -2217,7 +2241,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							RestartRealtime: parseTruthy(call.Args["restart_realtime"]),
 						})
 						if applyErr == nil && directiveChanged {
-							t.threads.SendWithPartsExecution(id, fmt.Sprintf("[directive updated] %s", directive), nil, t.currentEventExecutions())
+							t.threads.SendWithPartsExecution(id, fmt.Sprintf("[directive updated] %s", directive)+leaderDirectiveNotice(t.threads.ChildrenOf(id)), nil, t.currentEventExecutions())
 						}
 					}
 					if applyErr != nil {
@@ -2281,10 +2305,17 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						currentDirective = t.config.GetDirective()
 					}
 					d, summary, err := applyDirectiveEdit(currentDirective, call.Args)
+					keptManaged := true
+					if err == nil {
+						d, keptManaged = protectManagedBlocks(currentDirective, d)
+						if !keptManaged {
+							summary = directiveEditSummaryWithWarnings(summary, []string{"platform-maintained sections were kept unchanged; only the operator can change them"})
+						}
+					}
 					if err != nil {
 						addResult(directiveEditCorrectionResult(err))
 					} else if d == currentDirective {
-						addResult(evolveCompletionToolResult("directive already current; no update was needed", ""))
+						addResult(evolveCompletionToolResult("directive already current; no update was needed", summary))
 					} else {
 						if err := t.config.SetDirective(d); err != nil {
 							addResult(fmt.Sprintf("error: persist directive: %v", err))
@@ -2296,6 +2327,8 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							if t.telemetry != nil {
 								t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
 							}
+							// Inheriting threads and shared sections follow main.
+							t.syncThreadDirectives()
 							addResult(evolveCompletionToolResult("directive updated", summary))
 						}
 					}
@@ -3080,53 +3113,71 @@ func (t *Thinker) Run() {
 		// alone doesn't justify keeping the turn — without text or
 		// tool calls there's nothing for the agent to act on or the
 		// provider to replay.
+		//
+		// Near the context limit an empty answer can mean the context is
+		// too large, so Core compacts and asks again. Otherwise it asks
+		// again a few times, then ends the turn without an answer and
+		// waits for the next event or wake like after any other turn.
+		emptyTurn := false
 		if reply == "" && len(chatResp.ToolCalls) == 0 && len(chatResp.GeneratedFiles) == 0 {
 			emptyLLMResponses++
-			if shouldRecoverFromEmptyResponse(usage, t.modelID(), requestMessages, emptyLLMResponses) {
-				reduced := t.compactForContextPressure("empty_response", usage, emptyLLMResponses)
-				emptyLLMResponses = 0
-				if !reduced {
-					logMsg("RUN", fmt.Sprintf("[%s] context pressure compaction made no progress after empty response; backing off before retry", t.threadID))
-					select {
-					case <-time.After(30 * time.Second):
-					case <-t.quit:
-						return
-					}
+			if shouldRecoverFromEmptyResponse(usage, t.modelID(), requestMessages) {
+				if t.compactForContextPressure("empty_response", usage, emptyLLMResponses) {
+					emptyLLMResponses = 0
+					continue
 				}
-			} else {
-				logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls — skipping assistant turn (empty_streak=%d)", t.threadID, t.iteration, emptyLLMResponses))
+				logMsg("RUN", fmt.Sprintf("[%s] iter %d: context pressure compaction made no progress after an empty response; ending the turn", t.threadID, t.iteration))
+			} else if emptyLLMResponses < maxEmptyModelResponses {
+				logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls — asking again (empty_streak=%d)", t.threadID, t.iteration, emptyLLMResponses))
 				select {
 				case <-time.After(5 * time.Second):
 				case <-t.quit:
 					return
 				}
+				continue
+			} else {
+				logMsg("RUN", fmt.Sprintf("[%s] iter %d: model produced no text or tool calls %d times in a row; ending the turn", t.threadID, t.iteration, emptyLLMResponses))
 			}
-			continue
-		}
-		emptyLLMResponses = 0
-		assistantMsg := Message{
-			Role:          "assistant",
-			Content:       reply,
-			ToolCalls:     chatResp.ToolCalls,
-			Reasoning:     chatResp.Reasoning,
-			ProviderState: chatResp.ProviderState,
-			Parts:         generatedFileParts(chatResp.GeneratedFiles),
-		}
-		if t.work != nil {
-			w := workAtRequest
-			if len(chatResp.ToolCalls) == 0 && t.pendingToolCount() == 0 {
-				w.Kind = "result"
-				w.Status = "completed"
+			if t.telemetry != nil {
+				t.telemetry.Emit("llm.empty_response_limited", t.threadID, map[string]any{
+					"iteration": t.iteration, "empty_responses": emptyLLMResponses,
+				})
 			}
-			assistantMsg.Work = &w
-		}
-		t.messages = append(t.messages, assistantMsg)
+			t.failEventExecutions("repeated_empty_model_responses")
+			if t.work != nil {
+				if err := t.publishThreadWork(workAtRequest, "The model returned no answer.", "failed", nil); err != nil {
+					t.recordPersistenceFailure(err)
+					return
+				}
+			}
+			emptyLLMResponses = 0
+			emptyTurn = true
+		} else {
+			emptyLLMResponses = 0
+			assistantMsg := Message{
+				Role:          "assistant",
+				Content:       reply,
+				ToolCalls:     chatResp.ToolCalls,
+				Reasoning:     chatResp.Reasoning,
+				ProviderState: chatResp.ProviderState,
+				Parts:         generatedFileParts(chatResp.GeneratedFiles),
+			}
+			if t.work != nil {
+				w := workAtRequest
+				if len(chatResp.ToolCalls) == 0 && t.pendingToolCount() == 0 {
+					w.Kind = "result"
+					w.Status = "completed"
+				}
+				assistantMsg.Work = &w
+			}
+			t.messages = append(t.messages, assistantMsg)
 
-		// Persist to session history
-		if t.session != nil {
-			if err := t.session.AppendMessage(assistantMsg, t.iteration, usage); err != nil {
-				t.recordPersistenceFailure(err)
-				return
+			// Persist to session history
+			if t.session != nil {
+				if err := t.session.AppendMessage(assistantMsg, t.iteration, usage); err != nil {
+					t.recordPersistenceFailure(err)
+					return
+				}
 			}
 		}
 
@@ -3277,7 +3328,7 @@ func (t *Thinker) Run() {
 		t.applyActiveModelFloor()
 		t.publishRuntimeStatus()
 
-		if t.work != nil && len(calls) == 0 && t.pendingToolCount() == 0 {
+		if t.work != nil && !emptyTurn && len(calls) == 0 && t.pendingToolCount() == 0 {
 			if err := t.publishThreadWork(workAtRequest, reply, "completed", generatedFileParts(chatResp.GeneratedFiles)); err != nil {
 				t.recordPersistenceFailure(err)
 				return
@@ -3449,13 +3500,18 @@ func (t *Thinker) Run() {
 			timer = time.NewTimer(delay)
 			timerC = timer.C
 		}
+	wait:
 		select {
 		case <-timerC:
 			t.wakeDeadlineFired = true
 			t.wakeReason = "timer"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
 		case <-t.mutationWake:
-			t.applyRuntimeMutations()
+			if !t.applyRuntimeMutationsWhileWaiting() {
+				// A quiet change (an inherited directive refresh) takes
+				// effect on the next real wake.
+				goto wait
+			}
 		case <-t.sub.Wake:
 			t.wakeReason = "event"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: event received", t.threadID))
@@ -3769,16 +3825,28 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 	permanentFallbacks := map[string]error{}
 	for {
 		primary := t.provider
-		resp, nextMessages, err := t.callProviderWithOverloadRecovery(ctx, primary, messages, t.model)
-		messages = nextMessages
-		primaryErr := err
-		if managesInferenceLifecycle(primary) {
-			return resp, err
+		var resp ChatResponse
+		var err error
+		if skipped := t.unhealthyPrimary(primary); skipped != nil {
+			// Its credentials were rejected recently: make no request and go
+			// straight to the rest of the pool.
+			resp = ChatResponse{Provider: primary.Name(), Model: modelIDForProvider(primary, t.model)}
+			err = skipped
+		} else {
+			var nextMessages []Message
+			resp, nextMessages, err = t.callProviderWithOverloadRecovery(ctx, primary, messages, t.model)
+			messages = nextMessages
+			if managesInferenceLifecycle(primary) {
+				return resp, err
+			}
+			t.recordProviderOutcome(ctx, primary, resp, err)
 		}
+		primaryErr := err
 		if isInvalidToolHistory(err) {
 			return resp, err
 		}
-		if err != nil && t.telemetry != nil && !cancelledByCaller(ctx) {
+		var notCalled *providerUnhealthyError
+		if err != nil && t.telemetry != nil && !cancelledByCaller(ctx) && !errors.As(err, &notCalled) {
 			t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": resp.Provider, "model": resp.Model, "error": err.Error(), "role": "primary", "iteration": t.iteration})
 		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
@@ -3797,35 +3865,60 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 		// A provider that can't run here is the agent's choice, not an outage:
 		// moving the request to another provider is left to the user.
 		if err != nil && !isContextLengthError(err) && !errors.Is(err, ErrProviderUnavailable) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
-			if fallback := t.compatibleFallback(primary.Name(), messages); fallback != nil {
-				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), err, fallback.Name()))
-				fallbackErr := permanentFallbacks[fallback.Name()]
-				var fallbackResp ChatResponse
-				if fallbackErr == nil {
-					fallbackResp, messages, fallbackErr = t.callProviderWithOverloadRecovery(ctx, fallback, messages, t.model)
-					if fallbackErr != nil {
-						if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
-							permanentFallbacks[fallback.Name()] = fallbackErr
-						}
-						if t.telemetry != nil && !cancelledByCaller(ctx) {
-							model := fallbackResp.Model
-							if model == "" {
-								model = modelIDForProvider(fallback, t.model)
-							}
-							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": model, "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
-						}
-					}
+			// Walk the rest of the pool in configured order until a provider
+			// answers. Each provider that cannot take the request, or fails
+			// it, is named in the error if none does.
+			pool := t.pool
+			attempts := []providerAttempt{{Provider: primary.Name(), Role: "primary", Err: primaryErr}}
+			for _, name := range append([]string(nil), pool.Names()...) {
+				fallback := pool.Get(name)
+				if name == primary.Name() || fallback == nil {
+					continue
 				}
+				if cached := permanentFallbacks[name]; cached != nil {
+					// Failed for good earlier in this request; don't ask again.
+					attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: cached})
+					continue
+				}
+				budget, fits := t.fallbackFits(primary.Name(), fallback, messages)
+				if !fits {
+					attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: &fallbackSkippedError{Budget: budget}})
+					continue
+				}
+				if status, ok := pool.healthStore().admit(name); !ok {
+					attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: &providerUnhealthyError{Status: status}})
+					continue
+				}
+				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), primaryErr, name))
+				fallbackResp, nextMessages, fallbackErr := t.callProviderWithOverloadRecovery(ctx, fallback, messages, t.model)
+				messages = nextMessages
+				t.recordProviderOutcome(ctx, fallback, fallbackResp, fallbackErr)
 				if isInvalidToolHistory(fallbackErr) {
 					return fallbackResp, fallbackErr
 				}
 				if fallbackErr == nil {
 					if count := consumeTransientAttachments(t.messages); count > 0 {
-						t.emitAttachmentLifecycle("attachment.consumed", count, fallback.Name(), "provider_request_completed")
+						t.emitAttachmentLifecycle("attachment.consumed", count, name, "provider_request_completed")
 					}
 					return fallbackResp, nil
 				}
-				err = &providerChainError{PrimaryName: primary.Name(), FallbackName: fallback.Name(), Primary: primaryErr, Fallback: fallbackErr}
+				if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
+					permanentFallbacks[name] = fallbackErr
+				}
+				if t.telemetry != nil && !cancelledByCaller(ctx) {
+					model := fallbackResp.Model
+					if model == "" {
+						model = modelIDForProvider(fallback, t.model)
+					}
+					t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": name, "model": model, "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
+				}
+				attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: fallbackErr})
+				if ctx.Err() != nil {
+					break
+				}
+			}
+			if len(attempts) > 1 {
+				err = &providerChainError{Attempts: attempts}
 			}
 		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
@@ -4230,8 +4323,12 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 
 func (t *Thinker) ReloadDirective() {
 	_ = t.mutateRuntime(func() error {
+		before := t.directive
 		if t.reloadDirectiveNow() {
-			t.InjectConsole("Directive updated to: " + t.directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
+			sync := t.syncThreadDirectives()
+			if notice := t.directiveChangeNotice(before, t.directive, sync); notice != "" {
+				t.InjectConsole(notice)
+			}
 		}
 		return nil
 	})

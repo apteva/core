@@ -2,6 +2,20 @@ package core
 
 import "fmt"
 
+// recordCompletionResult keeps the message a thread passed to done so the
+// thread.done telemetry event can carry it.
+func (thread *Thread) recordCompletionResult(message string) {
+	thread.completionMu.Lock()
+	thread.completionMessage = message
+	thread.completionMu.Unlock()
+}
+
+func (thread *Thread) completionResult() string {
+	thread.completionMu.Lock()
+	defer thread.completionMu.Unlock()
+	return thread.completionMessage
+}
+
 func (thread *Thread) queueCompletion(callID, message string) error {
 	if thread.IsRealtime {
 		thread.completionMu.Lock()

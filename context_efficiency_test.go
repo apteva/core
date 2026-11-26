@@ -127,7 +127,7 @@ func TestContextEfficiencyFallbackSkipsSmallWindowWithoutRewriting(t *testing.T)
 	for _, compatible := range []bool{false, true} {
 		t.Run(map[bool]string{false: "retry-primary", true: "use-large-fallback"}[compatible], func(t *testing.T) {
 			primary := &efficiencyBudgetProvider{&scriptedRetryProvider{name: "primary", failures: 1, failureErr: errors.New("HTTP 429 rate limit"), response: ChatResponse{Text: "primary recovered"}}, "gpt-6.1-sol"}
-			small := &efficiencyBudgetProvider{&scriptedRetryProvider{name: "small", response: ChatResponse{Text: "must not run"}}, "claude-fable-5"}
+			small := &efficiencyBudgetProvider{&scriptedRetryProvider{name: "small", response: ChatResponse{Text: "must not run"}}, "gpt-4o"}
 			large := &efficiencyBudgetProvider{&scriptedRetryProvider{name: "large", response: ChatResponse{Text: "large recovered"}}, "gpt-6.1-sol"}
 			original := []Message{{Role: "system", Content: "Keep instructions"}, {Role: "user", Content: strings.Repeat("large current input ", 40000)}}
 			th := recoveryTestThinker(t, primary, original)
@@ -237,6 +237,15 @@ func TestContextEfficiencyOutputBudgetAndUnknownCapabilities(t *testing.T) {
 	b := estimatePreparedRequest("anthropic", "unknown-budget-model", nil, nil)
 	if b.ContextWindowSource != "unknown_model_default" {
 		t.Fatal("unknown window claimed as advertised", b)
+	}
+	if _, warned := unknownWindowModels.Load("unknown-budget-model"); !warned {
+		t.Fatal("unknown window not reported")
+	}
+	if b := estimatePreparedRequest("claude-subscription", "opus", nil, nil); b.ContextWindow != 200_000 || b.ContextWindowSource != "static_model_table" {
+		t.Fatal("Claude alias fell back to the default window", b)
+	}
+	if _, warned := unknownWindowModels.Load("opus"); warned {
+		t.Fatal("known model reported as unknown")
 	}
 }
 

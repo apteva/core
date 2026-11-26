@@ -72,13 +72,20 @@ func TestOversizedPreparedRequestRecoversBeforeProviderAndPersists(t *testing.T)
 		t.Fatal("restart restored oversized input")
 	}
 	ref := ""
+	started := false
 	events, _ := th.telemetry.StoredEvents(0)
 	for _, ev := range events {
+		if ev.Type == "llm.context_recovery_started" {
+			started = ref == ""
+		}
 		if ev.Type == "llm.context_recovery" {
 			var d map[string]any
 			_ = json.Unmarshal(ev.Data, &d)
 			ref = strings.TrimPrefix(d["archive_ref"].(string), strings.TrimSuffix(th.session.path, "main.jsonl"))
 		}
+	}
+	if !started {
+		t.Fatal("recovery did not report its start before its result")
 	}
 
 	archived, err := th.session.archive.Read(ref)
@@ -248,7 +255,7 @@ func TestContextBudgetBlocksUnshrinkableInstructionsWithoutNetwork(t *testing.T)
 func TestProviderChainErrorPreservesBothCauses(t *testing.T) {
 	primary := errors.New("context_length_exceeded")
 	fallback := errors.New("Anthropic API error 401: invalid API key")
-	err := &providerChainError{PrimaryName: "openai-codex", Primary: primary, FallbackName: "anthropic", Fallback: fallback}
+	err := &providerChainError{Attempts: []providerAttempt{{Provider: "openai-codex", Role: "primary", Err: primary}, {Provider: "anthropic", Role: "fallback", Err: fallback}}}
 	if !errors.Is(err, primary) || !errors.Is(err, fallback) || !isContextLengthError(err) {
 		t.Fatal("original error identity lost")
 	}

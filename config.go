@@ -62,6 +62,14 @@ type PersistentThread struct {
 	TurnDetection       *RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"` // realtime VAD/turn-taking profile and overrides
 	Pace                *PersistentPaceState         `json:"pace,omitempty"`           // runtime cadence/deadline; never part of the directive
 	Events              []PersistentThreadEvent      `json:"events,omitempty"`         // pending inbox payloads + bounded consumed-ID ledger
+	// APIManaged marks a thread created through the API (by an app, channels
+	// or the dashboard) rather than by an agent. Agent tools may message it
+	// but not update or kill it.
+	APIManaged bool `json:"api_managed,omitempty"`
+	// InheritMain records a thread whose directive is main's directive plus
+	// DirectiveSuffix. Core recomputes it whenever main's directive changes.
+	InheritMain     bool   `json:"inherit_main,omitempty"`
+	DirectiveSuffix string `json:"directive_suffix,omitempty"`
 }
 
 // ProviderConfig persists a provider and its model selections.

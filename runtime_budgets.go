@@ -52,7 +52,8 @@ func permanentProviderError(err error) bool {
 		return false
 	}
 	var invalid *toolNameError
-	if errors.As(err, &invalid) || errors.Is(err, ErrProviderUnavailable) {
+	var skipped *providerUnhealthyError
+	if errors.As(err, &invalid) || errors.Is(err, ErrProviderUnavailable) || errors.As(err, &skipped) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())

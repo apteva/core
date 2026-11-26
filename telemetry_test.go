@@ -380,6 +380,24 @@ func TestModelContextWindow(t *testing.T) {
 		{"claude-sonnet-4-5[1m]", 1_000_000},
 		{"claude-haiku-4-5-20251001", 200_000},
 		{"claude-3-5-sonnet-20241022", 200_000},
+		{"claude-opus-4-8[1m]", 1_000_000},
+		// Claude 5 family: 1M across every documented id and id form.
+		{"claude-fable-5", 1_000_000},
+		{"claude-fable-5-2", 1_000_000},
+		{"claude-mythos-5-1", 1_000_000},
+		{"claude-opus-5-5", 1_000_000},
+		{"anthropic.claude-opus-5", 1_000_000},
+		{"claude-sonnet-5-5", 1_000_000},
+		{"claude-haiku-5-5", 1_000_000},
+		// Claude Code aliases (claude-subscription), matched exactly.
+		{"opus", 200_000},
+		{" Sonnet ", 200_000},
+		{"haiku", 200_000},
+		{"opus[1m]", 1_000_000},
+		{"sonnet[1m]", 1_000_000},
+		// Ids that merely contain an alias are not Claude models.
+		{"magnum-opus-72b", 0},
+		{"haiku-writer", 0},
 		// OpenAI.
 		{"gpt-4o", 128_000},
 		{"gpt-4o-mini", 128_000},

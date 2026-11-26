@@ -200,6 +200,10 @@ func (a *APIServer) status(w http.ResponseWriter, r *http.Request) {
 	if status.ProviderUnavailable != nil {
 		body["provider_unavailable"] = status.ProviderUnavailable
 	}
+	// Providers skipped because their credentials or account were rejected.
+	if health := a.thinker.pool.ProviderHealth(); len(health) > 0 {
+		body["provider_health"] = health
+	}
 	writeJSON(w, body)
 }
 
@@ -219,12 +223,16 @@ type threadJSON struct {
 	Model               string          `json:"model"`
 	Reasoning           string          `json:"reasoning,omitempty"`
 	Age                 string          `json:"age"`
+	StartedAt           string          `json:"started_at,omitempty"`
 	Realtime            bool            `json:"realtime,omitempty"`
 	Ephemeral           bool            `json:"ephemeral,omitempty"`
 	Voice               string          `json:"voice,omitempty"`
 	Provider            string          `json:"provider,omitempty"`
 	ProviderPin         string          `json:"provider_pin,omitempty"`
 	ProviderMissing     bool            `json:"provider_missing,omitempty"`
+	APIManaged          bool            `json:"api_managed,omitempty"`
+	InheritMain         bool            `json:"inherit_main,omitempty"`
+	DirectiveSuffix     string          `json:"directive_suffix,omitempty"`
 }
 
 func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
@@ -250,6 +258,7 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 		Model:      status.Model.String(),
 		Reasoning:  status.Reasoning.String(),
 		Age:        formatAge(time.Since(a.startTime)),
+		StartedAt:  formatNextWakeAt(a.startTime),
 	}}
 
 	// Recursively collect all threads (including sub-threads of leaders)
@@ -272,12 +281,16 @@ func (a *APIServer) threads(w http.ResponseWriter, r *http.Request) {
 				Model:               t.Model.String(),
 				Reasoning:           t.Reasoning.String(),
 				Age:                 formatAge(time.Since(t.Started)),
+				StartedAt:           formatNextWakeAt(t.Started),
 				Realtime:            t.Realtime,
 				Ephemeral:           t.Ephemeral,
 				Voice:               t.Voice,
 				Provider:            t.Provider,
 				ProviderPin:         t.ProviderPin,
 				ProviderMissing:     t.ProviderMissing,
+				APIManaged:          t.APIManaged,
+				InheritMain:         t.InheritMain,
+				DirectiveSuffix:     t.DirectiveSuffix,
 			})
 			// Recurse into children
 			if t.SubThreads > 0 {
@@ -494,11 +507,17 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 			return
 		}
 	}
+	// A directive built from main stays tied to main: Core recomputes it when
+	// main's directive changes. An explicit directive is the caller's own text
+	// and carries main's managed blocks like any other worker.
 	directive := body.Directive
+	inheritance := &ThreadInheritance{InheritMain: directive == "", Suffix: body.DirectiveSuffix}
 	if directive == "" {
-		directive = a.thinker.config.GetDirective()
-		if body.DirectiveSuffix != "" {
-			directive = directive + body.DirectiveSuffix
+		directive = a.thinker.config.GetDirective() + body.DirectiveSuffix
+	} else {
+		inheritance.Suffix = ""
+		if system, realtime, ok := a.thinker.threads.threadKind(id); ok {
+			directive = a.thinker.threads.composeThreadDirective(directive, system, realtime, false, "")
 		}
 	}
 	normalizedEvents, err := normalizeAPIThreadEvents(body.Events)
@@ -515,6 +534,7 @@ func (a *APIServer) updateThread(w http.ResponseWriter, r *http.Request, id stri
 		ReplaceTools:            body.Tools != nil,
 		MCPNames:                body.MCP,
 		BypassCapabilityCeiling: true,
+		Inheritance:             inheritance,
 	}, normalizedEvents)
 	if err != nil {
 		if errors.Is(err, ErrRealtimeConfigurationRestartRequired) {
@@ -768,8 +788,13 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Realtime threads keep the directive they started with for the length
+	// of a call, so only ordinary threads follow main automatically.
+	inheritMain := body.Directive == "" && !body.Realtime
 
 	if t := findThinkerByID(a.thinker, id); t != nil {
+		// Threads created before Core recorded these flags learn them here.
+		a.thinker.threads.backfillAPIThread(id, inheritMain, body.DirectiveSuffix)
 		// The server may lose its in-memory spawn cache while core keeps the
 		// thread alive. Preserve POST idempotency and backfill a missing
 		// durable record.
@@ -826,6 +851,9 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		Model:             strings.ToLower(strings.TrimSpace(body.Model)),
 		DeferRun:          true,
 		ContinueToolsFrom: strings.TrimSpace(body.ContinueToolsFrom),
+		APIManaged:        true,
+		InheritMain:       inheritMain,
+		DirectiveSuffix:   body.DirectiveSuffix,
 	}
 	if opts.ContinueToolsFrom != "" {
 		if err := validateThreadID(opts.ContinueToolsFrom); err != nil {
@@ -1349,6 +1377,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 
 		cfg := a.thinker.config
+		directiveBefore := cfg.GetDirective()
 		providers := cfg.GetProviders()
 		savedProviders := providers
 		providerChanged := len(body.Providers) > 0 || body.Provider != nil || body.RealtimeEnabled != nil
@@ -1432,6 +1461,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if providerChanged {
+			pool.inheritHealth(a.thinker.pool, savedProviders, providers, enabled != savedEnabled)
 			a.thinker.pool = pool
 			a.thinker.provider = pool.Default()
 			if info := pool.Unavailable(); info != nil {
@@ -1448,6 +1478,15 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Directive != "" || providerChanged || body.MCPServers != nil {
 			a.thinker.refreshRuntimePrompt(refreshReason, toolsChanged)
+		}
+		// Bring workers in line with main and tell main what changed, in the
+		// same turn the new directive starts.
+		directiveAfter := cfg.GetDirective()
+		if directiveAfter != directiveBefore {
+			sync := a.thinker.syncThreadDirectives()
+			if notice := a.thinker.directiveChangeNotice(directiveBefore, directiveAfter, sync); notice != "" {
+				a.thinker.InjectConsole(notice)
+			}
 		}
 		a.thinker.publishRuntimeStatus()
 		a.thinker.publishContextStatus()

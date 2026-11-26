@@ -35,7 +35,16 @@ type executionTrace struct {
 	ids                                          traceIDs
 	created                                      time.Time
 	ready, firstInference, firstAction, finished bool
+	outcome                                      string // first worker.finished outcome
 	attempt                                      int
+}
+
+// finishedOutcome returns the outcome worker.finished reported, or "" when
+// the worker has not finished.
+func (tr *executionTrace) finishedOutcome() string {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return tr.outcome
 }
 
 func (t *Thinker) tracing() *executionTrace {
@@ -113,6 +122,9 @@ func (t *Thinker) workerMilestoneTrace(kind, outcome string, origin *traceIDs, t
 	}
 	if flag != nil {
 		*flag = true
+	}
+	if kind == "finished" {
+		tr.outcome = outcome
 	}
 	ids, created := tr.ids, tr.created
 	tr.mu.Unlock()

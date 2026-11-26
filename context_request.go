@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Estimates are deliberately labelled: serialized bytes are exact, tokens are
@@ -84,6 +85,7 @@ func (b *requestBudget) finish(output int) {
 	if b.ContextWindow <= 0 {
 		b.ContextWindow = contextPressureCharFallback / 4
 		b.ContextWindowSource = "unknown_model_default"
+		warnUnknownContextWindow(b.Provider, b.Model)
 	}
 	if output <= 0 {
 		output = 16384
@@ -96,6 +98,18 @@ func (b *requestBudget) finish(output int) {
 	b.InputTokens = b.SystemTokens + b.ConversationTokens + b.ToolTokens + b.ImageTokens + b.OpaqueTokens
 	b.OverBudget = b.InputTokens > b.InputBudget
 }
+
+// unknownWindowModels holds the models already reported as having no known
+// context window, so each is logged once rather than on every request.
+var unknownWindowModels sync.Map
+
+func warnUnknownContextWindow(provider, model string) {
+	if _, seen := unknownWindowModels.LoadOrStore(model, true); seen {
+		return
+	}
+	logMsg("CONTEXT", fmt.Sprintf("no context window known for model %q (provider %s); budgeting with the %d-token default", model, provider, contextPressureCharFallback/4))
+}
+
 func requestFingerprint(body []byte) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
@@ -237,12 +251,29 @@ func observeProviderRequest(ctx context.Context, provider, model string, body []
 }
 
 // Preserve both causal identities; errors.As/Is must see primary AND fallback.
-type providerChainError struct {
-	PrimaryName, FallbackName string
-	Primary, Fallback         error
+// providerAttempt is one provider's part in a request that no provider
+// answered: the error it returned, or why it was not called.
+type providerAttempt struct {
+	Provider string
+	Role     string // "primary" or "fallback"
+	Err      error
 }
 
+// providerChainError names every provider a request went through, in order,
+// so one error says why each of them did not answer.
+type providerChainError struct{ Attempts []providerAttempt }
+
 func (e *providerChainError) Error() string {
-	return fmt.Sprintf("primary %s: %v; fallback %s: %v", e.PrimaryName, e.Primary, e.FallbackName, e.Fallback)
+	parts := make([]string, 0, len(e.Attempts))
+	for _, attempt := range e.Attempts {
+		parts = append(parts, fmt.Sprintf("%s %s: %v", attempt.Role, attempt.Provider, attempt.Err))
+	}
+	return fmt.Sprintf("no provider answered (%d tried or skipped): %s", len(e.Attempts), strings.Join(parts, "; "))
 }
-func (e *providerChainError) Unwrap() []error { return []error{e.Primary, e.Fallback} }
+func (e *providerChainError) Unwrap() []error {
+	out := make([]error, 0, len(e.Attempts))
+	for _, attempt := range e.Attempts {
+		out = append(out, attempt.Err)
+	}
+	return out
+}

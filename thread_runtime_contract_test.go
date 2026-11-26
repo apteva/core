@@ -343,6 +343,13 @@ func TestDoneRuntimeRecordsResultBeforeParentDeliveryAndThreadDone(t *testing.T)
 			}
 		case "thread.done":
 			doneIndex = index
+			var done ThreadDoneData
+			if err := json.Unmarshal(event.Data, &done); err != nil {
+				t.Fatalf("decode thread.done: %v", err)
+			}
+			if done.Result != "runtime final" || done.ResultTruncated || done.Outcome != "completed" || done.ParentID != "main" {
+				t.Fatalf("thread.done data = %+v", done)
+			}
 		}
 	}
 	if successfulResults != 1 || resultIndex < 0 || doneIndex < 0 || resultIndex >= doneIndex {
