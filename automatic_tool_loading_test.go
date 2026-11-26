@@ -22,7 +22,7 @@ func TestAutomaticToolsDefaultAndDisableCompatibility(t *testing.T) {
 	th := automaticTicketThinker(t)
 	th.config.AutomaticToolLoading = nil
 	defaults := th.config.GetAutomaticToolLoading()
-	if !defaults.Enabled || !defaults.IncludeMemory || defaults.MaxTools != 8 || defaults.MaxSchemaTokens != 2000 {
+	if !defaults.Enabled || !defaults.IncludeMemory || defaults.MaxTools != 8 || defaults.MaxSchemaTokens != 6000 {
 		t.Fatalf("unexpected defaults: %+v", defaults)
 	}
 	registerSearchTool(th.registry)

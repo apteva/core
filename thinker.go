@@ -966,7 +966,13 @@ type Thinker struct {
 	// activeToolAge tracks the iteration each active tool was last
 	// surfaced — the recency key for evictActiveToolsLRU. Lazily
 	// initialised by touchActiveTool.
-	activeToolAge       map[string]int
+	activeToolAge map[string]int
+	// activeToolsSnapshot is the last published copy of activeTools, safe to
+	// read from other goroutines (thread tool continuity).
+	activeToolsSnapshot atomic.Pointer[[]string]
+	// retiredTools remembers the loaded tools of ended threads. Shared by
+	// every thread of this Core process.
+	retiredTools        *retiredToolSets
 	discoveredToolUntil map[string]int
 	// presentedTools is the exact schema-name set supplied to the model for
 	// its current request/session configuration. Sub-thread dispatch uses
@@ -1434,6 +1440,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	t.registry = NewToolRegistry(apiKey)
 	t.toolIndex = NewToolIndex()
 	t.activeTools = map[string]bool{}
+	t.retiredTools = newRetiredToolSets()
 	t.directive = config.GetDirective()
 
 	// Register system-only tools (for unconscious thread)

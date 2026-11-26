@@ -775,6 +775,7 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		RealtimeExecution          *RealtimeExecutionConfig    `json:"realtime_execution,omitempty"`
 		RealtimeOutput             RealtimeOutputConfig        `json:"realtime_output,omitempty"`
 		TurnDetection              RealtimeTurnDetectionConfig `json:"turn_detection,omitempty"`
+		ContinueToolsFrom          string                      `json:"continue_tools_from,omitempty"`
 	}
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -849,9 +850,16 @@ func (a *APIServer) spawnThread(w http.ResponseWriter, r *http.Request, id strin
 		ProviderName:      strings.TrimSpace(body.ProviderName),
 		Model:             strings.ToLower(strings.TrimSpace(body.Model)),
 		DeferRun:          true,
+		ContinueToolsFrom: strings.TrimSpace(body.ContinueToolsFrom),
 		APIManaged:        true,
 		InheritMain:       inheritMain,
 		DirectiveSuffix:   body.DirectiveSuffix,
+	}
+	if opts.ContinueToolsFrom != "" {
+		if err := validateThreadID(opts.ContinueToolsFrom); err != nil {
+			http.Error(w, "continue_tools_from: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	if body.BridgeDisconnectTTLSeconds < 0 || body.BridgeDisconnectTTLSeconds > 3600 {
 		http.Error(w, "bridge_disconnect_ttl_seconds must be between 0 and 3600", http.StatusBadRequest)

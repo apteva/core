@@ -383,6 +383,9 @@ type SpawnOpts struct {
 	// Pace restores the agent-owned pending wake of a persistent thread. It is
 	// not exposed through spawn and never enters the thread directive.
 	Pace *PersistentPaceState
+	// ContinueToolsFrom names an earlier thread, live or recently ended, whose
+	// loaded MCP tools this thread starts with, as far as its own grants allow.
+	ContinueToolsFrom string
 	// APIManaged marks a thread created through the authenticated API. Never
 	// set by the agent spawn tool.
 	APIManaged bool
@@ -416,6 +419,13 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	if id == "main" {
 		return fmt.Errorf("thread id %q is reserved", id)
+	}
+	var continued []string
+	if opts.ContinueToolsFrom != "" && opts.ContinueToolsFrom != id {
+		continued = tm.continuedTools(opts.ContinueToolsFrom)
+		if continued == nil {
+			continued = []string{}
+		}
 	}
 	tm.spawnMu.Lock()
 	defer tm.spawnMu.Unlock()
@@ -822,6 +832,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		mcpServers:             threadMCPServers,
 		toolIndex:              tm.parent.toolIndex,
 		activeTools:            preloadActive,
+		retiredTools:           tm.parent.retiredTools,
 		directive:              directive,
 		systemThread:           isSystem,
 		allowNoSpawn:           opts.BypassNoSpawn,
@@ -847,6 +858,15 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	}
 	thinker.onStop = func() { tm.cleanupThreadInstance(thinker.threadID, thinker) }
 	thread.Thinker = thinker
+	if continued != nil {
+		loaded := thinker.continueActiveTools(continued)
+		logMsg("SPAWN", continuityLogLine(id, opts.ContinueToolsFrom, loaded, len(continued)))
+		if tm.parent.telemetry != nil {
+			tm.parent.telemetry.Emit("thread.tools_continued", id, map[string]any{"from": opts.ContinueToolsFrom, "loaded": loaded, "offered": len(continued)})
+		}
+	} else {
+		thinker.publishActiveTools()
+	}
 	if !thread.Ephemeral {
 		thinker.persistPace = func(state PersistentPaceState) error {
 			persisted := persistentThreadState(thread)
@@ -2753,6 +2773,9 @@ func (tm *ThreadManager) cleanupThreadInstance(id string, expected *Thinker) {
 	}
 	delete(tm.threads, id)
 	tm.mu.Unlock()
+	if thread != nil && thread.Thinker != nil && tm.parent != nil {
+		tm.parent.retiredTools.record(id, thread.Thinker.loadedToolsSnapshot(), time.Now())
+	}
 	if thread != nil && thread.Realtime != nil {
 		thread.Realtime.captureTerminalWork()
 		thread.Realtime.finishShutdown()

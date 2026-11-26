@@ -40,6 +40,11 @@ func validateAutomaticToolLoading(c *AutomaticToolLoadingConfig) error {
 	return nil
 }
 
+// defaultAutomaticSchemaTokens fits roughly six to eight typical app tool
+// schemas. At 2,000, workers with large Processes and CRM schemas got two to
+// four tools and searched for the rest.
+const defaultAutomaticSchemaTokens = 6000
+
 func (c *Config) GetAutomaticToolLoading() AutomaticToolLoadingConfig {
 	out := AutomaticToolLoadingConfig{Enabled: true, IncludeMemory: true}
 	if c != nil {
@@ -54,7 +59,7 @@ func (c *Config) GetAutomaticToolLoading() AutomaticToolLoadingConfig {
 		out.MaxTools = 8
 	}
 	if out.MaxSchemaTokens == 0 {
-		out.MaxSchemaTokens = 2000
+		out.MaxSchemaTokens = defaultAutomaticSchemaTokens
 	}
 	return out
 }
@@ -114,8 +119,37 @@ func (t *Thinker) automaticToolQueries(c AutomaticToolLoadingConfig) []automatic
 	add("directive", t.directive)
 	// Reuse recall that already ran for this model request. Never perform an
 	// extra memory/model request, and never treat remembered names as grants.
-	if c.IncludeMemory {
+	// A worker thread with an assigned task already has its instruction, task
+	// and directive; recall there picks tools from unrelated past work and
+	// spends the budget the task needs.
+	if c.IncludeMemory && !t.assignedWorker(ids) {
 		add("memory", t.memoryRecall.context)
+	}
+	return out
+}
+
+// assignedWorker reports a thread other than main that is working on a
+// tracked task, such as a workflow step worker.
+func (t *Thinker) assignedWorker(executions []string) bool {
+	return t.threadID != "main" && len(executions) > 0
+}
+
+// exactToolNames returns canonical MCP tool names written in text, in order.
+// A task that names its tools should get them before relevance guesses.
+func (t *Thinker) exactToolNames(text string) []string {
+	if t.toolIndex == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, token := range toolNameTokens(text) {
+		if seen[token] || !strings.Contains(token, "_") {
+			continue
+		}
+		seen[token] = true
+		if entry, ok := t.toolIndex.Get(token); ok {
+			out = append(out, entry.Name)
+		}
 	}
 	return out
 }
@@ -219,11 +253,28 @@ func (t *Thinker) prepareAutomaticTools(c AutomaticToolLoadingConfig) map[string
 		}
 	}
 	if len(previous.names) == 0 || previous.context != contextKey {
+		// Tool names written in the instruction, task or directive load at
+		// workflow priority, for up to half the tool budget, so the rest
+		// stays open for relevance matches.
+		exactLimit := c.MaxTools / 2
+		if exactLimit < 1 {
+			exactLimit = 1
+		}
+		exactSeen := map[string]bool{}
 		for _, q := range queries {
 			// Short acknowledgements are not evidence for new capabilities.
 			// Explicit tool/server references still work even as one-word input.
 			if sticky && len(previous.names) > 0 && !t.automaticToolExpansion(q.Text, available) {
 				continue
+			}
+			if q.Source != "memory" {
+				for _, name := range t.exactToolNames(q.Text) {
+					if len(exactSeen) >= exactLimit || exactSeen[name] {
+						continue
+					}
+					exactSeen[name] = true
+					intents = append(intents, compileDiscoveryIntent(name, nil, DiscoveryAccessAny, 1, q.Source, 100, available)...)
+				}
 			}
 			priority := 70
 			if q.Source == "memory" {

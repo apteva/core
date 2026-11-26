@@ -49,6 +49,9 @@ type IndexEntry struct {
 	SchemaCost  int // approximate native-schema tokens, computed once at registration
 	Match       string
 	Score       float64
+	// WeakMatch marks a descriptive hit that covers under half of the query's
+	// terms: a guess, not evidence that the requested operation exists.
+	WeakMatch bool
 	// Full-description term frequencies and separate name terms are computed
 	// at registration. Descriptive ranking uses BM25 with a distinct name boost.
 	tokens       map[string]int
@@ -459,6 +462,32 @@ type indexSearchResult struct {
 type indexSearchOptions struct {
 	Servers map[string]bool
 	Access  DiscoveryAccess
+	// DemoteSends lowers tools that send messages outside the platform, for
+	// searches that read or list something.
+	DemoteSends bool
+}
+
+// sendWords mark a tool whose operation delivers a message to someone.
+var sendWords = wordSet("send", "reply", "forward", "notify", "publish", "broadcast", "invite", "sms")
+
+// externalSendTool reports a tool that sends a message, judged from its own
+// name. A read-only annotation always wins.
+func externalSendTool(e IndexEntry) bool {
+	if e.Access == ToolAccessRead {
+		return false
+	}
+	name := e.LocalName
+	if name == "" {
+		name = e.Name
+	}
+	for _, word := range strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	}) {
+		if sendWords[word] {
+			return true
+		}
+	}
+	return false
 }
 
 func (ix *ToolIndex) search(query string, k int, allowNoSpawn bool, authorized func(IndexEntry) bool) []IndexEntry {
@@ -598,13 +627,18 @@ func (ix *ToolIndex) searchDetailedWithOptions(query string, k int, allowNoSpawn
 		avgLength = math.Max(1, float64(totalLength)/float64(len(candidates)))
 	}
 	type scored struct {
-		entry IndexEntry
-		score float64
+		entry   IndexEntry
+		score   float64
+		matched int
 	}
 	var hits []scored
 	for _, e := range candidates {
 		score := 0.0
+		matched := 0
 		for _, term := range terms {
+			if e.tokens[term] > 0 || e.nameTokens[term] > 0 || e.schemaTokens[term] > 0 || e.serverTokens[term] > 0 {
+				matched++
+			}
 			idf := math.Log1p((float64(len(candidates)-df[term]) + 0.5) / (float64(df[term]) + 0.5))
 			if e.nameTokens[term] > 0 {
 				score += 3 * idf
@@ -620,11 +654,16 @@ func (ix *ToolIndex) searchDetailedWithOptions(query string, k int, allowNoSpawn
 				score += idf * tf * 2.2 / (tf + 1.2*(0.25+0.75*float64(e.tokenCount)/avgLength))
 			}
 		}
-		if options.Access == DiscoveryAccessPreferRead && e.Access == ToolAccessRead {
+		// The read bonus breaks ties between relevant tools. Without a matched
+		// term it would turn every read tool into a hit for any query.
+		if options.Access == DiscoveryAccessPreferRead && e.Access == ToolAccessRead && score > 0 {
 			score += 1
 		}
+		if options.DemoteSends && externalSendTool(e) {
+			score /= 2
+		}
 		if score > 0 {
-			hits = append(hits, scored{e, score})
+			hits = append(hits, scored{e, score, matched})
 		}
 	}
 	sort.Slice(hits, func(i, j int) bool {
@@ -641,6 +680,7 @@ func (ix *ToolIndex) searchDetailedWithOptions(query string, k int, allowNoSpawn
 		out[i] = h.entry
 		out[i].Match = "bm25"
 		out[i].Score = h.score
+		out[i].WeakMatch = len(terms) >= 2 && h.matched*2 < len(terms)
 	}
 	if explicit {
 		for i := range out {
