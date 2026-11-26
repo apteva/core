@@ -248,7 +248,7 @@ func TestContextBudgetBlocksUnshrinkableInstructionsWithoutNetwork(t *testing.T)
 func TestProviderChainErrorPreservesBothCauses(t *testing.T) {
 	primary := errors.New("context_length_exceeded")
 	fallback := errors.New("Anthropic API error 401: invalid API key")
-	err := &providerChainError{PrimaryName: "openai-codex", Primary: primary, FallbackName: "anthropic", Fallback: fallback}
+	err := &providerChainError{Attempts: []providerAttempt{{Provider: "openai-codex", Role: "primary", Err: primary}, {Provider: "anthropic", Role: "fallback", Err: fallback}}}
 	if !errors.Is(err, primary) || !errors.Is(err, fallback) || !isContextLengthError(err) {
 		t.Fatal("original error identity lost")
 	}

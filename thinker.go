@@ -3762,16 +3762,28 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 	permanentFallbacks := map[string]error{}
 	for {
 		primary := t.provider
-		resp, nextMessages, err := t.callProviderWithOverloadRecovery(ctx, primary, messages, t.model)
-		messages = nextMessages
-		primaryErr := err
-		if managesInferenceLifecycle(primary) {
-			return resp, err
+		var resp ChatResponse
+		var err error
+		if skipped := t.unhealthyPrimary(primary); skipped != nil {
+			// Its credentials were rejected recently: make no request and go
+			// straight to the rest of the pool.
+			resp = ChatResponse{Provider: primary.Name(), Model: modelIDForProvider(primary, t.model)}
+			err = skipped
+		} else {
+			var nextMessages []Message
+			resp, nextMessages, err = t.callProviderWithOverloadRecovery(ctx, primary, messages, t.model)
+			messages = nextMessages
+			if managesInferenceLifecycle(primary) {
+				return resp, err
+			}
+			t.recordProviderOutcome(ctx, primary, resp, err)
 		}
+		primaryErr := err
 		if isInvalidToolHistory(err) {
 			return resp, err
 		}
-		if err != nil && t.telemetry != nil && !cancelledByCaller(ctx) {
+		var notCalled *providerUnhealthyError
+		if err != nil && t.telemetry != nil && !cancelledByCaller(ctx) && !errors.As(err, &notCalled) {
 			t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": resp.Provider, "model": resp.Model, "error": err.Error(), "role": "primary", "iteration": t.iteration})
 		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
@@ -3790,35 +3802,60 @@ func (t *Thinker) callLLMWithRetryMessages(ctx context.Context, messages []Messa
 		// A provider that can't run here is the agent's choice, not an outage:
 		// moving the request to another provider is left to the user.
 		if err != nil && !isContextLengthError(err) && !errors.Is(err, ErrProviderUnavailable) && ctx.Err() == nil && primary != nil && t.pool != nil && t.pool.Count() > 1 {
-			if fallback := t.compatibleFallback(primary.Name(), messages); fallback != nil {
-				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), err, fallback.Name()))
-				fallbackErr := permanentFallbacks[fallback.Name()]
-				var fallbackResp ChatResponse
-				if fallbackErr == nil {
-					fallbackResp, messages, fallbackErr = t.callProviderWithOverloadRecovery(ctx, fallback, messages, t.model)
-					if fallbackErr != nil {
-						if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
-							permanentFallbacks[fallback.Name()] = fallbackErr
-						}
-						if t.telemetry != nil && !cancelledByCaller(ctx) {
-							model := fallbackResp.Model
-							if model == "" {
-								model = modelIDForProvider(fallback, t.model)
-							}
-							t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": fallback.Name(), "model": model, "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
-						}
-					}
+			// Walk the rest of the pool in configured order until a provider
+			// answers. Each provider that cannot take the request, or fails
+			// it, is named in the error if none does.
+			pool := t.pool
+			attempts := []providerAttempt{{Provider: primary.Name(), Role: "primary", Err: primaryErr}}
+			for _, name := range append([]string(nil), pool.Names()...) {
+				fallback := pool.Get(name)
+				if name == primary.Name() || fallback == nil {
+					continue
 				}
+				if cached := permanentFallbacks[name]; cached != nil {
+					// Failed for good earlier in this request; don't ask again.
+					attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: cached})
+					continue
+				}
+				budget, fits := t.fallbackFits(primary.Name(), fallback, messages)
+				if !fits {
+					attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: &fallbackSkippedError{Budget: budget}})
+					continue
+				}
+				if status, ok := pool.healthStore().admit(name); !ok {
+					attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: &providerUnhealthyError{Status: status}})
+					continue
+				}
+				logMsg("FALLBACK", fmt.Sprintf("[%s] %s failed (%v), trying %s for this request", t.threadID, primary.Name(), primaryErr, name))
+				fallbackResp, nextMessages, fallbackErr := t.callProviderWithOverloadRecovery(ctx, fallback, messages, t.model)
+				messages = nextMessages
+				t.recordProviderOutcome(ctx, fallback, fallbackResp, fallbackErr)
 				if isInvalidToolHistory(fallbackErr) {
 					return fallbackResp, fallbackErr
 				}
 				if fallbackErr == nil {
 					if count := consumeTransientAttachments(t.messages); count > 0 {
-						t.emitAttachmentLifecycle("attachment.consumed", count, fallback.Name(), "provider_request_completed")
+						t.emitAttachmentLifecycle("attachment.consumed", count, name, "provider_request_completed")
 					}
 					return fallbackResp, nil
 				}
-				err = &providerChainError{PrimaryName: primary.Name(), FallbackName: fallback.Name(), Primary: primaryErr, Fallback: fallbackErr}
+				if permanentProviderError(fallbackErr) || isContextLengthError(fallbackErr) {
+					permanentFallbacks[name] = fallbackErr
+				}
+				if t.telemetry != nil && !cancelledByCaller(ctx) {
+					model := fallbackResp.Model
+					if model == "" {
+						model = modelIDForProvider(fallback, t.model)
+					}
+					t.telemetry.Emit("llm.provider_error", t.threadID, map[string]any{"provider": name, "model": model, "error": fallbackErr.Error(), "role": "fallback", "primary_provider": primary.Name(), "primary_error": primaryErr.Error()})
+				}
+				attempts = append(attempts, providerAttempt{Provider: name, Role: "fallback", Err: fallbackErr})
+				if ctx.Err() != nil {
+					break
+				}
+			}
+			if len(attempts) > 1 {
+				err = &providerChainError{Attempts: attempts}
 			}
 		}
 		if err != nil && !attachmentRecoveryUsed && transientAttachmentCount(messages) > 0 && isProviderAttachmentInputError(err) {
