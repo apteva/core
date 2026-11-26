@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -636,9 +637,19 @@ func TestAPI_Config_Put(t *testing.T) {
 	if thinker.directive != "new directive" {
 		t.Errorf("live directive not reloaded, got %q", thinker.directive)
 	}
+	// Main is told which sections changed, never the full new text: the
+	// directive is already in its system prompt.
 	select {
 	case ev := <-thinker.sub.C:
-		t.Fatalf("directive config update should not inject a wake event, got %s %q", ev.Type, ev.Text)
+		if !strings.HasPrefix(ev.Text, "[console] [directive updated]") || strings.Contains(ev.Text, "new directive") {
+			t.Fatalf("directive change notice = %q", ev.Text)
+		}
+	default:
+		t.Fatal("directive change did not tell main what changed")
+	}
+	select {
+	case ev := <-thinker.sub.C:
+		t.Fatalf("directive change sent a second event: %s %q", ev.Type, ev.Text)
 	default:
 	}
 }

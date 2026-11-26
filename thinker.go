@@ -484,8 +484,16 @@ func rosterEntry(t ThreadInfo) string {
 		}
 		runtimeInfo = fmt.Sprintf(" [realtime; %s; audio bridge %s; listed configuration already applied]", ownership, bridge)
 	}
-	return fmt.Sprintf("- %s%s%s\n  directive: %s\n  tools: %s\n",
-		label, subInfo, runtimeInfo, truncateStr(t.Directive, 150), strings.Join(t.Tools, ", "))
+	ownerInfo := ""
+	if t.APIManaged {
+		ownerInfo = " [created by the platform; message it with send, do not update or kill]"
+	}
+	directive := truncateStr(t.Directive, 150)
+	if t.InheritMain {
+		directive = "(your directive) + " + truncateStr(strings.TrimSpace(t.DirectiveSuffix), 120)
+	}
+	return fmt.Sprintf("- %s%s%s%s\n  directive: %s\n  tools: %s\n",
+		label, subInfo, runtimeInfo, ownerInfo, directive, strings.Join(t.Tools, ", "))
 }
 
 // rosterShouldDigest applies the two budgets plus hysteresis. entries are the
@@ -1537,6 +1545,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 				Events:            pt.Events,
 				WorkMode:          pt.WorkMode,
 				RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
+				APIManaged:        pt.APIManaged,
+				InheritMain:       pt.InheritMain,
+				DirectiveSuffix:   pt.DirectiveSuffix,
 			})
 			if err != nil {
 				t.reportThreadRestoreFailure(pt.ID, err)
@@ -1568,6 +1579,9 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 					Events:            pt.Events,
 					WorkMode:          pt.WorkMode,
 					RealtimeExecution: cloneRealtimeExecutionConfig(pt.RealtimeExecution),
+					APIManaged:        pt.APIManaged,
+					InheritMain:       pt.InheritMain,
+					DirectiveSuffix:   pt.DirectiveSuffix,
 				})
 				if err != nil {
 					t.reportThreadRestoreFailure(pt.ID, err)
@@ -2149,7 +2163,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				id := call.Args["id"]
 				if id == "" {
 					addResult("error: kill requires id")
-				} else if err := t.threads.ValidateAgentTarget(id); err != nil {
+				} else if err := t.threads.ValidateManagedTarget(id); err != nil {
 					addResult("error: " + err.Error())
 				} else {
 					if err := t.config.RemoveThread(id); err != nil {
@@ -2178,7 +2192,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 				directiveEditRequested := hasDirectiveEditArgs(call.Args)
 				if id == "" {
 					addResult("error: update requires id")
-				} else if err := t.threads.ValidateAgentTarget(id); err != nil {
+				} else if err := t.threads.ValidateManagedTarget(id); err != nil {
 					addResult("error: " + err.Error())
 				} else if newID == "" && name == "" && !directiveEditRequested && toolsStr == "" {
 					addResult("error: update requires at least one of new_id, name, directive, tools")
@@ -2202,6 +2216,9 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							applyErr = err
 						} else {
 							directive, directiveSummary, applyErr = applyDirectiveEdit(currentDirective, call.Args)
+							if applyErr == nil {
+								directive, _ = protectManagedBlocks(currentDirective, directive)
+							}
 							directiveChanged = applyErr == nil && directive != currentDirective
 						}
 					}
@@ -2210,7 +2227,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							RestartRealtime: parseTruthy(call.Args["restart_realtime"]),
 						})
 						if applyErr == nil && directiveChanged {
-							t.threads.SendWithPartsExecution(id, fmt.Sprintf("[directive updated] %s", directive), nil, t.currentEventExecutions())
+							t.threads.SendWithPartsExecution(id, fmt.Sprintf("[directive updated] %s", directive)+leaderDirectiveNotice(t.threads.ChildrenOf(id)), nil, t.currentEventExecutions())
 						}
 					}
 					if applyErr != nil {
@@ -2274,10 +2291,17 @@ func mainToolHandler(t *Thinker) ToolHandler {
 						currentDirective = t.config.GetDirective()
 					}
 					d, summary, err := applyDirectiveEdit(currentDirective, call.Args)
+					keptManaged := true
+					if err == nil {
+						d, keptManaged = protectManagedBlocks(currentDirective, d)
+						if !keptManaged {
+							summary = directiveEditSummaryWithWarnings(summary, []string{"platform-maintained sections were kept unchanged; only the operator can change them"})
+						}
+					}
 					if err != nil {
 						addResult(directiveEditCorrectionResult(err))
 					} else if d == currentDirective {
-						addResult(evolveCompletionToolResult("directive already current; no update was needed", ""))
+						addResult(evolveCompletionToolResult("directive already current; no update was needed", summary))
 					} else {
 						if err := t.config.SetDirective(d); err != nil {
 							addResult(fmt.Sprintf("error: persist directive: %v", err))
@@ -2289,6 +2313,8 @@ func mainToolHandler(t *Thinker) ToolHandler {
 							if t.telemetry != nil {
 								t.telemetry.Emit("directive.evolved", t.threadID, DirectiveChangeData{New: d})
 							}
+							// Inheriting threads and shared sections follow main.
+							t.syncThreadDirectives()
 							addResult(evolveCompletionToolResult("directive updated", summary))
 						}
 					}
@@ -3442,13 +3468,18 @@ func (t *Thinker) Run() {
 			timer = time.NewTimer(delay)
 			timerC = timer.C
 		}
+	wait:
 		select {
 		case <-timerC:
 			t.wakeDeadlineFired = true
 			t.wakeReason = "timer"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: timer expired", t.threadID))
 		case <-t.mutationWake:
-			t.applyRuntimeMutations()
+			if !t.applyRuntimeMutationsWhileWaiting() {
+				// A quiet change (an inherited directive refresh) takes
+				// effect on the next real wake.
+				goto wait
+			}
 		case <-t.sub.Wake:
 			t.wakeReason = "event"
 			logMsg("RUN", fmt.Sprintf("[%s] woke: event received", t.threadID))
@@ -4260,8 +4291,12 @@ func (t *Thinker) APIEvents(since int) ([]APIEvent, int) {
 
 func (t *Thinker) ReloadDirective() {
 	_ = t.mutateRuntime(func() error {
+		before := t.directive
 		if t.reloadDirectiveNow() {
-			t.InjectConsole("Directive updated to: " + t.directive + "\n\nAdjust the system accordingly — spawn, kill, or reconfigure threads as needed.")
+			sync := t.syncThreadDirectives()
+			if notice := t.directiveChangeNotice(before, t.directive, sync); notice != "" {
+				t.InjectConsole(notice)
+			}
 		}
 		return nil
 	})
