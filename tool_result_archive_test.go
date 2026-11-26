@@ -61,7 +61,7 @@ func TestSessionPersistsOnlyToolResultMetadataAndReloadsPreview(t *testing.T) {
 	if err := session.AppendMessage(Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "call-1", Name: "media_search"}}}, 1, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-1", ToolName: "media_search", Content: payload, Image: []byte("pixels")}}}, 1, TokenUsage{}); err != nil {
+	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-1", ToolName: "media_search", Content: payload, Images: []ToolImage{{Data: []byte("pixels")}}}}}, 1, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,7 +74,7 @@ func TestSessionPersistsOnlyToolResultMetadataAndReloadsPreview(t *testing.T) {
 	}
 	entries := readSessionEntriesForTest(t, session.path)
 	stored := entries[len(entries)-1].ToolResults[0]
-	if stored.Content != "" || len(stored.Image) != 0 || stored.SHA256 == "" || stored.ArchiveRef == "" || stored.OriginalBytes == 0 {
+	if stored.Content != "" || len(firstToolImageData(stored.Images)) != 0 || stored.SHA256 == "" || stored.ArchiveRef == "" || stored.OriginalBytes == 0 {
 		t.Fatalf("durable result is not metadata-only: %+v", stored)
 	}
 
@@ -84,14 +84,14 @@ func TestSessionPersistsOnlyToolResultMetadataAndReloadsPreview(t *testing.T) {
 		t.Fatalf("reloaded messages = %+v", messages)
 	}
 	preview := messages[1].ToolResults[0]
-	if !preview.ContentIsPreview || len(preview.Content) > historicalToolResultPerResultChars || !strings.Contains(preview.Content, "OLDER TOOL RESULT") || strings.Contains(preview.Content, "archive_ref") || len(preview.Image) != 0 {
+	if !preview.ContentIsPreview || len(preview.Content) > historicalToolResultPerResultChars || !strings.Contains(preview.Content, "OLDER TOOL RESULT") || strings.Contains(preview.Content, "archive_ref") || len(firstToolImageData(preview.Images)) != 0 {
 		t.Fatalf("restart did not load bounded preview: %+v", preview)
 	}
 	object, err := restarted.archive.Read(preview.ArchiveRef)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if object.Content != payload || string(object.Image) != "pixels" {
+	if object.Content != payload || string(firstToolImageData(object.Images)) != "pixels" {
 		t.Fatal("immutable archive did not preserve the full payload")
 	}
 }

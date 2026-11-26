@@ -208,22 +208,26 @@ func toOpenAIMessages(messages []Message) []any {
 		// Tool result messages
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
-				if tr.Image != nil {
-					// Tool result with image (screenshot) — send as multimodal content
-					// Use "high" detail for computer use: it is the OpenAI spec's maximum-
+				if len(tr.Images) > 0 {
+					// Tool result with images — send as multimodal content, each
+					// image labelled. Use "high" detail: it is the OpenAI spec's maximum-
 					// fidelity setting. Do NOT use "original" — it is not in the schema.
 					// api.openai.com silently ignores unknown detail values, but strict
 					// OpenAI-compatible gateways (opencode-go) reject the request with 400.
+					content := []map[string]any{{"type": "text", "text": tr.Content}}
+					for _, img := range tr.Images {
+						if caption := toolImageCaption(img); caption != "" {
+							content = append(content, map[string]any{"type": "text", "text": caption})
+						}
+						content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{
+							"url":    toolImageDataURL(img),
+							"detail": "high",
+						}})
+					}
 					out = append(out, map[string]any{
 						"role":         "tool",
 						"tool_call_id": tr.CallID,
-						"content": []map[string]any{
-							{"type": "text", "text": tr.Content},
-							{"type": "image_url", "image_url": map[string]any{
-								"url":    "data:image/png;base64," + base64Encode(tr.Image),
-								"detail": "high",
-							}},
-						},
+						"content":      content,
 					})
 				} else {
 					out = append(out, openaiToolResultMsg{

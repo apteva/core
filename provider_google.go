@@ -302,14 +302,16 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 						Response: response,
 					},
 				})
-				// Gemini Computer Use: screenshots go as separate inlineData parts
-				if tr.Image != nil {
-					parts = append(parts, geminiPart{
-						InlineData: &geminiInline{
-							MimeType: "image/png",
-							Data:     base64Encode(tr.Image),
-						},
-					})
+				// Gemini takes tool images as inlineData parts next to the
+				// function response; each one is labelled first.
+				for _, img := range tr.Images {
+					if caption := toolImageCaption(img); caption != "" {
+						parts = append(parts, geminiPart{Text: caption})
+					}
+					parts = append(parts, geminiPart{InlineData: &geminiInline{
+						MimeType: toolImageMIME(img),
+						Data:     base64Encode(img.Data),
+					}})
 				}
 			}
 			if len(contents) > 0 && contents[len(contents)-1].Role == "user" {

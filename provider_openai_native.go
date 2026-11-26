@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -746,13 +745,17 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 		// Tool results
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
-				if tr.Image != nil {
-					imageURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tr.Image)
+				if len(tr.Images) > 0 {
 					var blocks []oaiContentBlock
 					if tr.Content != "" {
 						blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: tr.Content})
 					}
-					blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: imageURL, Detail: "high"})
+					for _, img := range tr.Images {
+						if caption := toolImageCaption(img); caption != "" {
+							blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: caption})
+						}
+						blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: toolImageDataURL(img), Detail: "high"})
+					}
 					items = append(items, oaiInputItem{
 						Type:   "function_call_output",
 						CallID: tr.CallID,

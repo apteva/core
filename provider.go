@@ -263,8 +263,8 @@ type ToolResult struct {
 	DirectReceipt      *ThreadWorkReceipt `json:"direct_receipt,omitempty"` // Core-authored, not tool-controlled
 	CallID             string             `json:"call_id"`
 	ToolName           string             `json:"tool_name,omitempty"`
-	Content            string             `json:"content"`         // full text for first consumption; bounded archive preview thereafter
-	Image              []byte             `json:"image,omitempty"` // optional image (screenshot etc.)
+	Content            string             `json:"content"`          // full text for first consumption; bounded archive preview thereafter
+	Images             []ToolImage        `json:"images,omitempty"` // images the tool returned, in order, each labelled
 	IsError            bool               `json:"is_error,omitempty"`
 	OriginalChars      int                `json:"original_chars,omitempty"`
 	OriginalBytes      int                `json:"original_bytes,omitempty"`

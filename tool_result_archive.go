@@ -29,9 +29,12 @@ const (
 )
 
 type archivedToolResultObject struct {
-	Version            int       `json:"version"`
-	SHA256             string    `json:"sha256"`
-	Content            string    `json:"content"`
+	Version int         `json:"version"`
+	SHA256  string      `json:"sha256"`
+	Content string      `json:"content"`
+	Images  []ToolImage `json:"images,omitempty"`
+	// Image is the single image of objects written before images became a
+	// list. Read normalizes it into Images.
 	Image              []byte    `json:"image,omitempty"`
 	IsError            bool      `json:"is_error,omitempty"`
 	OriginalChars      int       `json:"original_chars"`
@@ -101,16 +104,37 @@ func (a *ToolResultArchive) loadCallLedger() {
 	}
 }
 
-func toolResultPayloadSHA256(content string, image []byte, isError bool) string {
+// toolResultPayloadSHA256 hashes a result's content and images. Results with
+// at most one unlabelled image keep the v1 hash, so archives written before
+// images became a list still verify.
+func toolResultPayloadSHA256(content string, images []ToolImage, isError bool) string {
 	h := sha256.New()
-	_, _ = h.Write([]byte("apteva-tool-result-v1\x00"))
 	var length [8]byte
-	binary.BigEndian.PutUint64(length[:], uint64(len(content)))
-	_, _ = h.Write(length[:])
-	_, _ = h.Write([]byte(content))
-	binary.BigEndian.PutUint64(length[:], uint64(len(image)))
-	_, _ = h.Write(length[:])
-	_, _ = h.Write(image)
+	writeField := func(data []byte) {
+		binary.BigEndian.PutUint64(length[:], uint64(len(data)))
+		_, _ = h.Write(length[:])
+		_, _ = h.Write(data)
+	}
+	if len(images) <= 1 && (len(images) == 0 || (images[0].Label == "" && images[0].Retention == "")) {
+		_, _ = h.Write([]byte("apteva-tool-result-v1\x00"))
+		writeField([]byte(content))
+		var image []byte
+		if len(images) == 1 {
+			image = images[0].Data
+		}
+		writeField(image)
+	} else {
+		_, _ = h.Write([]byte("apteva-tool-result-v2\x00"))
+		writeField([]byte(content))
+		binary.BigEndian.PutUint64(length[:], uint64(len(images)))
+		_, _ = h.Write(length[:])
+		for _, img := range images {
+			writeField([]byte(img.MIMEType))
+			writeField([]byte(img.Label))
+			writeField([]byte(img.Retention))
+			writeField(img.Data)
+		}
+	}
 	if isError {
 		_, _ = h.Write([]byte{1})
 	} else {
@@ -143,19 +167,19 @@ func (a *ToolResultArchive) Archive(result ToolResult) (ToolResult, error) {
 	defer a.mu.Unlock()
 
 	if result.SHA256 == "" || result.ArchiveRef == "" {
-		hash := toolResultPayloadSHA256(result.Content, result.Image, result.IsError)
+		hash := toolResultPayloadSHA256(result.Content, result.Images, result.IsError)
 		result.SHA256 = hash
 		result.ArchiveRef = toolResultArchiveRef(hash)
 		result.OriginalChars = utf8.RuneCountInString(result.Content)
-		result.OriginalBytes = len(result.Content) + len(result.Image)
-		result.OriginalImageBytes = len(result.Image)
+		result.OriginalBytes = len(result.Content) + toolImagesBytes(result.Images)
+		result.OriginalImageBytes = toolImagesBytes(result.Images)
 		result.ContentIsPreview = false
 
 		object := archivedToolResultObject{
 			Version:            toolResultArchiveVersion,
 			SHA256:             hash,
 			Content:            result.Content,
-			Image:              append([]byte(nil), result.Image...),
+			Images:             cloneToolImages(result.Images),
 			IsError:            result.IsError,
 			OriginalChars:      result.OriginalChars,
 			OriginalBytes:      result.OriginalBytes,
@@ -314,7 +338,11 @@ func (a *ToolResultArchive) Read(refOrHash string) (archivedToolResultObject, er
 	if object.Version != toolResultArchiveVersion || object.SHA256 != hash {
 		return archivedToolResultObject{}, fmt.Errorf("archive object metadata mismatch for %s", hash)
 	}
-	if got := toolResultPayloadSHA256(object.Content, object.Image, object.IsError); got != hash {
+	if len(object.Images) == 0 && len(object.Image) > 0 {
+		object.Images = []ToolImage{{Data: object.Image}}
+	}
+	object.Image = nil
+	if got := toolResultPayloadSHA256(object.Content, object.Images, object.IsError); got != hash {
 		return archivedToolResultObject{}, fmt.Errorf("archive object checksum mismatch for %s", hash)
 	}
 	return object, nil
@@ -376,8 +404,23 @@ func validToolResultSuffix(content string, maxBytes int) string {
 }
 
 func projectArchivedToolResult(result ToolResult, maxChars int) ToolResult {
+	// Older results drop their images; the note says which ones went.
+	note := toolImagesRemovedNote(toolImagesToNote(result.Images, result.ToolName), result.ToolName, "with older history")
+	if note == "" {
+		return projectArchivedToolResultText(result, maxChars)
+	}
+	textBudget := maxChars - len(note) - 1
+	if textBudget < 0 {
+		textBudget = 0
+	}
+	projected := projectArchivedToolResultText(result, textBudget)
+	projected.Content = appendToolResultNote(projected.Content, note)
+	return projected
+}
+
+func projectArchivedToolResultText(result ToolResult, maxChars int) ToolResult {
 	projected := result
-	projected.Image = nil
+	projected.Images = nil
 	projected.ContentIsPreview = true
 	if len(result.Content) <= maxChars && !result.ContentIsPreview {
 		projected.ContentIsPreview = false
@@ -413,7 +456,7 @@ func projectArchivedToolResult(result ToolResult, maxChars int) ToolResult {
 
 func metadataOnlyArchivedToolResult(result ToolResult) ToolResult {
 	result.Content = ""
-	result.Image = nil
+	result.Images = nil
 	result.ContentIsPreview = true
 	return result
 }

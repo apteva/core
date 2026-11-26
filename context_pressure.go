@@ -54,7 +54,7 @@ func contextChars(messages []Message) int {
 			}
 		}
 		for _, result := range msg.ToolResults {
-			n += len(result.CallID) + len(result.Content) + len(result.Image)
+			n += len(result.CallID) + len(result.Content) + toolImagesBytes(result.Images)
 		}
 	}
 	return n
@@ -113,8 +113,8 @@ func estimatedContextTokens(messages []Message) int {
 		}
 		for _, result := range msg.ToolResults {
 			textChars += len(result.CallID) + len(result.Content)
-			if len(result.Image) > 0 {
-				imageTokens += estimateImageTokens(result.Image)
+			for _, img := range result.Images {
+				imageTokens += estimateImageTokens(img.Data)
 			}
 		}
 	}
@@ -170,104 +170,186 @@ func isComputerToolName(name string) bool {
 	return strings.HasPrefix(name, "computer_")
 }
 
-// The current frame and its navigation metadata remain current evidence even
-// after several model calls. Historical-result aging must not remove them.
-func latestComputerScreenshotCallID(messages []Message) string {
+// toolResultName prefers the name recorded on the result, then its call.
+func toolResultName(result ToolResult, names map[string]string) string {
+	if name := names[result.CallID]; name != "" {
+		return name
+	}
+	return result.ToolName
+}
+
+// latestToolImageCallIDs returns, for every group of "latest" images (one
+// screen for computer_* tools, one per other tool), the call whose result
+// holds the current image. That image is current evidence even after several
+// model calls, so historical-result aging must not remove it.
+func latestToolImageCallIDs(messages []Message) map[string]bool {
 	names := toolNamesByCallID(messages)
+	seenGroups := make(map[string]bool)
+	current := make(map[string]bool)
 	for i := len(messages) - 1; i >= 0; i-- {
 		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
 			result := messages[i].ToolResults[j]
-			if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
-				return result.CallID
+			name := toolResultName(result, names)
+			if !resultHasLatestImages(result, name) {
+				continue
+			}
+			group := latestToolImageGroup(name)
+			if seenGroups[group] {
+				continue
+			}
+			seenGroups[group] = true
+			if result.CallID != "" {
+				current[result.CallID] = true
 			}
 		}
 	}
-	return ""
+	return current
 }
 
-// evictStaleComputerScreenshots keeps only the newest computer frame. Unlike
-// generated/user images, browser screenshots are transient observations: once
-// a subsequent action returns a newer frame, replaying older frames adds cost
-// and can confuse the model about the current UI state.
-func evictStaleComputerScreenshots(messages []Message, keep int) int {
+// evictReplacedToolImages keeps only the newest `keep` results of each group
+// of "latest" images (screen captures and the like). Unlike kept images, they
+// are observations of a state that has since changed: replaying older ones
+// adds cost and can confuse the model about the current state.
+func evictReplacedToolImages(messages []Message, keep int) int {
 	if keep < 0 {
 		keep = 0
 	}
 	names := toolNamesByCallID(messages)
-	seen := 0
+	seen := make(map[string]int)
 	removed := 0
 	for i := len(messages) - 1; i >= 0; i-- {
 		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
 			result := &messages[i].ToolResults[j]
-			if len(result.Image) == 0 || !isComputerToolName(names[result.CallID]) {
+			name := toolResultName(*result, names)
+			if !resultHasLatestImages(*result, name) {
 				continue
 			}
-			seen++
-			if seen > keep {
-				result.Image = nil
+			group := latestToolImageGroup(name)
+			seen[group]++
+			if seen[group] <= keep {
+				continue
+			}
+			latest, kept := splitLatestToolImages(result.Images, name)
+			result.Images = kept
+			removed += len(latest)
+			if isComputerToolName(name) {
 				result.Content = evictedScreenshotPlaceholder
-				removed++
+			} else {
+				result.Content = appendToolResultNote(result.Content, fmt.Sprintf("[%d image(s) from %s replaced by a newer result]", len(latest), name))
 			}
 		}
 	}
 	return removed
 }
 
-// prepareComputerScreenshotTail returns a provider-only projection. Computer
-// pixels are removed from their historical function outputs without changing
-// the durable messages, then the newest frame is attached as a regular user
-// image at the request tail. A changing frame can therefore invalidate only
-// the volatile suffix instead of rewriting an earlier cached prefix.
-func prepareComputerScreenshotTail(messages []Message) []Message {
-	names := toolNamesByCallID(messages)
-	latestCallID := ""
-	var latestImage []byte
-	for i := len(messages) - 1; i >= 0 && latestImage == nil; i-- {
-		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
-			result := messages[i].ToolResults[j]
-			if len(result.Image) == 0 || !isComputerToolName(names[result.CallID]) {
-				continue
-			}
-			latestCallID = result.CallID
-			latestImage = append([]byte(nil), result.Image...)
-			break
-		}
-	}
-	if len(latestImage) == 0 {
+// prepareLatestToolImageTail returns a provider-only projection. "Latest"
+// images are removed from their historical function outputs without changing
+// the durable messages, then the current one of each group is attached as a
+// regular user image at the request tail. A changing frame can therefore
+// invalidate only the volatile suffix instead of rewriting an earlier cached
+// prefix. Kept images stay in their tool results.
+func prepareLatestToolImageTail(messages []Message) []Message {
+	current := latestToolImageCallIDs(messages)
+	if len(current) == 0 {
 		return messages
 	}
-
+	names := toolNamesByCallID(messages)
+	type tailEntry struct {
+		callID string
+		name   string
+		images []ToolImage
+	}
+	var tail []tailEntry
 	projected := cloneMessages(messages)
 	for i := range projected {
 		for j := range projected[i].ToolResults {
 			result := &projected[i].ToolResults[j]
-			if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
-				result.Image = nil
+			name := toolResultName(*result, names)
+			if !resultHasLatestImages(*result, name) {
+				continue
+			}
+			latest, kept := splitLatestToolImages(result.Images, name)
+			result.Images = kept
+			if current[result.CallID] {
+				tail = append(tail, tailEntry{callID: result.CallID, name: name, images: latest})
 			}
 		}
 	}
+	for _, entry := range tail {
+		var parts []ContentPart
+		if isComputerToolName(entry.name) {
+			parts = append(parts, ContentPart{Type: "text", Text: fmt.Sprintf("%s\nSource computer tool call: %s", computerScreenshotTailHeader, entry.callID)})
+		} else {
+			parts = append(parts, ContentPart{Type: "text", Text: fmt.Sprintf("[CURRENT IMAGE FROM %s — a newer result from this tool replaces it]\nSource tool call: %s", entry.name, entry.callID)})
+		}
+		for _, img := range entry.images {
+			// A single screen capture keeps its long-standing two-part shape.
+			if caption := toolImageCaption(img); caption != "" && (len(entry.images) > 1 || !isComputerToolName(entry.name)) {
+				parts = append(parts, ContentPart{Type: "text", Text: caption})
+			}
+			parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: toolImageDataURL(img), Detail: "high"}})
+		}
+		projected = append(projected, Message{Role: "user", RequestContext: true, Parts: parts})
+	}
+	return projected
+}
 
-	mimeType := "image/png"
-	if _, format, err := image.DecodeConfig(bytes.NewReader(latestImage)); err == nil {
-		switch strings.ToLower(format) {
-		case "jpeg", "jpg":
-			mimeType = "image/jpeg"
-		case "gif":
-			mimeType = "image/gif"
-		case "png":
-			mimeType = "image/png"
+// limitKeptToolImages applies the shared image budget to a provider-only
+// projection. Images from results the model has not seen yet are always
+// sent and count first; older kept images go, oldest first, once the newest
+// ones fill the budget. Each shortened result says exactly what was removed.
+func limitKeptToolImages(messages []Message, unseen func(ToolResult) bool) ([]Message, int) {
+	names := toolNamesByCallID(messages)
+	count, tokens := 0, 0
+	var projected []Message
+	removedTotal := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		for j := len(messages[i].ToolResults) - 1; j >= 0; j-- {
+			result := messages[i].ToolResults[j]
+			if len(result.Images) == 0 {
+				continue
+			}
+			name := toolResultName(result, names)
+			fresh := unseen != nil && unseen(result)
+			keep := make([]bool, len(result.Images))
+			var removed []ToolImage
+			for k := len(result.Images) - 1; k >= 0; k-- {
+				img := result.Images[k]
+				if toolImageIsLatest(img, name) {
+					keep[k] = true // handled by the latest-image tail
+					continue
+				}
+				cost := estimateImageTokens(img.Data)
+				if fresh || (count < maxKeptToolImages && tokens+cost <= maxKeptToolImageTokens) {
+					keep[k] = true
+					count++
+					tokens += cost
+					continue
+				}
+				removed = append([]ToolImage{img}, removed...)
+			}
+			if len(removed) == 0 {
+				continue
+			}
+			if projected == nil {
+				projected = cloneMessages(messages)
+			}
+			target := &projected[i].ToolResults[j]
+			var images []ToolImage
+			for k, img := range target.Images {
+				if keep[k] {
+					images = append(images, img)
+				}
+			}
+			target.Images = images
+			target.Content = appendToolResultNote(target.Content, toolImagesRemovedNote(removed, name, "to save context"))
+			removedTotal += len(removed)
 		}
 	}
-	imageURL := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(latestImage)
-	projected = append(projected, Message{
-		Role:           "user",
-		RequestContext: true,
-		Parts: []ContentPart{
-			{Type: "text", Text: fmt.Sprintf("%s\nSource computer tool call: %s", computerScreenshotTailHeader, latestCallID)},
-			{Type: "image_url", ImageURL: &ImageURL{URL: imageURL, Detail: "high"}},
-		},
-	})
-	return projected
+	if projected == nil {
+		return messages, 0
+	}
+	return projected, removedTotal
 }
 
 // checkpointHistoryWindow trims history in occasional blocks instead of
@@ -317,8 +399,10 @@ func messageForSession(history []Message, msg Message) Message {
 	msg.ToolResults = append([]ToolResult(nil), msg.ToolResults...)
 	for i := range msg.ToolResults {
 		result := &msg.ToolResults[i]
-		if len(result.Image) > 0 && isComputerToolName(names[result.CallID]) {
-			result.Image = nil
+		name := toolResultName(*result, names)
+		if resultHasLatestImages(*result, name) {
+			_, kept := splitLatestToolImages(result.Images, name)
+			result.Images = kept
 		}
 	}
 	return msg
