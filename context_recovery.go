@@ -158,6 +158,7 @@ func (t *Thinker) recoverOversizedRequest(ctx context.Context, provider LLMProvi
 	protected := t.toolCallIDsProtectedFromSanitization(nil)
 	next := projectBulkyContext(messages, ref, protected)
 	before := estimatedContextTokens(messages)
+	t.telemetry.Emit("llm.context_recovery_started", t.threadID, map[string]any{"provider": provider.Name(), "model": modelIDForProvider(provider, tier), "iteration": t.iteration, "reason": reason.Error(), "pass": pass, "before_tokens_est": before})
 	materiallySmaller := func(candidate []Message) bool { return estimatedContextTokens(candidate) <= before-max(128, before/20) }
 	// Use the rejecting request's complete budget, including schema overhead.
 	// The adapter still checks the exact serialized candidate before submission.

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Estimates are deliberately labelled: serialized bytes are exact, tokens are
@@ -84,6 +85,7 @@ func (b *requestBudget) finish(output int) {
 	if b.ContextWindow <= 0 {
 		b.ContextWindow = contextPressureCharFallback / 4
 		b.ContextWindowSource = "unknown_model_default"
+		warnUnknownContextWindow(b.Provider, b.Model)
 	}
 	if output <= 0 {
 		output = 16384
@@ -96,6 +98,18 @@ func (b *requestBudget) finish(output int) {
 	b.InputTokens = b.SystemTokens + b.ConversationTokens + b.ToolTokens + b.ImageTokens + b.OpaqueTokens
 	b.OverBudget = b.InputTokens > b.InputBudget
 }
+
+// unknownWindowModels holds the models already reported as having no known
+// context window, so each is logged once rather than on every request.
+var unknownWindowModels sync.Map
+
+func warnUnknownContextWindow(provider, model string) {
+	if _, seen := unknownWindowModels.LoadOrStore(model, true); seen {
+		return
+	}
+	logMsg("CONTEXT", fmt.Sprintf("no context window known for model %q (provider %s); budgeting with the %d-token default", model, provider, contextPressureCharFallback/4))
+}
+
 func requestFingerprint(body []byte) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
