@@ -876,6 +876,9 @@ type Thinker struct {
 	config               *Config
 	registry             *ToolRegistry
 
+	// Kept tool images retire in latched batches to protect the prompt cache.
+	keptToolImages keptToolImageRetirement
+
 	maxHistory int // max messages in context window (varies by role)
 
 	// Prompt-cache state is per agent thread. The epoch changes only when

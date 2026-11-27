@@ -18,7 +18,7 @@ func TestExecuteToolKeepsFullResultButBoundsTelemetry(t *testing.T) {
 		Name: "large_result",
 		Handler: func(map[string]string) ToolResponse {
 			defer close(completed)
-			return ToolResponse{Text: payload, Image: image}
+			return ToolResponse{Text: payload, Images: []ToolImage{{Data: image}}}
 		},
 	})
 	bus := NewEventBus()
@@ -45,7 +45,7 @@ func TestExecuteToolKeepsFullResultButBoundsTelemetry(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	if fullResult == nil || fullResult.Content != payload || string(fullResult.Image) != string(image) {
+	if fullResult == nil || fullResult.Content != payload || string(firstToolImageData(fullResult.Images)) != string(image) {
 		t.Fatalf("agent context did not retain full result: %+v", fullResult)
 	}
 

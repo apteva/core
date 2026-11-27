@@ -87,11 +87,11 @@ func TestPrepareComputerScreenshotTailDoesNotMutateHistory(t *testing.T) {
 		id := "call-" + string(rune('1'+i))
 		original = append(original,
 			Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: id, Name: "computer_computer_use"}}},
-			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: "screen metadata " + id, Image: pixels}}},
+			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: "screen metadata " + id, Images: []ToolImage{{Data: pixels}}}}},
 		)
 	}
 	before := cloneMessages(original)
-	projected := prepareComputerScreenshotTail(original)
+	projected := prepareLatestToolImageTail(original)
 	if !reflect.DeepEqual(original, before) {
 		t.Fatal("screenshot projection mutated durable history")
 	}
@@ -100,7 +100,7 @@ func TestPrepareComputerScreenshotTailDoesNotMutateHistory(t *testing.T) {
 	}
 	for _, message := range projected[:len(original)] {
 		for _, result := range message.ToolResults {
-			if len(result.Image) != 0 {
+			if len(firstToolImageData(result.Images)) != 0 {
 				t.Fatalf("historical tool result retained inline pixels: %s", result.CallID)
 			}
 			if !strings.Contains(result.Content, "screen metadata") {

@@ -16,20 +16,32 @@ import (
 func decodeMCPResult(result mcpCallResult) (ToolResponse, error) {
 	out := ToolResponse{IsError: result.IsError}
 	var texts []string
+	// A short text block directly before an image is that image's caption.
+	caption := ""
 	for _, c := range result.Content {
+		previousCaption := caption
+		caption = ""
 		switch c.Type {
 		case "text":
 			texts = append(texts, c.Text)
+			caption = toolImageLabelFromText(c.Text)
 		case "image":
 			data, err := base64.StdEncoding.DecodeString(c.Data)
 			if err != nil {
 				return out, fmt.Errorf("invalid MCP image: %w", err)
 			}
-			if c.MIMEType == "image/png" && out.Image == nil {
-				out.Image = data
-			} else {
-				out.Parts = append(out.Parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: "data:" + c.MIMEType + ";base64," + c.Data}})
+			// Every image stays on the tool result, in order, so the model
+			// can tell which call returned it and what it shows.
+			label := toolImageMetaString(c.Meta, toolImageLabelMetaKey)
+			if label == "" {
+				label = previousCaption
 			}
+			out.Images = append(out.Images, ToolImage{
+				MIMEType:  c.MIMEType,
+				Data:      data,
+				Label:     label,
+				Retention: normalizeToolImageRetention(toolImageMetaString(c.Meta, toolImageRetentionMetaKey)),
+			})
 		case "audio":
 			if c.MIMEType == "audio/wav" || c.MIMEType == "audio/mpeg" || c.MIMEType == "audio/mp3" {
 				format := "mp3"

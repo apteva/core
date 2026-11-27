@@ -18,7 +18,7 @@ import (
 // thinker.go's image-cap, so dropping orphan-with-image entirely is
 // safe and matches the protocol.
 //
-// If anyone reintroduces the `tr.Image != nil` exception in
+// If anyone reintroduces the `firstToolImageData(tr.Images) != nil` exception in
 // sanitizeToolPairs, these tests fail and the Patreon login flow
 // (and any other long-running multi-turn image-tool flow) starts
 // 400ing on opencode-go again.
@@ -34,12 +34,12 @@ func TestSanitize_OrphanToolResult_NoImage_Dropped(t *testing.T) {
 }
 
 // The regression. Before the fix this kept the orphan because
-// `tr.Image != nil`, leaving a tool_call_id with no matching tool_use
+// `firstToolImageData(tr.Images) != nil`, leaving a tool_call_id with no matching tool_use
 // in the wire payload. Moonshot 400s on this; Fireworks accepts it.
 func TestSanitize_OrphanToolResult_WithImage_Dropped(t *testing.T) {
 	in := []Message{
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "screenshot_tool:8", Content: "stale screenshot", Image: []byte("fake-png")},
+			{CallID: "screenshot_tool:8", Content: "stale screenshot", Images: []ToolImage{{Data: []byte("fake-png")}}},
 		}},
 	}
 	out := sanitizeToolPairs(in)
@@ -101,7 +101,7 @@ func TestSanitize_OrphanToolUse_KeptByImageException_Dropped(t *testing.T) {
 		// kept the result → toolResultIDs included :8 → assistant
 		// tool_call also kept → both wrong-shape on wire.
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "screenshot_tool:99", Image: []byte("fake-png")}, // orphan
+			{CallID: "screenshot_tool:99", Images: []ToolImage{{Data: []byte("fake-png")}}}, // orphan
 		}},
 	}
 	out := sanitizeToolPairs(in)
@@ -136,7 +136,7 @@ func TestSanitize_PairedToolsWithImage_Kept(t *testing.T) {
 	in := []Message{
 		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:1", Name: "screenshot_tool"}}},
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "screenshot_tool:1", Content: "ok", Image: []byte("png")},
+			{CallID: "screenshot_tool:1", Content: "ok", Images: []ToolImage{{Data: []byte("png")}}},
 		}},
 	}
 	out := sanitizeToolPairs(in)
@@ -149,7 +149,7 @@ func TestSanitize_PairedToolsWithImage_Kept(t *testing.T) {
 	if len(out[1].ToolResults) != 1 || out[1].ToolResults[0].CallID != "screenshot_tool:1" {
 		t.Fatalf("user tool_result dropped from a valid pair")
 	}
-	if out[1].ToolResults[0].Image == nil {
+	if firstToolImageData(out[1].ToolResults[0].Images) == nil {
 		t.Fatalf("image stripped from valid tool_result")
 	}
 }
@@ -174,7 +174,7 @@ func TestSanitize_AllOrphanResults_MessageDropped(t *testing.T) {
 	in := []Message{
 		{Role: "user", ToolResults: []ToolResult{
 			{CallID: "a:1", Content: "x"},
-			{CallID: "b:2", Content: "y", Image: []byte("png")},
+			{CallID: "b:2", Content: "y", Images: []ToolImage{{Data: []byte("png")}}},
 		}},
 	}
 	out := sanitizeToolPairs(in)
@@ -189,8 +189,8 @@ func TestSanitize_MixedToolResults_OnlyOrphanDropped(t *testing.T) {
 	in := []Message{
 		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "a:1", Name: "x"}}},
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "a:1", Content: "ok"},                               // paired → keep
-			{CallID: "ghost:99", Content: "stale", Image: []byte("png")}, // orphan → drop
+			{CallID: "a:1", Content: "ok"}, // paired → keep
+			{CallID: "ghost:99", Content: "stale", Images: []ToolImage{{Data: []byte("png")}}}, // orphan → drop
 		}},
 	}
 	out := sanitizeToolPairs(in)
@@ -215,7 +215,7 @@ func TestSanitize_PostconditionReferentialIntegrity(t *testing.T) {
 		// outside the slice (rolled off by LoadTail). This is exactly
 		// the shape that triggered the Patreon-login 400.
 		{Role: "user", ToolResults: []ToolResult{
-			{CallID: "screenshot_tool:8", Content: "stale", Image: []byte("png")},
+			{CallID: "screenshot_tool:8", Content: "stale", Images: []ToolImage{{Data: []byte("png")}}},
 		}},
 		// Healthy pair inside the window.
 		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screenshot_tool:9", Name: "screenshot_tool"}}},
@@ -525,7 +525,7 @@ func TestSessionLoadTailDoesNotReloadComputerScreenshots(t *testing.T) {
 	if err := session.AppendMessage(Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "call-screen", Name: "computer_computer_use"}}}, 1, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-screen", Content: "screen metadata", Image: []byte("stale pixels")}}}, 2, TokenUsage{}); err != nil {
+	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-screen", Content: "screen metadata", Images: []ToolImage{{Data: []byte("stale pixels")}}}}}, 2, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -533,7 +533,7 @@ func TestSessionLoadTailDoesNotReloadComputerScreenshots(t *testing.T) {
 	if len(messages) != 2 || len(messages[1].ToolResults) != 1 {
 		t.Fatalf("loaded messages = %+v", messages)
 	}
-	if messages[1].ToolResults[0].Image != nil {
+	if firstToolImageData(messages[1].ToolResults[0].Images) != nil {
 		t.Fatal("stale computer screenshot was reloaded")
 	}
 	if messages[1].ToolResults[0].Content != "screen metadata" {
@@ -551,7 +551,7 @@ func TestSessionForceCompactStripsRecentComputerScreenshots(t *testing.T) {
 	if err := session.AppendMessage(Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "call-screen", Name: "computer_computer_use"}}}, 6, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-screen", Content: "screen metadata", Image: []byte("pixels")}}}, 7, TokenUsage{}); err != nil {
+	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "call-screen", Content: "screen metadata", Images: []ToolImage{{Data: []byte("pixels")}}}}}, 7, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -560,7 +560,7 @@ func TestSessionForceCompactStripsRecentComputerScreenshots(t *testing.T) {
 	if len(entries) != 3 || len(entries[2].ToolResults) != 1 {
 		t.Fatalf("compacted entries = %+v", entries)
 	}
-	if entries[2].ToolResults[0].Image != nil {
+	if firstToolImageData(entries[2].ToolResults[0].Images) != nil {
 		t.Fatal("recent computer screenshot remained in compacted session")
 	}
 }

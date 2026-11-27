@@ -281,9 +281,7 @@ func cloneToolResults(in []ToolResult) []ToolResult {
 	out := make([]ToolResult, len(in))
 	for i, tr := range in {
 		out[i] = tr
-		if tr.Image != nil {
-			out[i].Image = append([]byte(nil), tr.Image...)
-		}
+		out[i].Images = cloneToolImages(tr.Images)
 	}
 	return out
 }

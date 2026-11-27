@@ -56,8 +56,8 @@ func projectBulkyContext(messages []Message, ref string, protected ...map[string
 					changed = true
 				}
 			}
-			if len(r.Image) > 0 && i < len(next)-2 {
-				r.Image = nil
+			if len(r.Images) > 0 && i < len(next)-2 {
+				r.Images = nil
 				r.Content += "\n[Historical image archived at " + ref + "]"
 				changed = true
 			}

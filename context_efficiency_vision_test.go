@@ -29,7 +29,7 @@ func TestContextEfficiencyComputerScreenshotSurvivesProjection(t *testing.T) {
 					latest = pixels
 				}
 				th.messages = append(th.messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: id, Name: "computer_computer_use"}}})
-				observation := th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: "Navigation succeeded; screen metadata " + id + strings.Repeat(" element coordinates ", 1000), Image: pixels}}})
+				observation := th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: "Navigation succeeded; screen metadata " + id + strings.Repeat(" element coordinates ", 1000), Images: []ToolImage{{Data: pixels}}}}})
 				th.messages = append(th.messages, observation)
 			}
 			if textPressure {
@@ -70,10 +70,10 @@ func TestContextEfficiencyComputerScreenshotSurvivesProjection(t *testing.T) {
 			// The previously current frame may age only when a newer frame
 			// replaces it. Scheduled checkpoints must preserve that new one.
 			th.messages = append(th.messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "next-screen", Name: "computer_computer_use"}}})
-			th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "next-screen", Content: "Next navigation state", Image: latest}}}))
+			th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "next-screen", Content: "Next navigation state", Images: []ToolImage{{Data: latest}}}}}))
 			th.commitMatureToolResults(th.messages)
 			nextRequest := th.prepareToolResultRequest(th.messages)
-			if len(nextRequest[5].ToolResults[0].Image) != 0 || th.toolResultIsHistorical(th.messages[len(th.messages)-1].ToolResults[0]) || !strings.Contains(nextRequest[len(nextRequest)-1].Parts[0].Text, "next-screen") {
+			if len(firstToolImageData(nextRequest[5].ToolResults[0].Images)) != 0 || th.toolResultIsHistorical(th.messages[len(th.messages)-1].ToolResults[0]) || !strings.Contains(nextRequest[len(nextRequest)-1].Parts[0].Text, "next-screen") {
 				t.Fatal("screenshot replacement failed to move current-frame protection")
 			}
 		})
@@ -103,7 +103,7 @@ func TestIntegration_CodexGPT61SolComputerVisionRetention(t *testing.T) {
 		{Role: "user", Content: "What colors are in the four quadrants of the current screen?"},
 		{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "screen", Name: "computer_computer_use", Args: map[string]string{"action": "screenshot"}}}},
 	}
-	th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "screen", Content: "Capture successful", Image: pixels}}}))
+	th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "screen", Content: "Capture successful", Images: []ToolImage{{Data: pixels}}}}}))
 	th.messages = append(th.messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "document", Name: "read_document"}}})
 	th.messages = append(th.messages, th.archiveToolResultMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "document", Content: strings.Repeat("Historical document unrelated to the current screen. ", 7000)}}}))
 	th.messages = append(th.messages, Message{Role: "assistant", Content: "First follow-up."}, Message{Role: "assistant", Content: "Second follow-up."}, Message{Role: "assistant", Content: "Third follow-up."})

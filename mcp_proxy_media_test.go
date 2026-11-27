@@ -82,7 +82,7 @@ func TestMCPProxyPreservesDecodedContent(t *testing.T) {
 				handler := mcpProxyHandlerContext(conn, "read", map[string]any{"type": "object"}, blobs)
 				got := handler(context.Background(), nil)
 				if !reflect.DeepEqual(got, expected) {
-					t.Fatalf("proxy changed decoded response: image %d -> %d, parts %d -> %d, text_equal=%v error %v -> %v", len(expected.Image), len(got.Image), len(expected.Parts), len(got.Parts), expected.Text == got.Text, expected.IsError, got.IsError)
+					t.Fatalf("proxy changed decoded response: image %d -> %d, parts %d -> %d, text_equal=%v error %v -> %v", len(firstToolImageData(expected.Images)), len(firstToolImageData(got.Images)), len(expected.Parts), len(got.Parts), expected.Text == got.Text, expected.IsError, got.IsError)
 				}
 			})
 		}
@@ -104,17 +104,17 @@ func TestMCPProxyPreservesNativeContentWithLegacyScreenshot(t *testing.T) {
 			metadata, _ := json.Marshal(map[string]any{"current_url": "https://example.com", "screenshot": map[string]any{"_binary": true, "mimeType": "image/jpeg", "base64": base64.StdEncoding.EncodeToString(screenshot)}, "screenshot_b64": "legacy duplicate"})
 			conn := mediaResultMCP(t, mediaResultPayload(mediaImageBlock("image/png", native), map[string]any{"type": "audio", "mimeType": "audio/wav", "data": "AQIDBA=="}, map[string]any{"type": "text", "text": string(metadata)}))
 			got := mcpProxyHandler(conn, "capture")(nil)
-			if !bytes.Equal(got.Image, native) {
+			if !bytes.Equal(firstToolImageData(got.Images), native) {
 				t.Fatal("legacy screenshot overwrote original native image")
 			}
 			want := 2
 			if duplicate {
 				want = 1
 			}
-			if len(got.Parts) != want || got.Parts[0].InputAudio == nil {
-				t.Fatalf("native media or screenshot lost: %+v", got.Parts)
+			if len(got.Images) != want || len(got.Parts) != 1 || got.Parts[0].InputAudio == nil {
+				t.Fatalf("native media or screenshot lost: images=%d parts=%+v", len(got.Images), got.Parts)
 			}
-			if !duplicate && (got.Parts[1].ImageURL == nil || got.Parts[1].ImageURL.URL != "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(screenshot)) {
+			if !duplicate && (!bytes.Equal(got.Images[1].Data, screenshot) || got.Images[1].MIMEType != "image/jpeg") {
 				t.Fatal("additional screenshot missing or MIME type changed")
 			}
 			if strings.Contains(got.Text, "screenshot_b64") || !strings.Contains(got.Text, "attached as image") {
@@ -131,7 +131,7 @@ func TestMCPProxyPreservesMediaAlongsideBinaryHandles(t *testing.T) {
 	blobs := NewBlobStore(1<<20, time.Hour)
 	defer blobs.Close()
 	got := mcpProxyHandler(conn, "read", blobs)(nil)
-	if !bytes.Equal(got.Image, png) || len(got.Parts) != 1 {
+	if len(got.Images) != 2 || !bytes.Equal(got.Images[0].Data, png) || got.Images[1].MIMEType != "image/jpeg" || len(got.Parts) != 0 {
 		t.Fatal("binary handle rewriting dropped native media")
 	}
 	if strings.Contains(got.Text, "JVBERi0xLjcK") || !strings.Contains(got.Text, "blobref://") || blobs.Count() != 1 {
@@ -175,9 +175,10 @@ func dispatchMediaFixtureTool(t *testing.T, th *Thinker, call NativeToolCall) Ev
 }
 func mediaEventMessages(event Event) []Message {
 	messages := []Message{{Role: "user", ToolResults: []ToolResult{*event.ToolResult}}}
-	// Core's inbox keeps native images in the paired ToolResult, and other
-	// content parts in the following multimodal user message. With no separate
-	// text event, the inbox currently prepends an empty text part.
+	// Core's inbox keeps every native image, labelled, in the paired
+	// ToolResult. Other content parts (audio) go in the following multimodal
+	// user message; with no separate text event, the inbox prepends an empty
+	// text part.
 	if len(event.Parts) > 0 {
 		parts := append([]ContentPart{{Type: "text", Text: ""}}, event.Parts...)
 		messages = append(messages, Message{Role: "user", Parts: parts})
@@ -193,8 +194,14 @@ func TestMCPNativeMediaSurvivesDispatchAndProviderProjection(t *testing.T) {
 	registerMediaFixtureTool(th, conn)
 	call := NativeToolCall{ID: "native-observation", Name: "media_read", Args: map[string]string{"_reason": "Inspect the source content"}}
 	event := dispatchMediaFixtureTool(t, th, call)
-	if !bytes.Equal(event.ToolResult.Image, png) || len(event.Parts) != 1 || event.Parts[0].ImageURL == nil {
+	images := event.ToolResult.Images
+	if len(images) != 2 || !bytes.Equal(images[0].Data, png) || !bytes.Equal(images[1].Data, jpeg) || len(event.Parts) != 0 {
 		t.Fatal("dispatched native content was lost")
+	}
+	// The short text block before the first image labels it; the second
+	// image gets its position and the tool's name.
+	if images[0].Label != "Observation" || images[1].Label != "Image 2 of 2 from media_read" || images[1].MIMEType != "image/jpeg" {
+		t.Fatalf("image labels = %q, %q (mime %q)", images[0].Label, images[1].Label, images[1].MIMEType)
 	}
 	messages := append([]Message{{Role: "assistant", ToolCalls: []NativeToolCall{call}}}, mediaEventMessages(event)...)
 	// Both the Responses/Codex and Chat Completions projections must carry
@@ -262,16 +269,21 @@ func TestMCPImageOnlyToolThroughThinkerInbox(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("image-only tool result did not reach inference")
 			}
-			if mime == "image/jpeg" {
-				emptyLead := false
-				for _, m := range messages {
-					if len(m.Parts) > 1 && m.Parts[0].Type == "text" && m.Parts[0].Text == "" && m.Parts[1].ImageURL != nil {
-						emptyLead = true
+			// The image stays on its tool result, labelled, instead of
+			// arriving as an unlabelled one-request user attachment.
+			var onResult []ToolImage
+			for _, m := range messages {
+				for _, part := range m.Parts {
+					if part.ImageURL != nil {
+						t.Fatalf("tool image sent as a separate user attachment: %+v", m)
 					}
 				}
-				if !emptyLead {
-					t.Fatal("test did not exercise the inbox's empty leading text part")
+				for _, result := range m.ToolResults {
+					onResult = append(onResult, result.Images...)
 				}
+			}
+			if len(onResult) != 1 || onResult[0].Label != "Image from media_read" || onResult[0].MIMEType != mime {
+				t.Fatalf("tool result images = %+v", onResult)
 			}
 			items := (&OpenAINativeProvider{}).buildInput(messages)
 			assertResponsesTextBlocksPresent(t, items)

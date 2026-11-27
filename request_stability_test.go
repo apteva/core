@@ -155,7 +155,7 @@ func TestRequestStabilityContextPressureAndContinuation(t *testing.T) {
 	var s ephemeralTurnContextState
 	messages := []Message{{Role: "user", Content: "Inspect"}}
 	first := s.prepare(messages, strings.Repeat("memory ", 14000), "now", false, true)
-	messages = append(messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "pending", Name: "read"}}}, Message{Role: "user", ToolResults: []ToolResult{{CallID: "pending", Content: "exact result", Image: []byte{1, 2, 3}}}})
+	messages = append(messages, Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "pending", Name: "read"}}}, Message{Role: "user", ToolResults: []ToolResult{{CallID: "pending", Content: "exact result", Images: []ToolImage{{Data: []byte{1, 2, 3}}}}}})
 	continued := s.prepare(messages, "ignore until next wake", "later", false, false)
 	if commonPrefixBytes(stabilityInputBytes(first), stabilityInputBytes(continued)) != len(stabilityInputBytes(first)) {
 		t.Fatal("tool continuation rewrote context")
@@ -164,7 +164,7 @@ func TestRequestStabilityContextPressureAndContinuation(t *testing.T) {
 	if !s.checkpointed || len(s.snapshots) != 1 || !strings.Contains(checkpoint[len(checkpoint)-1].Content, "replacement") {
 		t.Fatal("byte budget failed to checkpoint to full current context")
 	}
-	if len(checkpoint[2].ToolResults[0].Image) != 3 || checkpoint[2].ToolResults[0].Content != "exact result" {
+	if len(firstToolImageData(checkpoint[2].ToolResults[0].Images)) != 3 || checkpoint[2].ToolResults[0].Content != "exact result" {
 		t.Fatal("checkpoint changed image or result pairing")
 	}
 }

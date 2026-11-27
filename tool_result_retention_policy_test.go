@@ -221,7 +221,7 @@ func TestToolResultRetentionRestoresUsingModelBudget(t *testing.T) {
 	if err := session.AppendMessage(Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "restored", Name: "read"}}}, 0, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "restored", Content: payload, Image: []byte("historical pixels")}}}, 0, TokenUsage{}); err != nil {
+	if err := session.AppendMessage(Message{Role: "user", ToolResults: []ToolResult{{CallID: "restored", Content: payload, Images: []ToolImage{{Data: []byte("historical pixels")}}}}}, 0, TokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
 	for _, window := range []int{64000, 100000, 200000} {
@@ -234,7 +234,7 @@ func TestToolResultRetentionRestoresUsingModelBudget(t *testing.T) {
 				t.Fatalf("restored messages: %+v", messages)
 			}
 			result := messages[1].ToolResults[0]
-			if len(result.Image) != 0 || len(result.Content) > per {
+			if len(firstToolImageData(result.Images)) != 0 || len(result.Content) > per {
 				t.Fatal("restore exceeded its model budget or reloaded pixels")
 			}
 			if window >= 100000 {

@@ -329,7 +329,7 @@ func TestOpenAINativeBuildInput_FunctionImageOutputs(t *testing.T) {
 		{Role: "user", ToolResults: []ToolResult{{
 			CallID:  "call_image",
 			Content: "screenshot attached",
-			Image:   []byte{0x89, 0x50, 0x4e, 0x47},
+			Images:  []ToolImage{{Data: []byte{0x89, 0x50, 0x4e, 0x47}}},
 		}}},
 	}
 
@@ -718,7 +718,7 @@ func TestOpenAINativeBuildInputSkipsEmptyMultimodalText(t *testing.T) {
 func TestOpenAINativeBuildInputSkipsEmptyImageToolOutputText(t *testing.T) {
 	for _, text := range []string{"", "caption", " \n"} {
 		t.Run(text, func(t *testing.T) {
-			messages := []Message{{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "image-only", Name: "read_image"}}}, {Role: "user", ToolResults: []ToolResult{{CallID: "image-only", Image: []byte{1, 2, 3}, Content: text}}}}
+			messages := []Message{{Role: "assistant", ToolCalls: []NativeToolCall{{ID: "image-only", Name: "read_image"}}}, {Role: "user", ToolResults: []ToolResult{{CallID: "image-only", Images: []ToolImage{{Data: []byte{1, 2, 3}}}, Content: text}}}}
 			items := (&OpenAINativeProvider{}).buildInput(messages)
 			blocks := items[1].Output.([]oaiContentBlock)
 			want := []oaiContentBlock{}
