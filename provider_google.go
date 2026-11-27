@@ -479,10 +479,14 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		logMsg("GEMINI", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
 	})
 	defer idleBody.Close()
-	return parseGeminiStream(idleBody, onChunk, onToolChunk)
+	return parseGeminiStreamReady(idleBody, onChunk, onToolChunk, toolReadyObserverFromContext(ctx))
 }
 
 func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+	return parseGeminiStreamReady(stream, onChunk, onToolChunk, nil)
+}
+
+func parseGeminiStreamReady(stream io.Reader, onChunk func(string), onToolChunk func(string, string, string), onToolReady toolReadyObserver) (ChatResponse, error) {
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
@@ -565,6 +569,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 					if onToolChunk != nil {
 						onToolChunk(part.FunctionCall.Name, callID, string(argsJSON))
 					}
+					notifyToolReady(onToolReady, part.FunctionCall.Name, callID, string(argsJSON))
 				}
 			}
 		}

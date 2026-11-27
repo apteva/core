@@ -584,6 +584,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	streamBody := newIdleReader(resp.Body, streamIdleTimeout(), nil)
 	defer streamBody.Close()
 
+	onToolReady := toolReadyObserverFromContext(ctx)
 	scanner := bufio.NewScanner(streamBody)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -725,6 +726,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 					CanonicalArgs: json.RawMessage(currentTool.json.String()),
 				})
 				replay = append(replay, map[string]any{"type": "tool_use", "id": currentTool.id, "name": currentTool.name, "input": json.RawMessage(currentTool.json.String())})
+				notifyToolReady(onToolReady, currentTool.name, currentTool.id, currentTool.json.String())
 				currentTool = nil
 			}
 			currentBlock = nil
