@@ -118,6 +118,10 @@ type DiscoveryIntent struct {
 	Priority int
 	// DemoteSends ranks tools that send messages lower (read or list intent).
 	DemoteSends bool
+	// preset supplies candidates the caller has already ranked, in order,
+	// in place of a search for Query. They pass the same scope, grant and
+	// budget checks as searched candidates.
+	preset []IndexEntry
 }
 
 type DiscoveryRequest struct {
@@ -303,7 +307,9 @@ func (t *Thinker) discoverToolsOnce(request DiscoveryRequest) DiscoveryResult {
 			}
 		}
 		var found indexSearchResult
-		if len(intent.Servers) == 0 || len(serverScope) > 0 {
+		if intent.preset != nil {
+			found.Hits = intent.preset
+		} else if len(intent.Servers) == 0 || len(serverScope) > 0 {
 			found = t.toolIndex.searchDetailedWithOptions(intent.Query, intent.Limit, request.AllowNoSpawn, authorized, indexSearchOptions{Servers: serverScope, Access: intent.Access, DemoteSends: intent.DemoteSends})
 		}
 		group.Unresolved, group.Ambiguous = found.Unresolved, found.Ambiguous
@@ -392,7 +398,12 @@ func (result *DiscoveryResult) plan(t *Thinker, request DiscoveryRequest) {
 					candidate.SkipReason = "memory_budget"
 					continue
 				}
-				if len(selected) >= request.MaxTools || result.SchemaTokens+entry.SchemaCost > request.MaxSchemaTokens {
+				if len(selected) >= request.MaxTools {
+					candidate.SkipReason = "tool_count"
+					result.SkippedBudget++
+					continue
+				}
+				if result.SchemaTokens+entry.SchemaCost > request.MaxSchemaTokens {
 					candidate.SkipReason = "schema_budget"
 					result.SkippedBudget++
 					continue

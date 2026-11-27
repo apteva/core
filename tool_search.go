@@ -377,6 +377,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 		return nil
 	}
 	t.recordToolCatalog()
+	t.restoreUsedTools()
 	eager := t.useEagerTools()
 	automatic := t.config.GetAutomaticToolLoading()
 	var overlay map[string]bool

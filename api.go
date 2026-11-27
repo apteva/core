@@ -1515,6 +1515,7 @@ func (a *APIServer) configNow(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, "recreate agent history: "+err.Error(), http.StatusInternalServerError)
 					return
 				}
+				a.thinker.usedTools.clear()
 				contextResult, err := resetThinkerContextNow(a.thinker)
 				if err != nil {
 					http.Error(w, "reset agent context: "+err.Error(), http.StatusInternalServerError)

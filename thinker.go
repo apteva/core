@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -972,7 +973,10 @@ type Thinker struct {
 	activeToolsSnapshot atomic.Pointer[[]string]
 	// retiredTools remembers the loaded tools of ended threads. Shared by
 	// every thread of this Core process.
-	retiredTools        *retiredToolSets
+	retiredTools *retiredToolSets
+	// usedTools saves the main thread's successfully called tools to disk
+	// so they load again after a restart. Nil on every other thread.
+	usedTools           *usedToolStore
 	discoveredToolUntil map[string]int
 	// presentedTools is the exact schema-name set supplied to the model for
 	// its current request/session configuration. Sub-thread dispatch uses
@@ -1441,6 +1445,7 @@ func NewThinker(apiKey string, provider LLMProvider, cfg ...*Config) *Thinker {
 	t.toolIndex = NewToolIndex()
 	t.activeTools = map[string]bool{}
 	t.retiredTools = newRetiredToolSets()
+	t.usedTools = newUsedToolStore(filepath.Join(filepath.Dir(t.session.path), usedToolsFile), time.Now())
 	t.directive = config.GetDirective()
 
 	// Register system-only tools (for unconscious thread)

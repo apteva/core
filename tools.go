@@ -248,6 +248,9 @@ func executeTool(t *Thinker, call toolCall) {
 		if generation != t.toolGeneration.Load() || t.toolContext().Err() != nil {
 			return
 		}
+		if outcome == "success" && def != nil && def.MCP {
+			t.usedTools.record(call.Name, time.Now())
+		}
 		logMsg("TOOL", fmt.Sprintf("result %s (%dms): bytes=%d error=%v", call.Name, time.Since(start).Milliseconds(), len(resp.Text), resp.IsError))
 
 		// Telemetry: tool.result
