@@ -216,7 +216,7 @@ func appendEphemeralTurnContext(messages []Message, dynamicContext, now string, 
 func recallQueryForTurn(consumed []string, messages []Message, directive string) (query, source string) {
 	var current []string
 	for _, event := range consumed {
-		if strings.TrimSpace(event) == "" || strings.HasPrefix(event, "[tool:") {
+		if strings.TrimSpace(event) == "" || isSystemNotice(event) {
 			continue
 		}
 		current = append(current, event)
@@ -235,6 +235,11 @@ func recallQueryForTurn(consumed []string, messages []Message, directive string)
 			continue
 		}
 		if strings.Contains(cleaned, "(no events)") || strings.Contains(cleaned, "(no new events;") {
+			continue
+		}
+		// A message that holds only Core's own notices is not what the
+		// thread was asked to do: keep looking for the last real one.
+		if cleaned = withoutSystemNotices(cleaned); cleaned == "" {
 			continue
 		}
 		return cleaned, "latest_user_context"
@@ -287,4 +292,55 @@ func stripLegacyDynamicContext(content string) (string, bool) {
 		return strings.TrimSpace(trimmed[loc[0]:]), true
 	}
 	return "", true
+}
+
+// System notices are text events Core writes to a thread about its own tool
+// calls: the "[tool:" result lines, and the "[late-result]" notice sent when
+// a call finishes after its turn ended. They arrive like any other event and
+// are stored in user messages, but nobody asked the thread for anything.
+// Code that looks for the current instruction must skip them; otherwise a
+// notice naming a tool is read as a request for that tool.
+var systemNoticePrefixes = []string{"[late-result]", "[tool:"}
+
+func isSystemNotice(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, prefix := range systemNoticePrefixes {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// eventBullet starts each event in a stored "[time] Events:" user message.
+const eventBullet = "• "
+
+// withoutSystemNotices removes system notices from a user message's text and
+// returns what is left, or "" when nothing else was in it. In an events
+// message a notice runs from its bullet to the next bullet, so a notice whose
+// tool result spans several lines is removed whole.
+func withoutSystemNotices(content string) string {
+	if isSystemNotice(content) {
+		return ""
+	}
+	if !strings.Contains(content, "\n"+eventBullet) && !strings.HasPrefix(content, eventBullet) {
+		return content
+	}
+	var kept []string
+	events, inNotice := 0, false
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, eventBullet) {
+			inNotice = isSystemNotice(strings.TrimPrefix(line, eventBullet))
+			if !inNotice {
+				events++
+			}
+		}
+		if !inNotice {
+			kept = append(kept, line)
+		}
+	}
+	if events == 0 {
+		return ""
+	}
+	return strings.Join(kept, "\n")
 }

@@ -2695,7 +2695,7 @@ func (t *Thinker) Run() {
 		// Drain events from bus, optionally filter/route
 		drained := t.drainEvents()
 		for _, event := range drained {
-			if event.ToolResult == nil && strings.TrimSpace(event.Text) != "" && !strings.HasPrefix(event.Text, "[late-result]") && !strings.HasPrefix(event.Text, "[tool:") {
+			if event.ToolResult == nil && strings.TrimSpace(event.Text) != "" && !isSystemNotice(event.Text) {
 				t.resetMCPFailures()
 				// A fresh external instruction starts a new workflow, so a
 				// prior no-progress fingerprint must not constrain it.
@@ -3015,7 +3015,7 @@ func (t *Thinker) Run() {
 		// stable directive-only preload that lets the prompt prefix cache.
 		var preloadEvents []string
 		for _, ev := range consumed {
-			if !strings.HasPrefix(ev, "[tool:") {
+			if !isSystemNotice(ev) {
 				preloadEvents = append(preloadEvents, ev)
 			}
 		}
@@ -4205,7 +4205,7 @@ func (t *Thinker) waitForPendingTools(
 
 func isUrgentPendingToolInterruption(ev Event) bool {
 	text := strings.TrimSpace(ev.Text)
-	if text == "" || strings.HasPrefix(text, "[late-result]") || strings.HasPrefix(text, "[tool:") {
+	if text == "" || isSystemNotice(text) {
 		return false
 	}
 	// Empty From is retained for API/backwards-compatible events and tests.
