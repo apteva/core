@@ -76,6 +76,13 @@ type Message struct {
 	ToolCalls          []NativeToolCall            `json:"tool_calls,omitempty"`     // assistant messages: structured tool calls
 	ToolResults        []ToolResult                `json:"tool_results,omitempty"`   // user messages: results for prior tool calls
 	ProviderState      *ProviderResponseState      `json:"provider_state,omitempty"` // opaque state for exact provider replay
+	// Instruction is what this user message asked the thread to do: the text
+	// of its events, without tool results and without Core's own notices
+	// (Event.Notice). It is recorded when the message is built, from the
+	// events themselves, so nothing has to parse Content to find it. An empty
+	// string means the message held only results and notices. Nil means the
+	// message predates the field. Providers never receive it.
+	Instruction *string `json:"instruction,omitempty"`
 	// EventIDs records durable API inbox events represented by this user
 	// message. Providers never receive these identifiers; the session journal
 	// uses them to reconcile an accepted event across process restarts.

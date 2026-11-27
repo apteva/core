@@ -30,7 +30,13 @@ type Event struct {
 	From string // source: "main", thread ID, "tui", "api", "tool:name"
 	To   string // target subscriber ID; "" = broadcast
 
-	Text       string        // message payload
+	Text string // message payload
+	// Notice marks text that Core wrote itself about its own bookkeeping: a
+	// tool result that arrived late, a child thread starting or finishing, a
+	// policy update. The thread reads it like any other event, but nobody
+	// asked the thread for anything, so it is never taken as an instruction.
+	// It is set where the event is created; nothing infers it from the text.
+	Notice     bool
 	ToolName   string        // tool name (for EventToolChunk)
 	Parts      []ContentPart // optional media or durable server file references attached to this event
 	ToolResult *ToolResult   // optional: structured tool result

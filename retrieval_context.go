@@ -213,13 +213,12 @@ func appendEphemeralTurnContext(messages []Message, dynamicContext, now string, 
 	return state.prepare(messages, dynamicContext, now, idle, true)
 }
 
-func recallQueryForTurn(consumed []string, messages []Message, directive string) (query, source string) {
+func recallQueryForTurn(instructions []string, messages []Message, directive string) (query, source string) {
 	var current []string
-	for _, event := range consumed {
-		if strings.TrimSpace(event) == "" || strings.HasPrefix(event, "[tool:") {
-			continue
+	for _, event := range instructions {
+		if strings.TrimSpace(event) != "" {
+			current = append(current, event)
 		}
-		current = append(current, event)
 	}
 	if len(current) > 0 {
 		return strings.Join(current, "\n"), "event"
@@ -230,6 +229,14 @@ func recallQueryForTurn(consumed []string, messages []Message, directive string)
 		if message.Role != "user" || len(message.ToolResults) > 0 || strings.TrimSpace(message.Content) == "" {
 			continue
 		}
+		// The message recorded what it asked for when it was built.
+		if message.Instruction != nil {
+			if instruction := strings.TrimSpace(*message.Instruction); instruction != "" {
+				return instruction, "latest_user_context"
+			}
+			continue
+		}
+		// Messages stored before Instruction existed: read their content.
 		cleaned, synthetic := stripLegacyDynamicContext(message.Content)
 		if synthetic && strings.TrimSpace(cleaned) == "" {
 			continue
@@ -251,8 +258,8 @@ func recallQueryForTurn(consumed []string, messages []Message, directive string)
 // memory scope; current external context supplements it but never replaces it.
 // The strings stay separate so long directives cannot dilute a strong event
 // match (or vice versa) inside lexical or embedding retrieval.
-func recallQueriesForTurn(consumed []string, messages []Message, directive string) (queries []string, source string) {
-	current, currentSource := recallQueryForTurn(consumed, messages, "")
+func recallQueriesForTurn(instructions []string, messages []Message, directive string) (queries []string, source string) {
+	current, currentSource := recallQueryForTurn(instructions, messages, "")
 	if strings.TrimSpace(current) != "" {
 		queries = append(queries, current)
 	}

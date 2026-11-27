@@ -1922,7 +1922,7 @@ func (t *Thinker) runUnconsciousSafetyFloors(ticks <-chan time.Time, historySize
 			t.bus.Publish(Event{
 				Type: EventInbox,
 				To:   "unconscious",
-				Text: "[wake] " + reason,
+				Text: "[wake] " + reason, Notice: true,
 			})
 			logMsg("UNCONSCIOUS-FLOOR", fmt.Sprintf("force-woke unconscious: %s", reason))
 		}
@@ -2703,7 +2703,7 @@ func (t *Thinker) Run() {
 		// Drain events from bus, optionally filter/route
 		drained := t.drainEvents()
 		for _, event := range drained {
-			if event.ToolResult == nil && strings.TrimSpace(event.Text) != "" && !strings.HasPrefix(event.Text, "[late-result]") && !strings.HasPrefix(event.Text, "[tool:") {
+			if event.instruction() != "" {
 				t.resetMCPFailures()
 				// A fresh external instruction starts a new workflow, so a
 				// prior no-progress fingerprint must not constrain it.
@@ -2714,12 +2714,18 @@ func (t *Thinker) Run() {
 
 		// Extract text strings, collect media parts, and separate tool results
 		var consumed []string
+		// instructions is the part of consumed that asks the thread for
+		// something: no tool results, none of Core's own notices.
+		var instructions []string
 		var mediaParts []ContentPart
 		var toolResults []ToolResult
 		var eventIDs []string
 		var executionIDs []string
 		for _, de := range drained {
 			consumed = append(consumed, de.Text)
+			if text := de.instruction(); text != "" {
+				instructions = append(instructions, text)
+			}
 			mediaParts = append(mediaParts, de.Parts...)
 			if de.ID != "" {
 				eventIDs = append(eventIDs, de.ID)
@@ -2749,7 +2755,7 @@ func (t *Thinker) Run() {
 		// A message from the operator still ends the wait at once. Only
 		// then are the calls still running given a placeholder
 		// (injectPlaceholdersForPending), so every tool_use stays paired.
-		t.waitForPendingTools(&toolResults, &consumed, &mediaParts, pendingToolWaitLimit, &eventIDs, &executionIDs)
+		t.waitForPendingTools(&toolResults, &consumed, &mediaParts, pendingToolWaitLimit, &eventIDs, &executionIDs, &instructions)
 		t.addEventExecutions(executionIDs)
 		if t.pendingToolCount() > 0 {
 			injectedBefore := len(toolResults)
@@ -2874,7 +2880,8 @@ func (t *Thinker) Run() {
 				}
 			}
 			if sb.Len() > 0 || len(mediaParts) > 0 {
-				msg := Message{Role: "user", Content: sb.String(), EventIDs: append([]string(nil), eventIDs...)}
+				instruction := strings.Join(instructions, "\n")
+				msg := Message{Role: "user", Content: sb.String(), Instruction: &instruction, EventIDs: append([]string(nil), eventIDs...)}
 				if t.work != nil {
 					w := t.work.snapshot()
 					msg.Work = &w
@@ -2938,7 +2945,7 @@ func (t *Thinker) Run() {
 			// The standing directive always defines memory scope; current external
 			// context supplements it without replacing or diluting it. Generated
 			// assistant filler and injected request snapshots are never queries.
-			memQueries, querySource := recallQueriesForTurn(consumed, t.messages, t.directive)
+			memQueries, querySource := recallQueriesForTurn(instructions, t.messages, t.directive)
 			if t.memoryRecall.failureQuery != "" {
 				memQueries = append(memQueries, t.memoryRecall.failureQuery)
 				querySource += "+tool_failure"
@@ -4043,10 +4050,20 @@ func providerRetryDelay(err error, attempt int) time.Duration {
 type drainedEvent struct {
 	Work         *ThreadWork
 	ID           string
+	Notice       bool
 	Text         string
 	Parts        []ContentPart
 	ToolResult   *ToolResult
 	ExecutionIDs []string
+}
+
+// instruction returns the event's text when it asks the thread for something:
+// not a tool result and not one of Core's own notices.
+func (e drainedEvent) instruction() string {
+	if e.ToolResult != nil || e.Notice {
+		return ""
+	}
+	return strings.TrimSpace(e.Text)
 }
 
 // drainEventTexts is a convenience for tests — returns just the text strings.
@@ -4067,7 +4084,7 @@ func (t *Thinker) drainEvents() []drainedEvent {
 		}
 		if ev.Type == EventInbox {
 			t.work.observe(ev.Work)
-			items = append(items, drainedEvent{Work: cloneThreadWork(ev.Work), ID: ev.ID, Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult, ExecutionIDs: append([]string(nil), ev.ExecutionIDs...)})
+			items = append(items, drainedEvent{Work: cloneThreadWork(ev.Work), ID: ev.ID, Notice: ev.Notice, Text: ev.Text, Parts: ev.Parts, ToolResult: ev.ToolResult, ExecutionIDs: append([]string(nil), ev.ExecutionIDs...)})
 		}
 	}
 	return items
@@ -4170,6 +4187,9 @@ func (t *Thinker) waitForPendingTools(
 					if isUrgentPendingToolInterruption(ev) {
 						urgentInterruption = true
 					}
+					if len(eventIDs) > 2 && eventIDs[2] != nil && ev.ToolResult == nil && !ev.Notice && strings.TrimSpace(ev.Text) != "" {
+						*eventIDs[2] = append(*eventIDs[2], ev.Text)
+					}
 				}
 				if len(ev.Parts) > 0 {
 					*mediaParts = append(*mediaParts, ev.Parts...)
@@ -4208,8 +4228,7 @@ func (t *Thinker) waitForPendingTools(
 }
 
 func isUrgentPendingToolInterruption(ev Event) bool {
-	text := strings.TrimSpace(ev.Text)
-	if text == "" || strings.HasPrefix(text, "[late-result]") || strings.HasPrefix(text, "[tool:") {
+	if strings.TrimSpace(ev.Text) == "" || ev.Notice || ev.ToolResult != nil {
 		return false
 	}
 	// Empty From is retained for API/backwards-compatible events and tests.
@@ -4281,8 +4300,8 @@ func (t *Thinker) sweepStalePlaceholders() {
 		}
 		if now.Sub(info.dispatchedAt) > 5*time.Minute || t.iteration-info.iteration > 20 {
 			stale = append(stale, id)
-			t.Inject(fmt.Sprintf("[late-result] Tool %s (call id=%s, dispatched iter %d) timed out after %s — no result ever arrived. Treat as failure.",
-				info.toolName, id, info.iteration, now.Sub(info.dispatchedAt).Round(time.Second)))
+			t.bus.Publish(Event{Type: EventInbox, To: t.threadID, Notice: true, Text: fmt.Sprintf("[late-result] Tool %s (call id=%s, dispatched iter %d) timed out after %s — no result ever arrived. Treat as failure.",
+				info.toolName, id, info.iteration, now.Sub(info.dispatchedAt).Round(time.Second))})
 		}
 		return true
 	})

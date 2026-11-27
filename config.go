@@ -33,6 +33,7 @@ type PersistentThreadEvent struct {
 	Hash           string        `json:"hash"`
 	Text           string        `json:"text,omitempty"`
 	Parts          []ContentPart `json:"parts,omitempty"`
+	Notice         bool          `json:"notice,omitempty"` // see Event.Notice
 	Consumed       bool          `json:"consumed,omitempty"`
 	TrackLifecycle bool          `json:"track_lifecycle,omitempty"`
 	ExecutionID    string        `json:"execution_id,omitempty"`

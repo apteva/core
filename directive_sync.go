@@ -101,7 +101,7 @@ func (t *Thinker) syncThreadDirectives() directiveSyncResult {
 		notice := policyUpdateNotice(changed)
 		// A directive can return to an earlier text (a mode changed, then
 		// changed back), so the notice ID is unique per sync rather than per text.
-		event := PersistentThreadEvent{ID: fmt.Sprintf("directive-policy-%d-%s", syncedAt, shortDirectiveHash(next)), Text: notice}
+		event := PersistentThreadEvent{ID: fmt.Sprintf("directive-policy-%d-%s", syncedAt, shortDirectiveHash(next)), Text: notice, Notice: true}
 		event.Hash = threadEventHash(event.Text, nil)
 		if _, err := t.threads.UpdateWithEvents(target.id, "", next, nil, ThreadUpdateOptions{}, []PersistentThreadEvent{event}); err != nil {
 			logMsg("DIRECTIVE", fmt.Sprintf("apply directive policy to %s failed: %v", target.id, err))
