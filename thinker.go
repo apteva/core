@@ -3013,13 +3013,7 @@ func (t *Thinker) Run() {
 		// (e.g. "send a pushover" → pushover_* tools preloaded). Cleared
 		// after think() so a subsequent quiet iteration reverts to the
 		// stable directive-only preload that lets the prompt prefix cache.
-		var preloadEvents []string
-		for _, ev := range consumed {
-			if !isSystemNotice(ev) {
-				preloadEvents = append(preloadEvents, ev)
-			}
-		}
-		t.lastInboundForPreload = strings.Join(preloadEvents, "\n")
+		t.lastInboundForPreload = inboundTextForPreload(consumed)
 
 		// Full-budget preflight and bounded recovery run after tool schemas are
 		// selected, immediately before the provider call.

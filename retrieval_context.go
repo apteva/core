@@ -216,7 +216,7 @@ func appendEphemeralTurnContext(messages []Message, dynamicContext, now string, 
 func recallQueryForTurn(consumed []string, messages []Message, directive string) (query, source string) {
 	var current []string
 	for _, event := range consumed {
-		if strings.TrimSpace(event) == "" || isSystemNotice(event) {
+		if strings.TrimSpace(event) == "" || isCoreNotice(event) {
 			continue
 		}
 		current = append(current, event)
@@ -312,15 +312,38 @@ func isSystemNotice(text string) bool {
 	return false
 }
 
+// Thread lifecycle notices are the other text Core writes to a thread itself:
+// a child thread started, finished, or a realtime thread ended. The started
+// notice lists the child's provider, role and tools; read as an instruction
+// it loads those tools for the parent. A finished child's notice carries its
+// final output, which the parent reads in its context, but what the parent
+// was asked to do is still the request that made it start the child.
+//
+// Only the forms Core generates match, not any text that begins "[thread:".
+var threadLifecycleNotice = regexp.MustCompile(`^\[thread:[^\]\s]+(\] started \(| done\]| ended\])`)
+
+func isThreadLifecycleNotice(text string) bool {
+	return threadLifecycleNotice.MatchString(strings.TrimSpace(text))
+}
+
+// isCoreNotice reports text that Core wrote and that therefore carries no
+// instruction: a system notice or a thread lifecycle notice. The lookup for
+// the current instruction skips both. isSystemNotice stays the narrower test
+// for the places that decide whether an event interrupts or resets work,
+// where a child finishing does count.
+func isCoreNotice(text string) bool {
+	return isSystemNotice(text) || isThreadLifecycleNotice(text)
+}
+
 // eventBullet starts each event in a stored "[time] Events:" user message.
 const eventBullet = "• "
 
-// withoutSystemNotices removes system notices from a user message's text and
+// withoutSystemNotices removes Core's own notices from a user message's text and
 // returns what is left, or "" when nothing else was in it. In an events
 // message a notice runs from its bullet to the next bullet, so a notice whose
 // tool result spans several lines is removed whole.
 func withoutSystemNotices(content string) string {
-	if isSystemNotice(content) {
+	if isCoreNotice(content) {
 		return ""
 	}
 	if !strings.Contains(content, "\n"+eventBullet) && !strings.HasPrefix(content, eventBullet) {
@@ -330,7 +353,7 @@ func withoutSystemNotices(content string) string {
 	events, inNotice := 0, false
 	for _, line := range strings.Split(content, "\n") {
 		if strings.HasPrefix(line, eventBullet) {
-			inNotice = isSystemNotice(strings.TrimPrefix(line, eventBullet))
+			inNotice = isCoreNotice(strings.TrimPrefix(line, eventBullet))
 			if !inNotice {
 				events++
 			}
@@ -341,6 +364,18 @@ func withoutSystemNotices(content string) string {
 	}
 	if events == 0 {
 		return ""
+	}
+	return strings.Join(kept, "\n")
+}
+
+// inboundTextForPreload joins the events drained this turn that can carry an
+// instruction, for the tool preload. Core's own notices are left out.
+func inboundTextForPreload(consumed []string) string {
+	var kept []string
+	for _, event := range consumed {
+		if !isCoreNotice(event) {
+			kept = append(kept, event)
+		}
 	}
 	return strings.Join(kept, "\n")
 }
