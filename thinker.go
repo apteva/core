@@ -3667,6 +3667,17 @@ func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider 
 		}
 	}
 
+	// One event per call, at the moment its arguments are complete. Several
+	// calls in one response become ready one after another while the model
+	// is still writing the rest; tool.call follows only after the stream ends.
+	onToolReady := func(toolName, callID string, argBytes int) {
+		if t.telemetry != nil {
+			t.telemetry.Emit("llm.tool_ready", t.threadID, map[string]any{
+				"tool": toolName, "name": toolName, "id": callID, "arg_bytes": argBytes, "iteration": t.iteration,
+			})
+		}
+	}
+
 	modelID := modelIDForProvider(provider, tier)
 	messages = fileRefMessagesForModel(messages)
 	budget := estimatePreparedRequest(provider.Name(), modelID, messages, nativeTools)
@@ -3726,6 +3737,7 @@ func (t *Thinker) thinkWithProviderMessagesAtTier(ctx context.Context, provider 
 	request.start()
 	ctx = context.WithValue(ctx, requestTraceKey{}, request)
 	ctx = withBlobCallerThread(ctx, t.threadID)
+	ctx = withToolReadyObserver(ctx, onToolReady)
 	resp, err := chatProvider.Chat(ctx, messages, modelID, nativeTools, onChunk, onThinking, onToolChunk)
 	if err == nil {
 		resp, err = validateProviderToolOutput(resp)
