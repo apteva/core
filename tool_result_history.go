@@ -27,7 +27,7 @@ func toolResultKey(result ToolResult) string {
 }
 
 func shouldArchiveToolResult(result ToolResult) bool {
-	return isToolResultSHA256(result.SHA256) || len(result.Image) > 0 || len(result.Content)+len(result.Image) > largeToolResultThresholdBytes
+	return isToolResultSHA256(result.SHA256) || len(result.Images) > 0 || len(result.Content)+toolImagesBytes(result.Images) > largeToolResultThresholdBytes
 }
 
 // archiveToolResultMessage assigns tool names and internally archives only
@@ -123,6 +123,21 @@ func (t *Thinker) markLoadedToolResultsHistorical(messages []Message) {
 	}
 }
 
+// toolResultUnseen reports whether no provider request has carried this
+// result yet. Its images are always sent once, whatever the image budget.
+func (t *Thinker) toolResultUnseen(result ToolResult) bool {
+	if result.ContentIsPreview {
+		return false
+	}
+	key := toolResultKey(result)
+	if key == "" {
+		return true
+	}
+	t.toolResultMu.Lock()
+	defer t.toolResultMu.Unlock()
+	return !t.toolResultHistorical[key] && t.toolResultAge[key] == 0
+}
+
 func (t *Thinker) toolResultIsHistorical(result ToolResult) bool {
 	if result.ContentIsPreview {
 		return true
@@ -149,13 +164,13 @@ func (t *Thinker) matureToolResultStats(messages []Message) toolResultProjection
 	}
 	protected := t.protectedHistoricalToolResults(messages)
 	seen := make(map[string]bool)
-	currentScreen := latestComputerScreenshotCallID(messages)
+	currentImages := latestToolImageCallIDs(messages)
 	t.toolResultMu.Lock()
 	defer t.toolResultMu.Unlock()
 	for _, message := range messages {
 		for _, result := range message.ToolResults {
 			key := toolResultKey(result)
-			if key == "" || seen[key] || protected[result.CallID] || (currentScreen != "" && result.CallID == currentScreen) || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
+			if key == "" || seen[key] || protected[result.CallID] || currentImages[result.CallID] || t.toolResultHistorical[key] || !shouldArchiveToolResult(result) {
 				continue
 			}
 			seen[key] = true
@@ -245,7 +260,7 @@ func (t *Thinker) prepareHistoricalToolResults(messages []Message) []Message {
 				maxForResult = 0
 			}
 			remainingResults--
-			mustProject := len(result.Image) > 0 || len(result.Content) > min(perResult, maxForResult)
+			mustProject := len(result.Images) > 0 || len(result.Content) > min(perResult, maxForResult)
 			if !mustProject {
 				remaining -= len(result.Content)
 				continue
@@ -289,15 +304,22 @@ func (t *Thinker) prepareToolResultRequest(messages []Message) []Message {
 			})
 		}
 	}
-	projected := prepareComputerScreenshotTail(t.prepareHistoricalToolResults(messages))
+	projected, imagesRemoved, imagesRetired := t.keptToolImages.apply(t.prepareHistoricalToolResults(messages), t.toolResultUnseen)
+	if imagesRetired > 0 {
+		// One deliberate prefix rewrite per batch, like mature-result projection.
+		t.advancePromptCacheEpoch("tool_images_retired", false, map[string]any{
+			"images_retired": imagesRetired, "images_removed": imagesRemoved,
+		})
+	}
+	projected = prepareLatestToolImageTail(projected)
 	if t.telemetry != nil {
 		original, sent, shortened := 0, 0, 0
 		for i, message := range messages {
 			for j, result := range message.ToolResults {
-				original += len(result.Content) + len(result.Image)
+				original += len(result.Content) + toolImagesBytes(result.Images)
 				next := projected[i].ToolResults[j]
-				sent += len(next.Content) + len(next.Image)
-				if next.Content != result.Content || len(next.Image) != len(result.Image) {
+				sent += len(next.Content) + toolImagesBytes(next.Images)
+				if next.Content != result.Content || len(next.Images) != len(result.Images) {
 					shortened++
 				}
 			}
@@ -305,6 +327,7 @@ func (t *Thinker) prepareToolResultRequest(messages []Message) []Message {
 		t.telemetry.Emit("tool.result.context", t.threadID, map[string]any{
 			"iteration": t.iteration, "original_bytes": original,
 			"projected_bytes": sent, "results_shortened": shortened,
+			"images_removed": imagesRemoved,
 		})
 	}
 	return projected
@@ -333,8 +356,8 @@ func (t *Thinker) historicalToolResultBudgets() (perResult, total int) {
 
 func (t *Thinker) protectedHistoricalToolResults(messages []Message) map[string]bool {
 	protected := t.toolCallIDsProtectedFromSanitization(nil)
-	if screen := latestComputerScreenshotCallID(messages); screen != "" {
-		protected[screen] = true
+	for callID := range latestToolImageCallIDs(messages) {
+		protected[callID] = true
 	}
 	boundary, turns := len(messages), 0
 	for i := len(messages) - 1; i >= 0; i-- {

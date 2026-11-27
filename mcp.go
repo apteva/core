@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"sort"
@@ -157,6 +156,9 @@ type mcpCallResult struct {
 		MIMEType string          `json:"mimeType,omitempty"`
 		Resource json.RawMessage `json:"resource,omitempty"`
 		URI      string          `json:"uri,omitempty"`
+		// Meta is the block's MCP _meta. Image blocks may carry
+		// io.apteva/label and io.apteva/retention.
+		Meta map[string]json.RawMessage `json:"_meta,omitempty"`
 	} `json:"content"`
 	IsError           bool            `json:"isError"`
 	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
@@ -499,18 +501,17 @@ func mcpProxyHandlerContext(server MCPConn, toolName string, opts ...any) func(c
 		// silently discarded those native content blocks.
 		resp.Text = result
 		if len(image) > 0 {
-			if len(resp.Image) == 0 {
-				resp.Image = image
-			} else if !bytes.Equal(resp.Image, image) {
-				// A legacy JSON screenshot may coexist with native content.
-				// Retain both, without mutating the original Parts backing array.
-				mime := http.DetectContentType(image)
-				if !strings.HasPrefix(mime, "image/") {
-					mime = "image/png"
+			// A legacy JSON screenshot may coexist with native image blocks.
+			// Keep it once, without mutating the decoded Images backing array.
+			duplicate := false
+			for _, existing := range resp.Images {
+				if bytes.Equal(existing.Data, image) {
+					duplicate = true
+					break
 				}
-				resp.Parts = append(append([]ContentPart(nil), resp.Parts...), ContentPart{
-					Type: "image_url", ImageURL: &ImageURL{URL: "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)},
-				})
+			}
+			if !duplicate {
+				resp.Images = append(append([]ToolImage(nil), resp.Images...), ToolImage{MIMEType: sniffImageMIME(image), Data: image})
 			}
 		}
 		return resp

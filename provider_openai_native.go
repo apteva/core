@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -540,7 +539,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 					logMsg("OPENAI-NATIVE", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
 				})
 				defer idleBody.Close()
-				return p.streamResponse(idleBody, onChunk, onThinking, onToolChunk)
+				return p.streamResponseReady(idleBody, onChunk, onThinking, onToolChunk, toolReadyObserverFromContext(ctx))
 			}
 			respBody, _ = io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
@@ -570,7 +569,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 					logMsg("OPENAI-NATIVE", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
 				})
 				defer idleBody.Close()
-				return p.streamResponse(idleBody, onChunk, onThinking, onToolChunk)
+				return p.streamResponseReady(idleBody, onChunk, onThinking, onToolChunk, toolReadyObserverFromContext(ctx))
 			}
 			respBody, _ = io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
@@ -583,7 +582,7 @@ func (p *OpenAINativeProvider) Chat(ctx context.Context, messages []Message, mod
 		logMsg("OPENAI-NATIVE", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
 	})
 	defer idleBody.Close()
-	return p.streamResponse(idleBody, onChunk, onThinking, onToolChunk)
+	return p.streamResponseReady(idleBody, onChunk, onThinking, onToolChunk, toolReadyObserverFromContext(ctx))
 }
 
 func (p *OpenAINativeProvider) buildAPITools(_ string, tools []NativeTool) []any {
@@ -746,13 +745,17 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 		// Tool results
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
-				if tr.Image != nil {
-					imageURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tr.Image)
+				if len(tr.Images) > 0 {
 					var blocks []oaiContentBlock
 					if tr.Content != "" {
 						blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: tr.Content})
 					}
-					blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: imageURL, Detail: "high"})
+					for _, img := range tr.Images {
+						if caption := toolImageCaption(img); caption != "" {
+							blocks = append(blocks, oaiContentBlock{Type: "input_text", Text: caption})
+						}
+						blocks = append(blocks, oaiContentBlock{Type: "input_image", ImageURL: toolImageDataURL(img), Detail: "high"})
+					}
 					items = append(items, oaiInputItem{
 						Type:   "function_call_output",
 						CallID: tr.CallID,
@@ -835,6 +838,10 @@ func (p *OpenAINativeProvider) buildInput(messages []Message) []oaiInputItem {
 
 // streamResponse parses the Responses API SSE stream.
 func (p *OpenAINativeProvider) streamResponse(body io.Reader, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+	return p.streamResponseReady(body, onChunk, onThinking, onToolChunk, nil)
+}
+
+func (p *OpenAINativeProvider) streamResponseReady(body io.Reader, onChunk func(string), onThinking func(string), onToolChunk func(string, string, string), onToolReady toolReadyObserver) (ChatResponse, error) {
 	var full strings.Builder
 	var fullReasoning strings.Builder
 	var usage TokenUsage
@@ -1049,6 +1056,7 @@ streamLoop:
 						RawArgs:       argsJSON,
 						CanonicalArgs: json.RawMessage(argsJSON),
 					})
+					notifyToolReady(onToolReady, pf.name, pf.id, argsJSON)
 					delete(pendingFuncs, item.ID)
 				}
 

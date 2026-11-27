@@ -213,7 +213,7 @@ func (s *Session) projectEntriesForModelLoad(entries []SessionEntry, toolResultB
 				object, err = s.archive.Read(ref)
 				if err == nil {
 					archived.Content = object.Content
-					archived.Image = append([]byte(nil), object.Image...)
+					archived.Images = cloneToolImages(object.Images)
 					archived.IsError = object.IsError
 					archived.OriginalChars = object.OriginalChars
 					archived.OriginalBytes = object.OriginalBytes
@@ -225,7 +225,7 @@ func (s *Session) projectEntriesForModelLoad(entries []SessionEntry, toolResultB
 			}
 			if err != nil {
 				archived = original
-				archived.Image = nil
+				archived.Images = nil
 				archived.Content = deterministicToolResultExcerpt(original.Content, limit)
 				archived.ContentIsPreview = true
 			}
@@ -248,7 +248,7 @@ func (s *Session) archiveEntriesForDurability(entries []SessionEntry) ([]Session
 			if !shouldArchiveToolResult(original) {
 				continue
 			}
-			if isToolResultSHA256(original.SHA256) && original.Content == "" && len(original.Image) == 0 && original.ContentIsPreview {
+			if isToolResultSHA256(original.SHA256) && original.Content == "" && len(original.Images) == 0 && original.ContentIsPreview {
 				continue
 			}
 			archived, err := s.archive.Archive(original)
@@ -402,9 +402,10 @@ func (s *Session) LoadTail(n int, toolResultBudget ...int) (messages []Message, 
 
 	// Sanitize: remove orphaned tool_results that have no matching tool_use
 	messages = sanitizeToolPairs(messages)
-	// Computer screenshots are transient. Old session files may contain raw
-	// frames from before this policy; never reload them into a new process.
-	evictStaleComputerScreenshots(messages, 0)
+	// Screen captures and other "latest" images are transient. Old session
+	// files may contain raw frames from before this policy; never reload them
+	// into a new process.
+	evictReplacedToolImages(messages, 0)
 
 	return messages, compactedSummaries
 }

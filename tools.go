@@ -255,7 +255,7 @@ func executeTool(t *Thinker, call toolCall) {
 			success := !resp.IsError && !strings.HasPrefix(resp.Text, "error") && !strings.HasPrefix(resp.Text, "unknown")
 			data := newToolResultData(
 				call.NativeID, call.Name, time.Since(start).Milliseconds(), success,
-				resp.Text, resp.Text, len(resp.Image),
+				resp.Text, resp.Text, toolImagesBytes(resp.Images),
 			)
 			data.ExecutionIDs = executionIDs
 			t.telemetry.Emit("tool.result", t.threadID, call.trace.data(data))
@@ -277,7 +277,7 @@ func executeTool(t *Thinker, call toolCall) {
 			CallID:   call.NativeID,
 			ToolName: call.Name,
 			Content:  resultText,
-			Image:    resp.Image,
+			Images:   labelToolImages(resp.Images, call.Name),
 			IsError:  resp.IsError,
 		}
 
@@ -315,7 +315,7 @@ func executeTool(t *Thinker, call toolCall) {
 			lateText := fmt.Sprintf("[late-result] Tool %s (call id=%s) completed: %s", call.Name, call.NativeID, resultText)
 			t.bus.Publish(Event{
 				Type: EventInbox, To: t.threadID,
-				Text: lateText, Notice: true, ExecutionIDs: executionIDs, Parts: toolResponseParts(resp), ToolGeneration: &generation,
+				Text: lateText, Notice: true, ExecutionIDs: executionIDs, Parts: toolResponseParts(resp, call.Name), ToolGeneration: &generation,
 			})
 			return
 		}

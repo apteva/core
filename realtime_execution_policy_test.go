@@ -87,7 +87,7 @@ func TestDirectReceiptGuards(t *testing.T) {
 			case "oversize":
 				response.Text = `{"status":"confirmed","date":"` + strings.Repeat("x", 450) + `","reference":"R42"}`
 			case "media":
-				response.Image = []byte{1}
+				response.Images = []ToolImage{{Data: []byte{1}}}
 			case "missing_decision":
 				delete(args, completeAssignmentArg)
 			case "not_terminal":

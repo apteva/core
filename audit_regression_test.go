@@ -94,14 +94,16 @@ func TestAuditTelemetryCursorRollover(t *testing.T) {
 func TestAuditLateToolImage(t *testing.T) {
 	th := retryTestThinker(nil)
 	th.registry = NewToolRegistry("")
-	th.registry.Register(&ToolDef{Name: "image_test", Handler: func(map[string]string) ToolResponse { return ToolResponse{Text: "screenshot", Image: []byte{1, 2, 3}} }})
+	th.registry.Register(&ToolDef{Name: "image_test", Handler: func(map[string]string) ToolResponse {
+		return ToolResponse{Text: "screenshot", Images: []ToolImage{{Data: []byte{1, 2, 3}}}}
+	}})
 	th.placeholdersSent.Store("call1", placeholderInfo{iteration: 1, dispatchedAt: time.Now()})
 	executeTool(th, toolCall{Name: "image_test", NativeID: "call1", Args: map[string]string{}})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		for _, e := range th.sub.DrainTargeted() {
 			if strings.Contains(e.Text, "late-result") {
-				if len(e.Parts) == 0 && (e.ToolResult == nil || len(e.ToolResult.Image) == 0) {
+				if len(e.Parts) == 0 && (e.ToolResult == nil || len(firstToolImageData(e.ToolResult.Images)) == 0) {
 					t.Fatal("late result contains text only; image was discarded")
 				}
 				return
@@ -222,7 +224,7 @@ func TestAuditMCPNativeImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Image) == 0 && resp.Text == "" {
+	if len(firstToolImageData(resp.Images)) == 0 && resp.Text == "" {
 		t.Fatal("standard MCP image content silently became an empty result")
 	}
 }

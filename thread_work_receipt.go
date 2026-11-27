@@ -167,7 +167,7 @@ func (t *Thinker) directToolReceipt(call toolCall, response ToolResponse) (recei
 			t.telemetry.Emit("thread.work_direct_result_evaluated", t.threadID, data)
 		}()
 	}
-	if policy == nil || call.work == nil || call.NativeID == "" || call.Args[completeAssignmentArg] != "true" || !t.work.current(*call.work) || response.IsError || len(response.Image) != 0 || len(response.Parts) != 0 {
+	if policy == nil || call.work == nil || call.NativeID == "" || call.Args[completeAssignmentArg] != "true" || !t.work.current(*call.work) || response.IsError || len(response.Images) != 0 || len(response.Parts) != 0 {
 		return nil
 	}
 	// Policy cannot override a tool's own argument with the same reserved name.

@@ -44,7 +44,7 @@ func TestExperienceUsesExistingMemoryThreadAndKeepsDirectiveAuthority(t *testing
 }
 
 func TestExperienceHistoryPreservesOutcomeIdentityWithoutArgumentsOrMedia(t *testing.T) {
-	entry := SessionEntry{Sequence: 12, Role: "tool_result", Content: "observed reply", Reasoning: "private reasoning", ToolCalls: []NativeToolCall{{ID: "call-12", Name: "call_customer", Args: map[string]string{"secret": "private argument"}}}, ToolResults: []ToolResult{{CallID: "call-12", ToolName: "call_customer", Content: "Connected; recipient declined.", IsError: false}, {CallID: "call-13", ToolName: "lookup", Content: "Temporary failure", IsError: true, ContentIsPreview: true, Image: []byte("private pixels")}}}
+	entry := SessionEntry{Sequence: 12, Role: "tool_result", Content: "observed reply", Reasoning: "private reasoning", ToolCalls: []NativeToolCall{{ID: "call-12", Name: "call_customer", Args: map[string]string{"secret": "private argument"}}}, ToolResults: []ToolResult{{CallID: "call-12", ToolName: "call_customer", Content: "Connected; recipient declined.", IsError: false}, {CallID: "call-13", ToolName: "lookup", Content: "Temporary failure", IsError: true, ContentIsPreview: true, Images: []ToolImage{{Data: []byte("private pixels")}}}}}
 	projected, ok := historyEntry("chat-a", entry)
 	if !ok || len(projected.ToolResults) != 2 {
 		t.Fatal("missing projected results")

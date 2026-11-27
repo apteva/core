@@ -208,22 +208,26 @@ func toOpenAIMessages(messages []Message) []any {
 		// Tool result messages
 		if len(m.ToolResults) > 0 {
 			for _, tr := range m.ToolResults {
-				if tr.Image != nil {
-					// Tool result with image (screenshot) — send as multimodal content
-					// Use "high" detail for computer use: it is the OpenAI spec's maximum-
+				if len(tr.Images) > 0 {
+					// Tool result with images — send as multimodal content, each
+					// image labelled. Use "high" detail: it is the OpenAI spec's maximum-
 					// fidelity setting. Do NOT use "original" — it is not in the schema.
 					// api.openai.com silently ignores unknown detail values, but strict
 					// OpenAI-compatible gateways (opencode-go) reject the request with 400.
+					content := []map[string]any{{"type": "text", "text": tr.Content}}
+					for _, img := range tr.Images {
+						if caption := toolImageCaption(img); caption != "" {
+							content = append(content, map[string]any{"type": "text", "text": caption})
+						}
+						content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{
+							"url":    toolImageDataURL(img),
+							"detail": "high",
+						}})
+					}
 					out = append(out, map[string]any{
 						"role":         "tool",
 						"tool_call_id": tr.CallID,
-						"content": []map[string]any{
-							{"type": "text", "text": tr.Content},
-							{"type": "image_url", "image_url": map[string]any{
-								"url":    "data:image/png;base64," + base64Encode(tr.Image),
-								"detail": "high",
-							}},
-						},
+						"content":      content,
 					})
 				} else {
 					out = append(out, openaiToolResultMsg{
@@ -471,12 +475,31 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	var fullReasoning strings.Builder
 	var usage TokenUsage
 	// Track streamed tool calls by index
-	pendingTools := make(map[int]*struct {
+	type pendingTool struct {
 		id         string
 		name       string
 		argsJSON   strings.Builder
-		pendingBuf strings.Builder
-	})
+		pendingBuf strings.Builder // chunks accumulated before tc.ID arrived
+		ready      bool            // llm.tool_ready already reported
+	}
+	pendingTools := make(map[int]*pendingTool)
+	// Chat Completions has no per-call "done" event. A call is complete
+	// when the stream moves on to a different index, or when it finishes.
+	// Arguments that do not parse yet (a gateway interleaving two calls)
+	// are left for the next pass, so a call is never reported early.
+	onToolReady := toolReadyObserverFromContext(ctx)
+	markToolsReady := func(writing int) {
+		if onToolReady == nil {
+			return
+		}
+		for i := 0; i < len(pendingTools); i++ {
+			pt, ok := pendingTools[i]
+			if !ok || pt.ready || i == writing {
+				continue
+			}
+			pt.ready = notifyToolReady(onToolReady, pt.name, pt.id, pt.argsJSON.String())
+		}
+	}
 
 	streamDone := false
 	scanner := bufio.NewScanner(resp.Body)
@@ -564,14 +587,10 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 				}
 				pt, ok := pendingTools[tc.Index]
 				if !ok {
-					pt = &struct {
-						id         string
-						name       string
-						argsJSON   strings.Builder
-						pendingBuf strings.Builder // chunks accumulated before tc.ID arrived
-					}{}
+					pt = &pendingTool{}
 					pendingTools[tc.Index] = pt
 				}
+				markToolsReady(tc.Index)
 				if tc.ID != "" {
 					pt.id = tc.ID
 				}
@@ -600,6 +619,9 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 				}
 			}
 		}
+		if streamDone {
+			markToolsReady(-1)
+		}
 		if event.Usage != nil {
 			usage.PromptTokens = event.Usage.PromptTokens
 			usage.CompletionTokens = event.Usage.CompletionTokens
@@ -626,6 +648,7 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, messages []Message, mod
 	}
 
 	// Assemble completed tool calls
+	markToolsReady(-1)
 	var toolCalls []NativeToolCall
 	for i := 0; i < len(pendingTools); i++ {
 		pt, ok := pendingTools[i]

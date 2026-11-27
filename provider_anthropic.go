@@ -386,20 +386,24 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 					ToolUseID: sanitizeToolID(tr.CallID),
 					IsError:   tr.IsError,
 				}
-				if tr.Image != nil {
-					// Image result (screenshot etc.) — detect MIME from magic bytes
-					mime := "image/png"
-					if len(tr.Image) > 2 && tr.Image[0] == 0xFF && tr.Image[1] == 0xD8 {
-						mime = "image/jpeg"
+				if len(tr.Images) > 0 {
+					// The tool's text and each image, labelled, stay inside
+					// the tool_result so the model knows which call they came from.
+					var content []anthropicContentBlock
+					if strings.TrimSpace(tr.Content) != "" {
+						content = append(content, anthropicContentBlock{Type: "text", Text: tr.Content})
 					}
-					logMsg("ANTHROPIC", fmt.Sprintf("tool_result image: call_id=%s mime=%s size=%d bytes first_bytes=%x", tr.CallID, mime, len(tr.Image), tr.Image[:4]))
-					block.Content = []anthropicContentBlock{
-						{Type: "image", Source: &anthropicSource{
+					for _, img := range tr.Images {
+						if caption := toolImageCaption(img); caption != "" {
+							content = append(content, anthropicContentBlock{Type: "text", Text: caption})
+						}
+						content = append(content, anthropicContentBlock{Type: "image", Source: &anthropicSource{
 							Type:      "base64",
-							MediaType: mime,
-							Data:      base64.StdEncoding.EncodeToString(tr.Image),
-						}},
+							MediaType: toolImageMIME(img),
+							Data:      base64.StdEncoding.EncodeToString(img.Data),
+						}})
 					}
+					block.Content = content
 				} else {
 					block.Content = tr.Content
 				}
@@ -580,6 +584,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 	streamBody := newIdleReader(resp.Body, streamIdleTimeout(), nil)
 	defer streamBody.Close()
 
+	onToolReady := toolReadyObserverFromContext(ctx)
 	scanner := bufio.NewScanner(streamBody)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -721,6 +726,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, model 
 					CanonicalArgs: json.RawMessage(currentTool.json.String()),
 				})
 				replay = append(replay, map[string]any{"type": "tool_use", "id": currentTool.id, "name": currentTool.name, "input": json.RawMessage(currentTool.json.String())})
+				notifyToolReady(onToolReady, currentTool.name, currentTool.id, currentTool.json.String())
 				currentTool = nil
 			}
 			currentBlock = nil

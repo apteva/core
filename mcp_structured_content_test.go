@@ -166,8 +166,8 @@ func TestDecodeMCPResultKeepsMediaWithMirroredStructuredContent(t *testing.T) {
 		map[string]any{"type": "audio", "mimeType": "audio/wav", "data": "AQIDBA=="},
 		map[string]any{"type": "resource_link", "uri": "https://example.com/r.pdf"},
 	))
-	if len(resp.Image) == 0 || len(resp.Parts) != 1 || resp.Parts[0].InputAudio == nil {
-		t.Fatalf("media lost: image=%d parts=%+v", len(resp.Image), resp.Parts)
+	if len(firstToolImageData(resp.Images)) == 0 || len(resp.Parts) != 1 || resp.Parts[0].InputAudio == nil {
+		t.Fatalf("media lost: image=%d parts=%+v", len(firstToolImageData(resp.Images)), resp.Parts)
 	}
 	if resp.Text != bookingJSON+"\nhttps://example.com/r.pdf" {
 		t.Fatalf("text=%q", resp.Text)

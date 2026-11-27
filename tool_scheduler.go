@@ -73,11 +73,12 @@ func (t *Thinker) acquireToolSlotForContext(ctx context.Context) bool {
 	}
 }
 
-func toolResponseParts(resp ToolResponse) []ContentPart {
+// toolResponseParts renders a late result's media as message parts. Its call
+// is already paired with a placeholder, so images travel labelled in the
+// message instead of in a tool result.
+func toolResponseParts(resp ToolResponse, toolName string) []ContentPart {
 	parts := append([]ContentPart(nil), resp.Parts...)
-	if resp.Image != nil {
-		parts = append(parts, ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: "data:image/png;base64," + base64Encode(resp.Image)}})
-	}
+	parts = append(parts, toolImageParts(labelToolImages(resp.Images, toolName))...)
 	if resp.IsError {
 		parts = append(parts, ContentPart{Type: "text", Text: fmt.Sprintf("Tool failed: %s", resp.Text)})
 	}

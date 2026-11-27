@@ -15,7 +15,7 @@ import (
 type ToolResponse struct {
 	Parts   []ContentPart // non-text protocol content
 	Text    string        // text result (always present)
-	Image   []byte        // optional image (screenshot etc.) — sent as part of tool result to LLM
+	Images  []ToolImage   // images returned with the result, in order; sent with the tool result
 	IsError bool          // true when the tool returned an MCP-level isError result
 	// StructuredContent is the MCP structuredContent value, kept verbatim for
 	// machine checks. Text holds the model-facing copy.

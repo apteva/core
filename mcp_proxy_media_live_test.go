@@ -88,7 +88,7 @@ func TestIntegration_CodexGPT61SolMCPNativeVision(t *testing.T) {
 					t.Fatalf("%s=%q want %q; report=%q", key, report[key], want, result.Text)
 				}
 			}
-			t.Logf("model=%s source=%s verified real tool call, four image quadrants; image_only=%v image_bytes=%d parts=%d", toolReasonLiveModel, tc.mime, tc.imageOnly, len(event.ToolResult.Image), len(event.Parts))
+			t.Logf("model=%s source=%s verified real tool call, four image quadrants; image_only=%v image_bytes=%d parts=%d", toolReasonLiveModel, tc.mime, tc.imageOnly, len(firstToolImageData(event.ToolResult.Images)), len(event.Parts))
 		})
 	}
 }

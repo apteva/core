@@ -47,7 +47,7 @@ func TestContextCharsCountsStructuredAndMultimodalPayloads(t *testing.T) {
 			{Type: "input_audio", InputAudio: &InputAudio{Data: "audio-data", Format: "wav"}},
 		},
 		ToolCalls:   []NativeToolCall{{ID: "call", Name: "tool", Args: map[string]string{"large": "argument"}, ThoughtSignature: "signature"}},
-		ToolResults: []ToolResult{{CallID: "call", Content: "result", Image: []byte("pixels")}},
+		ToolResults: []ToolResult{{CallID: "call", Content: "result", Images: []ToolImage{{Data: []byte("pixels")}}}},
 	}}
 	if got := contextChars(messages); got < 100 {
 		t.Fatalf("contextChars = %d; structured payloads were not fully counted", got)
@@ -126,7 +126,7 @@ func TestShouldCompactBeforeLLMIgnoresCompressedScreenshotByteSize(t *testing.T)
 		id := fmt.Sprintf("computer-%d", i)
 		messages = append(messages,
 			Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: id, Name: "computer_computer_use"}}},
-			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: strings.Repeat("som", 1600), Image: computerScreenshotJPEG(t, size)}}},
+			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: strings.Repeat("som", 1600), Images: []ToolImage{{Data: computerScreenshotJPEG(t, size)}}}}},
 		)
 	}
 
@@ -160,17 +160,17 @@ func TestEvictStaleComputerScreenshotsKeepsLatestFrame(t *testing.T) {
 		id := fmt.Sprintf("call-%d", i)
 		messages = append(messages,
 			Message{Role: "assistant", ToolCalls: []NativeToolCall{{ID: id, Name: "computer_computer_use"}}},
-			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: "screen", Image: computerScreenshotJPEG(t, 110_000+i*10_000)}}},
+			Message{Role: "user", ToolResults: []ToolResult{{CallID: id, Content: "screen", Images: []ToolImage{{Data: computerScreenshotJPEG(t, 110_000+i*10_000)}}}}},
 		)
 	}
 
-	if removed := evictStaleComputerScreenshots(messages, 1); removed != 2 {
+	if removed := evictReplacedToolImages(messages, 1); removed != 2 {
 		t.Fatalf("removed = %d, want 2", removed)
 	}
 	images := 0
 	for _, msg := range messages {
 		for _, result := range msg.ToolResults {
-			if len(result.Image) > 0 {
+			if len(firstToolImageData(result.Images)) > 0 {
 				images++
 				if result.CallID != "call-2" {
 					t.Fatalf("retained stale screenshot %s", result.CallID)
@@ -189,17 +189,17 @@ func TestMessageForSessionDropsComputerPixelsOnly(t *testing.T) {
 		{ID: "generated", Name: "image_generate"},
 	}}}
 	msg := Message{Role: "user", ToolResults: []ToolResult{
-		{CallID: "computer", Content: "screen metadata", Image: []byte("screen")},
-		{CallID: "generated", Content: "generated image", Image: []byte("art")},
+		{CallID: "computer", Content: "screen metadata", Images: []ToolImage{{Data: []byte("screen")}}},
+		{CallID: "generated", Content: "generated image", Images: []ToolImage{{Data: []byte("art")}}},
 	}}
 	persisted := messageForSession(history, msg)
-	if persisted.ToolResults[0].Image != nil {
+	if firstToolImageData(persisted.ToolResults[0].Images) != nil {
 		t.Fatal("computer screenshot should not be persisted")
 	}
-	if string(persisted.ToolResults[1].Image) != "art" {
+	if string(firstToolImageData(persisted.ToolResults[1].Images)) != "art" {
 		t.Fatal("non-computer image should remain persisted")
 	}
-	if string(msg.ToolResults[0].Image) != "screen" {
+	if string(firstToolImageData(msg.ToolResults[0].Images)) != "screen" {
 		t.Fatal("durable-copy sanitization mutated the live screenshot")
 	}
 }

@@ -302,14 +302,16 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 						Response: response,
 					},
 				})
-				// Gemini Computer Use: screenshots go as separate inlineData parts
-				if tr.Image != nil {
-					parts = append(parts, geminiPart{
-						InlineData: &geminiInline{
-							MimeType: "image/png",
-							Data:     base64Encode(tr.Image),
-						},
-					})
+				// Gemini takes tool images as inlineData parts next to the
+				// function response; each one is labelled first.
+				for _, img := range tr.Images {
+					if caption := toolImageCaption(img); caption != "" {
+						parts = append(parts, geminiPart{Text: caption})
+					}
+					parts = append(parts, geminiPart{InlineData: &geminiInline{
+						MimeType: toolImageMIME(img),
+						Data:     base64Encode(img.Data),
+					}})
 				}
 			}
 			if len(contents) > 0 && contents[len(contents)-1].Role == "user" {
@@ -477,10 +479,14 @@ func (p *GoogleProvider) Chat(ctx context.Context, messages []Message, model str
 		logMsg("GEMINI", fmt.Sprintf("stream idle for %s on model=%s", streamIdleTimeout(), model))
 	})
 	defer idleBody.Close()
-	return parseGeminiStream(idleBody, onChunk, onToolChunk)
+	return parseGeminiStreamReady(idleBody, onChunk, onToolChunk, toolReadyObserverFromContext(ctx))
 }
 
 func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(string, string, string)) (ChatResponse, error) {
+	return parseGeminiStreamReady(stream, onChunk, onToolChunk, nil)
+}
+
+func parseGeminiStreamReady(stream io.Reader, onChunk func(string), onToolChunk func(string, string, string), onToolReady toolReadyObserver) (ChatResponse, error) {
 	var full strings.Builder
 	var usage TokenUsage
 	var toolCalls []NativeToolCall
@@ -563,6 +569,7 @@ func parseGeminiStream(stream io.Reader, onChunk func(string), onToolChunk func(
 					if onToolChunk != nil {
 						onToolChunk(part.FunctionCall.Name, callID, string(argsJSON))
 					}
+					notifyToolReady(onToolReady, part.FunctionCall.Name, callID, string(argsJSON))
 				}
 			}
 		}
