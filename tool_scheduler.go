@@ -107,6 +107,7 @@ func (t *Thinker) publishToolFailure(call toolCall, generation uint64, execution
 	event := Event{Type: EventInbox, To: t.threadID, Text: fmt.Sprintf("[tool:%s] error: %s", call.Name, message), ExecutionIDs: executions, ToolGeneration: &generation}
 	if _, late := t.placeholdersSent.LoadAndDelete(call.NativeID); late {
 		event.Text = "[late-result] " + event.Text
+		event.Notice = true
 	} else {
 		event.ToolResult = &ToolResult{CallID: call.NativeID, ToolName: call.Name, Content: message, IsError: true}
 	}

@@ -110,7 +110,7 @@ func (thread *Thread) reportRealtimeTermination() {
 		if len(ids) == 0 {
 			ids = thread.Thinker.currentEventExecutions()
 		}
-		thread.finalParentReport = &PendingParentReport{ParentID: thread.Parent.threadID, Event: PersistentThreadEvent{ID: "realtime-completion/" + runID, Text: text, Hash: threadEventHash(text, nil), ExecutionIDs: ids}}
+		thread.finalParentReport = &PendingParentReport{ParentID: thread.Parent.threadID, Event: PersistentThreadEvent{ID: "realtime-completion/" + runID, Text: text, Notice: true, Hash: threadEventHash(text, nil), ExecutionIDs: ids}}
 	}
 	root := thread.Parent
 	for root.owner != nil {

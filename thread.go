@@ -1079,6 +1079,7 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	if !opts.System && !opts.WorkMode {
 		tm.parent.bus.Publish(Event{
 			Type: EventInbox, To: tm.parent.threadID,
+			Notice:       true,
 			Text:         fmt.Sprintf("[thread:%s] started (provider: %s, role: %s, tools: %s)", id, provName, role, strings.Join(toolList, ", ")),
 			ExecutionIDs: append([]string(nil), opts.ExecutionIDs...),
 		})

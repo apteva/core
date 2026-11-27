@@ -175,7 +175,7 @@ func publishThreadInboxEvents(bus *EventBus, threadID string, events []Persisten
 	for _, event := range events {
 		bus.Publish(Event{
 			ID: event.ID, Type: EventInbox, To: threadID, Work: cloneThreadWork(event.Work),
-			Text: event.Text, Parts: cloneContentParts(event.Parts),
+			Text: event.Text, Parts: cloneContentParts(event.Parts), Notice: event.Notice,
 			ExecutionIDs: executionIDsForEvent(event),
 		})
 	}

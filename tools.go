@@ -315,7 +315,7 @@ func executeTool(t *Thinker, call toolCall) {
 			lateText := fmt.Sprintf("[late-result] Tool %s (call id=%s) completed: %s", call.Name, call.NativeID, resultText)
 			t.bus.Publish(Event{
 				Type: EventInbox, To: t.threadID,
-				Text: lateText, ExecutionIDs: executionIDs, Parts: toolResponseParts(resp, call.Name), ToolGeneration: &generation,
+				Text: lateText, Notice: true, ExecutionIDs: executionIDs, Parts: toolResponseParts(resp, call.Name), ToolGeneration: &generation,
 			})
 			return
 		}

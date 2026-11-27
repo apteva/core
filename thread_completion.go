@@ -44,7 +44,7 @@ func (thread *Thread) queueCompletion(callID, message string) error {
 			return err
 		}
 	}
-	event := PersistentThreadEvent{ID: "completion/" + thread.ID + "/" + callID, Text: text, Hash: threadEventHash(text, nil), ExecutionIDs: ids}
+	event := PersistentThreadEvent{ID: "completion/" + thread.ID + "/" + callID, Text: text, Notice: true, Hash: threadEventHash(text, nil), ExecutionIDs: ids}
 	if parent.threadID == "main" {
 		_, err := parent.QueueMainEvents([]PersistentThreadEvent{event})
 		return err
