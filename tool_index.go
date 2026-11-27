@@ -7,12 +7,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // ToolIndex catalogs every MCP tool known to the process by metadata
 // (server, name, description, schema, no_spawn) and supports cheap
 // keyword search. It is the search surface for `search_tools` and the
-// per-turn preload, replacing the old main-access/catalog split.
+// the prompt's tool directory, replacing the old main-access/catalog split.
 //
 // The index is a metadata mirror of what's in ToolRegistry. The
 // registry remains the source of truth for handlers and dispatch;
@@ -264,27 +265,122 @@ func (ix *ToolIndex) ToolPolicyCountsByServer() map[string]map[ToolLoadMode]int 
 	return out
 }
 
-// computeMCPCatalog projects the index into the legacy
-// MCPServerInfo shape consumed by buildSystemPrompt. Kept as a free
-// function so the prompt builder doesn't need to learn about the
-// index type yet.
-func computeMCPCatalog(ix *ToolIndex) []MCPServerInfo {
+// SchemaTokens sums the approximate schema cost of the tools in scope that a
+// thread would be sent in direct mode: everything except tools their app
+// explicitly defers. A nil scope means every tool.
+func (ix *ToolIndex) SchemaTokens(scope func(IndexEntry) bool) int {
+	if ix == nil {
+		return 0
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	total := 0
+	for _, e := range ix.entries {
+		if normalizeToolLoadMode(e.LoadMode) == ToolLoadDeferred || scope != nil && !scope(e) {
+			continue
+		}
+		total += e.SchemaCost
+	}
+	return total
+}
+
+// computeMCPCatalog projects the index into the per-server shape consumed by
+// buildSystemPrompt: counts, the catalog's size in schema tokens, and one
+// directory line per tool. A nil scope means every tool; a thread with
+// narrower grants passes its own so its prompt lists only what it may use.
+func computeMCPCatalog(ix *ToolIndex, scope ...func(IndexEntry) bool) []MCPServerInfo {
 	if ix == nil {
 		return nil
 	}
-	counts := ix.ToolCountByServer()
-	policyCounts := ix.ToolPolicyCountsByServer()
-	out := make([]MCPServerInfo, 0, len(counts))
-	for _, name := range ix.Servers() {
-		out = append(out, MCPServerInfo{
-			Name:          name,
-			ToolCount:     counts[name],
-			AlwaysCount:   policyCounts[name][ToolLoadAlways],
-			AutoCount:     policyCounts[name][ToolLoadAuto],
-			DeferredCount: policyCounts[name][ToolLoadDeferred],
-		})
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	byServer := map[string]*MCPServerInfo{}
+	for _, e := range ix.entries {
+		if len(scope) > 0 && scope[0] != nil && !scope[0](e) {
+			continue
+		}
+		info := byServer[e.Server]
+		if info == nil {
+			info = &MCPServerInfo{Name: e.Server}
+			byServer[e.Server] = info
+		}
+		info.ToolCount++
+		mode := normalizeToolLoadMode(e.LoadMode)
+		switch mode {
+		case ToolLoadAlways:
+			info.AlwaysCount++
+		case ToolLoadDeferred:
+			info.DeferredCount++
+		default:
+			info.AutoCount++
+		}
+		if mode != ToolLoadDeferred {
+			info.SchemaTokens += e.SchemaCost
+		}
+		info.Tools = append(info.Tools, MCPToolLine{Name: e.Name, Summary: toolDirectorySummary(e.Description), Always: mode == ToolLoadAlways, Deferred: mode == ToolLoadDeferred})
+	}
+	names := make([]string, 0, len(byServer))
+	for name := range byServer {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]MCPServerInfo, 0, len(names))
+	for _, name := range names {
+		info := byServer[name]
+		sort.Slice(info.Tools, func(i, j int) bool { return info.Tools[i].Name < info.Tools[j].Name })
+		out = append(out, *info)
 	}
 	return out
+}
+
+const (
+	// toolDirectorySummaryChars bounds one tool's line in the directory.
+	toolDirectorySummaryChars = 90
+	// toolDirectoryMaxChars bounds the whole directory, about 4,000 tokens.
+	// A larger catalog is listed per server with counts only, and the model
+	// searches by what it needs.
+	toolDirectoryMaxChars = 16000
+)
+
+// toolDirectorySummary is the first sentence of a tool's description, on one
+// line, cut to toolDirectorySummaryChars.
+func toolDirectorySummary(description string) string {
+	text := strings.Join(strings.Fields(description), " ")
+	if end := strings.Index(text, ". "); end > 0 {
+		text = text[:end+1]
+	}
+	if len(text) > toolDirectorySummaryChars {
+		cut := toolDirectorySummaryChars
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = strings.TrimSpace(text[:cut]) + "…"
+	}
+	return text
+}
+
+// renderToolDirectory lists the tools a thread in search mode can load, by
+// name with a one-line summary, so the model knows what exists without
+// holding every schema. Tools already in the tool list are left out. It
+// returns "" when the directory would exceed toolDirectoryMaxChars.
+func renderToolDirectory(catalog []MCPServerInfo, eager bool) string {
+	var b strings.Builder
+	for _, info := range catalog {
+		for _, tool := range info.Tools {
+			if tool.Always || eager && !tool.Deferred {
+				continue
+			}
+			b.WriteString("- " + tool.Name)
+			if tool.Summary != "" {
+				b.WriteString(": " + tool.Summary)
+			}
+			b.WriteString("\n")
+			if b.Len() > toolDirectoryMaxChars {
+				return ""
+			}
+		}
+	}
+	return b.String()
 }
 
 // BaselineNames returns schemas that are visible without activation for the

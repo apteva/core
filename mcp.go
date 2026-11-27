@@ -185,7 +185,7 @@ type MCPServerConfig struct {
 	URL         string            `json:"url,omitempty"`       // http transport
 	// ToolLoading controls prompt-schema availability independently from
 	// connection and authorization. Always-loaded tools are present on every
-	// authorized model request; deferred tools require search/preload; auto
+	// authorized model request; deferred tools require search; auto
 	// preserves the global eager/discovery threshold behavior.
 	ToolLoading *MCPToolLoadingConfig `json:"tool_loading,omitempty"`
 	// NoSpawn, when true, hides this server's tools from sub-thread

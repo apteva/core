@@ -133,21 +133,6 @@ func TestDiscoveryEngineStrictReadOnlyAndMCPAnnotations(t *testing.T) {
 	}
 }
 
-func TestDiscoveryEngineAutomaticCurrentIntentOutranksMemory(t *testing.T) {
-	t.Setenv("APTEVA_TOOL_SEARCH", "on")
-	thinker := productionDiscoveryThinker(t)
-	thinker.config.AutomaticToolLoading.MaxTools = 2
-	thinker.messages = []Message{{Role: "user", Content: "Use Code repository files and Analytics performance."}}
-	thinker.memoryRecall.context = "CRM contacts and accounts are frequently important."
-	selected := thinker.prepareAutomaticTools(thinker.config.GetAutomaticToolLoading())
-	if !selected["code_list_files"] || !selected["analytics_top"] && !selected["analytics_query"] && !selected["analytics_topics"] {
-		t.Fatalf("current multi-server intent lost coverage: %v (%+v)", selected, thinker.automaticTools)
-	}
-	if selected["crm_list_contacts"] {
-		t.Fatalf("memory displaced the current request: %v", selected)
-	}
-}
-
 func TestDiscoveryEngineScopeNoSpawnAndDeterministicBudget(t *testing.T) {
 	thinker := productionDiscoveryThinker(t)
 	thinker.threadID = "worker"

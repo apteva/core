@@ -30,6 +30,19 @@ type MCPServerInfo struct {
 	AlwaysCount   int
 	AutoCount     int
 	DeferredCount int
+	// SchemaTokens is the approximate schema cost of the server's tools
+	// that direct mode would send (everything not explicitly deferred).
+	SchemaTokens int
+	// Tools is the server's directory: one line per tool.
+	Tools []MCPToolLine
+}
+
+// MCPToolLine is one tool in the prompt's directory.
+type MCPToolLine struct {
+	Name     string
+	Summary  string
+	Always   bool // already in the tool list
+	Deferred bool // its app asks for it to be loaded on demand
 }
 
 type ModelTier int
@@ -256,7 +269,7 @@ OWNERSHIP AND DELEGATION:
 - For batches of independent repeated work, especially tool-heavy or waiting/polling work, coordinate focused workers. Consolidate closely related continuing responsibilities under one owner instead of creating one thread per schedule.
 - Temporary and continuing workers are the same thread type. A one-shot worker owns one clear unit of work, uses the smallest required tool set, and returns its final result exactly once with done(message). A persistent owner sends requested reports, uses pace between cycles, and remains active.
 - ` + delegatedCompletionContract + `
-- Omit tools= and mcp= for normal spawning. The worker automatically inherits your effective delegable capability ceiling; its directive drives initial tool discovery and it can use search_tools for the rest.
+- Omit tools= and mcp= for normal spawning. The worker automatically inherits your effective delegable capability ceiling; it loads the tools it needs with search_tools.
 - Legacy tools= and mcp= remain strict narrowing overrides. They can reduce a child's exact tools or MCP server scopes, but can never grant anything outside your own ceiling.
 - Capability alone does not determine ownership: do not keep work on main merely because main can complete it. Keep only the very-small-work fast path local.
 - directive= is PLAIN NATURAL LANGUAGE describing the thread's goal. Never put tool names in the directive — the thread already receives its own tool documentation.
@@ -340,26 +353,26 @@ func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs s
 	// vars + total count, so what we tell the LLM matches what we'll
 	// actually send in `tools`).
 	if len(mcpCatalog) > 0 {
-		totalTools := 0
+		schemaTokens := 0
 		hasExplicitPolicy := false
 		for _, info := range mcpCatalog {
-			totalTools += info.ToolCount
+			schemaTokens += info.SchemaTokens
 			if info.AlwaysCount > 0 || info.DeferredCount > 0 {
 				hasExplicitPolicy = true
 			}
 		}
 		prompt += "\n\n[AVAILABLE MCP SERVERS]\n"
-		eager := poolUsesEagerTools(pool, totalTools)
+		eager := isEagerMode(schemaTokens)
+		directory := renderToolDirectory(mcpCatalog, eager)
 		if eager && !hasExplicitPolicy {
-			// Eager: every tool's schema is in `tools` already — telling
-			// the model to search_tools first would cost a wasted round-
-			// trip per request.
+			// Direct: every tool's schema is in `tools` already. Telling
+			// the model to search first would cost a round trip per request.
 			prompt += "These servers are attached and ALL their tools are already in your tool list — call them directly.\n\n"
 		} else if eager {
 			prompt += "Always and automatic MCP tools are already in your tool list. Explicitly deferred tools require search_tools. Never search for a tool that is already visible.\n\n"
 		} else {
-			prompt += "Always-loaded MCP tools are already in your tool list. Automatic and deferred tools require search_tools unless preloaded for the current task. Never search for a tool that is already visible. Repeat uses stay loaded.\n"
-			prompt += "New workers inherit your effective delegable MCP catalog automatically; their directive drives initial loading and search_tools can discover the rest. Legacy tools/mcp spawn fields are strict narrowing overrides only.\n\n"
+			prompt += "Only some of these tools are in your tool list. To use any other, call search_tools with its name or with what you need; it then stays in your tool list. Never search for a tool that is already visible.\n"
+			prompt += "New workers inherit your effective delegable MCP catalog automatically and load tools the same way. Legacy tools/mcp spawn fields are strict narrowing overrides only.\n\n"
 		}
 		for _, info := range mcpCatalog {
 			autoCount := info.AutoCount
@@ -379,6 +392,9 @@ func buildSystemPrompt(directive string, registry *ToolRegistry, extraToolDocs s
 				parts = append(parts, fmt.Sprintf("%d deferred", info.DeferredCount))
 			}
 			prompt += fmt.Sprintf("- %s (%d tools: %s)\n", info.Name, info.ToolCount, strings.Join(parts, ", "))
+		}
+		if directory != "" {
+			prompt += "\n[TOOL DIRECTORY] Tools you can load with search_tools:\n" + directory
 		}
 	}
 
@@ -953,14 +969,14 @@ type Thinker struct {
 	blobs *BlobStore
 	// toolIndex is the process-wide searchable catalog of every MCP
 	// tool currently registered. Owned by main; sub-threads share a
-	// pointer. Backs search_tools and per-turn BM25 preload.
+	// pointer. Backs search_tools and the prompt's tool directory.
 	toolIndex *ToolIndex
 	// activeTools is the per-thread set of MCP tool names whose
 	// schemas should be visible to the LLM this turn, overriding the
 	// MCP=true "hidden by default" flag. Populated by:
 	//   - spawn-time preload (SpawnOpts.MCPNames expansion)
 	//   - search_tools meta-tool results
-	//   - per-turn BM25 preload (applyPreload — sticky)
+	//   - a call to the tool
 	// Sticky on purpose: the set grows then stabilises, which keeps
 	// the `tools` array (a cached prompt-prefix component) stable
 	// turn-to-turn. Bounded by evictActiveToolsLRU + context-window
@@ -993,13 +1009,6 @@ type Thinker struct {
 	kickNextTurn            bool
 	inlineResultFingerprint string
 	inlineResultRepeats     int
-	// lastInboundForPreload carries the text of events drained on
-	// THIS iteration through to applyPreload's BM25 query. Set in
-	// Run() before think(); cleared after think() returns. Lets BM25
-	// preload include the user's just-arrived message without permanently
-	// destabilising the active-tools set on quiet turns.
-	lastInboundForPreload string
-	automaticTools        automaticToolSelection
 	// MCP server catalog — lightweight metadata for prompt (name +
 	// tool count). Derived from toolIndex; kept as a Thinker field
 	// for buildSystemPrompt back-compat.
@@ -1806,7 +1815,6 @@ func (t *Thinker) restoreFromExecutionCheckpoint(cp *executionCheckpoint) error 
 	t.silentToolMu.Lock()
 	t.silentToolResults = nil
 	t.silentToolMu.Unlock()
-	t.lastInboundForPreload = ""
 	restoreToInput := cp.Phase == string(ExecutionPhaseInputReady)
 	t.kickNextTurn = !restoreToInput
 	t.paused = restoreToInput
@@ -2440,7 +2448,7 @@ func mainToolHandler(t *Thinker) ToolHandler {
 					}
 					// Feed the search index so the freshly-connected
 					// server's tools are discoverable via search_tools
-					// and per-turn preload, same as startup-connected MCPs.
+					// and the tool directory, same as startup-connected MCPs.
 					if t.toolIndex != nil {
 						t.toolIndex.Add(name, tools, cfg.NoSpawn, cfg.ToolLoading)
 						t.mcpCatalog = computeMCPCatalog(t.toolIndex)
@@ -2841,12 +2849,12 @@ func (t *Thinker) Run() {
 		//
 		// RAG tool retrieval used to live here too — it embedded tool
 		// descriptions and injected the top-5 as text docs. It's gone:
-		// MCP tool discovery is now search_tools + per-turn BM25 preload
+		// MCP tool discovery is now search_tools, the prompt's tool directory
 		// + activeTools, and for native-tool providers every non-MCP
 		// tool main can use is already in the NativeTools array. The RAG
 		// path's only remaining effect was leaking MCP tools as text
 		// (bypassing the MCP=true visibility gate) and feeding its own
-		// injected text back into the preload query.
+		// injected text back into tool selection.
 		if hadEvents {
 			// Filter out tool result text from the events text (they're already in ToolResults)
 			var textEvents []string
@@ -3011,19 +3019,6 @@ func (t *Thinker) Run() {
 		// changes when the directive or static config (MCPs,
 		// providers) does — handled at the call sites of buildSystemPrompt.
 
-		// Hand the just-drained event text to applyPreload so BM25 can
-		// surface tools the user's message references on this same turn
-		// (e.g. "send a pushover" → pushover_* tools preloaded). Cleared
-		// after think() so a subsequent quiet iteration reverts to the
-		// stable directive-only preload that lets the prompt prefix cache.
-		var preloadEvents []string
-		for _, ev := range consumed {
-			if !strings.HasPrefix(ev, "[tool:") {
-				preloadEvents = append(preloadEvents, ev)
-			}
-		}
-		t.lastInboundForPreload = strings.Join(preloadEvents, "\n")
-
 		// Full-budget preflight and bounded recovery run after tool schemas are
 		// selected, immediately before the provider call.
 
@@ -3052,7 +3047,6 @@ func (t *Thinker) Run() {
 		if t.applyRuntimeMutations() && runCtx.Err() == nil {
 			continue
 		}
-		t.lastInboundForPreload = ""
 
 		duration := time.Since(start)
 		reply := chatResp.Text

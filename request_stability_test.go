@@ -24,8 +24,8 @@ func stabilityInputBytes(messages []Message) []byte {
 func TestRequestStabilityToolFollowupsAndDiscovery(t *testing.T) {
 	t.Setenv("APTEVA_TOOL_SEARCH", "on")
 	th := productionDiscoveryThinker(t)
-	th.config.AutomaticToolLoading.MaxTools = 1
 	th.messages = []Message{{Role: "system", Content: "Stable"}, {Role: "user", Content: "crm_list_contacts"}}
+	runSearchTools(th, map[string]string{"query": "crm_list_contacts", "k": "1"}, true)
 	first := th.prepareNativeTools("openai-codex")
 	for _, text := range []string{"yes", "continue", "oui", "sí", "好", "crm_list_contacts"} {
 		th.messages = append(th.messages, Message{Role: "user", Content: text})
@@ -34,14 +34,11 @@ func TestRequestStabilityToolFollowupsAndDiscovery(t *testing.T) {
 			t.Fatalf("%q reshuffled schemas", text)
 		}
 	}
-	// A full automatic budget never disables explicit discovery of a new tool.
+	// What a message says never changes the tool list; a search does.
 	result := runSearchTools(th, map[string]string{"query": "code_read_file", "k": "1"}, true)
 	tools := nativeToolSet(th.prepareNativeTools("openai-codex"))
 	if !tools["crm_list_contacts"] || !tools["code_read_file"] || !strings.Contains(result, "code_read_file") {
 		t.Fatalf("new discovery unavailable: %v %s", tools, result)
-	}
-	if len(th.automaticTools.names) > 1 {
-		t.Fatal("automatic budget was expanded")
 	}
 	th.toolAllowlist = map[string]bool{"crm_list_contacts": true}
 	if nativeToolSet(th.prepareNativeTools("openai-codex"))["code_read_file"] || th.modelToolCallable("code_read_file", nil) {
@@ -52,13 +49,12 @@ func TestRequestStabilityToolFollowupsAndDiscovery(t *testing.T) {
 func TestRequestStabilityAutomaticExpansionAndCatalog(t *testing.T) {
 	t.Setenv("APTEVA_TOOL_SEARCH", "on")
 	th := productionDiscoveryThinker(t)
-	th.config.AutomaticToolLoading.MaxTools = 3
-	th.messages = []Message{{Role: "user", Content: "crm_list_contacts"}}
+	runSearchTools(th, map[string]string{"query": "crm_list_contacts", "k": "1"}, true)
 	th.prepareNativeTools("openai-codex")
-	th.messages = append(th.messages, Message{Role: "user", Content: "code_read_file"})
+	runSearchTools(th, map[string]string{"query": "code_read_file", "k": "1"}, true)
 	got := nativeToolSet(th.prepareNativeTools("openai-codex"))
 	if !got["crm_list_contacts"] || !got["code_read_file"] {
-		t.Fatal("automatic expansion lost old/new capability", got)
+		t.Fatal("a later search lost the tool loaded earlier", got)
 	}
 	updated := mkTool("list_contacts", "Updated CRM schema description")
 	th.toolIndex.Add("crm", []mcpToolDef{updated}, false)
@@ -72,6 +68,8 @@ func TestRequestStabilityAutomaticExpansionAndCatalog(t *testing.T) {
 	if !found {
 		t.Fatal("retained stale schema after catalog refresh")
 	}
+	// A disconnect removes the server from the registry and the index.
+	th.registry.RemoveByMCPServer("crm")
 	th.toolIndex.Remove("crm")
 	if nativeToolSet(th.prepareNativeTools("openai-codex"))["crm_list_contacts"] {
 		t.Fatal("disconnected tool remained presented")
@@ -239,15 +237,6 @@ func TestRequestStabilityIndependentRollbacks(t *testing.T) {
 		if got := s.prepare(nil, "context", fmt.Sprint(i), false, true); len(got) != 1 {
 			t.Fatal("context rollback unavailable")
 		}
-	}
-	t.Setenv("APTEVA_TOOL_SEARCH", "on")
-	t.Setenv("APTEVA_STABLE_TOOL_SELECTION", "0")
-	th := productionDiscoveryThinker(t)
-	th.messages = []Message{{Role: "user", Content: "crm_list_contacts"}}
-	first := th.prepareNativeTools("openai-codex")
-	th.messages = append(th.messages, Message{Role: "user", Content: "code_read_file"})
-	if reflect.DeepEqual(first, th.prepareNativeTools("openai-codex")) {
-		t.Fatal("selection rollback unavailable")
 	}
 }
 

@@ -40,10 +40,19 @@ func (t *Thinker) visibleNativeToolSnapshot(grants, scopes map[string]bool, over
 		}
 	}
 	active := make(map[string]bool, len(t.activeTools))
+	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
 	add := func(name string) {
-		if t.toolAuthorizedFor(name, grants, scopes) {
-			active[name] = true
+		if !t.toolAuthorizedFor(name, grants, scopes) {
+			return
 		}
+		// A tool loaded earlier must not outlive a policy change that takes
+		// it away from sub-threads.
+		if !allowNoSpawn && t.toolIndex != nil {
+			if entry, ok := t.toolIndex.Get(name); ok && entry.NoSpawn {
+				return
+			}
+		}
+		active[name] = true
 	}
 	for _, overlay := range overlays {
 		for name, enabled := range overlay {

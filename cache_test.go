@@ -187,27 +187,6 @@ func TestUseEagerTools_CodexUsesNormalThreshold(t *testing.T) {
 	}
 }
 
-func TestUseEagerTools_LargeSurfaceUsesDiscoveryByDefault(t *testing.T) {
-	ix := NewToolIndex()
-	var tools []mcpToolDef
-	for i := 0; i < defaultToolSearchAutoThreshold+1; i++ {
-		tools = append(tools, mcpToolDef{Name: fmt.Sprintf("tool_%02d", i), Description: "tool"})
-	}
-	ix.Add("large", tools, false)
-	tk := &Thinker{
-		provider:  &OpenAINativeProvider{name: "openai-codex"},
-		toolIndex: ix,
-	}
-	if tk.useEagerTools() {
-		t.Fatalf("tool surface above %d should use discovery by default", defaultToolSearchAutoThreshold)
-	}
-
-	t.Setenv("APTEVA_EAGER_TOOL_LIMIT", "999")
-	if !tk.useEagerTools() {
-		t.Fatal("APTEVA_EAGER_TOOL_LIMIT should allow rollback to eager mode")
-	}
-}
-
 func TestToolSearchEnvOverrideAppliesToCodex(t *testing.T) {
 	t.Setenv("APTEVA_TOOL_SEARCH", "on")
 	tk := &Thinker{

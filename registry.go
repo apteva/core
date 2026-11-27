@@ -67,7 +67,7 @@ type ToolDef struct {
 	MainOnly       bool   // only for main thread (spawn, kill)
 	ThreadOnly     bool   // only for sub-threads, not main (reply)
 	SystemOnly     bool   // only for system threads (unconscious)
-	MCP            bool   // provided by an MCP server — hidden from the per-turn tool list until activated (search_tools / spawn preload / BM25 preload)
+	MCP            bool   // provided by an MCP server — hidden from the per-turn tool list until loaded (search_tools, a call, or a pin)
 	MCPLocalName   string // immutable raw MCP tools/call name
 	MCPServer      string // name of the MCP server that provides this tool
 	MCPApp         bool   // routed through Apteva's authenticated app MCP gateway
@@ -570,7 +570,7 @@ func (tr *ToolRegistry) Counts() (core, rag, total int) {
 //   - MCP tools (ToolDef.MCP == true): hidden by default — they only
 //     appear when their name is in `active`. That's how the
 //     "agent-driven discovery" model works: spawn-time MCPNames
-//     preload, search_tools, and per-turn BM25 preload all push
+//     preload and search_tools both push
 //     names into the active set; nothing else gets MCP tools on
 //     the wire.
 //

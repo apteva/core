@@ -161,50 +161,6 @@ func TestAPISpawnContinueToolsFrom(t *testing.T) {
 	}
 }
 
-func TestAutomaticToolsSkipMemoryOnAssignedWorker(t *testing.T) {
-	assigned := func(threadID string) *Thinker {
-		th := automaticTicketThinker(t)
-		th.threadID = threadID
-		th.addEventExecutions([]string{"step"})
-		th.config.EventExecutions = []PersistentEventExecution{{ExecutionID: "step", Status: "running", Reason: "zebra quokka"}}
-		th.memoryRecall.context = "Last week we used tickets_tickets_update."
-		th.prepareNativeTools("opencode-go")
-		return th
-	}
-	for name, reason := range assigned("process-run-1-worker").automaticTools.reasons {
-		if reason == "memory" {
-			t.Fatalf("worker with an assigned task used memory to load %s", name)
-		}
-	}
-	if main := assigned("main"); main.automaticTools.reasons["tickets_tickets_update"] != "memory" {
-		t.Fatalf("main thread stopped using memory: %+v", main.automaticTools)
-	}
-}
-
-func TestAutomaticToolsLoadNamedToolsFirst(t *testing.T) {
-	th := automaticTicketThinker(t)
-	th.config.AutomaticToolLoading.MaxTools = 1
-	th.directive = "Record decisions with tickets_tickets_add_internal_note."
-	th.messages = []Message{{Role: "user", Content: "Create a feedback area for billing"}}
-	th.prepareNativeTools("opencode-go")
-	if !reflect.DeepEqual(th.automaticTools.names, []string{"tickets_tickets_add_internal_note"}) || th.automaticTools.reasons["tickets_tickets_add_internal_note"] != "directive" {
-		t.Fatalf("named tool did not load first: %+v", th.automaticTools)
-	}
-	// Named tools take at most half the budget; the rest stays for relevance.
-	th = automaticTicketThinker(t)
-	th.config.AutomaticToolLoading.MaxTools = 2
-	th.directive = "Use tickets_tickets_add_internal_note and tickets_tickets_history."
-	th.messages = []Message{{Role: "user", Content: "Create a feedback area for billing"}}
-	th.prepareNativeTools("opencode-go")
-	got := map[string]bool{}
-	for _, name := range th.automaticTools.names {
-		got[name] = true
-	}
-	if !got["tickets_tickets_add_internal_note"] || !got["tickets_ticket_areas_create"] || got["tickets_tickets_history"] {
-		t.Fatalf("named tools did not leave room for relevance: %v", th.automaticTools.names)
-	}
-}
-
 func searchResult(t *testing.T, th *Thinker, args map[string]string) searchToolsResult {
 	t.Helper()
 	var res searchToolsResult

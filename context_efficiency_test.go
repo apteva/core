@@ -249,18 +249,6 @@ func TestContextEfficiencyOutputBudgetAndUnknownCapabilities(t *testing.T) {
 	}
 }
 
-func TestContextEfficiencyPhaseHashesFullInstruction(t *testing.T) {
-	th := automaticTicketThinker(t)
-	th.messages = []Message{{Role: "user", Content: strings.Repeat("same opening ", 900) + "Task A"}}
-	th.prepareNativeTools("openai-codex")
-	phase := th.automaticTools.context
-	th.messages[0].Content = strings.Repeat("same opening ", 900) + "Task B"
-	th.prepareNativeTools("openai-codex")
-	if phase == th.automaticTools.context {
-		t.Fatal("different long task reused phase")
-	}
-}
-
 func TestContextEfficiencyAnthropicBudgetIgnoresResponsesState(t *testing.T) {
 	messages := []Message{{Role: "assistant", Content: "Observed exact state", Reasoning: strings.Repeat("private reasoning ", 10000)}}
 	plain := cloneMessages(messages)
