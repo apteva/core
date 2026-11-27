@@ -2735,17 +2735,21 @@ func (t *Thinker) Run() {
 			logMsg("RUN", fmt.Sprintf("[%s] drained %d silent tool results", t.threadID, len(silentResults)))
 		}
 
-		// --- Iter-boundary wait barrier for parallel async tool calls ---
-		// Without this, when the previous iteration dispatched N parallel
-		// tool calls and only some of their results landed before the
-		// first Wake, the half-finished batch would reach think() and
-		// the model would retry the "missing" ones. The barrier drains
-		// additional events as they arrive, up to a short deadline, and
-		// for anything still pending after the deadline it injects a
-		// placeholder tool_result (see injectPlaceholdersForPending) so
-		// the tool_use is properly paired and the model is told not to
-		// retry.
-		t.waitForPendingTools(&toolResults, &consumed, &mediaParts, 3*time.Second, &eventIDs, &executionIDs)
+		// --- A turn ends when its tool calls have returned ---
+		// The previous response may have dispatched several tool calls.
+		// The model is not called again until all of them have a result,
+		// so it sees the whole batch once. Each call is bounded by its own
+		// timeout, and pendingToolWaitLimit is only a backstop behind that.
+		//
+		// The wait used to stop after three seconds. Calls still running
+		// were then answered with a placeholder and their real results
+		// arrived later as text, each one waking the thread for another
+		// model call just to read it.
+		//
+		// A message from the operator still ends the wait at once. Only
+		// then are the calls still running given a placeholder
+		// (injectPlaceholdersForPending), so every tool_use stays paired.
+		t.waitForPendingTools(&toolResults, &consumed, &mediaParts, pendingToolWaitLimit, &eventIDs, &executionIDs)
 		t.addEventExecutions(executionIDs)
 		if t.pendingToolCount() > 0 {
 			injectedBefore := len(toolResults)
@@ -4124,6 +4128,12 @@ func (t *Thinker) drainSilentToolResults() []ToolResult {
 // loop. When the deadline fires and some tools are still pending, the
 // caller is expected to inject placeholder tool_results for them (see
 // injectPlaceholdersForPending).
+// pendingToolWaitLimit bounds how long a turn waits for its tool calls. Every
+// call already ends at its own timeout (toolCallTimeout, at most
+// maxConnectorCallTimeout); this is the backstop for a call that never
+// reports. A variable so tests can shorten it.
+var pendingToolWaitLimit = maxConnectorCallTimeout + 30*time.Second
+
 func (t *Thinker) waitForPendingTools(
 	toolResults *[]ToolResult,
 	consumed *[]string,
