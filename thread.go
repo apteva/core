@@ -590,6 +590,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	// rather than a pool that a config change may be replacing.
 	nativeToolDocs := &atomic.Bool{}
 	nativeToolDocs.Store(poolSupportsNativeTools(tm.parent.pool))
+	// workerDirectory lists the tools this thread can load, once its Thinker
+	// exists to say which tools it may use.
+	var workerDirectory func() string
 	buildThreadPrompt := func(currentID, currentParentID, currentDirective string) string {
 		parentLabel := currentParentID
 		if parentLabel == "main" {
@@ -623,6 +626,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 		}
 		if canSpawn {
 			prompt += formatInheritedMCPServers(opts.MCPNames)
+		}
+		if workerDirectory != nil {
+			prompt += workerDirectory()
 		}
 		return prompt + "\n\n[DIRECTIVE]\n" + currentDirective
 	}
@@ -755,9 +761,9 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 	var threadMCPServers []MCPConn // intentionally empty — main owns the live set
 
 	// MCPNames authorize discovery across the listed servers. Loading policy
-	// decides which scoped schemas are immediately present: always/eager tools
-	// arrive through the normal baseline, relevant automatic tools through
-	// BM25 preload, and deferred tools through search_tools. Exact SpawnOpts
+	// decides which scoped schemas are immediately present: always tools and,
+	// in direct mode, every other tool arrive through the normal baseline. In
+	// search mode the thread loads the rest with search_tools. Exact SpawnOpts
 	// tools below are the only names force-preloaded here.
 	preloadActive := map[string]bool{}
 	// Explicit per-tool preload (SpawnOpts.Tools) lets a caller hand-pick
@@ -897,6 +903,25 @@ func (tm *ThreadManager) spawnInternal(id, directive string, tools []string, opt
 
 	// Set tool handler AFTER Children is set up (handler references thread.Children)
 	thinker.handleTools = threadToolHandler(thread, tm)
+
+	// In search mode the thread's prompt lists the tools it can load, so it
+	// knows what exists without Core guessing what it needs. Realtime
+	// threads keep their scoped tools and a short prompt.
+	if !opts.Realtime {
+		workerDirectory = func() string {
+			if thinker.toolIndex == nil || thinker.useEagerTools() {
+				return ""
+			}
+			directory := renderToolDirectory(computeMCPCatalog(thinker.toolIndex, thinker.catalogScope()), false)
+			if directory == "" {
+				return ""
+			}
+			return "\n\n[TOOL DIRECTORY] Tools you can load: call search_tools with a tool's name or with what you need, and it stays in your tool list.\n" + directory
+		}
+		if section := workerDirectory(); section != "" && len(thinker.messages) > 0 {
+			thinker.messages[0] = Message{Role: "system", Content: buildThreadPrompt(id, parentID, directive)}
+		}
+	}
 
 	// Load conversation history from persistent session (for respawned threads)
 	restoredToolResultBudget, _ := thinker.historicalToolResultBudgets()

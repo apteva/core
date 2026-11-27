@@ -8,41 +8,41 @@ import (
 	"strings"
 )
 
-// defaultToolSearchAutoThreshold: at or below this many indexed
-// tools, APTEVA_TOOL_SEARCH=auto loads everything eagerly. The
-// original A/B runs put the crossover above ~21 tools (discovery
-// lost there) and well below 113 (discovery won big). We ship 60 as
-// the default so typical agents stay on the cheaper eager path, while
-// large app surfaces (60+ MCP tools, common for media/channel managers)
-// use discovery instead of sending every schema on each scheduled wake.
+// Core decides which tools a thread may use. It does not guess which ones
+// the thread needs. There are two modes, chosen by the size of the thread's
+// own catalog:
 //
-// Override at runtime via APTEVA_EAGER_TOOL_LIMIT=<int>. The two
-// env vars compose: APTEVA_TOOL_SEARCH=off forces eager regardless
-// of count; APTEVA_TOOL_SEARCH=on forces discovery regardless;
-// APTEVA_TOOL_SEARCH=auto (default) consults APTEVA_EAGER_TOOL_LIMIT.
-const defaultToolSearchAutoThreshold = 60
+//   - direct: the schemas of every tool the thread may use fit the budget,
+//     so all of them are sent and the model calls them.
+//   - search: the catalog is larger. The model sees a directory of tool
+//     names in its prompt and loads what it needs with search_tools. A tool
+//     it has loaded or called stays loaded.
+//
+// The budget is in schema tokens, not tools: seventy small tools cost less
+// than ten large ones, and a count cannot tell them apart.
+const defaultDirectToolTokens = 30000
 
-func eagerToolLimit() int {
-	if raw := strings.TrimSpace(os.Getenv("APTEVA_EAGER_TOOL_LIMIT")); raw != "" {
+// directToolTokenBudget is the largest catalog, in approximate schema
+// tokens, that is sent whole. Override with APTEVA_DIRECT_TOOL_TOKENS.
+func directToolTokenBudget() int {
+	if raw := strings.TrimSpace(os.Getenv("APTEVA_DIRECT_TOOL_TOKENS")); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
 			return n
 		}
 	}
-	return defaultToolSearchAutoThreshold
+	return defaultDirectToolTokens
 }
 
-// activeToolsCap bounds the sticky active-tool set in discovery mode.
-// Sticky preload makes the per-turn tool list grow then STABILISE,
-// which is what lets the prompt prefix cache. The cap stops an
-// unbounded set on a long, topic-hopping conversation from creeping
-// toward "everything"; evictActiveToolsLRU trims to ~70% when hit.
+// activeToolsCap bounds the set of loaded tools in search mode. The set
+// grows as the model loads tools, then settles, which keeps the tool list
+// (part of the cached prompt prefix) stable. evictActiveToolsLRU trims it
+// to about 70% when the cap is hit.
 const activeToolsCap = 40
 
 // toolSearchMode resolves APTEVA_TOOL_SEARCH: "auto" (default) | "on"
-// | "off". "on" forces the discovery model (search + preload); "off"
-// makes auto-policy tools eager; "auto" decides by the size of the
-// attached surface. Explicit always/deferred policy still wins over this
-// process-wide default. Mirrors Anthropic's own ENABLE_TOOL_SEARCH knob.
+// | "off". "on" forces search mode and "off" forces direct mode; "auto"
+// decides by the size of the thread's catalog. An app's explicit
+// always/deferred policy for a tool still wins over this.
 func toolSearchMode() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APTEVA_TOOL_SEARCH"))) {
 	case "on":
@@ -54,36 +54,39 @@ func toolSearchMode() string {
 	}
 }
 
-// isEagerMode is the pure-function form of useEagerTools — takes the
-// raw indexed-tool count and returns whether eager applies, honoring
-// the APTEVA_TOOL_SEARCH / APTEVA_EAGER_TOOL_LIMIT env vars.
-// Pulled out so buildSystemPrompt can decide which [AVAILABLE MCP
-// SERVERS] wording to emit without needing a Thinker pointer.
-func isEagerMode(toolCount int) bool {
+// isEagerMode reports direct mode for a catalog of the given size in
+// approximate schema tokens.
+func isEagerMode(schemaTokens int) bool {
 	switch toolSearchMode() {
 	case "off":
 		return true
 	case "on":
 		return false
 	default:
-		return toolCount <= eagerToolLimit()
+		return schemaTokens <= directToolTokenBudget()
 	}
 }
 
-// useEagerTools reports whether this thinker should load every
-// attached tool every turn (eager) rather than the discovery model.
-// Resolved per-turn so a runtime connect / app-install that pushes the
-// surface past the auto threshold flips the mode without a restart.
+// useEagerTools reports whether this thread is in direct mode. It is
+// resolved from the tools the thread itself may use, so a worker scoped to a
+// few tools gets them directly however large the agent's whole catalog is.
+// Resolved per turn: an app install or a grant change moves the thread
+// between modes without a restart.
 func (t *Thinker) useEagerTools() bool {
-	n := 0
-	if t.toolIndex != nil {
-		n = t.toolIndex.Count()
+	if t == nil || t.toolIndex == nil {
+		return isEagerMode(0)
 	}
-	return isEagerMode(n)
+	return isEagerMode(t.toolIndex.SchemaTokens(t.catalogScope()))
 }
 
-func poolUsesEagerTools(pool *ProviderPool, toolCount int) bool {
-	return isEagerMode(toolCount)
+// catalogScope is the filter for tools this thread may use and that are not
+// explicitly deferred by their app.
+func (t *Thinker) catalogScope() func(IndexEntry) bool {
+	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
+	authorized := t.discoveryAuthorizedPredicate()
+	return func(entry IndexEntry) bool {
+		return (allowNoSpawn || !entry.NoSpawn) && (authorized == nil || authorized(entry))
+	}
 }
 
 // search_tools is the meta-tool every thread has in its scaffolding.
@@ -94,10 +97,9 @@ func poolUsesEagerTools(pool *ProviderPool, toolCount int) bool {
 //
 // Activation is sticky for the rest of the thread's life (subject to
 // context-window compaction): once the LLM has called a tool we keep
-// its schema visible so a follow-up call has no search overhead. The
-// per-turn BM25 preload (see thinker.go iteration loop) handles the
-// transient case — tools the user's current message is about that
-// the LLM hasn't yet searched for.
+// its schema visible so a follow-up call has no search overhead. Core
+// never loads a tool because some text seemed to mention it: the model
+// asks, or the agent's configuration pins the tool.
 
 // registerSearchTool adds search_tools to a registry as a Core tool
 // so it appears in every thread's tool list regardless of allowlist.
@@ -206,32 +208,6 @@ func readIntentQuery(query string) bool {
 	return read
 }
 
-// applyPreload searches the directive and events drained this iteration, then
-// stickily activates a bounded set. Quiet turns use only the directive. Schema
-// changes can invalidate the provider's cacheable prefix even on user turns;
-// keeping existing selections avoids needless reshuffling. Unresolved exact
-// names never automatically activate descriptive suggestions here.
-func (t *Thinker) applyPreload(k int, extraQuery string) {
-	if t == nil || t.toolIndex == nil {
-		return
-	}
-	query := strings.TrimSpace(t.directive)
-	if extra := strings.TrimSpace(extraQuery); extra != "" {
-		if query == "" {
-			query = extra
-		} else {
-			query = query + "\n" + extra
-		}
-	}
-	if query == "" {
-		return
-	}
-	allowNoSpawn := t.threadID == "main" || t.allowNoSpawn
-	for _, h := range t.searchAuthorizedTools(query, k, allowNoSpawn) {
-		t.touchActiveTool(h.Name)
-	}
-}
-
 // toolAuthorized is the common hard capability predicate for model schema
 // exposure, discovery/preloading, and execution. Main has the complete
 // attached surface. Workers get Core/exact tools from toolAllowlist plus MCP
@@ -282,7 +258,7 @@ func (t *Thinker) authorizedToolAllowlist(allowlist map[string]bool) map[string]
 
 // touchActiveTool marks a tool active and refreshes its recency to
 // the current iteration. Every path that surfaces a tool — spawn-time
-// preload, search_tools, per-turn applyPreload — goes through here so
+// continuity, search_tools, a tool call — goes through here so
 // evictActiveToolsLRU has a consistent recency key. Lazily inits both
 // maps so bare test thinkers don't need to.
 func (t *Thinker) touchActiveTool(name string) {
@@ -378,23 +354,12 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 	}
 	t.recordToolCatalog()
 	eager := t.useEagerTools()
-	automatic := t.config.GetAutomaticToolLoading()
 	var overlay map[string]bool
 	if eager {
-		t.automaticTools = automaticToolSelection{}
 		t.lastToolMode = "eager"
 	} else {
 		t.lastToolMode = "discovery"
-		preloadK := 5
-		if providerName == "openai-codex" {
-			preloadK = 3
-		}
-		if automatic.Enabled {
-			overlay = t.prepareAutomaticTools(automatic)
-		} else {
-			t.automaticTools = automaticToolSelection{}
-			t.applyPreload(preloadK, t.lastInboundForPreload)
-		}
+		overlay = t.pinnedTools()
 		t.evictActiveToolsLRU(activeToolsCap)
 	}
 	t.publishActiveTools()
@@ -434,7 +399,7 @@ func (t *Thinker) prepareNativeTools(providerName string) []NativeTool {
 	return tools
 }
 
-// evictActiveToolsLRU bounds the sticky active-tool set. Sticky preload
+// evictActiveToolsLRU bounds the sticky active-tool set. Sticky loading
 // is what makes the tool list cache-friendly (grow then stabilise),
 // but an unbounded set on a long, topic-hopping conversation would
 // creep toward "everything" and lose the token win. When the set
@@ -632,4 +597,24 @@ func runSearchTools(t *Thinker, args map[string]string, allowNoSpawn bool) strin
 	}
 	out, _ := json.Marshal(res)
 	return string(out)
+}
+
+// pinnedTools returns the tools the agent's configuration names to keep
+// loaded in search mode (automatic_tool_loading.workflow_tools). They are an
+// operator's explicit choice and pass the same grant checks as every tool.
+func (t *Thinker) pinnedTools() map[string]bool {
+	if t == nil || t.config == nil || t.toolIndex == nil {
+		return nil
+	}
+	var out map[string]bool
+	for _, name := range t.config.GetAutomaticToolLoading().WorkflowTools {
+		if _, ok := t.toolIndex.Get(name); !ok || !t.toolAuthorized(name) {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[name] = true
+	}
+	return out
 }

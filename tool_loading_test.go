@@ -100,8 +100,8 @@ func TestPrepareNativeToolsAlwaysLoadsChannelsUnderForcedDiscovery(t *testing.T)
 	registerTestMCPTools(registry, "channels", channelTools)
 	index.Add("channels", channelTools, true, &MCPToolLoadingConfig{Default: ToolLoadAlways})
 
-	decoys := make([]mcpToolDef, 0, defaultToolSearchAutoThreshold+1)
-	for i := 0; i < defaultToolSearchAutoThreshold+1; i++ {
+	decoys := make([]mcpToolDef, 0, 61)
+	for i := 0; i < 61; i++ {
 		decoys = append(decoys, mcpToolDef{
 			Name:        "decoy_" + string(rune('A'+i%26)) + string(rune('a'+i/26)),
 			Description: "Unrelated inventory capability",
@@ -199,7 +199,7 @@ func TestSystemPromptDescribesMixedLoadingWithoutAssumingDeliveryTool(t *testing
 	if strings.Contains(prompt, "channels_send") {
 		t.Fatalf("prompt invents channels_send from the server catalog")
 	}
-	if !strings.Contains(prompt, "4 always") || !strings.Contains(prompt, "Always-loaded MCP tools are already") {
+	if !strings.Contains(prompt, "4 always") || !strings.Contains(prompt, "Only some of these tools are in your tool list") {
 		t.Fatalf("prompt missing mixed loading guidance:\n%s", prompt)
 	}
 }

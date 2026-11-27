@@ -73,12 +73,6 @@ func TestDiscoveryTicketsIncidentQueries(t *testing.T) {
 			}
 		})
 	}
-	th.applyPreload(3, "Read ticket details and assign the ticket to an agent")
-	for _, name := range []string{"tickets_tickets_get", "tickets_tickets_update"} {
-		if !th.activeTools[name] {
-			t.Errorf("preload did not activate %s: %v", name, th.activeTools)
-		}
-	}
 }
 
 func TestDiscoverySuggestionsAreDistinctAndScoped(t *testing.T) {
@@ -93,12 +87,7 @@ func TestDiscoverySuggestionsAreDistinctAndScoped(t *testing.T) {
 	if !reflect.DeepEqual(res.Loaded, []string{"tickets_tickets_update"}) {
 		t.Fatal("suggested schema not available in same search", res)
 	}
-	// Preload cannot hide the unresolved-name warning by silently activating it.
 	fresh := ticketDiscoveryThinker(t)
-	fresh.applyPreload(5, "tickets_missing assign ticket to assignee")
-	if len(fresh.activeTools) != 0 {
-		t.Fatal("preload silently substituted unknown operation")
-	}
 	for _, query := range []string{"tickets_missing", "tickets_tickets_update assign ticket", "tickets_update assign ticket"} {
 		fresh.toolAllowlist = map[string]bool{"tickets_tickets_get": true}
 		got := fresh.searchAuthorizedToolsDetailed(query, 5, true)

@@ -121,14 +121,12 @@ type DiscoveryIntent struct {
 }
 
 type DiscoveryRequest struct {
-	Intents               []DiscoveryIntent
-	AllowNoSpawn          bool
-	AllowSuggestions      bool
-	MaxTools              int
-	MaxSchemaTokens       int
-	MemoryMaxTools        int
-	MemoryMaxSchemaTokens int
-	Activate              bool
+	Intents          []DiscoveryIntent
+	AllowNoSpawn     bool
+	AllowSuggestions bool
+	MaxTools         int
+	MaxSchemaTokens  int
+	Activate         bool
 }
 
 type DiscoveryToolResult struct {
@@ -343,8 +341,6 @@ func (result *DiscoveryResult) plan(t *Thinker, request DiscoveryRequest) {
 		request.MaxSchemaTokens = 16000
 	}
 	selected := map[string]bool{}
-	memorySelected := 0
-	memoryTokens := 0
 	priorities := map[int]bool{}
 	for _, group := range result.Results {
 		priorities[group.priority] = true
@@ -384,14 +380,6 @@ func (result *DiscoveryResult) plan(t *Thinker, request DiscoveryRequest) {
 						continue
 					}
 				}
-				if group.Source == "memory" && request.MemoryMaxTools > 0 && memorySelected >= request.MemoryMaxTools {
-					candidate.SkipReason = "memory_budget"
-					continue
-				}
-				if group.Source == "memory" && request.MemoryMaxSchemaTokens > 0 && memoryTokens+entry.SchemaCost > request.MemoryMaxSchemaTokens {
-					candidate.SkipReason = "memory_budget"
-					continue
-				}
 				if len(selected) >= request.MaxTools || result.SchemaTokens+entry.SchemaCost > request.MaxSchemaTokens {
 					candidate.SkipReason = "schema_budget"
 					result.SkippedBudget++
@@ -400,10 +388,6 @@ func (result *DiscoveryResult) plan(t *Thinker, request DiscoveryRequest) {
 				selected[candidate.Name], candidate.Loaded = true, true
 				result.Loaded = append(result.Loaded, candidate.Name)
 				result.SchemaTokens += entry.SchemaCost
-				if group.Source == "memory" {
-					memorySelected++
-					memoryTokens += entry.SchemaCost
-				}
 			}
 		}
 	}
